@@ -51,6 +51,7 @@ class SPMDManager:
         self, 
         spmd_id: str, 
         config: SPMDConfig,
+        placement_group: Optional[Any] = None,
         checkpoint_id: Optional[str] = None
     ) -> SPMDHandle:
         """
@@ -59,15 +60,15 @@ class SPMDManager:
         Args:
             spmd_id: Unique identifier for the SPMD
             config: SPMD configuration
+            placement_group: Ray PlacementGroup for resource allocation
             checkpoint_id: Optional checkpoint to restore from
             
         Returns:
             Handle to the started SPMD
             
-        TODO: Create or reuse Placement Group
         TODO: Check for existing checkpoint
-        TODO: Start SPMD Master (Ray Actor)
-        TODO: Start SPMD Workers (Ray Actors)
+        TODO: Start SPMD Master (Ray Actor) using placement_group
+        TODO: Start SPMD Workers (Ray Actors) using placement_group
         TODO: Establish Worker Handle connections
         TODO: Initialize state management
         """

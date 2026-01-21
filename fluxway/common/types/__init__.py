@@ -13,6 +13,8 @@ from .data_types import (
     # Resource and Scheduling Types (Section 2.1.2)
     ResourceSpec,
     PlacementPlan,
+    PlacementStrategy,
+    ResourcePriority,
     # State Management Types (Section 2.1.4)
     GlobalState,
     SPMDState,

@@ -10,9 +10,9 @@ The Controller orchestrates the training job by coordinating:
 - StateManager: Global state and checkpointing
 """
 
-from typing import Dict, List, Optional, Any, Type
+from typing import Dict, List, Optional, Any
 
-from ..common.types import Graph, Node, ResourceSpec, PlacementPlan, SPMDConfig
+from ..common.types import Graph
 from .monitor import Monitor
 from .scheduler import Scheduler
 from .spmd_manager import SPMDManager, SPMDHandle
@@ -29,6 +29,9 @@ class Controller:
     - Manages SPMD instances via SPMDManager
     - Tracks state via StateManager
     - Monitors cluster health via Monitor
+    
+    Note: Resource-related operations are proxied through Scheduler.
+    Controller can get SPMD view from spmd_manager but without resource info.
     """
     
     def __init__(
@@ -38,27 +41,27 @@ class Controller:
         scheduler: Scheduler,
         spmd_manager: SPMDManager,
         state_manager: StateManager,
-        spmd_handles: Dict[str, SPMDHandle]
     ):
         """
         Initialize Controller with all components.
+        
+        The scheduler is initialized with spmd_manager reference for
+        SPMD-resource binding operations.
         
         Use from_graph() class method for standard initialization.
         
         Args:
             graph: The task graph defining SPMD nodes and edges
             monitor: Cluster state monitor
-            scheduler: Resource scheduler
+            scheduler: Resource scheduler (holds spmd_manager reference)
             spmd_manager: SPMD lifecycle manager
             state_manager: State and checkpoint manager
-            spmd_handles: Handles to initialized SPMD instances
         """
         self._graph = graph
         self._monitor = monitor
         self._scheduler = scheduler
         self._spmd_manager = spmd_manager
         self._state_manager = state_manager
-        self._spmd_handles = spmd_handles
     
     @classmethod
     def from_graph(cls, graph: Graph) -> "Controller":
@@ -66,61 +69,34 @@ class Controller:
         Initialize Controller from a Graph.
         
         Initialization flow:
-        1. Initialize scheduler
-        2. Request placement groups for each Node based on resource requirements
-        3. Initialize SPMDs (allocate resources to master and workers)
-        4. Initialize spmd_manager, state_manager, and monitor
+        1. Create all components (spmd_manager, state_manager, monitor)
+        2. Create scheduler with spmd_manager reference
+        3. Call scheduler.schedule() which handles:
+           - Resource allocation
+           - SPMD initialization
+           - Topology establishment
         
         Args:
             graph: The task graph built using Builder
             
         Returns:
             Initialized Controller instance
+            
+        Raises:
+            RuntimeError: If scheduling fails
         """
-        # Step 1: Initialize scheduler
-        scheduler = Scheduler()
-        
-        # Step 2: Request placement groups for each Node
-        # For now, allocate resources per node without sharing/eviction/preemption
-        placement_groups: Dict[str, Any] = {}
-        for node_name, node in graph.nodes.items():
-            resource = node.resource
-            if resource is not None:
-                # Create placement group for this node
-                pg = scheduler.allocate_resources(PlacementPlan(
-                    node_placements={node_name: resource}
-                ))
-                placement_groups[node_name] = pg
-        
-        # Step 3: Initialize SPMDs
-        # For now, just create handles and assign allocated resources
-        spmd_handles: Dict[str, SPMDHandle] = {}
-        for node_name, node in graph.nodes.items():
-            spmd_config = node.spmd_config
-            if spmd_config is None:
-                continue
-            
-            # Create SPMD handle
-            handle = SPMDHandle(spmd_id=node_name)
-            
-            # Assign placement group resources (master and workers)
-            # The actual SPMD initialization logic will be implemented later
-            if node_name in placement_groups:
-                handle._placement_group = placement_groups[node_name]
-            
-            spmd_handles[node_name] = handle
-        
-        # Step 4: Initialize remaining components
+        # Step 1: Create all components
         spmd_manager = SPMDManager()
-        for spmd_id, handle in spmd_handles.items():
-            spmd_manager.register_spmd(spmd_id, handle)
-        
-        # Establish topology from graph edges
-        topology = cls._build_topology(graph)
-        spmd_manager.establish_topology(topology)
-        
         state_manager = StateManager()
         monitor = Monitor()
+        
+        # Step 2: Create scheduler with spmd_manager reference
+        scheduler = Scheduler(spmd_manager=spmd_manager)
+        
+        # Step 3: Schedule - handles resource allocation, SPMD init, and topology
+        success = scheduler.schedule(graph)
+        if not success:
+            raise RuntimeError("Failed to schedule graph")
         
         return cls(
             graph=graph,
@@ -128,26 +104,7 @@ class Controller:
             scheduler=scheduler,
             spmd_manager=spmd_manager,
             state_manager=state_manager,
-            spmd_handles=spmd_handles
         )
-    
-    @staticmethod
-    def _build_topology(graph: Graph) -> Dict[str, List[str]]:
-        """
-        Build SPMD topology from graph edges.
-        
-        Args:
-            graph: The task graph
-            
-        Returns:
-            Mapping of node name to list of downstream node names
-        """
-        topology: Dict[str, List[str]] = {name: [] for name in graph.nodes}
-        for edge in graph.edges:
-            if edge.source_node in topology:
-                if edge.target_node not in topology[edge.source_node]:
-                    topology[edge.source_node].append(edge.target_node)
-        return topology
     
     @property
     def graph(self) -> Graph:
@@ -174,17 +131,20 @@ class Controller:
         """Get the state manager component."""
         return self._state_manager
     
-    def get_spmd_handle(self, node_name: str) -> Optional[SPMDHandle]:
+    def get_spmd_handle(self, spmd_id: str) -> Optional[SPMDHandle]:
         """
-        Get handle to an SPMD instance.
+        Get handle to an SPMD instance from spmd_manager.
+        
+        Note: This returns the handle without resource info.
+        Use scheduler for resource-related operations.
         
         Args:
-            node_name: Name of the node/SPMD
+            spmd_id: ID of the SPMD
             
         Returns:
             SPMDHandle or None if not found
         """
-        return self._spmd_handles.get(node_name)
+        return self._spmd_manager.get_spmd_handle(spmd_id)
     
     def start(self) -> None:
         """

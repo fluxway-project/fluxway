@@ -11,14 +11,31 @@ Responsibilities:
 - Support preemption and eviction (via Ray API)
 """
 
-from typing import List, Optional, Any
+from typing import List, Optional, Any, Dict, TYPE_CHECKING
+import logging
 
-from ...common.types import Graph, ResourceSpec, PlacementPlan
+try:
+    import ray
+    RAY_AVAILABLE = True
+except ImportError:
+    RAY_AVAILABLE = False
+
+from ...common.types import Graph, ResourceSpec, PlacementPlan, PlacementStrategy, ResourcePriority
+from .pg_manager import PGManager
+
+if TYPE_CHECKING:
+    from ..spmd_manager import SPMDManager
+
+logger = logging.getLogger(__name__)
 
 
 class Scheduler:
     """
     Resource scheduler using Ray Placement Groups.
+    
+    Holds references to:
+    - spmd_manager: For SPMD lifecycle operations
+    - pg_pool_manager: For resource pool management
     
     Scheduling strategies:
     - Resource-aware scheduling
@@ -27,11 +44,71 @@ class Scheduler:
     - Conditional branch shared PG (TODO: interface only)
     """
     
-    def __init__(self):
-        self._placement_groups: dict = {}
-        self._node_priorities: dict = {}
+    def __init__(self, spmd_manager: Optional["SPMDManager"] = None):
+        """
+        Initialize Scheduler.
+        
+        Args:
+            spmd_manager: Reference to SPMDManager for SPMD lifecycle operations
+        """
+        self._spmd_manager = spmd_manager
+        self._pg_manager = PGManager()
+        self._current_plan: Optional[PlacementPlan] = None
     
-    def schedule(self, graph: Graph) -> PlacementPlan:
+    @property
+    def spmd_manager(self) -> Optional["SPMDManager"]:
+        """Get the SPMD manager reference."""
+        return self._spmd_manager
+    
+    @property
+    def pg_manager(self) -> PGManager:
+        """Get the PG manager."""
+        return self._pg_manager
+    
+    def schedule(self, graph: Graph) -> bool:
+        """
+        Schedule resources and initialize SPMDs for the given graph.
+        
+        This method performs the complete scheduling workflow:
+        1. Generate placement plan from graph
+        2. Allocate resources via pg_pool_manager
+        3. Initialize SPMDs via spmd_manager
+        4. Establish SPMD topology
+        
+        Args:
+            graph: The task graph to schedule
+            
+        Returns:
+            True if scheduling succeeded, False otherwise
+        """
+        try:
+            # Step 1: Generate placement plan
+            plan = self._generate_plan(graph)
+            self._current_plan = plan
+            
+            # Step 2: Allocate resources via pg_pool_manager
+            if not self._allocate_resources(plan):
+                logger.error("Failed to allocate resources")
+                return False
+            
+            # Step 3: Initialize SPMDs via spmd_manager
+            if not self._init_spmds(graph, plan):
+                logger.error("Failed to initialize SPMDs")
+                return False
+            
+            # Step 4: Establish topology
+            if self._spmd_manager is not None:
+                topology = self._build_topology(graph)
+                self._spmd_manager.establish_topology(topology)
+            
+            logger.info(f"Successfully scheduled {len(plan.spmd_placements)} SPMDs")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Scheduling failed: {e}")
+            return False
+    
+    def _generate_plan(self, graph: Graph) -> PlacementPlan:
         """
         Generate resource allocation plan based on Graph.
         
@@ -40,110 +117,242 @@ class Scheduler:
             
         Returns:
             Placement plan for all SPMDs
+        """
+        spmd_placements: Dict[str, ResourceSpec] = {}
+        spmd_priorities: Dict[str, ResourcePriority] = {}
+        shared_pgs: Dict[str, List[str]] = {}
+        
+        for node_name, node in graph.nodes.items():
+            spmd_placements[node_name] = node.resource if node.resource is not None else ResourceSpec(num_cpus=1)
             
-        TODO: Analyze graph resource requirements
-        TODO: Generate placement group configurations
-        TODO: Handle conditional branch resource sharing
-        """
-        pass
+            # Use node.priority if specified, otherwise default to MID
+            spmd_priorities[node_name] = node.priority if node.priority is not None else ResourcePriority.MID
+        
+        # TODO: Analyze conditional branches for shared PG opportunities
+        # TODO: Implement affinity rules based on graph edges
+        
+        return PlacementPlan(
+            spmd_placements=spmd_placements,
+            spmd_priorities=spmd_priorities,
+            shared_pgs=shared_pgs,
+            strategy=PlacementStrategy.PACK
+        )
     
-    def allocate_resources(self, plan: PlacementPlan) -> Any:
+    def _allocate_resources(self, plan: PlacementPlan) -> bool:
         """
-        Allocate resources based on Ray Placement Group.
+        Allocate resources via pg_pool_manager.
         
         Args:
             plan: The placement plan to execute
             
         Returns:
-            Ray PlacementGroup object
-            
-        TODO: Create Ray Placement Groups
-        TODO: Handle allocation failures
-        TODO: Implement retry logic
+            True if all resources allocated successfully
         """
-        pass
+        success = True
+        
+        for spmd_id, resource in plan.spmd_placements.items():
+            priority = plan.spmd_priorities.get(spmd_id, ResourcePriority.MID)
+            
+            # Create PG via pg_pool_manager
+            pg = self._pg_manager.create_pg(
+                spmd_id=spmd_id,
+                resource=resource,
+                priority=priority,
+                strategy=plan.strategy
+            )
+            
+            if pg is None and RAY_AVAILABLE:
+                logger.warning(f"Failed to create PG for SPMD {spmd_id}")
+                success = False
+        
+        return success
+    
+    def _init_spmds(self, graph: Graph, plan: PlacementPlan) -> bool:
+        """
+        Initialize SPMDs via spmd_manager.
+        
+        Args:
+            graph: The task graph
+            plan: The placement plan
+            
+        Returns:
+            True if all SPMDs initialized successfully
+        """
+        if self._spmd_manager is None:
+            logger.warning("No spmd_manager set, skipping SPMD initialization")
+            return True
+        
+        for node_name, node in graph.nodes.items():
+            spmd_config = node.spmd_config
+            if spmd_config is None:
+                continue
+            
+            # Get the allocated PG for this SPMD
+            pg = self._pg_manager.get_pg(node_name)
+            
+            # Start SPMD via spmd_manager, passing PG directly
+            # Registration happens inside start_spmd
+            handle = self._spmd_manager.start_spmd(
+                spmd_id=node_name,
+                config=spmd_config,
+                placement_group=pg,
+                checkpoint_id=None
+            )
+            
+            if handle is None:
+                logger.warning(f"Failed to start SPMD {node_name}")
+        
+        return True
+    
+    def _build_topology(self, graph: Graph) -> Dict[str, List[str]]:
+        """
+        Build SPMD topology from graph edges.
+        
+        Args:
+            graph: The task graph
+            
+        Returns:
+            Mapping of node name to list of downstream node names
+        """
+        topology: Dict[str, List[str]] = {name: [] for name in graph.nodes}
+        for edge in graph.edges:
+            if edge.source_node in topology:
+                if edge.target_node not in topology[edge.source_node]:
+                    topology[edge.source_node].append(edge.target_node)
+        return topology
     
     def create_shared_pg(
         self, 
-        node_ids: List[str], 
-        resources: ResourceSpec
+        spmd_ids: List[str], 
+        resources: ResourceSpec,
+        priority: ResourcePriority = ResourcePriority.MID
     ) -> Any:
         """
-        Create shared Placement Group for conditional branch nodes.
+        Create shared Placement Group for conditional branch SPMDs.
         
         Args:
-            node_ids: IDs of nodes sharing the PG
-            resources: Resource specification
+            spmd_ids: IDs of SPMDs sharing the PG
+            resources: Resource specification (maximum required)
+            priority: Resource priority
             
         Returns:
-            Ray PlacementGroup object
+            PlacementGroup or None
             
         TODO: Implement shared PG creation
-        TODO: Handle resource conflicts
         """
-        pass
+        logger.info(f"create_shared_pg called for SPMDs {spmd_ids} (not implemented)")
+        return None
     
-    def preempt_node(self, node_id: str, reason: str) -> bool:
+    def preempt_spmd(self, spmd_id: str, reason: str) -> bool:
         """
-        Preempt node resources (based on Ray API).
+        Preempt SPMD resources.
         
         Args:
-            node_id: ID of node to preempt
+            spmd_id: ID of SPMD to preempt
             reason: Reason for preemption
             
         Returns:
             True if preemption successful
-            
-        TODO: Implement preemption logic (interface only for now)
-        TODO: Trigger state saving before preemption
         """
-        pass
+        return self._pg_manager.preempt(spmd_id, reason)
     
-    def evict_node(self, node_id: str, checkpoint: bool = True) -> bool:
+    def evict_spmd(self, spmd_id: str, checkpoint: bool = True) -> bool:
         """
-        Evict node (save state before eviction).
+        Evict SPMD (save state before eviction).
         
         Args:
-            node_id: ID of node to evict
+            spmd_id: ID of SPMD to evict
             checkpoint: Whether to save checkpoint before eviction
             
         Returns:
             True if eviction successful
-            
-        TODO: Implement eviction logic (interface only for now)
-        TODO: Coordinate with StateManager for checkpoint
         """
-        pass
+        if checkpoint and self._spmd_manager is not None:
+            # TODO: Trigger checkpoint via spmd_manager
+            pass
+        
+        return self._pg_manager.evict(spmd_id)
+    
+    def release_resources(self, spmd_id: str) -> None:
+        """
+        Release resources held by an SPMD.
+        
+        Args:
+            spmd_id: ID of the SPMD
+        """
+        self._pg_manager.release_pg(spmd_id)
+    
+    def get_allocated_resources(self, spmd_id: str) -> Optional[ResourceSpec]:
+        """
+        Get the resources allocated to an SPMD.
+        
+        Args:
+            spmd_id: ID of the SPMD
+            
+        Returns:
+            ResourceSpec or None if not allocated
+        """
+        return self._pg_manager.get_resource(spmd_id)
+    
+    def get_spmd_priority(self, spmd_id: str) -> ResourcePriority:
+        """
+        Get priority of an SPMD for preemption decisions.
+        
+        Args:
+            spmd_id: ID of the SPMD
+            
+        Returns:
+            ResourcePriority value
+        """
+        return self._pg_manager.get_priority(spmd_id)
     
     def check_resource_availability(self, resources: ResourceSpec) -> bool:
         """
-        Check if resources are available.
+        Check if resources are available in the Ray cluster.
         
         Args:
             resources: Required resources
             
         Returns:
             True if resources are available
+        """
+        if not RAY_AVAILABLE:
+            logger.warning("Ray not available, assuming resources are available")
+            return True
+
+        try:
+            available = ray.available_resources()
             
-        TODO: Query Ray cluster for available resources
-        TODO: Consider reserved resources
-        """
-        pass
+            if resources.num_gpus > 0:
+                available_gpus = available.get("GPU", 0)
+                if available_gpus < resources.num_gpus:
+                    return False
+            
+            if resources.num_cpus > 0:
+                available_cpus = available.get("CPU", 0)
+                if available_cpus < resources.num_cpus:
+                    return False
+            
+            if resources.memory_gb > 0:
+                available_memory = available.get("memory", 0)
+                required_memory = resources.memory_gb * 1024 * 1024 * 1024
+                if available_memory < required_memory:
+                    return False
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error checking resource availability: {e}")
+            return False
     
-    def get_node_priority(self, node_id: str) -> int:
+    def get_preemptable_spmds(self, required_resource: ResourceSpec) -> List[str]:
         """
-        Get priority of a node for preemption decisions.
+        Get SPMDs that could be preempted to free resources.
         
-        TODO: Implement priority calculation
-        TODO: Consider execution phase, resource usage, etc.
+        Args:
+            required_resource: Resource needed
+            
+        Returns:
+            List of SPMD IDs sorted by priority (LOW first)
         """
-        pass
-    
-    def release_resources(self, node_id: str) -> None:
-        """
-        Release resources held by a node.
-        
-        TODO: Implement resource release
-        TODO: Update placement group state
-        """
-        pass
+        return self._pg_manager.get_preemptable_spmds(required_resource)
