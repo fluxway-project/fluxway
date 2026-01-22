@@ -75,12 +75,14 @@ def spmd(
         def get_spmd_config(c) -> SPMDConfig:
             forward_fn = getattr(c, 'forward', None)
             backward_fn = getattr(c, 'backward', None)
+            update_fn = getattr(c, 'update', None)
             return SPMDConfig(
                 mesh=c._mesh,
                 input_sharding=c._input_sharding,
                 output_sharding=c._output_sharding,
                 user_forward_fn=forward_fn,
                 user_backward_fn=backward_fn,
+                user_update_fn=update_fn,
                 max_async_steps=c._max_async_steps,
                 params_update_steps=c._params_update_steps
             )

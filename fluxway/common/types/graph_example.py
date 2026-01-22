@@ -8,6 +8,7 @@
 @fluxway.data_type{
     state_argument: ["id"],
     tensor_argument: ["tensor"]
+    static_argument: ["static"]
 }
 class ActionState1:
     id: int

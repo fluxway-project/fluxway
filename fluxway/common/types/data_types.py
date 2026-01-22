@@ -34,6 +34,7 @@ class SPMDConfig(BaseModel):
     output_sharding: Optional[Dict[PartitionType, int]] = None  # Output sharding specification
     user_forward_fn: Optional[Callable] = None
     user_backward_fn: Optional[Callable] = None
+    user_update_fn: Optional[Callable] = None  # User-defined parameter update function
     max_async_steps: int = 1  # Maximum async steps between workers in the same SPMD
     params_update_steps: int = 1  # Sync barrier every N steps for parameter updates
 
