@@ -14,10 +14,12 @@ Usage:
     class MyData:
         id: int
         tensor: torch.Tensor
-
+    
+    # Use tuple-based mesh with user-defined axis names
     @fluxway.spmd(
         resource={"nums_cpu": 4, "nums_gpu": 2},
-        input_sharding={PartitionType.DP: 4},
+        mesh_axis_names=("data", "model"),
+        mesh_axis_shapes=(4, 2),
         max_async_steps=10
     )
     class MySPMD:
@@ -28,16 +30,24 @@ Usage:
 __version__ = "0.1.0"
 
 # Import decorators for top-level access
-from fluxway.common.api import data_type, spmd
+from fluxway.common.decorators import data_type, spmd, operator
 
 # Import common types
 from fluxway.common.types import (
-    PartitionType,
     SPMDConfig,
     Graph,
     Node,
     Edge,
     ResourceSpec,
+    # Sharding types
+    LayoutMesh,
+    LayoutOp,
+    LayoutType,
+    ShardingSpec,
+    StaticShardingSpec,
+    DynamicShardingSpec,
+    DynamicRoutingFn,
+    create_mesh,
 )
 
 # Import control plane components
@@ -49,6 +59,7 @@ __all__ = [
     # Decorators
     "data_type",
     "spmd",
+    "operator",
     # Types
     "PartitionType",
     "SPMDConfig",
@@ -56,6 +67,15 @@ __all__ = [
     "Node",
     "Edge",
     "ResourceSpec",
+    # Sharding
+    'LayoutMesh',
+    'LayoutOp',
+    'LayoutType',
+    'ShardingSpec',
+    'StaticShardingSpec',
+    'DynamicShardingSpec',
+    'DynamicRoutingFn',
+    'create_mesh',
     # Control Plane
     "GraphParser",
     "Builder",

@@ -1,3 +1,6 @@
-"""Control Mailbox module."""
+"""Mailbox module for dual-stream data caching."""
 
-from .mailbox import ControlMailbox
+from .mailbox import (
+    WorkerMailbox,
+    OpType,
+)

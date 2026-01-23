@@ -1,10 +1,9 @@
 """Common type definitions for Fluxway framework."""
 
 from .data_types import (
-    # Partition and Sharding Types
-    PartitionType,
     # SPMD Configuration
     SPMDConfig,
+    OpType,
     # Graph Builder Types
     Edge,
     Node,
@@ -15,6 +14,8 @@ from .data_types import (
     PlacementPlan,
     PlacementStrategy,
     ResourcePriority,
+    DriverResourceSpec,
+    SPMDPlacementSpec,
     # State Management Types (Section 2.1.4)
     GlobalState,
     SPMDState,
@@ -30,4 +31,119 @@ from .data_types import (
     LayoutSpec,
     DependencySpec,
     RPCPayload,
+    # Tensor Metadata (for routing and backward tracking)
+    TensorMeta,
+    # Operator metadata
+    EdgeShardingInfo,
+    OperatorMeta,
+    ArgumentType,
+    # Driver and Worker Status Types
+    DriverStatus,
+    WorkerStatus,
+    ControllerState,
+    ControllerEvent,
+    DriverState,
+    DriverEvent,
+    WorkerHeartbeat,
+    DriverHeartbeat,
+    HeartbeatConfig,
+    AsyncStepConfig,
+    SPMDOpStep,
+    OpLockState,
+    # Reader types (new)
+    NodeType,
+    ReaderConfig,
+    ReaderState,
+    MailboxStatus,
 )
+
+# Sharding types
+from .sharding import (
+    LayoutMesh,
+    LayoutOp,
+    LayoutType,
+    ShardingSpec,
+    StaticShardingSpec,
+    DynamicShardingSpec,
+    DynamicRoutingFn,
+    RawShardingSpec,
+    RawShardingDependency,
+    Axis,
+    create_mesh,
+    # Sharding strategy types (migrated from sharding_strategy.py)
+    DenseShardingStrategy,
+    DimShardingInfo,
+    _compute_intersection_range,
+)
+
+__all__ = [
+    # SPMD Configuration
+    "SPMDConfig",
+    "OpType",
+    # Graph Builder Types
+    "Edge",
+    "Node",
+    "Graph",
+    "GraphValidationResult",
+    # Resource and Scheduling Types
+    "ResourceSpec",
+    "PlacementPlan",
+    "PlacementStrategy",
+    "ResourcePriority",
+    "DriverResourceSpec",
+    "SPMDPlacementSpec",
+    # State Management Types
+    "GlobalState",
+    "SPMDState",
+    "WorkerTelemetry",
+    # Handle Types
+    "LogicalHandle",
+    "ActualHandle",
+    "NodeView",
+    # Dual-Stream Convergence Types
+    "ControlConfig",
+    # ULP Protocol Types
+    "PartitionOp",
+    "LayoutSpec",
+    "DependencySpec",
+    "RPCPayload",
+    # Tensor Metadata
+    "TensorMeta",
+    # Operator metadata
+    "EdgeShardingInfo",
+    "OperatorMeta",
+    "ArgumentType",
+    # Driver and Worker Status Types
+    "DriverStatus",
+    "WorkerStatus",
+    "ControllerState",
+    "ControllerEvent",
+    "DriverState",
+    "DriverEvent",
+    "WorkerHeartbeat",
+    "DriverHeartbeat",
+    "HeartbeatConfig",
+    "AsyncStepConfig",
+    "SPMDOpStep",
+    "OpLockState",
+    # Reader types
+    "NodeType",
+    "ReaderConfig",
+    "ReaderState",
+    "MailboxStatus",
+    # Sharding types
+    "LayoutMesh",
+    "LayoutOp",
+    "LayoutType",
+    "ShardingSpec",
+    "StaticShardingSpec",
+    "DynamicShardingSpec",
+    "DynamicRoutingFn",
+    "RawShardingSpec",
+    "RawShardingDependency",
+    "Axis",
+    "create_mesh",
+    # Sharding strategy types
+    "DenseShardingStrategy",
+    "DimShardingInfo",
+]

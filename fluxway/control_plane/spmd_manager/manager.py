@@ -4,75 +4,224 @@ SPMD Manager for global SPMD lifecycle management.
 Based on ARCHITECTURE.md Section 2.1.3
 
 Responsibilities:
-- SPMD lifecycle: Start SPMD Master and Workers based on scheduling results
+- SPMD lifecycle: Start SPMD Driver based on scheduling results
 - SPMD topology: Establish connections between SPMDs
 - SPMD initialization: Initialize SPMD state and internal FSM
 - State recovery: Direct or FSM-triggered checkpoint recovery
 - Node changes: Manage node creation, eviction, and rebuilding
+
+Note: Controller layer only starts drivers. Workers are started by drivers.
 """
 
-from typing import Dict, List, Optional, Any
+import logging
+from typing import Any, Dict, List, Optional
 
-from ...common.types import SPMDConfig, SPMDState
+try:
+    import ray
+    RAY_AVAILABLE = True
+except ImportError:
+    RAY_AVAILABLE = False
+
+from ...common.types import SPMDConfig, SPMDState, NodeType, ReaderConfig
+
+logger = logging.getLogger(__name__)
 
 
 class SPMDHandle:
-    """Handle to an SPMD instance."""
+    """
+    Handle to an SPMD instance.
     
-    def __init__(self, spmd_id: str):
+    Contains reference to the driver actor only.
+    Worker handles are managed internally by the driver.
+    """
+    
+    def __init__(self, spmd_id: str, node_type: NodeType = NodeType.SPMD):
         self.spmd_id = spmd_id
-        self._master_handle: Optional[Any] = None
-        self._worker_handles: Dict[str, Any] = {}
+        self.node_type = node_type
+        self._driver_handle: Optional[Any] = None  # ray.ActorHandle
+        self._config: Optional[SPMDConfig] = None
+        self._reader_config: Optional[ReaderConfig] = None
+        self._is_initialized: bool = False
     
-    # TODO: Add methods for SPMD control
+    @property
+    def driver_handle(self) -> Optional[Any]:
+        """Get the driver actor handle."""
+        return self._driver_handle
+    
+    @property
+    def is_initialized(self) -> bool:
+        """Check if the SPMD is initialized."""
+        return self._is_initialized
+    
+    def set_driver_handle(self, handle: Any) -> None:
+        """Set the driver actor handle."""
+        self._driver_handle = handle
+    
+    def set_initialized(self, initialized: bool = True) -> None:
+        """Mark the SPMD as initialized."""
+        self._is_initialized = initialized
+    
+    def call_driver(self, method: str, *args, **kwargs) -> Any:
+        """
+        Call a method on the driver.
+        
+        Args:
+            method: Method name to call
+            *args: Positional arguments
+            **kwargs: Keyword arguments
+            
+        Returns:
+            Ray ObjectRef for the method call result
+        """
+        if self._driver_handle is None:
+            raise RuntimeError(f"Driver handle not set for SPMD {self.spmd_id}")
+        
+        if not hasattr(self._driver_handle, method):
+            raise AttributeError(f"Driver does not have method: {method}")
+        
+        method_fn = getattr(self._driver_handle, method)
+        return method_fn.remote(*args, **kwargs)
 
 
 class SPMDManager:
     """
     Global SPMD Manager (Orchestrator).
     
-    Manages the lifecycle of all SPMD instances in the training job.
+    Manages the lifecycle of all SPMD drivers in the training job.
+    Workers are managed by their respective drivers.
     """
     
-    def __init__(self):
+    def __init__(self, controller_handle: Optional[Any] = None):
+        """
+        Initialize SPMDManager.
+        
+        Args:
+            controller_handle: Reference to the Controller (for driver callbacks)
+        """
+        self._controller_handle = controller_handle
         self._spmd_handles: Dict[str, SPMDHandle] = {}
-        self._topology: Dict[str, List[str]] = {}
+        self._topology: Dict[str, List[str]] = {}  # spmd_id -> downstream spmd_ids
+        self._reverse_topology: Dict[str, List[str]] = {}  # spmd_id -> upstream spmd_ids
+    
+    def set_controller_handle(self, controller_handle: Any) -> None:
+        """Set the controller handle for driver callbacks."""
+        self._controller_handle = controller_handle
     
     def register_spmd(self, spmd_id: str, handle: SPMDHandle) -> None:
         """
         Register an SPMD instance.
         
-        TODO: Implement registration logic
-        TODO: Validate SPMD ID uniqueness
+        Args:
+            spmd_id: SPMD identifier
+            handle: SPMD handle
         """
-        pass
+        if spmd_id in self._spmd_handles:
+            logger.warning(f"SPMD {spmd_id} already registered, overwriting")
+        
+        self._spmd_handles[spmd_id] = handle
+        logger.info(f"Registered SPMD: {spmd_id}")
     
     def start_spmd(
         self, 
         spmd_id: str, 
         config: SPMDConfig,
         placement_group: Optional[Any] = None,
-        checkpoint_id: Optional[str] = None
-    ) -> SPMDHandle:
+        worker_bundle_indices: Optional[List[int]] = None,
+        driver_bundle_index: int = 0,
+        checkpoint_id: Optional[str] = None,
+        node_type: NodeType = NodeType.SPMD,
+        reader_config: Optional[ReaderConfig] = None,
+    ) -> Optional[SPMDHandle]:
         """
-        Start an SPMD instance, optionally from checkpoint.
+        Start an SPMD instance by creating its driver.
+        
+        The driver will start workers internally using the provided
+        placement group and bundle indices.
         
         Args:
             spmd_id: Unique identifier for the SPMD
             config: SPMD configuration
             placement_group: Ray PlacementGroup for resource allocation
+            worker_bundle_indices: Bundle indices for workers [1, 2, ..., n]
+            driver_bundle_index: Bundle index for driver (default 0)
             checkpoint_id: Optional checkpoint to restore from
+            node_type: Type of node (SPMD or READER)
+            reader_config: Reader configuration (required for READER nodes)
             
         Returns:
-            Handle to the started SPMD
-            
-        TODO: Check for existing checkpoint
-        TODO: Start SPMD Master (Ray Actor) using placement_group
-        TODO: Start SPMD Workers (Ray Actors) using placement_group
-        TODO: Establish Worker Handle connections
-        TODO: Initialize state management
+            Handle to the started SPMD, or None on failure
         """
-        pass
+        # Create handle
+        handle = SPMDHandle(spmd_id, node_type=node_type)
+        handle._config = config
+        handle._reader_config = reader_config
+        
+        if not RAY_AVAILABLE:
+            logger.warning(f"Ray not available, creating mock SPMD handle for {spmd_id}")
+            self._spmd_handles[spmd_id] = handle
+            return handle
+        
+        try:
+            # Import driver here to avoid circular imports
+            from ...spmd.driver import SPMDDriver
+            
+            # Build graph topology for this SPMD
+            graph_topology = {
+                "predecessors": self._reverse_topology.get(spmd_id, []),
+                "successors": self._topology.get(spmd_id, []),
+            }
+            
+            # Create driver actor with placement group
+            driver_name = f"{'reader' if node_type == NodeType.READER else 'spmd'}_driver_{spmd_id}"
+            
+            if placement_group is not None:
+                driver = SPMDDriver.options(
+                    placement_group=placement_group,
+                    placement_group_bundle_index=driver_bundle_index,
+                    name=driver_name,
+                ).remote(
+                    spmd_id=spmd_id,
+                    config=config,
+                    placement_group=placement_group,
+                    worker_bundle_indices=worker_bundle_indices or list(range(1, config.worker_count + 1)),
+                    controller_handle=self._controller_handle,
+                    graph_topology=graph_topology,
+                    node_type=node_type,
+                    reader_config=reader_config,
+                )
+            else:
+                # No placement group - for testing or mock scenarios
+                driver = SPMDDriver.remote(
+                    spmd_id=spmd_id,
+                    config=config,
+                    placement_group=None,
+                    worker_bundle_indices=worker_bundle_indices or list(range(1, config.worker_count + 1)),
+                    controller_handle=self._controller_handle,
+                    graph_topology=graph_topology,
+                    node_type=node_type,
+                    reader_config=reader_config,
+                )
+            
+            handle.set_driver_handle(driver)
+            
+            # Initialize the driver (this starts workers)
+            # TODO(Chiave): 摒弃下面的同步机制，通过 driver init 之后发送的就绪心跳，来同步状态（同步改为异步）
+            init_result = ray.get(driver.initialize.remote(checkpoint_id))
+            
+            if init_result:
+                handle.set_initialized(True)
+                node_type_str = "Reader" if node_type == NodeType.READER else "SPMD"
+                logger.info(f"Successfully started {node_type_str} {spmd_id}")
+            else:
+                logger.error(f"Failed to initialize SPMD {spmd_id}")
+            
+            # Register handle
+            self._spmd_handles[spmd_id] = handle
+            return handle
+            
+        except Exception as e:
+            logger.error(f"Failed to start SPMD {spmd_id}: {e}")
+            return None
     
     def stop_spmd(self, spmd_id: str, save_checkpoint: bool = True) -> None:
         """
@@ -81,23 +230,62 @@ class SPMDManager:
         Args:
             spmd_id: ID of SPMD to stop
             save_checkpoint: Whether to save checkpoint before stopping
-            
-        TODO: Trigger checkpoint save if requested
-        TODO: Stop all Workers
-        TODO: Stop Master
-        TODO: Release resources
         """
-        pass
+        handle = self._spmd_handles.get(spmd_id)
+        if handle is None:
+            logger.warning(f"SPMD {spmd_id} not found")
+            return
+        
+        if handle.driver_handle is None:
+            logger.warning(f"SPMD {spmd_id} has no driver handle")
+            return
+        
+        try:
+            if RAY_AVAILABLE:
+                # Call stop on driver
+                ray.get(handle.call_driver("stop", save_checkpoint))
+                
+                # Kill the driver actor
+                ray.kill(handle.driver_handle)
+            
+            handle.set_initialized(False)
+            logger.info(f"Stopped SPMD {spmd_id}")
+            
+        except Exception as e:
+            logger.error(f"Error stopping SPMD {spmd_id}: {e}")
     
     def get_spmd_handle(self, spmd_id: str) -> Optional[SPMDHandle]:
         """
         Get handle to an SPMD instance.
         
-        TODO: Implement handle lookup
+        Args:
+            spmd_id: SPMD identifier
+            
+        Returns:
+            SPMDHandle or None if not found
         """
-        pass
+        return self._spmd_handles.get(spmd_id)
     
-    def evict_spmd(self, spmd_id: str) -> str:
+    def get_driver_handle(self, spmd_id: str) -> Optional[Any]:
+        """
+        Get the driver actor handle for an SPMD.
+        
+        Args:
+            spmd_id: SPMD identifier
+            
+        Returns:
+            Driver ActorHandle or None
+        """
+        handle = self._spmd_handles.get(spmd_id)
+        if handle is None:
+            return None
+        return handle.driver_handle
+    
+    def get_all_spmd_ids(self) -> List[str]:
+        """Get all registered SPMD IDs."""
+        return list(self._spmd_handles.keys())
+    
+    def evict_spmd(self, spmd_id: str) -> Optional[str]:
         """
         Evict an SPMD and return checkpoint ID.
         
@@ -105,63 +293,131 @@ class SPMDManager:
             spmd_id: ID of SPMD to evict
             
         Returns:
-            Checkpoint ID for later restoration
+            Checkpoint ID for later restoration, or None on failure
             
-        TODO: Trigger state save
-        TODO: Stop SPMD gracefully
-        TODO: Mark handles as invalid
-        TODO: Return checkpoint reference
+        TODO: Implement checkpoint saving
         """
-        pass
+        logger.warning(f"evict_spmd called for {spmd_id} - checkpoint not implemented")
+        self.stop_spmd(spmd_id, save_checkpoint=True)
+        return None
     
-    def restore_spmd(self, spmd_id: str, checkpoint_id: str) -> SPMDHandle:
+    def restore_spmd(
+        self, 
+        spmd_id: str, 
+        config: SPMDConfig,
+        placement_group: Optional[Any] = None,
+        worker_bundle_indices: Optional[List[int]] = None,
+        checkpoint_id: Optional[str] = None,
+        node_type: NodeType = NodeType.SPMD,
+        reader_config: Optional[ReaderConfig] = None,
+    ) -> Optional[SPMDHandle]:
         """
         Restore an SPMD from checkpoint.
         
         Args:
             spmd_id: ID of SPMD to restore
+            config: SPMD configuration
+            placement_group: Placement group for resources
+            worker_bundle_indices: Worker bundle indices
             checkpoint_id: Checkpoint to restore from
+            node_type: Type of node (SPMD or READER)
+            reader_config: Reader configuration (for READER nodes)
             
         Returns:
             Handle to restored SPMD
             
-        TODO: Load checkpoint data
-        TODO: Start SPMD with restored state
-        TODO: Update handle mappings
+        TODO: Implement checkpoint loading
         """
-        pass
+        logger.warning(f"restore_spmd called for {spmd_id} - checkpoint not implemented")
+        return self.start_spmd(
+            spmd_id=spmd_id,
+            config=config,
+            placement_group=placement_group,
+            worker_bundle_indices=worker_bundle_indices,
+            checkpoint_id=checkpoint_id,
+            node_type=node_type,
+            reader_config=reader_config,
+        )
     
-    def update_handle_mapping(self, spmd_id: str) -> None:
-        """
-        Update handle mappings for an SPMD.
-        
-        Called after node changes to update logical-to-actual mappings.
-        
-        TODO: Get new actual handles
-        TODO: Update mapping table
-        TODO: Notify dependent SPMDs
-        """
-        pass
+    def get_reader_nodes(self) -> List[str]:
+        """Get all Reader node IDs."""
+        return [
+            spmd_id for spmd_id, handle in self._spmd_handles.items()
+            if handle.node_type == NodeType.READER
+        ]
+    
+    def is_reader_node(self, spmd_id: str) -> bool:
+        """Check if a node is a Reader node."""
+        handle = self._spmd_handles.get(spmd_id)
+        return handle is not None and handle.node_type == NodeType.READER
     
     def establish_topology(self, topology: Dict[str, List[str]]) -> None:
         """
         Establish SPMD topology connections.
         
         Args:
-            topology: Mapping of SPMD ID to connected SPMD IDs
-            
-        TODO: Validate topology
-        TODO: Create connections between SPMDs
-        TODO: Initialize handle mappings
+            topology: Mapping of SPMD ID to downstream SPMD IDs
         """
-        pass
+        self._topology = topology
+        
+        # Build reverse topology
+        self._reverse_topology = {spmd_id: [] for spmd_id in topology}
+        for source, targets in topology.items():
+            for target in targets:
+                if target not in self._reverse_topology:
+                    self._reverse_topology[target] = []
+                self._reverse_topology[target].append(source)
+        
+        logger.info(f"Established topology with {len(topology)} SPMDs")
+        
+        # Notify existing drivers of topology update
+        if RAY_AVAILABLE:
+            for spmd_id, handle in self._spmd_handles.items():
+                ## TODO(Chiave): 必须保证所有的 driver 都为 is_initialized 后，才执行前后置节点的注册
+                if handle.driver_handle is not None and handle.is_initialized:
+                    try:
+                        predecessors = self._reverse_topology.get(spmd_id, [])
+                        successors = self._topology.get(spmd_id, [])
+                        handle.call_driver("update_topology", predecessors, successors)
+                    except Exception as e:
+                        logger.error(f"Failed to update topology for {spmd_id}: {e}")
     
     def get_predecessors(self, spmd_id: str) -> List[str]:
         """Get predecessor SPMD IDs."""
-        # TODO: Implement topology lookup
-        pass
+        return self._reverse_topology.get(spmd_id, [])
     
     def get_successors(self, spmd_id: str) -> List[str]:
         """Get successor SPMD IDs."""
-        # TODO: Implement topology lookup
-        pass
+        return self._topology.get(spmd_id, [])
+    
+    def broadcast_to_all_drivers(self, method: str, *args, **kwargs) -> Dict[str, Any]:
+        """
+        Broadcast a method call to all drivers.
+        
+        Args:
+            method: Method name to call
+            *args: Positional arguments
+            **kwargs: Keyword arguments
+            
+        Returns:
+            Dict mapping spmd_id to result (or exception)
+        """
+        results = {}
+        refs = {}
+        
+        for spmd_id, handle in self._spmd_handles.items():
+            if handle.driver_handle is not None and handle.is_initialized:
+                try:
+                    ref = handle.call_driver(method, *args, **kwargs)
+                    refs[spmd_id] = ref
+                except Exception as e:
+                    results[spmd_id] = e
+        
+        if RAY_AVAILABLE:
+            for spmd_id, ref in refs.items():
+                try:
+                    results[spmd_id] = ray.get(ref)
+                except Exception as e:
+                    results[spmd_id] = e
+        
+        return results

@@ -5,9 +5,10 @@ Based on ARCHITECTURE.md sections 2.1.1, 3.2.1, 4.2, 4.3
 """
 
 from enum import IntEnum
-from typing import Callable, Dict, List, Optional, Any
+from typing import Callable, Dict, List, Optional, Any, Tuple, Type
+    
 import numpy as np
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, model_validator
 
 
 # =============================================================================
@@ -16,12 +17,53 @@ from pydantic import BaseModel, Field, ConfigDict
 
 from enum import Enum
 
+from fluxway.common.types.sharding import RawShardingSpec
+from fluxway.common.types.sharding import ShardingSpec
 
-class PartitionType(str, Enum):
-    """Partition type for sharding specification."""
-    
-    DP = "dp"  # Data Parallelism
-    TP = "tp"  # Tensor Parallelism
+
+class OpType(IntEnum):
+    """Operator type for execution phases.
+
+    name - op type
+    value - priority for execution order (lower value -> higher priority)
+    """
+    # TODO(Chiave): Support user-defined name and priority for each op_type
+    FORWARD = 0
+    BACKWARD = 1
+    UPDATE = 2
+
+
+class NodeType(str, Enum):
+    """Node type identifier."""
+    SPMD = "spmd"        # Normal SPMD node
+    READER = "reader"    # Data reader node
+
+
+class ReaderState(str, Enum):
+    """Reader state for data reading nodes."""
+    INITIALIZING = "initializing"
+    READING = "reading"
+    PAUSED = "paused"        # Paused due to backpressure
+    COMPLETED = "completed"
+    ERROR = "error"
+
+
+class ReaderConfig(BaseModel):
+    """Reader configuration for data reading nodes."""
+    src_dir: str                           # Source data directory
+    data_type: str = "json"                # Data type: json, parquet, csv, etc.
+    batch_size: int = 1000                 # Batch size for reading
+    file_pattern: str = "*"                # File pattern for matching
+    worker_count: int = 1                  # Number of reader workers
+    encoding: str = "utf-8"                # File encoding
+
+
+class MailboxStatus(BaseModel):
+    """Mailbox status for backpressure monitoring."""
+    is_full: bool = False
+    capacity: int = 100
+    current_size: int = 0
+    full_ratio: float = 0.8  # Ratio threshold to consider mailbox as full
 
 
 class SPMDConfig(BaseModel):
@@ -29,14 +71,38 @@ class SPMDConfig(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
     
     worker_count: int = 1
-    mesh: Optional[Dict[PartitionType, int]] = None  # Mesh topology specification
-    input_sharding: Optional[Dict[PartitionType, int]] = None  # Input sharding specification
-    output_sharding: Optional[Dict[PartitionType, int]] = None  # Output sharding specification
+    # Mesh is now stored as LayoutMesh directly
+    mesh: Optional[Any] = None  # LayoutMesh (use Any to avoid circular import)
     user_forward_fn: Optional[Callable] = None
     user_backward_fn: Optional[Callable] = None
     user_update_fn: Optional[Callable] = None  # User-defined parameter update function
     max_async_steps: int = 1  # Maximum async steps between workers in the same SPMD
     params_update_steps: int = 1  # Sync barrier every N steps for parameter updates
+
+    @model_validator(mode="after")
+    def _sync_worker_count_from_mesh(self) -> "SPMDConfig":
+        """
+        Keep worker_count derived from mesh.
+
+        worker_count = product(mesh axis sizes) = mesh.num_devices
+        """
+        if self.mesh is None:
+            self.worker_count = 1
+            return self
+        # LayoutMesh exposes num_devices which is the product of axis_shapes.
+        self.worker_count = int(getattr(self.mesh, "num_devices", 1))
+        return self
+    
+    @property
+    def has_mesh(self) -> bool:
+        """Check if mesh is defined."""
+        return self.mesh is not None
+    
+    def get_mesh_size(self) -> int:
+        """Get total number of devices in mesh."""
+        if not self.has_mesh or self.mesh is None:
+            return 1
+        return self.mesh.num_devices
 
 
 # =============================================================================
@@ -95,13 +161,15 @@ class Edge(BaseModel):
     """
     Represents an edge in the task graph.
     
-    Edges connect nodes and can have conditional functions to determine
-    when data flows through them.
+    Edges connect nodes and can specify source/target op types.
+    This allows flexible connections like forward->backward for sink nodes.
     """
     model_config = ConfigDict(arbitrary_types_allowed=True)
     
     source_node: str
     target_node: str
+    source_op: OpType = OpType.FORWARD   # Source node's op type
+    target_op: OpType = OpType.FORWARD   # Target node's op type
     condition_fn: Optional[Callable[..., bool]] = None
 
 
@@ -119,8 +187,158 @@ class Node(BaseModel):
     resource: Optional[ResourceSpec] = None
     priority: Optional[ResourcePriority] = None  # Resource priority for allocation
     spmd_config: SPMDConfig = Field(default_factory=SPMDConfig)
-    forward_edges: List[Edge] = Field(default_factory=list)
-    backward_edges: List[Edge] = Field(default_factory=list)
+    node_type: NodeType = NodeType.SPMD           # Node type: SPMD or READER
+    reader_config: Optional[ReaderConfig] = None  # Reader configuration (only for READER nodes)
+
+
+class ArgumentType(str, Enum):
+    """Argument type for fluxway transfer data."""
+    
+    STATE = "state"  # State argument
+    TENSOR = "tensor"  # Tensor argument
+    STATIC = "static"  # Static argument
+
+
+class EdgeShardingInfo(BaseModel):
+    """
+    Sharding information for a single logical edge (including conditional edges).
+
+    一个 SPMD operator 的前驱 / 后继边，可能是条件边，也可能是非条件边。
+    - 对于同一对 (source_spmd_id, target_spmd_id)，可能存在多条条件边，
+      因此需要用 List[EdgeShardingInfo] 来描述每一条边。
+    - 条件信息直接记录为 condition_fn，便于在运行时根据实际执行路径选择。
+    """
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    # 条件函数，如果为 None 表示无条件边（始终生效）
+    condition_fn: Optional[Callable[..., bool]] = None
+    # 对应这条边上，当前 operator 视角下相关 tensor 的 sharding 规格
+    # 例如：前驱边写入到 input_pre_sharding 时，是「前驱输出 tensor 的 sharding」；
+    #       后继边写入到 output_post_sharding 时，是「后继输入 tensor 的 sharding」。
+    tensor_sharding: Dict[str, ShardingSpec] = Field(default_factory=dict)
+    # 目标节点的 op 类型（用于跨 op 类型连边，如 forward->backward）
+    target_op: OpType = OpType.FORWARD
+
+
+class OperatorMeta(BaseModel):
+    """Metadata attached to an operator function."""
+    model_config = {"arbitrary_types_allowed": True}
+    
+    name: str
+    # Raw sharding specs (from @operator decorator, mesh-independent)
+    input_sharding_raw: Dict[str, RawShardingSpec] = Field(default_factory=dict)
+    output_sharding_raw: Dict[str, RawShardingSpec] = Field(default_factory=dict)
+    # Resolved sharding specs (from @spmd decorator, mesh-aware)
+    # These are set by @spmd decorator after mesh is available
+    input_sharding: Optional[Dict[str, ShardingSpec]] = None
+    output_sharding: Optional[Dict[str, ShardingSpec]] = None
+    # Keys use ArgumentType.value (i.e. "state" | "tensor" | "static") to avoid enum
+    # serialization / circular import surprises across control-plane and worker.
+    input_arguments: Optional[Dict[str, List[str]]]
+    output_arguments: Optional[Dict[str, List[str]]]
+    # Linking sharding specs (populated by Builder when constructing the graph)
+    # 对于当前 operator：
+    # - input_pre_sharding：记录所有「前驱 SPMD -> 当前 SPMD」的边及其 sharding，
+    #   包含条件边；key 为前驱 spmd_id，value 为该前驱到当前的若干条边。
+    #   结构：{pred_spmd_id: List[EdgeShardingInfo]}
+    # - output_post_sharding：记录所有「当前 SPMD -> 后继 SPMD」的边及其 sharding，
+    #   同样包含条件边；key 为后继 spmd_id。
+    #   结构：{succ_spmd_id: List[EdgeShardingInfo]}
+    input_pre_sharding: Dict[str, List[EdgeShardingInfo]] = Field(default_factory=dict)
+    output_post_sharding: Dict[str, List[EdgeShardingInfo]] = Field(default_factory=dict)
+    
+    # Eager trigger mode: when True, the operator triggers as soon as any data arrives
+    # (expected tensor shards = 1 for all tensors, ignoring sharding topology)
+    eager_trigger: bool = False
+
+    def get_arguments(self, is_output: bool, arg_type: "ArgumentType") -> List[str]:
+        """
+        Get input/output arguments list for a given arg type.
+
+        Note: input_arguments/output_arguments store keys as ArgumentType.value (str).
+        """
+        args_map = self.output_arguments if is_output else self.input_arguments
+        if not args_map:
+            return []
+        return list(args_map.get(arg_type.value) or [])
+
+    # ---------------------------------------------------------------------
+    # Compare / validate helpers (used by control-plane graph builder)
+    # ---------------------------------------------------------------------
+
+    def tensor_names(self, is_output: bool) -> List[str]:
+        """Get tensor argument names from input/output arguments."""
+        return self.get_arguments(is_output=is_output, arg_type=ArgumentType.TENSOR)
+
+    def state_names(self, is_output: bool) -> List[str]:
+        """Get state argument names from input/output arguments."""
+        return self.get_arguments(is_output=is_output, arg_type=ArgumentType.STATE)
+
+    def validate_tensor_io_match(
+        self,
+        dst_meta: "OperatorMeta",
+        src_is_output: bool,
+        ctx: str,
+    ) -> None:
+        """
+        Validate tensor variable names match between src and dst (io semantics).
+
+        - If src_is_output=True: compare src.output tensor vs dst.input tensor
+        - If src_is_output=False: compare src.input tensor vs dst.output tensor
+        """
+        src_names = set(self.tensor_names(is_output=src_is_output))
+        dst_names = set(dst_meta.tensor_names(is_output=not src_is_output))
+        if src_names != dst_names:
+            raise ValueError(
+                f"Tensor names mismatch in {ctx}: "
+                f"source={sorted(src_names)}, target={sorted(dst_names)}"
+            )
+
+    def validate_and_update_state_output_match_dest_input(
+        self,
+        dst_meta: "OperatorMeta",
+        src_spmd_class: Type,
+        src_method_name: str,
+        ctx: str,
+    ) -> None:
+        """
+        Validate state arguments between src output and dst input.
+
+        Logic:
+    - Compare src.output_arguments.state with dst.input_arguments.state (must match exactly)
+    - If src.output_arguments.state is missing, infer from src return type fields,
+      require that output fields contain all dst.input_arguments.state,
+      then update src.output_arguments.state = dst.input_arguments.state
+        """
+        from fluxway.common.utils import infer_fluxway_output_fields
+
+        dst_input_state = set(dst_meta.state_names(is_output=False))
+        src_output_state_list = self.state_names(is_output=True)
+
+        if src_output_state_list:
+            src_output_state = set(src_output_state_list)
+            if src_output_state != dst_input_state:
+                raise ValueError(
+                    f"State names mismatch in {ctx}: "
+                    f"src_output_state={sorted(src_output_state)}, "
+                    f"dst_input_state={sorted(dst_input_state)}"
+                )
+            return
+
+        # src.output_state not specified: infer from return type fields
+        output_fields = set(infer_fluxway_output_fields(src_spmd_class, src_method_name))
+        missing = dst_input_state - output_fields
+        if missing:
+            raise ValueError(
+                f"State coverage mismatch in {ctx}: operator output type of "
+                f"{src_spmd_class.__name__}.{src_method_name} is missing state fields "
+                f"{sorted(missing)} required by destination input"
+            )
+
+        # Update src.output_arguments.state = dst.input_state
+        if self.output_arguments is None:
+            self.output_arguments = {}
+        self.output_arguments[ArgumentType.STATE.value] = list(dst_input_state)
 
 
 class Graph(BaseModel):
@@ -324,3 +542,186 @@ class RPCPayload(BaseModel):
     data: Optional[np.ndarray] = None  # Data shard (Tensor)
     global_indices: Optional[np.ndarray] = None  # Original indices for Sparse->Dense restoration
     # Note: No sender_id or complex metadata needed
+
+
+# =============================================================================
+# Tensor Metadata Types (for routing and backward dependency tracking)
+# =============================================================================
+
+class TensorMeta(BaseModel):
+    """
+    Tensor metadata for routing computation and backward dependency tracking.
+    
+    Use cases:
+    1. sparse-to-dense routing: requires global_indices to compute target ranks
+    2. backward dependency on forward path: requires source tracking info
+    """
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    
+    # Basic info
+    tensor_name: str = ""
+    shape: Tuple[int, ...] = ()
+    dtype: str = "float32"
+    
+    # Routing info (required for sparse-to-dense routing)
+    global_indices: Optional[np.ndarray] = None  # Original global indices for sparse data
+    
+    # Source tracking (required for backward dependency on forward path)
+    source_spmd_id: str = ""
+    source_rank: int = -1
+    forward_step: int = -1
+    
+    # Data type flag
+    is_sparse: bool = False
+
+
+# =============================================================================
+# Driver and Worker Status Types (for heartbeat and state management)
+# =============================================================================
+
+class DriverStatus(str, Enum):
+    """Driver health status."""
+    HEALTHY = "healthy"
+    WARNING = "warning"
+    ERROR = "error"
+    TIMEOUT = "timeout"
+
+
+class WorkerStatus(str, Enum):
+    """Worker operational status."""
+    INITIALIZING = "initializing"
+    RUNNING = "running"
+    BLOCKED = "blocked"
+    ERROR = "error"
+
+
+class ControllerState(str, Enum):
+    """Controller state machine states."""
+    INITIALIZING = "initializing"  # Initializing resources
+    PENDING = "pending"            # Waiting for all drivers to be ready
+    RUNNING = "running"            # Normal execution
+    BLOCKED = "blocked"            # Task blocked (handling exceptions)
+    RECOVERING = "recovering"      # Recovering from errors
+    COMPLETED = "completed"        # Task completed
+    FAILED = "failed"              # Task failed
+
+
+class ControllerEvent(str, Enum):
+    """Events that trigger controller state transitions."""
+    INIT_COMPLETE = "init_complete"           # Initialization completed
+    ALL_DRIVERS_READY = "all_drivers_ready"   # All drivers heartbeat normal
+    DRIVER_ERROR = "driver_error"             # Driver heartbeat timeout or error
+    DRIVER_RECOVERED = "driver_recovered"     # Abnormal driver recovered
+    ALL_DRIVERS_COMPLETED = "all_drivers_completed"  # All drivers report completion
+    RECOVERY_FAILED = "recovery_failed"       # Recovery failed
+
+
+class DriverState(str, Enum):
+    """SPMD Driver state machine states."""
+    INITIALIZING = "initializing"  # Initializing workers
+    READY = "ready"                # Ready, waiting for Controller command
+    RUNNING = "running"            # Running
+    BLOCKED = "blocked"            # Blocked
+    ERROR = "error"                # Error state
+    RECOVERING = "recovering"      # Recovering
+    COMPLETED = "completed"        # Completed
+
+
+class DriverEvent(str, Enum):
+    """Events that trigger driver state transitions."""
+    INIT_COMPLETE = "init_complete"
+    INIT_FAILED = "init_failed"
+    START = "start"
+    WORKER_ERROR = "worker_error"
+    WORKER_RECOVERED = "worker_recovered"
+    BLOCK_REQUESTED = "block_requested"
+    UNBLOCK_REQUESTED = "unblock_requested"
+    ALL_WORKERS_COMPLETED = "all_workers_completed"
+    COMPLETE = "complete"
+
+
+class WorkerHeartbeat(BaseModel):
+    """Worker heartbeat data."""
+    rank: int
+    timestamp: float
+    op_steps: Dict[str, int] = Field(default_factory=dict)  # op_type.name -> step
+    status: WorkerStatus = WorkerStatus.RUNNING
+    error_message: Optional[str] = None
+    telemetry: Optional["WorkerTelemetry"] = None
+    mailbox_status: Optional[MailboxStatus] = None  # Mailbox status for backpressure
+
+
+class DriverHeartbeat(BaseModel):
+    """Driver heartbeat data reported to Controller."""
+    spmd_id: str
+    timestamp: float
+    status: DriverStatus = DriverStatus.HEALTHY
+    state: DriverState = DriverState.INITIALIZING
+    error_message: Optional[str] = None
+    op_steps: Dict[str, int] = Field(default_factory=dict)  # op_type.name -> spmd-level step
+    worker_count: int = 0
+    healthy_worker_count: int = 0
+    blocked_ops: List[str] = Field(default_factory=list)
+    workers_ready: bool = False    # All workers have reported heartbeat
+    workers_running: bool = False  # All workers are running main loop
+    is_downstream_busy: bool = False              # Whether downstream SPMDs are busy (for backpressure)
+    reader_state: Optional[ReaderState] = None    # Reader state (only for READER nodes)
+    busy_worker_ratio: float = 0.0                # Ratio of workers with full mailbox
+
+
+class HeartbeatConfig(BaseModel):
+    """Heartbeat configuration."""
+    heartbeat_interval: float = 5.0   # Heartbeat interval (seconds)
+    heartbeat_timeout: float = 15.0   # Heartbeat timeout (seconds)
+    max_missed_heartbeats: int = 3    # Maximum missed heartbeats before error
+
+
+class AsyncStepConfig(BaseModel):
+    """Configuration for async step difference control."""
+    max_forward_step_diff: int = 2    # Maximum forward step difference
+    max_backward_step_diff: int = 2   # Maximum backward step difference
+    min_lock_duration: float = 1.0    # Minimum lock duration (prevent frequent lock/unlock)
+
+
+class DriverResourceSpec(BaseModel):
+    """Driver management resource configuration (system default)."""
+    num_cpus: int = 1
+    memory_gb: float = 1.0
+
+
+class SPMDPlacementSpec(BaseModel):
+    """Complete SPMD resource configuration."""
+    spmd_id: str
+    driver_resource: DriverResourceSpec = Field(default_factory=DriverResourceSpec)
+    worker_resource: Optional["ResourceSpec"] = None  # Single worker resource
+    worker_count: int = 1
+    
+    @property
+    def total_worker_cpus(self) -> int:
+        """Total worker CPUs."""
+        if self.worker_resource is None:
+            return self.worker_count
+        return self.worker_resource.num_cpus * self.worker_count
+    
+    @property
+    def total_worker_gpus(self) -> int:
+        """Total worker GPUs."""
+        if self.worker_resource is None:
+            return 0
+        return self.worker_resource.num_gpus * self.worker_count
+
+
+class SPMDOpStep(BaseModel):
+    """SPMD operation step tracking."""
+    spmd_id: str
+    forward_step: int = 0
+    backward_step: int = 0
+    update_step: int = 0
+
+
+class OpLockState(BaseModel):
+    """Operation lock state."""
+    spmd_id: str
+    op_type: str  # OpType name
+    locked_at: float
+    reason: str

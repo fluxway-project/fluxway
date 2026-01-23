@@ -1,111 +1,308 @@
 """
-Control Mailbox for dual-stream convergence.
+Mailbox module for dual-stream convergence.
 
 Based on ARCHITECTURE.md Section 3.2.2
 
-Implements the control plane side of dual-stream convergence:
-- Store pre-pushed control info
-- Support put/get with alignment ID
-- Implement backpressure mechanism
+Implements dual-stream data caching:
+- WorkerMailbox: Data plane (tensor data from upstream workers)
+- ControlMailbox: Control plane (state data from Driver)
 
 Key technical points:
 1. Unique Alignment ID: Data and control converge via batch_id + global_step
 2. Credit-based Flow Control: Prevent speed mismatch between Controller and data
-3. Sidecar Agent: Host CPU receives Controller push, writes to shared memory
+3. Step-based synchronization: Track current step per operator type
+4. Named variables: Support multiple named tensors/states per operator
+5. Tensor metadata: Store (data, meta) tuple for routing and backward tracking
 """
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 import asyncio
 
-from ....common.types import ControlConfig
+from fluxway.common.types.data_types import OpType
+
+if TYPE_CHECKING:
+    from fluxway.common.types.data_types import TensorMeta
 
 
-class ControlMailbox:
+class WorkerMailbox:
     """
-    Control Mailbox for storing pre-pushed control configurations.
+    Mailbox for caching incoming data in SPMD Worker.
     
-    Supports:
-    - put(batch_id, config): Write config, wake up waiters
-    - get(batch_id, timeout): Get config, throw on timeout
-    - Backpressure: Trigger when exceeding max_cache_size
+    Supports dual-stream convergence with named variables:
+    - State data from Driver (control plane): {op_type: {name: {step: data}}}
+    - Tensor data from upstream workers (data plane): {op_type: {name: {step: {rank: (data, meta)}}}}
+    
+    Async-safe for concurrent access using asyncio.Lock.
     """
     
-    def __init__(self, max_cache_size: int = 100):
-        self._configs: Dict[str, ControlConfig] = {}
-        self._events: Dict[str, asyncio.Event] = {}
-        self._max_cache_size = max_cache_size
-        self._consumed_step: int = 0
+    def __init__(self):
+        # {op_type: {name: {step: data}}} - State data from control plane
+        self._state_data: Dict[OpType, Dict[str, Dict[int, Any]]] = {
+            OpType.FORWARD: {},
+            OpType.BACKWARD: {},
+            OpType.UPDATE: {},
+        }
+        # {op_type: {name: {step: {rank: (data, meta)}}}} - Tensor data with metadata
+        self._tensor_data: Dict[OpType, Dict[str, Dict[int, Dict[int, Tuple[Any, Optional["TensorMeta"]]]]]] = {
+            OpType.FORWARD: {},
+            OpType.BACKWARD: {},
+            OpType.UPDATE: {},
+        }
+        self._lock = asyncio.Lock()
     
-    async def put(self, batch_id: str, config: ControlConfig) -> None:
+    # =========================================================================
+    # State Data Operations (async versions)
+    # =========================================================================
+    
+    async def put_state(self, op_type: OpType, name: str, step: int, data: Any) -> None:
         """
-        Write config, wake up waiters.
+        Cache state data from control plane.
         
         Args:
-            batch_id: Unique batch identifier
-            config: Control configuration
-            
-        TODO: Store config
-        TODO: Signal waiting event if exists
-        TODO: Check cache size for backpressure
+            op_type: Operator type this data is for
+            name: State variable name
+            step: Step number
+            data: State data
         """
-        pass
+        async with self._lock:
+            if name not in self._state_data[op_type]:
+                self._state_data[op_type][name] = {}
+            self._state_data[op_type][name][step] = data
     
-    async def get(self, batch_id: str, timeout: Optional[float] = None) -> ControlConfig:
+    async def get_state(self, op_type: OpType, name: str, step: int) -> Optional[Any]:
+        """Get state data if available."""
+        async with self._lock:
+            name_data = self._state_data[op_type].get(name, {})
+            return name_data.get(step)
+    
+    async def get_all_states(self, op_type: OpType, step: int) -> Dict[str, Any]:
+        """Get all state data for a step, keyed by name."""
+        async with self._lock:
+            result = {}
+            for name, step_data in self._state_data[op_type].items():
+                if step in step_data:
+                    result[name] = step_data[step]
+            return result
+    
+    async def has_state(self, op_type: OpType, name: str, step: int) -> bool:
+        """Check if state data exists for a specific name."""
+        async with self._lock:
+            name_data = self._state_data[op_type].get(name, {})
+            return step in name_data
+    
+    async def has_all_states(self, op_type: OpType, step: int, expected_names: List[str]) -> bool:
+        """Check if all expected state variables have arrived."""
+        async with self._lock:
+            for name in expected_names:
+                name_data = self._state_data[op_type].get(name, {})
+                if step not in name_data:
+                    return False
+            return True
+    
+    # =========================================================================
+    # Tensor Data Operations (with metadata support, async versions)
+    # =========================================================================
+    
+    async def put_tensor(
+        self,
+        op_type: OpType,
+        name: str,
+        step: int,
+        rank: int,
+        data: Any,
+        meta: Optional["TensorMeta"] = None,
+    ) -> None:
         """
-        Get config, wait if not available.
+        Cache tensor data from upstream worker with optional metadata.
         
         Args:
-            batch_id: Unique batch identifier
-            timeout: Optional timeout in seconds
-            
+            op_type: Operator type this data is for
+            name: Tensor variable name
+            step: Step number
+            rank: Sender's rank
+            data: Tensor shard
+            meta: Optional tensor metadata (for routing and backward tracking)
+        """
+        async with self._lock:
+            if name not in self._tensor_data[op_type]:
+                self._tensor_data[op_type][name] = {}
+            if step not in self._tensor_data[op_type][name]:
+                self._tensor_data[op_type][name][step] = {}
+            self._tensor_data[op_type][name][step][rank] = (data, meta)
+    
+    async def get_tensor_shard(
+        self,
+        op_type: OpType,
+        name: str,
+        step: int,
+        rank: int,
+    ) -> Tuple[Optional[Any], Optional["TensorMeta"]]:
+        """
+        Get tensor shard and its metadata for a specific rank.
+        
         Returns:
-            Control configuration
+            Tuple of (data, meta), or (None, None) if not found
+        """
+        async with self._lock:
+            name_data = self._tensor_data[op_type].get(name, {})
+            step_data = name_data.get(step, {})
+            return step_data.get(rank, (None, None))
+    
+    async def get_tensor_shards(
+        self,
+        op_type: OpType,
+        name: str,
+        step: int,
+    ) -> Dict[int, Tuple[Any, Optional["TensorMeta"]]]:
+        """
+        Get all tensor shards (with metadata) for a step and name.
+        
+        Returns:
+            Dict of {rank: (data, meta)}
+        """
+        async with self._lock:
+            name_data = self._tensor_data[op_type].get(name, {})
+            return dict(name_data.get(step, {}))
+    
+    async def get_tensor_shards_data_only(
+        self,
+        op_type: OpType,
+        name: str,
+        step: int,
+    ) -> Dict[int, Any]:
+        """
+        Get all tensor shards (data only, no metadata) for a step and name.
+        
+        Returns:
+            Dict of {rank: data}
+        """
+        async with self._lock:
+            name_data = self._tensor_data[op_type].get(name, {})
+            step_data = name_data.get(step, {})
+            return {rank: item[0] for rank, item in step_data.items()}
+    
+    async def get_all_tensor_shards(
+        self,
+        op_type: OpType,
+        step: int,
+    ) -> Dict[str, Dict[int, Tuple[Any, Optional["TensorMeta"]]]]:
+        """
+        Get all tensor shards (with metadata) for a step, keyed by name.
+        
+        Returns:
+            Dict of {name: {rank: (data, meta)}}
+        """
+        async with self._lock:
+            result = {}
+            for name, step_data in self._tensor_data[op_type].items():
+                if step in step_data:
+                    result[name] = dict(step_data[step])
+            return result
+    
+    async def get_all_tensor_shards_data_only(
+        self,
+        op_type: OpType,
+        step: int,
+    ) -> Dict[str, Dict[int, Any]]:
+        """
+        Get all tensor shards (data only) for a step, keyed by name.
+        
+        Returns:
+            Dict of {name: {rank: data}}
+        """
+        async with self._lock:
+            result = {}
+            for name, step_data in self._tensor_data[op_type].items():
+                if step in step_data:
+                    result[name] = {rank: item[0] for rank, item in step_data[step].items()}
+            return result
+    
+    async def get_tensor_shard_count(self, op_type: OpType, name: str, step: int) -> int:
+        """Get number of received tensor shards for a step and name."""
+        async with self._lock:
+            name_data = self._tensor_data[op_type].get(name, {})
+            return len(name_data.get(step, {}))
+    
+    async def has_all_tensors(
+        self, 
+        op_type: OpType, 
+        step: int, 
+        expected_counts: Dict[str, int]
+    ) -> bool:
+        """
+        Check if all expected tensor shards have arrived.
+        
+        Args:
+            op_type: Operator type
+            step: Step number
+            expected_counts: {tensor_name: expected_shard_count}
+        """
+        async with self._lock:
+            for name, expected in expected_counts.items():
+                name_data = self._tensor_data[op_type].get(name, {})
+                if len(name_data.get(step, {})) < expected:
+                    return False
+            return True
+    
+    # =========================================================================
+    # Cleanup Operations (async versions)
+    # =========================================================================
+    
+    async def clear_step(self, op_type: OpType, step: int) -> None:
+        """Clear data for completed step."""
+        async with self._lock:
+            # Clear state data for this step across all names
+            for name in list(self._state_data[op_type].keys()):
+                self._state_data[op_type][name].pop(step, None)
+                # Clean up empty name entries
+                if not self._state_data[op_type][name]:
+                    del self._state_data[op_type][name]
             
-        Raises:
-            TimeoutError: If timeout exceeded
+            # Clear tensor data for this step across all names
+            for name in list(self._tensor_data[op_type].keys()):
+                self._tensor_data[op_type][name].pop(step, None)
+                # Clean up empty name entries
+                if not self._tensor_data[op_type][name]:
+                    del self._tensor_data[op_type][name]
+    
+    async def clear_all(self) -> None:
+        """Clear all cached data."""
+        async with self._lock:
+            for op_type in OpType:
+                self._state_data[op_type].clear()
+                self._tensor_data[op_type].clear()
+    
+    # =========================================================================
+    # Size and Capacity (for backpressure monitoring, async versions)
+    # =========================================================================
+    
+    async def get_size(self) -> int:
+        """
+        Get current total number of items in the mailbox.
+        
+        Counts all state entries and tensor entries.
+        """
+        async with self._lock:
+            size = 0
+            # Count state entries
+            for op_type in OpType:
+                for name_data in self._state_data[op_type].values():
+                    size += len(name_data)
             
-        TODO: Check if config exists
-        TODO: If not, create event and wait
-        TODO: Return config and clean up
-        """
-        pass
+            # Count tensor entries
+            for op_type in OpType:
+                for name_data in self._tensor_data[op_type].values():
+                    for step_data in name_data.values():
+                        size += len(step_data)
+            
+            return size
     
-    def get_nowait(self, batch_id: str) -> Optional[ControlConfig]:
+    async def get_capacity(self) -> int:
         """
-        Get config without waiting.
+        Get mailbox capacity for backpressure calculation.
         
-        Returns None if not available.
-        
-        TODO: Check and return config
+        This is a configurable limit on how many items can be stored.
+        Default is 100 items.
         """
-        pass
-    
-    def has_config(self, batch_id: str) -> bool:
-        """Check if config is available for batch_id."""
-        return batch_id in self._configs
-    
-    def report_consumed(self, step: int) -> None:
-        """
-        Report consumed step for flow control.
-        
-        TODO: Update consumed_step
-        TODO: Clear old configs
-        """
-        pass
-    
-    def get_pending_count(self) -> int:
-        """Get number of pending configs."""
-        return len(self._configs)
-    
-    def should_apply_backpressure(self) -> bool:
-        """
-        Check if backpressure should be applied.
-        
-        TODO: Check against max_cache_size
-        """
-        pass
-    
-    def clear(self) -> None:
-        """Clear all cached configs."""
-        self._configs.clear()
-        self._events.clear()
+        # TODO: Make this configurable
+        return 100

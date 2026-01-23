@@ -87,7 +87,7 @@ class Scheduler:
             self._current_plan = plan
             
             # Step 2: Allocate resources via pg_pool_manager
-            if not self._allocate_resources(plan):
+            if not self._allocate_resources(graph, plan):
                 logger.error("Failed to allocate resources")
                 return False
             
@@ -138,11 +138,16 @@ class Scheduler:
             strategy=PlacementStrategy.PACK
         )
     
-    def _allocate_resources(self, plan: PlacementPlan) -> bool:
+    def _allocate_resources(self, graph: Graph, plan: PlacementPlan) -> bool:
         """
         Allocate resources via pg_pool_manager.
         
+        Creates multi-bundle PG for each SPMD:
+        - 1 driver bundle
+        - N worker bundles (based on spmd_config.worker_count)
+        
         Args:
+            graph: The task graph (for worker_count info)
             plan: The placement plan to execute
             
         Returns:
@@ -153,12 +158,19 @@ class Scheduler:
         for spmd_id, resource in plan.spmd_placements.items():
             priority = plan.spmd_priorities.get(spmd_id, ResourcePriority.MID)
             
-            # Create PG via pg_pool_manager
+            # Get worker count from graph node's spmd_config
+            node = graph.nodes.get(spmd_id)
+            worker_count = 1
+            if node and node.spmd_config:
+                worker_count = node.spmd_config.worker_count
+            
+            # Create PG via pg_pool_manager with multi-bundle support
             pg = self._pg_manager.create_pg(
                 spmd_id=spmd_id,
                 resource=resource,
                 priority=priority,
-                strategy=plan.strategy
+                strategy=plan.strategy,
+                worker_count=worker_count,
             )
             
             if pg is None and RAY_AVAILABLE:
@@ -170,6 +182,8 @@ class Scheduler:
     def _init_spmds(self, graph: Graph, plan: PlacementPlan) -> bool:
         """
         Initialize SPMDs via spmd_manager.
+        
+        Passes PG info including worker bundle indices to SPMDManager.
         
         Args:
             graph: The task graph
@@ -187,15 +201,17 @@ class Scheduler:
             if spmd_config is None:
                 continue
             
-            # Get the allocated PG for this SPMD
-            pg = self._pg_manager.get_pg(node_name)
+            # Get the allocated PG info for this SPMD
+            pg_info = self._pg_manager.get_pg_info(node_name)
             
-            # Start SPMD via spmd_manager, passing PG directly
+            # Start SPMD via spmd_manager, passing PG and bundle info
             # Registration happens inside start_spmd
             handle = self._spmd_manager.start_spmd(
                 spmd_id=node_name,
                 config=spmd_config,
-                placement_group=pg,
+                placement_group=pg_info.get("pg") if pg_info else None,
+                worker_bundle_indices=pg_info.get("worker_bundle_indices") if pg_info else None,
+                driver_bundle_index=pg_info.get("driver_bundle_index", 0) if pg_info else 0,
                 checkpoint_id=None
             )
             

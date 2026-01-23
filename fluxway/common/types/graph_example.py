@@ -77,6 +77,7 @@ class Gradient3:
     params_update_steps: 1,
 }
 class SPMD1:
+    @fluxway.operator(name="forward")
     def forward(self, datasource: DataSource) -> ActionState1:
         return read_from_datasource(datasource)
 
@@ -89,15 +90,15 @@ class SPMD1:
         cnt: int
     },
     mesh: Dict[PartitionType, int]
-    input_sharding: Dict[PartitionType, int],
-    output_sharding: Dict[PartitionType, int],
     max_async_steps: 10,
     params_update_steps: 1,
 }
 class SPMD2:
+    @fluxway.operator(name="forward")
     def forward(self, state: ActionState1) -> ActionState2:
         return ActionState2(id=state.id, tensor=state.tensor)
 
+    @fluxway.operator(name="backward")
     def backward(self, state: ActionState2) -> Optional[Gradient2]:
         pass
 
@@ -112,23 +113,37 @@ class PartitionType(str, Enum):
     TP = "tp"
 
 
-@fluxway.spmd{
-    resource: {
-        nums_cpu: int,
-        nums_gpu: int,
-        memory: int,
-        cnt: int
+@fluxway.spmd(
+    resource={
+        "nums_cpu": 4,
+        "nums_gpu": 2,
+        "memory": 16,
+        "cnt": 1
     },
-    mesh: Dict[PartitionType, int]
-    input_sharding: Dict[PartitionType, int],
-    output_sharding: Dict[PartitionType, int],
-    max_async_steps: 10,
-    params_update_steps: 1,
-}
+    mesh_axis_names=("dp", "tp"),
+    mesh_axis_shapes=(4, 2),
+    max_async_steps=10,
+    params_update_steps=1,
+)
 class SPMD3:
+    @fluxway.operator(
+        name="forward",
+        input_sharding={
+            "id": {"type": "dense", "axis": [None]},  # Replicate
+            "tensor": {"type": "dense", "axis": ["dp"]}  # Shard along dp axis
+        },
+        output_sharding={
+            "id": {"type": "dense", "axis": [None]},  # Replicate
+            "tensor": {"type": "dense", "axis": ["dp"]}  # Shard along dp axis
+            # For sparse sharding, use fn:
+            # "tensor": {"type": "sparse", "axis": ["dp"], "fn": my_routing_fn}
+            # where fn(tensor, tensor_meta, post_spec) -> List[(slice, rank)]
+        }
+    )
     def forward(self, state: ActionState1) -> ActionState3:
         return ActionState3(id=state.id, tensor=state.tensor)
 
+    @fluxway.operator(name="backward")
     def backward(self, state: ActionState3) -> Optional[Gradient3]:
         pass
 
