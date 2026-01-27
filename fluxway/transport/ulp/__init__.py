@@ -5,4 +5,4 @@ from .receiver import TicketBarrierReceiver
 from .payload import RPCPayload
 
 # Re-export types
-from ...common.types import LayoutSpec, DependencySpec, PartitionOp
+from fluxway.common.types import LayoutSpec, DependencySpec, PartitionOp

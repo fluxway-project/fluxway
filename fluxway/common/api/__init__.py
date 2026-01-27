@@ -8,6 +8,6 @@ from .data import data_type
 from .spmd import spmd
 
 __all__ = [
-    'data_type',
-    'spmd',
+    "data_type",
+    "spmd",
 ]
