@@ -150,6 +150,36 @@ class WorkerTelemetry(BaseModel):
     # TODO: Add memory usage
     # TODO: Add network I/O statistics
     # TODO: Add heartbeat timestamp
+    timestamp: float = 0.0  # Collection timestamp
+
+    # CPU metrics
+    cpu_percent: float = 0.0
+    cpu_count: int = 0
+    cpu_times_user: float = 0.0
+    cpu_times_system: float = 0.0
+
+    # Memory metrics
+    memory_rss_mb: float = 0.0  # Physical memory (RSS)
+    memory_vms_mb: float = 0.0  # Virtual memory (VMS)
+    memory_percent: float = 0.0
+
+    # GPU metrics (may be empty on macOS or systems without GPU)
+    gpu_ids: List[int] = Field(default_factory=list)
+    gpu_utilization_percent: Dict[int, float] = Field(default_factory=dict)
+    gpu_memory_used_mb: Dict[int, float] = Field(default_factory=dict)
+    gpu_memory_total_mb: Dict[int, float] = Field(default_factory=dict)
+    gpu_temperature_c: Dict[int, float] = Field(default_factory=dict)
+
+    # Network I/O
+    network_bytes_sent: int = 0
+    network_bytes_recv: int = 0
+
+    # Disk I/O
+    disk_read_bytes: int = 0
+    disk_write_bytes: int = 0
+
+    # Heartbeat
+    heartbeat_timestamp: float = 0.0
 
 
 # =============================================================================

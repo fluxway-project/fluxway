@@ -157,8 +157,36 @@ class SPMDWorker:
         TODO: Serialize optimizer state
         TODO: Save RNG seeds
         """
-        pass
-    
+        # Monitor worker state save attempt
+        import time
+
+        start_time = time.time()
+
+        from fluxway.common.monitoring import MonitoringFacade
+
+        MonitoringFacade.record_checkpoint_event(
+            event_type="save_attempt",
+            checkpoint_id="pending",
+            component_type="worker",
+            component_id=self.worker_id,
+            status="not_implemented",
+        )
+
+        # TODO: Serialize model state
+        # TODO: Serialize optimizer state
+        # TODO: Save RNG seeds
+
+        duration = time.time() - start_time
+        MonitoringFacade.record_checkpoint_event(
+            event_type="save_complete",
+            checkpoint_id=f"{self.worker_id}_checkpoint",
+            component_type="worker",
+            component_id=self.worker_id,
+            status="not_implemented",
+            duration_seconds=duration,
+        )
+        return {}
+
     def load_states(self, state: Dict[str, Any]) -> None:
         """
         Load worker state from checkpoint.
@@ -167,13 +195,65 @@ class SPMDWorker:
         TODO: Restore optimizer state
         TODO: Restore RNG seeds
         """
-        pass
-    
+        # Monitor worker state load attempt
+        import time
+
+        start_time = time.time()
+
+        from fluxway.common.monitoring import MonitoringFacade
+
+        MonitoringFacade.record_checkpoint_event(
+            event_type="load_attempt",
+            checkpoint_id="unknown",
+            component_type="worker",
+            component_id=self.worker_id,
+            status="not_implemented",
+        )
+
+        # TODO: Restore model state
+        # TODO: Restore optimizer state
+        # TODO: Restore RNG seeds
+
+        duration = time.time() - start_time
+        MonitoringFacade.record_checkpoint_event(
+            event_type="load_complete",
+            checkpoint_id="unknown",
+            component_type="worker",
+            component_id=self.worker_id,
+            status="not_implemented",
+            duration_seconds=duration,
+        )
+
     def send_heartbeat(self) -> None:
         """
         Send heartbeat to monitor.
-        
+        Reports telemetry and updates health status.
+        Uses MonitoringFacade for minimal code intrusion.
         TODO: Report telemetry
         TODO: Update health status
         """
-        pass
+        try:
+            from fluxway.common.monitoring import MonitoringFacade
+
+            # Check if metrics collector exists
+            if not hasattr(self, "_metrics_collector") or self._metrics_collector is None:
+                # Create metrics collector if not exists
+                self._metrics_collector = MonitoringFacade.create_worker_collector(
+                    self.worker_id, self.spmd_id
+                )
+
+            # Collect metrics
+            try:
+                import ray
+
+                telemetry = ray.get(self._metrics_collector.collect.remote())
+            except Exception:
+                # If Ray is not available or collector failed, skip
+                return
+
+            # Send heartbeat via MonitoringFacade
+            MonitoringFacade.send_heartbeat(self.worker_id, self.spmd_id, telemetry)
+        except Exception as e:
+            # Log error but don't fail the worker
+            # In production, should use proper logging
+            pass

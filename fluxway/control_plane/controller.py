@@ -120,8 +120,14 @@ class Controller:
         spmd_manager.establish_topology(topology)
         
         state_manager = StateManager()
-        monitor = Monitor()
-        
+        # Initialize Monitor with backends (can be configured)
+        monitor = Monitor(
+            enable_tensorboard=True,
+            enable_ray=True,
+            enable_prometheus=False,  # Disabled by default
+            enable_alert=True,
+        )
+
         return cls(
             graph=graph,
             monitor=monitor,
@@ -189,25 +195,99 @@ class Controller:
     def start(self) -> None:
         """
         Start training execution.
-        
+
+        Starts monitoring daemon and begins execution loop.
         TODO: Implement execution loop
         TODO: Start all SPMDs
         TODO: Begin data flow
         """
-        pass
-    
+        # Register Monitor with MonitoringFacade
+        try:
+            from ..common.monitoring import MonitoringFacade
+
+            MonitoringFacade.register_main_monitor(self._monitor)
+        except Exception:
+            pass
+
+        # Register SPMD handles with Monitor
+        for spmd_id, handle in self._spmd_handles.items():
+            self._monitor.register_spmd_handle(spmd_id, handle)
+
+        # Start monitoring daemon
+        try:
+            from .monitor.daemon import MonitorDaemon
+
+            # Create daemon with failure callback
+            def failure_handler(spmd_id: str, reason: str):
+                """Handle SPMD failures detected by daemon."""
+                # Log failure
+                # In production, can trigger recovery actions or alerts
+                print(f"SPMD {spmd_id} failed: {reason}")
+
+            self._monitor_daemon = MonitorDaemon(
+                monitor=self._monitor,
+                probe_interval=30.0,  # Probe every 30 seconds
+                health_check_interval=10.0,  # Health check every 10 seconds
+                failure_callback=failure_handler,
+            )
+
+            # Start daemon in background
+            self._monitor_daemon.start()
+        except Exception:
+            # If daemon fails to start, continue without it
+            # In production, should log the error
+            self._monitor_daemon = None
+
+        # TODO: Implement execution loop
+        # TODO: Start all SPMDs
+        # TODO: Begin data flow
+
     def stop(self, save_checkpoint: bool = True) -> None:
         """
         Stop training execution.
         
         Args:
             save_checkpoint: Whether to save checkpoint before stopping
-            
+
+        Stops monitoring daemon and performs graceful shutdown.
         TODO: Stop all SPMDs gracefully
         TODO: Save final checkpoint
         """
-        pass
-    
+        # Stop monitoring daemon
+        if hasattr(self, "_monitor_daemon") and self._monitor_daemon is not None:
+            try:
+                self._monitor_daemon.stop()
+            except Exception:
+                pass
+
+        # Monitor final checkpoint save attempt
+        if save_checkpoint:
+            from fluxway.common.monitoring import MonitoringFacade
+            import time
+
+            start_time = time.time()
+
+            MonitoringFacade.record_checkpoint_event(
+                event_type="final_save_attempt",
+                checkpoint_id="final",
+                component_type="task",
+                component_id="task",
+                status="not_implemented",
+            )
+
+            # TODO: Stop all SPMDs gracefully
+            # TODO: Save final checkpoint
+
+            duration = time.time() - start_time
+            MonitoringFacade.record_checkpoint_event(
+                event_type="final_save_complete",
+                checkpoint_id="final",
+                component_type="task",
+                component_id="task",
+                status="not_implemented",
+                duration_seconds=duration,
+            )
+
     def get_cluster_status(self) -> Dict[str, str]:
         """
         Get status of all SPMD nodes.

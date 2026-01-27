@@ -37,8 +37,10 @@ class PartitionManager:
     """
     
     def __init__(self):
-        self._function_sharding: Dict[str, Dict[str, ShardingInfo]] = {}  # func_name -> param_name -> sharding
-    
+        self._function_sharding: Dict[str, Dict[str, ShardingInfo]] = (
+            {}
+        )  # func_name -> param_name -> sharding
+
     def register_function_sharding(
         self,
         func_name: str,

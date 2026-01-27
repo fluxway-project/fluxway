@@ -1,0 +1,23 @@
+# Monitor组件依赖
+# Monitor Component Dependencies
+
+# 基础系统监控（必需）
+psutil>=5.9.0
+
+# GPU监控（Linux only，可选）
+# GPU Monitoring (Linux only, optional)
+gpustat>=1.1.0
+nvidia-ml-py>=12.535.0
+
+# Ray（必需，用于分布式）
+# Ray (required for distributed execution)
+ray>=2.8.0
+
+# 数据验证（项目已有）
+# Data validation (project existing)
+pydantic>=2.0.0
+numpy>=1.24.0
+
+# 可选：TensorBoard集成
+# Optional: TensorBoard integration
+# tensorboard>=2.13.0

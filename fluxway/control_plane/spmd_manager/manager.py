@@ -111,8 +111,39 @@ class SPMDManager:
         TODO: Mark handles as invalid
         TODO: Return checkpoint reference
         """
-        pass
-    
+        # Monitor SPMD eviction attempt
+        import time
+
+        start_time = time.time()
+
+        from fluxway.common.monitoring import MonitoringFacade
+
+        MonitoringFacade.record_checkpoint_event(
+            event_type="evict_attempt",
+            checkpoint_id="pending",
+            component_type="spmd",
+            component_id=spmd_id,
+            status="not_implemented",
+        )
+
+        # TODO: Trigger state save
+        # TODO: Stop SPMD gracefully
+        # TODO: Mark handles as invalid
+        # TODO: Return checkpoint reference
+
+        checkpoint_id = f"{spmd_id}_evicted_{id(self)}"  # Placeholder
+
+        duration = time.time() - start_time
+        MonitoringFacade.record_checkpoint_event(
+            event_type="evict_complete",
+            checkpoint_id=checkpoint_id,
+            component_type="spmd",
+            component_id=spmd_id,
+            status="not_implemented",
+            duration_seconds=duration,
+        )
+        return checkpoint_id
+
     def restore_spmd(self, spmd_id: str, checkpoint_id: str) -> SPMDHandle:
         """
         Restore an SPMD from checkpoint.
@@ -128,8 +159,36 @@ class SPMDManager:
         TODO: Start SPMD with restored state
         TODO: Update handle mappings
         """
-        pass
-    
+        # Monitor SPMD restore attempt
+        import time
+
+        start_time = time.time()
+
+        from fluxway.common.monitoring import MonitoringFacade
+
+        MonitoringFacade.record_checkpoint_event(
+            event_type="restore_attempt",
+            checkpoint_id=checkpoint_id,
+            component_type="spmd",
+            component_id=spmd_id,
+            status="not_implemented",
+        )
+
+        # TODO: Load checkpoint data
+        # TODO: Start SPMD with restored state
+        # TODO: Update handle mappings
+
+        duration = time.time() - start_time
+        MonitoringFacade.record_checkpoint_event(
+            event_type="restore_complete",
+            checkpoint_id=checkpoint_id,
+            component_type="spmd",
+            component_id=spmd_id,
+            status="not_implemented",
+            duration_seconds=duration,
+        )
+        return SPMDHandle(spmd_id)
+
     def update_handle_mapping(self, spmd_id: str) -> None:
         """
         Update handle mappings for an SPMD.

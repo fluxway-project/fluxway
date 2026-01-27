@@ -46,21 +46,61 @@ class SPMDDriver:
     def start(self) -> None:
         """
         Start the sub-orchestrator.
-        
+        Starts monitoring loop and begins FSM execution.
         TODO: Start monitoring loop
         TODO: Begin FSM execution
         """
-        pass
-    
+        # Register SPMDMonitor with MonitoringFacade
+        try:
+            from fluxway.common.monitoring.facade import MonitoringFacade
+
+            MonitoringFacade.register_spmd_monitor(self.spmd_id, self.monitor)
+        except Exception:
+            pass
+
+        # Start monitoring daemon
+        try:
+            from .monitor.daemon import SPMDMonitorDaemon
+
+            # Create daemon with anomaly callback
+            def anomaly_handler(spmd_id: str, anomalies: dict):
+                """Handle anomalies detected by daemon."""
+                # Log anomalies
+                # In production, can trigger alerts or recovery actions
+                pass
+
+            self._monitor_daemon = SPMDMonitorDaemon(
+                spmd_monitor=self.monitor,
+                check_interval=10.0,  # Check every 10 seconds
+                report_interval=30.0,  # Report every 30 seconds
+                anomaly_callback=anomaly_handler,
+            )
+
+            # Start daemon in background
+            self._monitor_daemon.start()
+        except Exception:
+            # If daemon fails to start, continue without it
+            # In production, should log the error
+            self._monitor_daemon = None
+
+        # TODO: Begin FSM execution
+
     def stop(self) -> None:
         """
         Stop the sub-orchestrator.
-        
+        Graceful shutdown including stopping monitoring daemon.
         TODO: Graceful shutdown
         TODO: Save state if needed
         """
-        pass
-    
+        # Stop monitoring daemon
+        if hasattr(self, "_monitor_daemon") and self._monitor_daemon is not None:
+            try:
+                self._monitor_daemon.stop()
+            except Exception:
+                pass
+
+        # TODO: Save state if needed
+
     def execute_step(self, step: int) -> None:
         """
         Execute a single training step.
@@ -68,8 +108,49 @@ class SPMDDriver:
         TODO: Coordinate forward/backward across workers
         TODO: Handle synchronization points
         """
-        pass
-    
+        # Monitor training step execution (non-blocking)
+        try:
+            from fluxway.common.monitoring.facade import MonitoringFacade
+            import time
+
+            # Record step start timing
+            MonitoringFacade.record_training_timing(step, "step_start", self.spmd_id)
+            step_start_time = time.time()
+
+            # TODO: Execute forward pass
+            # MonitoringFacade.record_training_timing(step, "forward_start", self.spmd_id)
+            # forward_result = self.executor.execute_forward(step)
+            # MonitoringFacade.record_training_timing(step, "forward_end", self.spmd_id)
+
+            # TODO: Execute backward pass
+            # MonitoringFacade.record_training_timing(step, "backward_start", self.spmd_id)
+            # backward_result = self.executor.execute_backward(step)
+            # MonitoringFacade.record_training_timing(step, "backward_end", self.spmd_id)
+
+            # TODO: Execute parameter update if needed
+            # MonitoringFacade.record_training_timing(step, "update_start", self.spmd_id)
+            # update_result = self.executor.execute_parameter_update()
+            # MonitoringFacade.record_training_timing(step, "update_end", self.spmd_id)
+
+            # Record step completion with timing
+            step_time = time.time() - step_start_time
+            step_time_ms = step_time * 1000
+
+            # Calculate throughput
+            throughput_steps_per_sec = 1.0 / step_time if step_time > 0 else 0.0
+
+            # Record training progress with timing and throughput
+            MonitoringFacade.record_training_progress(
+                step=step,
+                spmd_id=self.spmd_id,
+                metrics={
+                    "total_step_time_ms": step_time_ms,
+                    "throughput_steps_per_sec": throughput_steps_per_sec,
+                },
+            )
+        except Exception:
+            pass  # Non-intrusive: continue if monitoring fails
+
     def broadcast_control(self, batch_id: str, config: dict) -> None:
         """
         Broadcast control configuration to all workers.

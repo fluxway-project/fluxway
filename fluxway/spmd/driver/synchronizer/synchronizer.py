@@ -84,8 +84,26 @@ class SPMDSynchronizer:
         TODO: Implement blocking wait
         TODO: Handle timeouts
         """
-        pass
-    
+        # Monitor synchronization wait time (non-blocking)
+        try:
+            from fluxway.common.monitoring.facade import MonitoringFacade
+            import time
+
+            wait_start = time.time()
+
+            # TODO: Actual synchronization wait
+            # ... blocking wait logic ...
+
+            wait_time = time.time() - wait_start
+
+            # Record sync wait time
+            MonitoringFacade.record_communication_metrics(
+                step=step, sync_wait_time_ms=wait_time * 1000, spmd_id=self.spmd_id
+            )
+        except Exception:
+            # Non-intrusive: continue if monitoring fails
+            pass
+
     def signal_forward_complete(self, step: int) -> None:
         """
         Signal forward pass completion.
