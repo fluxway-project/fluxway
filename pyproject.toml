@@ -1,0 +1,48 @@
+[project]
+requires-python = ">=3.9"
+
+[tool.ruff]
+line-length = 88
+extend-exclude = [
+]
+
+[tool.ruff.lint]
+extend-select = ["I", "B", "Q", "C4", "W"]
+ignore = [
+    "B003",
+    "B005",
+    "B007",
+    "B008",
+    "B011",
+    "B012",
+    "B015",
+    "B017",
+    "B028",
+    "C408",
+    "C417",
+    "E741",
+    # Below are auto-fixable rules
+    "I001",
+]
+
+[tool.ruff.lint.flake8-quotes]
+avoid-escape = false
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+section-order = ["future", "standard-library", "third-party", "first-party", "local-folder", "afterray"]
+known-local-folder = ["fluxway"]
+known-third-party = []
+
+[tool.ruff.lint.isort.sections]
+afterray = ["psutil", "setproctitle"]
+
+# Some of the directories need to be kept in the blacklist for isort ("I" rule):
+# doc/*
+# */__init__.py
+# For the rest we will gradually remove them from the blacklist as we
+# reformat the code to follow the style guide.
+[tool.ruff.lint.per-file-ignores]
+"doc/*" = ["I"]
+"fluxway/__init__.py" = ["I"]
+"release/*_tests/*.py" = ["I"]
