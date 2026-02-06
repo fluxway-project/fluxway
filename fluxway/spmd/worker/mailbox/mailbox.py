@@ -17,8 +17,11 @@ Key technical points:
 
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 import asyncio
+import logging
 
 from fluxway.common.types.data_types import OpType
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from fluxway.common.types.data_types import TensorMeta
@@ -68,6 +71,11 @@ class WorkerMailbox:
             if name not in self._state_data[op_type]:
                 self._state_data[op_type][name] = {}
             self._state_data[op_type][name][step] = data
+        
+        # Debug log outside lock to avoid blocking
+        logger.debug(
+            f"Mailbox put_state: op={op_type.name}, name={name}, step={step}"
+        )
     
     async def get_state(self, op_type: OpType, name: str, step: int) -> Optional[Any]:
         """Get state data if available."""
@@ -129,6 +137,12 @@ class WorkerMailbox:
             if step not in self._tensor_data[op_type][name]:
                 self._tensor_data[op_type][name][step] = {}
             self._tensor_data[op_type][name][step][rank] = (data, meta)
+        
+        # Debug log outside lock to avoid blocking
+        logger.debug(
+            f"Mailbox put_tensor: op={op_type.name}, name={name}, step={step}, "
+            f"rank={rank}, has_meta={meta is not None}"
+        )
     
     async def get_tensor_shard(
         self,

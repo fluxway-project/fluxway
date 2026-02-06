@@ -10,9 +10,10 @@ Responsibilities:
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TYPE_CHECKING
 import threading
 import logging
+import inspect
 
 from fluxway.common.types.data_types import ArgumentType, OpType, TensorMeta
 from fluxway.common.types.sharding import (
@@ -71,6 +72,7 @@ class OperatorManager:
             rank: This worker's rank
             spmd_id: SPMD identifier (for self-loop detection)
         """
+        self._config = config  # Store config for explicit meta access
         self._mesh = config.mesh  # LayoutMesh from config
         self._rank = rank
         self._total_rank = config.worker_count
@@ -141,6 +143,24 @@ class OperatorManager:
         # True means the operator triggers immediately on any data, ignoring step ordering
         self._eager_trigger_cache: Dict[OpType, bool] = {}
         
+        # Operator input types (pre-computed from function signatures)
+        # {op_type: Type} - the data_type class that the operator expects as input
+        self._operator_input_types: Dict[OpType, Optional[Type]] = {
+            OpType.FORWARD: None,
+            OpType.BACKWARD: None,
+            OpType.UPDATE: None,
+        }
+        
+        # Output-to-input tensor name mapping (positional correspondence)
+        # Built from input_arguments.tensor and output_arguments.tensor at init.
+        # Used by Worker._send_output to look up the correct input meta when
+        # input and output tensor names differ (e.g. input="input", output="tensor").
+        self._output_to_input_tensor_mapping: Dict[OpType, Dict[str, str]] = {
+            OpType.FORWARD: {},
+            OpType.BACKWARD: {},
+            OpType.UPDATE: {},
+        }
+        
         # Thread lock
         self._lock = threading.Lock()
         
@@ -152,6 +172,9 @@ class OperatorManager:
         
         # Pre-compute expected tensor shards after routing strategies are ready
         self._precompute_expected_tensor_shards()
+        
+        # Pre-compute operator input types from function signatures
+        self._precompute_operator_input_types()
     
     # =========================================================================
     # Metadata Parsing (at initialization)
@@ -179,6 +202,17 @@ class OperatorManager:
                 self._input_sharding[op_type] = dict(meta.input_sharding)
             if meta.output_sharding:
                 self._output_sharding[op_type] = dict(meta.output_sharding)
+            
+            logger.debug(
+                "OperatorManager[%s]: op=%s, input_sharding_keys=%s, output_sharding_keys=%s, "
+                "input_pre_sharding_keys=%s, output_post_sharding_keys=%s",
+                self._spmd_id,
+                op_type.name,
+                list(self._input_sharding[op_type].keys()),
+                list(self._output_sharding[op_type].keys()),
+                list(meta.input_pre_sharding.keys()),
+                list(meta.output_post_sharding.keys()),
+            )
             
             # 2. Expected parameter names
             self._expected_state_names[op_type] = list(
@@ -241,16 +275,44 @@ class OperatorManager:
                     is_self_loop=(post_spmd_id == self._spmd_id),
                 )
             
+            # 5. Build output-to-input tensor name mapping (positional correspondence)
+            input_tensor_names = list(
+                meta.get_arguments(is_output=False, arg_type=ArgumentType.TENSOR) or []
+            )
+            output_tensor_names = list(
+                meta.get_arguments(is_output=True, arg_type=ArgumentType.TENSOR) or []
+            )
+            mapping: Dict[str, str] = {}
+            for idx, out_name in enumerate(output_tensor_names):
+                if idx < len(input_tensor_names):
+                    mapping[out_name] = input_tensor_names[idx]
+            self._output_to_input_tensor_mapping[op_type] = mapping
+            
             logger.debug(
                 f"Parsed operator meta for {op_type.name}: "
                 f"state={self._expected_state_names[op_type]}, "
                 f"tensor={self._expected_tensor_names[op_type]}, "
                 f"predecessors={list(self._predecessor_topology[op_type].keys())}, "
-                f"successors={list(self._successor_topology[op_type].keys())}"
+                f"successors={list(self._successor_topology[op_type].keys())}, "
+                f"output_to_input_tensor_mapping={mapping}"
             )
     
     def _get_operator_metadata(self, op_type: OpType) -> Optional["OperatorMeta"]:
-        """Get metadata attached to an operator."""
+        """
+        Get metadata attached to an operator.
+        
+        Prefers explicit meta from SPMDConfig (properly serialized) over
+        function attributes (lost when pickled by reference across processes).
+        """
+        # First try to get from SPMDConfig's explicit fields (properly serialized)
+        if op_type == OpType.FORWARD and self._config.forward_meta is not None:
+            return self._config.forward_meta
+        elif op_type == OpType.BACKWARD and self._config.backward_meta is not None:
+            return self._config.backward_meta
+        elif op_type == OpType.UPDATE and self._config.update_meta is not None:
+            return self._config.update_meta
+        
+        # Fallback to function attribute (may not have edge info in worker processes)
         operator = self._operators.get(op_type)
         if operator is None:
             return None
@@ -421,6 +483,43 @@ class OperatorManager:
                     + (" (eager_trigger=True)" if eager_trigger else "")
                 )
     
+    def _precompute_operator_input_types(self) -> None:
+        """
+        Pre-compute operator input types from function signatures.
+        
+        Extracts the first parameter type (excluding self) from each operator function
+        and caches it for use in _assemble_input.
+        """
+        for op_type, operator in self._operators.items():
+            if operator is None:
+                continue
+            
+            try:
+                sig = inspect.signature(operator)
+                params = list(sig.parameters.values())
+                
+                if not params:
+                    logger.warning(f"Operator {op_type.name} has no parameters")
+                    continue
+                
+                # Get the first parameter (excluding self)
+                param = params[0] if params[0].name != 'self' else (params[1] if len(params) > 1 else None)
+                if param is None:
+                    logger.warning(f"Operator {op_type.name} has no valid parameters")
+                    continue
+                
+                param_type = param.annotation
+                if param_type == inspect.Parameter.empty:
+                    logger.warning(f"Operator {op_type.name} parameter '{param.name}' has no type annotation")
+                    continue
+                
+                self._operator_input_types[op_type] = param_type
+                logger.debug(f"Precomputed input type for {op_type.name}: {param_type}")
+                
+            except Exception as e:
+                logger.warning(f"Failed to extract input type for {op_type.name}: {e}")
+                continue
+    
     # =========================================================================
     # Topology Query
     # =========================================================================
@@ -535,6 +634,56 @@ class OperatorManager:
             {tensor_name: expected_shard_count}
         """
         return dict(self._expected_tensor_shards_cache.get(op_type, {}))
+    
+    def get_operator_input_type(self, op_type: OpType) -> Optional[Type]:
+        """
+        Get the input type (data_type class) expected by an operator.
+        
+        Returns:
+            The Type of the data_type class, or None if not available
+        """
+        return self._operator_input_types.get(op_type)
+    
+    def get_output_to_input_tensor_mapping(self, op_type: OpType) -> Dict[str, str]:
+        """
+        Get the output-to-input tensor name mapping for an operator.
+        
+        Built at init from positional correspondence between input_arguments.tensor
+        and output_arguments.tensor.  e.g. if input tensors are ["input"] and output
+        tensors are ["tensor"], the mapping is {"tensor": "input"}.
+        
+        Returns:
+            Dict mapping output tensor name → corresponding input tensor name.
+        """
+        return dict(self._output_to_input_tensor_mapping.get(op_type, {}))
+    
+    def get_input_sharding(self, op_type: OpType) -> Dict[str, ShardingSpec]:
+        """Get input sharding specs for an operator."""
+        return dict(self._input_sharding.get(op_type, {}))
+    
+    def get_predecessor_topology(self, op_type: OpType) -> Dict[str, SPMDTopologyInfo]:
+        """Get predecessor topology info for an operator."""
+        return dict(self._predecessor_topology.get(op_type, {}))
+    
+    def get_input_routing_strategy(
+        self,
+        op_type: OpType,
+        pre_spmd_id: str,
+        tensor_name: str,
+    ) -> Optional[DenseShardingStrategy]:
+        """
+        Get pre-computed input routing strategy for a tensor.
+        
+        Args:
+            op_type: Operator type
+            pre_spmd_id: Predecessor SPMD ID
+            tensor_name: Tensor name
+            
+        Returns:
+            DenseShardingStrategy if available, None otherwise
+        """
+        cache_key = (op_type, pre_spmd_id, tensor_name)
+        return self._input_routing_strategies.get(cache_key)
     
     # =========================================================================
     # Output Routing (4 cases)
@@ -740,13 +889,48 @@ class OperatorManager:
         # fn(tensor, tensor_meta, post_sharding_spec) -> routing result
         return output_spec.fn(tensor_data, tensor_meta, post_spec)
     
+    def has_sparse_route_fn(
+        self,
+        op_type: OpType,
+        target_spmd_id: str,
+        output_tensor_name: str,
+    ) -> bool:
+        """
+        Check whether the sparse routing path for a given successor has a
+        user-provided routing function (``DynamicShardingSpec.fn``).
+
+        The check mirrors the ``get_successor_target_route`` routing-case
+        selection:
+
+        * dense-to-dense → always ``False`` (no sparse involved).
+        * dense-to-sparse → ``post_spec.fn is not None``.
+        * sparse-to-dense → ``output_spec.fn is not None``.
+        * sparse-to-sparse → ``output_spec.fn is not None``.
+
+        Returns ``False`` when the topology / sharding info cannot be found.
+        """
+        succ_info = self._successor_topology[op_type].get(target_spmd_id)
+        if succ_info is None:
+            return False
+
+        output_spec = self._output_sharding.get(op_type, {}).get(output_tensor_name)
+        post_spec = succ_info.tensor_sharding.get(output_tensor_name)
+
+        src_is_sparse = isinstance(output_spec, DynamicShardingSpec)
+        dst_is_sparse = isinstance(post_spec, DynamicShardingSpec)
+
+        if not src_is_sparse and not dst_is_sparse:
+            return False  # dense-to-dense, no route fn concept
+        elif not src_is_sparse and dst_is_sparse:
+            return post_spec.fn is not None
+        elif src_is_sparse and not dst_is_sparse:
+            return output_spec.fn is not None
+        else:
+            return output_spec.fn is not None
+
     # =========================================================================
     # Sharding Query
     # =========================================================================
-    
-    def get_input_sharding(self, op_type: OpType) -> Dict[str, ShardingSpec]:
-        """Get input sharding for an operator."""
-        return dict(self._input_sharding.get(op_type, {}))
     
     def get_output_sharding(self, op_type: OpType) -> Dict[str, ShardingSpec]:
         """Get output sharding for an operator."""
@@ -788,13 +972,13 @@ class OperatorManager:
     # Execution
     # =========================================================================
     
-    def execute(self, op_type: OpType, input_data: Dict[str, Any]) -> Any:
+    def execute(self, op_type: OpType, input_data: Any) -> Any:
         """
         Execute an operator.
         
         Args:
             op_type: Operator type to execute
-            input_data: Assembled input data
+            input_data: Assembled input data (already constructed as data_type object)
             
         Returns:
             Operator output

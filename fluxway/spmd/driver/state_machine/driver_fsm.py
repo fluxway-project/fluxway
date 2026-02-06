@@ -177,10 +177,12 @@ class DriverStateMachine:
     # =========================================================================
     
     def _on_enter_ready(self) -> None:
-        """Called when entering READY state."""
+        """Called when entering READY state.
+        
+        Note: Heartbeat is already started in initialize() (before READY),
+        so we do NOT call _start_heartbeat() here.
+        """
         logger.info(f"SPMD {self._driver.spmd_id} is ready")
-        # Start heartbeat reporting to controller
-        self._driver._start_heartbeat()
     
     def _on_enter_running(self) -> None:
         """Called when entering RUNNING state."""

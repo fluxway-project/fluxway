@@ -47,6 +47,7 @@ class JsonDatasource(FileBaseSource):
         file_pattern: str = "*.json",
         encoding: str = "utf-8",
         recursive: bool = True,
+        tensor_type: Optional[Any] = None,
     ):
         """
         Initialize JSON datasource.
@@ -56,6 +57,7 @@ class JsonDatasource(FileBaseSource):
             file_pattern: Glob pattern for matching files
             encoding: File encoding (default: utf-8)
             recursive: Whether to search subdirectories recursively
+            tensor_type: Target type for converting the entire batch (e.g., np.ndarray)
         """
         super().__init__(
             src_dir=src_dir,
@@ -64,6 +66,9 @@ class JsonDatasource(FileBaseSource):
             recursive=recursive,
         )
         self.encoding = encoding
+        # tensor_type is used to convert the entire batch (List[Dict]) to target type
+        self.tensor_type = tensor_type
+        logger.debug(f"Initialized JsonDatasource with tensor_type: {tensor_type}")
     
     def _read_json_lines(self, file_path: str) -> Iterator[Dict[str, Any]]:
         """
@@ -158,19 +163,21 @@ class JsonDatasource(FileBaseSource):
         self,
         task: ReadTask,
         batch_size: int,
-    ) -> Iterator[List[Dict[str, Any]]]:
+    ) -> Iterator[Any]:
         """
         Read JSON data in batches.
         
         Reads from all files in the task and yields batches of records.
-        Each batch is a list of dicts with up to batch_size records.
+        If tensor_type is configured, converts the entire batch (List[Dict]) to the target type.
+        Otherwise, yields batches as list of dicts.
         
         Args:
             task: File read task containing list of files
             batch_size: Maximum number of records per batch
             
         Yields:
-            List of dicts (JSON objects), one batch at a time
+            If tensor_type is set: converted tensor data (e.g., np.ndarray)
+            Otherwise: List of dicts (JSON objects), one batch at a time
         """
         if not isinstance(task, FileReadTask):
             logger.error(f"Expected FileReadTask, got {type(task)}")
@@ -188,7 +195,7 @@ class JsonDatasource(FileBaseSource):
                     total_records += 1
                     
                     if len(batch) >= batch_size:
-                        yield batch
+                        yield self._convert_batch(batch)
                         batch = []
                         
             except Exception as e:
@@ -197,12 +204,46 @@ class JsonDatasource(FileBaseSource):
         
         # Yield remaining records
         if batch:
-            yield batch
+            yield self._convert_batch(batch)
         
         logger.debug(
             f"Task {task.task_id} completed: "
             f"read {total_records} records from {len(task.files)} files"
         )
+    
+    def _convert_batch(self, batch: List[Dict[str, Any]]) -> Any:
+        """
+        Convert a batch of records to the target tensor type.
+        
+        The entire batch (List[Dict]) is converted to tensor_type.
+        tensor_name is not used in conversion, it's only for worker to send data.
+        
+        Args:
+            batch: List of dicts (JSON records)
+            
+        Returns:
+            Converted batch data (e.g., np.ndarray) or original batch if no conversion needed
+        """
+        # If no tensor_type configured, return batch as-is
+        if not self.tensor_type:
+            return batch
+        
+        # If tensor_type is list, return batch as-is (no conversion)
+        if self.tensor_type is list:
+            return batch
+        
+        # Convert based on tensor_type
+        import numpy as np
+        
+        if self.tensor_type is np.ndarray:
+            # Convert entire List[Dict] to np.ndarray
+            # This converts the list of dicts directly to a numpy array
+            return np.array(batch)
+        else:
+            raise NotImplementedError(
+                f"Tensor type conversion for {self.tensor_type} is not implemented. "
+                f"Only np.ndarray and list are currently supported."
+            )
     
     def read_all(self, task: ReadTask) -> List[Dict[str, Any]]:
         """
@@ -228,6 +269,7 @@ def create_datasource(
     file_pattern: Optional[str] = None,
     encoding: str = "utf-8",
     recursive: bool = True,
+    tensor_type: Optional[Any] = None,
     **kwargs: Any,
 ) -> FileBaseSource:
     """
@@ -260,6 +302,7 @@ def create_datasource(
             file_pattern=pattern,
             encoding=encoding,
             recursive=recursive,
+            tensor_type=tensor_type,
         )
     
     # TODO: Add support for other formats

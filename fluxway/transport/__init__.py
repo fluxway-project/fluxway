@@ -1,3 +1,10 @@
+"""Transport layer: Data transmission between SPMDs."""
+
+# Ensure INFO logs are visible even when importing this subpackage directly.
+from ..common.utils.logging import ensure_logging_configured  # noqa: E402
+
+ensure_logging_configured()
+
 from .tensor import TransportTensor
 from .sharding import (
     Layout,

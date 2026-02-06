@@ -12,12 +12,16 @@ Usage:
     graph = builder.build(name="my_graph")
 """
 
-from typing import Any, Dict, List, Optional, Callable, Union, Type
+from typing import Any, Dict, List, Optional, Callable, Union, Type, Tuple
+import logging
 
 from ...common.types import (
     Graph, Node, Edge, OperatorMeta, OpType, EdgeShardingInfo,
     NodeType, ReaderConfig, ResourceSpec, SPMDConfig,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class Builder:
@@ -96,6 +100,7 @@ class Builder:
         resource: Optional[Dict[str, Any]] = None,
         description: str = "",
         encoding: str = "utf-8",
+        output_data_type: Optional[Type] = None,
     ) -> "Builder":
         """
         Add a Reader node to the graph.
@@ -114,6 +119,9 @@ class Builder:
             resource: Resource requirements dict (nums_cpu, nums_gpu, memory)
             description: Human-readable description of the node
             encoding: File encoding (default: utf-8)
+            output_data_type: Output data type class (e.g., TensorOnly). 
+                             If provided, reader will convert batch data to this type.
+                             The tensor field name from this type will be used when sending data.
             
         Returns:
             Self for method chaining
@@ -135,7 +143,20 @@ class Builder:
         if name in self._nodes:
             raise ValueError(f"Node '{name}' already exists in the graph")
         
+        # Parse output_data_type to extract tensor field name and type
+        tensor_name = None
+        tensor_type = None
+        if output_data_type:
+            tensor_name, tensor_type = self._extract_tensor_field_info(output_data_type)
+            logger.debug(f"Extracted tensor field name: {tensor_name}, type: {tensor_type}")
+            if not tensor_name:
+                raise ValueError(
+                    f"Cannot extract tensor field name from output_data_type {output_data_type.__name__}. "
+                    f"For eager mode (reader's downstream), output_data_type must have exactly one tensor field (np.ndarray)."
+                )
+        
         # Create ReaderConfig
+        # Note: output_data_type is only used for parsing, not stored in ReaderConfig
         reader_config = ReaderConfig(
             src_dir=src_dir,
             data_type=data_type,
@@ -143,6 +164,8 @@ class Builder:
             file_pattern=file_pattern,
             worker_count=worker_count,
             encoding=encoding,
+            tensor_name=tensor_name,
+            tensor_type=tensor_type,
         )
         
         # Parse resource specification
@@ -175,6 +198,58 @@ class Builder:
         self._reader_configs[name] = reader_config
         
         return self
+    
+    def _extract_tensor_field_info(self, output_data_type: Type) -> Tuple[Optional[str], Optional[Type]]:
+        """
+        Extract tensor field name and type from output_data_type.
+        
+        For eager mode (reader's downstream), there should be exactly one tensor arg.
+        A tensor field is identified by having type np.ndarray (or compatible).
+        
+        Args:
+            output_data_type: The output data type class (e.g., TensorOnly)
+            
+        Returns:
+            Tuple of (tensor_field_name, tensor_field_type), or (None, None) if not found
+        """
+        import numpy as np
+        
+        # Get field annotations
+        annotations = getattr(output_data_type, "__annotations__", {})
+        
+        # Try dataclass_fields for more info
+        if hasattr(output_data_type, "__dataclass_fields__"):
+            fields = output_data_type.__dataclass_fields__
+            # Check each field's type
+            for field_name, field_info in fields.items():
+                if field_name.startswith("_"):
+                    continue
+                field_type = annotations.get(field_name, None)
+                # Check if type is np.ndarray or compatible
+                if field_type is np.ndarray or (hasattr(field_type, "__origin__") and 
+                                                 getattr(field_type, "__origin__", None) is np.ndarray):
+                    return field_name, field_type
+                # Also check string representation
+                type_str = str(field_type)
+                if "ndarray" in type_str or "numpy" in type_str.lower():
+                    return field_name, field_type
+        
+        # Fallback: check annotations directly
+        for field_name, field_type in annotations.items():
+            if field_name.startswith("_"):
+                continue
+            if field_type is np.ndarray:
+                return field_name, field_type
+            type_str = str(field_type)
+            if "ndarray" in type_str or "numpy" in type_str.lower():
+                return field_name, field_type
+        
+        # If no tensor field found, return first non-private field as fallback
+        for field_name, field_type in annotations.items():
+            if not field_name.startswith("_"):
+                return field_name, field_type
+        
+        return None, None
     
     def _is_reader_node(self, name: str) -> bool:
         """
@@ -520,42 +595,61 @@ class Builder:
         """
         Validate and link operators between two nodes with arbitrary op types.
         
-        This is the generic edge validation/linking method that handles all
-        source_op/target_op combinations including self-loops (e.g., forward->backward
-        on the same node).
-        
-        Args:
-            source_node: Source node name
-            source_op: Source operator type
-            target_node: Target node name  
-            target_op: Target operator type
-            condition_fn: Optional condition function
+        核心注意点：这里必须基于 Node.spmd_config 里的 user_forward_fn / user_backward_fn
+        上挂载的 OperatorMeta 来写回 input_pre_sharding / output_post_sharding，
+        这样修改才能随 SPMDConfig 一起传递到 worker 进程。
         """
+        # 从 Node 的 spmd_config 中获取实际传给 worker 的函数对象
+        # 同时仍然保留 spmd_class 引用，用于 state 校验时的反射
+        src_node = self._nodes[source_node]
+        dst_node = self._nodes[target_node]
+
+        src_cfg = src_node.spmd_config
+        dst_cfg = dst_node.spmd_config
+
+        def _get_fn_and_meta(cfg: SPMDConfig, op: OpType) -> Tuple[Optional[Callable], Optional[OperatorMeta]]:
+            if op == OpType.FORWARD:
+                fn = cfg.user_forward_fn
+                meta = cfg.forward_meta
+            elif op == OpType.BACKWARD:
+                fn = cfg.user_backward_fn
+                meta = cfg.backward_meta
+            else:
+                fn = cfg.user_update_fn
+                meta = cfg.update_meta
+            if fn is None:
+                return None, None
+            return fn, meta
+
+        _, src_meta = _get_fn_and_meta(src_cfg, source_op)
+        _, dst_meta = _get_fn_and_meta(dst_cfg, target_op)
+
+        # 用于错误信息和 state 校验的上下文
         src_cls = self._spmd_classes[source_node]
-        dst_cls = self._spmd_classes[target_node]
-        
-        src_meta = src_cls.get_operator_meta(source_op)
-        dst_meta = dst_cls.get_operator_meta(target_op)
-        
         ctx = f"edge {source_node}.{source_op.name.lower()} -> {target_node}.{target_op.name.lower()}"
         self._ensure_meta_exists(source_node, source_op.name.lower(), src_meta, ctx)
         self._ensure_meta_exists(target_node, target_op.name.lower(), dst_meta, ctx)
         
-        # For self-loops (same node, different ops), skip tensor/state validation
-        # because the data flows internally without external sharding requirements
+        # For self-loops (same node, different ops), skip tensor validation
+        # because the data flows internally without external sharding requirements.
+        # However, state output inference must still run so that
+        # _send_output knows which state fields to transmit via _self_receive_state.
         is_self_loop = (source_node == target_node)
         
         if not is_self_loop:
             # 1) Validate tensor: src_op output vs dst_op input
             src_meta.validate_tensor_io_match(dst_meta, src_is_output=True, ctx=ctx)
-            
-            # 2) Validate & update state: src_op output_state vs dst_op input_state
-            src_meta.validate_and_update_state_output_match_dest_input(
-                dst_meta=dst_meta,
-                src_spmd_class=src_cls,
-                src_method_name=source_op.name.lower(),
-                ctx=ctx,
-            )
+        
+        # 2) Validate & update state: src_op output_state vs dst_op input_state
+        #    This must run for ALL edges (including self-loops) so that
+        #    output_arguments[STATE] is populated and _send_output can
+        #    extract and transmit state fields.
+        src_meta.validate_and_update_state_output_match_dest_input(
+            dst_meta=dst_meta,
+            src_spmd_class=src_cls,
+            src_method_name=source_op.name.lower(),
+            ctx=ctx,
+        )
         
         # 3) Write back pre/post sharding to OperatorMeta (with target_op info)
         src_out = src_meta.output_sharding or {}
@@ -572,6 +666,14 @@ class Builder:
                     target_op=target_op,
                 )
             )
+            logger.debug(
+                "Builder linked input_pre_sharding: %s.%s <- %s.%s, tensor_keys=%s",
+                target_node,
+                target_op.name.lower(),
+                source_node,
+                source_op.name.lower(),
+                list(src_out.keys()),
+            )
         
         # Update source.source_op.output_post_sharding:
         #   key: target_node
@@ -584,111 +686,15 @@ class Builder:
                     target_op=target_op,
                 )
             )
-
-    def _validate_and_link_forward(
-        self,
-        source_node: str,
-        target_node: str,
-        condition_fn: Optional[Callable[..., bool]],
-    ) -> None:
-        """Validate and link forward operators between two nodes (with condition)."""
-        src_cls = self._spmd_classes[source_node]
-        dst_cls = self._spmd_classes[target_node]
-
-        src_meta = src_cls.get_operator_meta(OpType.FORWARD)
-        dst_meta = dst_cls.get_operator_meta(OpType.FORWARD)
-
-        ctx = f"forward edge {source_node} -> {target_node}"
-        self._ensure_meta_exists(source_node, OpType.FORWARD.name.lower(), src_meta, ctx)
-        self._ensure_meta_exists(target_node, OpType.FORWARD.name.lower(), dst_meta, ctx)
-
-        # 1) 校验 tensor：src.forward 输出 vs dst.forward 输入
-        src_meta.validate_tensor_io_match(dst_meta, src_is_output=True, ctx=ctx)
-
-        # 2) 校验 & 补全 state：src.forward.output_state vs dst.forward.input_state
-        src_meta.validate_and_update_state_output_match_dest_input(
-            dst_meta=dst_meta,
-            src_spmd_class=src_cls,
-            src_method_name="forward",
-            ctx=ctx,
-        )
-
-        # 4) 写回前/后置 sharding 到 OperatorMeta（包含条件信息）
-        # Source.forward.output -> Target.forward.input
-        src_out = src_meta.output_sharding or {}
-        dst_in = dst_meta.input_sharding or {}
-
-        # 更新 target.forward.input_pre_sharding：
-        #   key: source_node
-        #   value: 该前驱到当前节点的一条边（可能是条件边）对应的 sharding 信息
-        if src_out:
-            dst_meta.input_pre_sharding.setdefault(source_node, []).append(
-                EdgeShardingInfo(
-                    condition_fn=condition_fn,
-                    tensor_sharding=dict(src_out),
-                )
+            logger.debug(
+                "Builder linked output_post_sharding: %s.%s -> %s.%s, tensor_keys=%s",
+                source_node,
+                source_op.name.lower(),
+                target_node,
+                target_op.name.lower(),
+                list(dst_in.keys()),
             )
 
-        # 更新 source.forward.output_post_sharding：
-        #   key: target_node
-        #   value: 当前节点到后继的一条边对应的 sharding 信息
-        if dst_in:
-            src_meta.output_post_sharding.setdefault(target_node, []).append(
-                EdgeShardingInfo(
-                    condition_fn=condition_fn,
-                    tensor_sharding=dict(dst_in),
-                )
-            )
-
-    def _validate_and_link_backward(
-        self,
-        source_node: str,
-        target_node: str,
-        condition_fn: Optional[Callable[..., bool]],
-    ) -> None:
-        """Validate and link backward operators between two nodes (with condition)."""
-        src_cls = self._spmd_classes[source_node]
-        dst_cls = self._spmd_classes[target_node]
-
-        src_meta = src_cls.get_operator_meta(OpType.BACKWARD)
-        dst_meta = dst_cls.get_operator_meta(OpType.BACKWARD)
-
-        ctx = f"backward edge {source_node} -> {target_node}"
-        self._ensure_meta_exists(source_node, OpType.BACKWARD.name.lower(), src_meta, ctx)
-        self._ensure_meta_exists(target_node, OpType.BACKWARD.name.lower(), dst_meta, ctx)
-
-        # 1) 校验 tensor：src.backward 输出 vs dst.backward 输入
-        src_meta.validate_tensor_io_match(dst_meta, src_is_output=True, ctx=ctx)
-
-        # 2) 校验 & 补全 state：src.backward.output_state vs dst.backward.input_state
-        src_meta.validate_and_update_state_output_match_dest_input(
-            dst_meta=dst_meta,
-            src_spmd_class=src_cls,
-            src_method_name="backward",
-            ctx=ctx,
-        )
-
-        # 4) 写回前/后置 sharding 到 OperatorMeta（包含条件信息）
-        # Source.backward.output -> Target.backward.input
-        src_out = src_meta.output_sharding or {}
-        dst_in = dst_meta.input_sharding or {}
-
-        if src_out:
-            dst_meta.input_pre_sharding.setdefault(source_node, []).append(
-                EdgeShardingInfo(
-                    condition_fn=condition_fn,
-                    tensor_sharding=dict(src_out),
-                )
-            )
-
-        if dst_in:
-            src_meta.output_post_sharding.setdefault(target_node, []).append(
-                EdgeShardingInfo(
-                    condition_fn=condition_fn,
-                    tensor_sharding=dict(dst_in),
-                )
-            )
-    
     def build(self, name: str = "") -> Graph:
         """
         Build and return the complete graph.

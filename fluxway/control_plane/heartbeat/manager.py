@@ -45,6 +45,7 @@ class HeartbeatManager:
         self, 
         config: Optional[HeartbeatConfig] = None,
         on_all_ready: Optional[Union[SyncCallback, AsyncCallback]] = None,
+        on_all_workers_running: Optional[Union[SyncCallback, AsyncCallback]] = None,
         on_driver_error: Optional[Union[SyncErrorCallback, AsyncErrorCallback]] = None,
         on_driver_recovered: Optional[Union[SyncRecoverCallback, AsyncRecoverCallback]] = None,
     ):
@@ -53,12 +54,15 @@ class HeartbeatManager:
         
         Args:
             config: Heartbeat configuration
-            on_all_ready: Callback when all registered drivers are ready (sync or async)
+            on_all_ready: Callback when all registered drivers are ready (workers_ready=True)
+            on_all_workers_running: Callback when all drivers report workers_running=True
+                (after topology registration completes)
             on_driver_error: Callback when a driver has error (spmd_id, error_msg) (sync or async)
             on_driver_recovered: Callback when a driver recovers (spmd_id) (sync or async)
         """
         self._config = config or HeartbeatConfig()
         self._on_all_ready = on_all_ready
+        self._on_all_workers_running = on_all_workers_running
         self._on_driver_error = on_driver_error
         self._on_driver_recovered = on_driver_recovered
         
@@ -74,8 +78,9 @@ class HeartbeatManager:
         # Drivers currently in error state
         self._error_drivers: Set[str] = set()
         
-        # Whether all drivers have been ready at least once
+        # Phase trigger flags (one-shot)
         self._all_ready_triggered = False
+        self._all_workers_running_triggered = False
         
         # Lock for thread safety (asyncio.Lock for async context)
         self._lock = asyncio.Lock()
@@ -144,13 +149,21 @@ class HeartbeatManager:
                     is_new_error = True
                     logger.error(f"Driver {spmd_id} reported error: {heartbeat.error_message}")
             
-            # Check if all drivers are ready (first time)
+            # Check if all drivers are ready (first time) — Phase 1
             should_trigger_ready = False
             if not self._all_ready_triggered:
                 if self._check_all_ready_internal():
                     self._all_ready_triggered = True
                     should_trigger_ready = True
-                    logger.info("All drivers are ready")
+                    logger.info("All drivers are ready (workers_ready=True)")
+            
+            # Check if all workers are running (first time) — Phase 2
+            should_trigger_running = False
+            if self._all_ready_triggered and not self._all_workers_running_triggered:
+                if self._check_all_workers_running_internal():
+                    self._all_workers_running_triggered = True
+                    should_trigger_running = True
+                    logger.info("All workers are running (workers_running=True)")
         
         # Call callbacks outside lock to prevent deadlock
         if was_in_error and heartbeat.status == DriverStatus.HEALTHY:
@@ -163,7 +176,15 @@ class HeartbeatManager:
         if should_trigger_ready:
             await self._call_ready_callback()
         
-        logger.debug(f"Received heartbeat from {spmd_id}: status={heartbeat.status}")
+        if should_trigger_running:
+            await self._call_workers_running_callback()
+        
+        logger.debug(
+            f"Received heartbeat from {spmd_id}: status={heartbeat.status.name}, "
+            f"state={heartbeat.state.name}, timestamp={heartbeat.timestamp:.3f}, "
+            f"healthy_workers={heartbeat.healthy_worker_count}/{heartbeat.worker_count}, "
+            f"op_steps={heartbeat.op_steps}, workers_ready={heartbeat.workers_ready}"
+        )
     
     async def _call_ready_callback(self) -> None:
         """Call the on_all_ready callback (handles sync and async)."""
@@ -198,8 +219,23 @@ class HeartbeatManager:
         except Exception as e:
             logger.error(f"Error in on_driver_recovered callback: {e}")
     
+    async def _call_workers_running_callback(self) -> None:
+        """Call the on_all_workers_running callback (handles sync and async)."""
+        if self._on_all_workers_running is None:
+            return
+        try:
+            result = self._on_all_workers_running()
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as e:
+            logger.error(f"Error in on_all_workers_running callback: {e}")
+    
     def _check_all_ready_internal(self) -> bool:
-        """Check if all registered drivers are ready (must hold lock)."""
+        """Check if all registered drivers are ready (must hold lock).
+        
+        Phase 1 check: All drivers have workers_ready=True and are in
+        READY or RUNNING state.
+        """
         if not self._registered_spmds:
             return False
         
@@ -213,6 +249,23 @@ class HeartbeatManager:
                 return False
             # Check if all workers have reported heartbeat
             if not heartbeat.workers_ready:
+                return False
+        
+        return True
+    
+    def _check_all_workers_running_internal(self) -> bool:
+        """Check if all registered drivers report workers_running=True (must hold lock).
+        
+        Phase 2 check: After topology registration, all workers should be running.
+        """
+        if not self._registered_spmds:
+            return False
+        
+        for spmd_id in self._registered_spmds:
+            heartbeat = self._heartbeats.get(spmd_id)
+            if heartbeat is None:
+                return False
+            if not heartbeat.workers_running:
                 return False
         
         return True
@@ -367,10 +420,28 @@ class HeartbeatManager:
                 if heartbeat is None:
                     # Never received a heartbeat
                     self._missed_counts[spmd_id] = self._missed_counts.get(spmd_id, 0) + 1
+                    missed = self._missed_counts[spmd_id]
+                    logger.debug(
+                        f"Heartbeat check: {spmd_id} never received heartbeat, "
+                        f"missed_count={missed}/{self._config.max_missed_heartbeats}"
+                    )
                 elif current_time - heartbeat.timestamp > self._config.heartbeat_timeout:
                     # Heartbeat timeout
                     self._missed_counts[spmd_id] = self._missed_counts.get(spmd_id, 0) + 1
+                    missed = self._missed_counts[spmd_id]
+                    age = current_time - heartbeat.timestamp
+                    logger.debug(
+                        f"Heartbeat check: {spmd_id} timeout (age={age:.2f}s > "
+                        f"timeout={self._config.heartbeat_timeout}s), "
+                        f"missed_count={missed}/{self._config.max_missed_heartbeats}"
+                    )
                 else:
+                    # Heartbeat is healthy
+                    age = current_time - heartbeat.timestamp
+                    logger.debug(
+                        f"Heartbeat check: {spmd_id} healthy (age={age:.2f}s < "
+                        f"timeout={self._config.heartbeat_timeout}s)"
+                    )
                     continue
                 
                 missed = self._missed_counts[spmd_id]
@@ -393,5 +464,6 @@ class HeartbeatManager:
             self._missed_counts.clear()
             self._error_drivers.clear()
             self._all_ready_triggered = False
+            self._all_workers_running_triggered = False
             for spmd_id in self._registered_spmds:
                 self._missed_counts[spmd_id] = 0

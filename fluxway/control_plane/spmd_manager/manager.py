@@ -14,6 +14,7 @@ Note: Controller layer only starts drivers. Workers are started by drivers.
 """
 
 import logging
+import asyncio
 from typing import Any, Dict, List, Optional
 
 try:
@@ -22,7 +23,7 @@ try:
 except ImportError:
     RAY_AVAILABLE = False
 
-from ...common.types import SPMDConfig, SPMDState, NodeType, ReaderConfig
+from ...common.types import SPMDConfig, NodeType, ReaderConfig
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +122,7 @@ class SPMDManager:
         self._spmd_handles[spmd_id] = handle
         logger.info(f"Registered SPMD: {spmd_id}")
     
-    def start_spmd(
+    async def start_spmd(
         self, 
         spmd_id: str, 
         config: SPMDConfig,
@@ -165,10 +166,10 @@ class SPMDManager:
             # Import driver here to avoid circular imports
             from ...spmd.driver import SPMDDriver
             
-            # Build graph topology for this SPMD
+            # Build graph topology for this SPMD (self-loops are already filtered)
             graph_topology = {
-                "predecessors": self._reverse_topology.get(spmd_id, []),
-                "successors": self._topology.get(spmd_id, []),
+                "predecessors": self.get_predecessors(spmd_id),
+                "successors": self.get_successors(spmd_id),
             }
             
             # Create driver actor with placement group
@@ -204,16 +205,7 @@ class SPMDManager:
             
             handle.set_driver_handle(driver)
             
-            # Initialize the driver (this starts workers)
-            # TODO(Chiave): 摒弃下面的同步机制，通过 driver init 之后发送的就绪心跳，来同步状态（同步改为异步）
-            init_result = ray.get(driver.initialize.remote(checkpoint_id))
-            
-            if init_result:
-                handle.set_initialized(True)
-                node_type_str = "Reader" if node_type == NodeType.READER else "SPMD"
-                logger.info(f"Successfully started {node_type_str} {spmd_id}")
-            else:
-                logger.error(f"Failed to initialize SPMD {spmd_id}")
+            driver.initialize.remote(checkpoint_id)
             
             # Register handle
             self._spmd_handles[spmd_id] = handle
@@ -223,7 +215,7 @@ class SPMDManager:
             logger.error(f"Failed to start SPMD {spmd_id}: {e}")
             return None
     
-    def stop_spmd(self, spmd_id: str, save_checkpoint: bool = True) -> None:
+    async def stop_spmd(self, spmd_id: str, save_checkpoint: bool = True) -> None:
         """
         Stop an SPMD instance.
         
@@ -243,7 +235,7 @@ class SPMDManager:
         try:
             if RAY_AVAILABLE:
                 # Call stop on driver
-                ray.get(handle.call_driver("stop", save_checkpoint))
+                await handle.call_driver("stop", save_checkpoint)
                 
                 # Kill the driver actor
                 ray.kill(handle.driver_handle)
@@ -358,15 +350,23 @@ class SPMDManager:
         Args:
             topology: Mapping of SPMD ID to downstream SPMD IDs
         """
-        self._topology = topology
+        # Filter out self-loops when building topology
+        self._topology = {}
+        for source, targets in topology.items():
+            # Filter out self-loops (where target == source)
+            self._topology[source] = [target for target in targets if target != source]
         
-        # Build reverse topology
+        # Build reverse topology (also filtering self-loops)
         self._reverse_topology = {spmd_id: [] for spmd_id in topology}
         for source, targets in topology.items():
             for target in targets:
+                # Skip self-loops
+                if target == source:
+                    continue
                 if target not in self._reverse_topology:
                     self._reverse_topology[target] = []
-                self._reverse_topology[target].append(source)
+                if source not in self._reverse_topology[target]:
+                    self._reverse_topology[target].append(source)
         
         logger.info(f"Established topology with {len(topology)} SPMDs")
         
@@ -383,14 +383,26 @@ class SPMDManager:
                         logger.error(f"Failed to update topology for {spmd_id}: {e}")
     
     def get_predecessors(self, spmd_id: str) -> List[str]:
-        """Get predecessor SPMD IDs."""
-        return self._reverse_topology.get(spmd_id, [])
+        """
+        Get predecessor SPMD IDs.
+        
+        Returns list excluding self-loops (where predecessor == spmd_id).
+        """
+        predecessors = self._reverse_topology.get(spmd_id, [])
+        # Filter out self-loops as a safety measure
+        return [p for p in predecessors if p != spmd_id]
     
     def get_successors(self, spmd_id: str) -> List[str]:
-        """Get successor SPMD IDs."""
-        return self._topology.get(spmd_id, [])
+        """
+        Get successor SPMD IDs.
+        
+        Returns list excluding self-loops (where successor == spmd_id).
+        """
+        successors = self._topology.get(spmd_id, [])
+        # Filter out self-loops as a safety measure
+        return [s for s in successors if s != spmd_id]
     
-    def broadcast_to_all_drivers(self, method: str, *args, **kwargs) -> Dict[str, Any]:
+    async def broadcast_to_all_drivers(self, method: str, *args, **kwargs) -> Dict[str, Any]:
         """
         Broadcast a method call to all drivers.
         
@@ -413,11 +425,11 @@ class SPMDManager:
                 except Exception as e:
                     results[spmd_id] = e
         
-        if RAY_AVAILABLE:
-            for spmd_id, ref in refs.items():
-                try:
-                    results[spmd_id] = ray.get(ref)
-                except Exception as e:
-                    results[spmd_id] = e
+        if RAY_AVAILABLE and refs:
+            spmd_ids = list(refs.keys())
+            obj_refs = [refs[s] for s in spmd_ids]
+            gathered = await asyncio.gather(*obj_refs, return_exceptions=True)
+            for spmd_id, result in zip(spmd_ids, gathered):
+                results[spmd_id] = result
         
         return results

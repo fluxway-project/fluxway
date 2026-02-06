@@ -12,25 +12,38 @@ This example demonstrates a comprehensive usage of the Fluxway framework with th
    - Active data reading from JSON files
    - Backpressure handling to prevent downstream overload
 5. **Transmission combinations**:
-   - Dense -> Dense (DenseDenseSPMD -> DenseDenseSPMD1)
-6. **Bidirectional edges**: Forward and backward data flow
-7. **Complete logging**: All operations include timestamps for performance monitoring
-8. **Dual-stream transmission**: Both tensor data (data plane) and state data (control plane) are transmitted
+   - Sparse -> Sparse (eager mode, Preprocessing)
+   - Sparse -> Sparse (Embedding)
+   - Sparse -> Dense (Model)
+6. **Eager mode execution**: Preprocessing uses eager_trigger for immediate data processing
+7. **Bidirectional edges**: Forward and backward data flow
+8. **Complete logging**: All operations include timestamps for performance monitoring
+9. **Dual-stream transmission**: Both tensor data (data plane) and state data (control plane) are transmitted
 
 ## Graph Structure
 
 ```
-DataReader (Reader node, 2 workers)
+Reader (Reader node, 2 workers)
     |
     | (reads JSON files, backpressure-aware)
     v
-DenseDenseSPMD (4 ranks, dense->dense)
+Preprocessing (4 ranks, preprocessing stage, eager mode)
     |
     v
-DenseDenseSPMD1 (8 ranks, dense->dense)
+Embedding (4 ranks, embedding stage)
     |
-    <---> (backward edge to DenseDenseSPMD)
+    v
+Model (4 ranks, model computation stage)
+    |
+    <--- (backward edge to Embedding)
 ```
+
+## Node Functions
+
+- **Reader**: Reads data from JSON files (outputs sparse)
+- **Preprocessing**: Preprocesses raw data (eager mode, sparse -> sparse)
+- **Embedding**: Performs embedding operations (sparse -> sparse)
+- **Model**: Performs model computation (sparse -> dense)
 
 ## New Reader Node API
 
@@ -38,14 +51,14 @@ The example now uses the new `add_reader()` API instead of the old `DataReaderSP
 
 ```python
 builder.add_reader(
-    name="DataReader",
+    name="Reader",
     src_dir="/tmp/fluxway_example_data",
     data_type="json",
     batch_size=100,
     file_pattern="*.json",
     worker_count=2,
     resource={"nums_cpu": 1, "nums_gpu": 0, "memory": 10},
-    description="JSON data reader node",
+    description="Data reader node for reading JSON files",
 )
 ```
 
@@ -58,13 +71,15 @@ builder.add_reader(
 
 ## Forward Edges
 
-- DataReader -> DenseDense
-- DenseDense -> DenseDense1
+- Reader -> Preprocessing (eager mode)
+- Preprocessing -> Embedding
+- Embedding -> Model
 
 ## Backward Edges
 
-- DenseDense1 -> DenseDense
-- (No backward edge to DataReader - it's a source node)
+- Model -> Embedding
+- (No backward edge from Embedding to Preprocessing - eager node doesn't need backward)
+- (No backward edge to Reader - it's a source node)
 
 ## Usage
 

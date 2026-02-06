@@ -1,13 +1,15 @@
 """
 ControllerStateMachine for managing Controller lifecycle.
 
-State transitions:
-- INITIALIZING -> PENDING (on INIT_COMPLETE)
-- PENDING -> RUNNING (on ALL_DRIVERS_READY, triggers spmd_0 forward)
+State transitions (event-driven initialization):
+- INITIALIZING -> PENDING (on INIT_COMPLETE: resources allocated, SPMDs started)
+- PENDING -> TOPOLOGY_REGISTERING (on ALL_DRIVERS_READY: all drivers report workers_ready)
+    -> triggers topology registration
+- TOPOLOGY_REGISTERING -> RUNNING (on ALL_SPMDS_TOPOLOGY_READY: all workers running)
+    -> starts heartbeat timeout monitoring
 - RUNNING -> BLOCKED (on DRIVER_ERROR, blocks all SPMDs, triggers restart)
-- BLOCKED -> RECOVERING (starts recovery process)
-- RECOVERING -> RUNNING (on DRIVER_RECOVERED)
-- RECOVERING -> FAILED (on RECOVERY_FAILED)
+- BLOCKED -> RUNNING (on DRIVER_RECOVERED)
+- BLOCKED -> FAILED (on RECOVERY_FAILED)
 - RUNNING -> COMPLETED (on ALL_DRIVERS_COMPLETED, reclaims resources)
 
 Supports async callbacks for Ray Actor Controller.
@@ -35,14 +37,20 @@ class ControllerStateMachine:
     
     # State transition table: (current_state, event) -> next_state
     _TRANSITIONS = {
+        # --- Event-driven initialization flow ---
         (ControllerState.INITIALIZING, ControllerEvent.INIT_COMPLETE): ControllerState.PENDING,
-        (ControllerState.PENDING, ControllerEvent.ALL_DRIVERS_READY): ControllerState.RUNNING,
+        (ControllerState.PENDING, ControllerEvent.ALL_DRIVERS_READY): ControllerState.TOPOLOGY_REGISTERING,
+        (ControllerState.TOPOLOGY_REGISTERING, ControllerEvent.ALL_SPMDS_TOPOLOGY_READY): ControllerState.RUNNING,
+        # --- Normal operation ---
         (ControllerState.RUNNING, ControllerEvent.DRIVER_ERROR): ControllerState.BLOCKED,
         (ControllerState.BLOCKED, ControllerEvent.DRIVER_RECOVERED): ControllerState.RUNNING,
         (ControllerState.BLOCKED, ControllerEvent.RECOVERY_FAILED): ControllerState.FAILED,
         (ControllerState.RUNNING, ControllerEvent.ALL_DRIVERS_COMPLETED): ControllerState.COMPLETED,
-        # Also allow recovery from BLOCKED directly
+        # Recovery from BLOCKED
         (ControllerState.BLOCKED, ControllerEvent.ALL_DRIVERS_READY): ControllerState.RUNNING,
+        # Errors during init phases
+        (ControllerState.PENDING, ControllerEvent.DRIVER_ERROR): ControllerState.BLOCKED,
+        (ControllerState.TOPOLOGY_REGISTERING, ControllerEvent.DRIVER_ERROR): ControllerState.BLOCKED,
     }
     
     def __init__(self, controller: "ControllerActor"):
@@ -117,6 +125,7 @@ class ControllerStateMachine:
         """Execute the entry callback for a state."""
         callbacks = {
             ControllerState.PENDING: self._on_enter_pending,
+            ControllerState.TOPOLOGY_REGISTERING: self._on_enter_topology_registering,
             ControllerState.RUNNING: self._on_enter_running,
             ControllerState.BLOCKED: self._on_enter_blocked,
             ControllerState.COMPLETED: self._on_enter_completed,
@@ -151,24 +160,42 @@ class ControllerStateMachine:
     # =========================================================================
     
     async def _on_enter_pending(self) -> None:
-        """Called when entering PENDING state."""
-        logger.info("Controller entering PENDING state, waiting for all drivers to be ready")
-    
-    async def _on_enter_running(self) -> None:
-        """
-        Called when entering RUNNING state.
+        """Called when entering PENDING state.
         
+        Resources are allocated and SPMDs are started (fire-and-forget).
+        Waiting for all drivers to report workers_ready via heartbeat.
+        """
+        logger.info("Controller entering PENDING state, waiting for all drivers to report workers_ready")
+    
+    async def _on_enter_topology_registering(self) -> None:
+        """Called when entering TOPOLOGY_REGISTERING state.
+        
+        All drivers have reported workers_ready.
         Initiates topology registration on all SPMDs (fire-and-forget).
         Workers will auto-start after handler registration.
-        State changes are observed via heartbeat.
         """
-        logger.info("Controller entering RUNNING state")
+        logger.info("Controller entering TOPOLOGY_REGISTERING state, initiating topology registration")
         
         # Initiate topology registration (fire-and-forget, no await needed)
         try:
             self._controller._initiate_topology_registration()
         except Exception as e:
             logger.error(f"Failed to initiate topology registration: {e}")
+    
+    async def _on_enter_running(self) -> None:
+        """Called when entering RUNNING state.
+        
+        All workers are running after topology registration.
+        Starts heartbeat timeout monitoring.
+        """
+        logger.info("Controller entering RUNNING state")
+        
+        # Start heartbeat timeout monitoring now that system is fully initialized
+        try:
+            await self._controller._heartbeat_manager.start_monitoring_async()
+            logger.info("Heartbeat timeout monitoring started")
+        except Exception as e:
+            logger.error(f"Failed to start heartbeat monitoring: {e}")
     
     async def _on_enter_blocked(self) -> None:
         """

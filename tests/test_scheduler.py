@@ -6,6 +6,7 @@ These tests require Ray to be installed and running.
 
 import pytest
 import ray
+import asyncio
 
 from fluxway.common.types import (
     Graph, Node, Edge, ResourceSpec, PlacementPlan, 
@@ -39,10 +40,12 @@ class TestPGManager:
         pg_manager = PGManager()
         resource = ResourceSpec(num_cpus=1)  # Only 1 CPU, no GPU
         
-        pg = pg_manager.create_pg(
-            spmd_id="test_spmd",
-            resource=resource,
-            priority=ResourcePriority.HIGH
+        pg = asyncio.run(
+            pg_manager.create_pg(
+                spmd_id="test_spmd",
+                resource=resource,
+                priority=ResourcePriority.HIGH,
+            )
         )
         
         assert pg is not None
@@ -67,7 +70,7 @@ class TestPGManager:
         pg_manager = PGManager()
         resource = ResourceSpec(num_cpus=1)
         
-        pg_manager.create_pg("spmd1", resource, ResourcePriority.LOW)
+        asyncio.run(pg_manager.create_pg("spmd1", resource, ResourcePriority.LOW))
         assert pg_manager.get_resource("spmd1") is not None
         
         result = pg_manager.release_pg("spmd1")
@@ -85,9 +88,9 @@ class TestPGManager:
         pg_manager = PGManager()
         resource = ResourceSpec(num_cpus=1)
         
-        pg_manager.create_pg("spmd1", resource)
-        pg_manager.create_pg("spmd2", resource)
-        pg_manager.create_pg("spmd3", resource)
+        asyncio.run(pg_manager.create_pg("spmd1", resource))
+        asyncio.run(pg_manager.create_pg("spmd2", resource))
+        asyncio.run(pg_manager.create_pg("spmd3", resource))
         
         spmd_ids = pg_manager.get_all_spmd_ids()
         assert set(spmd_ids) == {"spmd1", "spmd2", "spmd3"}
@@ -101,9 +104,9 @@ class TestPGManager:
         pg_manager = PGManager()
         resource = ResourceSpec(num_cpus=1)
         
-        pg_manager.create_pg("high", resource, ResourcePriority.HIGH)
-        pg_manager.create_pg("low", resource, ResourcePriority.LOW)
-        pg_manager.create_pg("mid", resource, ResourcePriority.MID)
+        asyncio.run(pg_manager.create_pg("high", resource, ResourcePriority.HIGH))
+        asyncio.run(pg_manager.create_pg("low", resource, ResourcePriority.LOW))
+        asyncio.run(pg_manager.create_pg("mid", resource, ResourcePriority.MID))
         
         preemptable = pg_manager.get_preemptable_spmds(ResourceSpec(num_cpus=1))
         
@@ -148,7 +151,7 @@ class TestScheduler:
         node = Node(name="test_node", resource=ResourceSpec(num_cpus=1))
         graph = Graph(name="test_graph", nodes={"test_node": node})
         
-        success = scheduler.schedule(graph)
+        success = asyncio.run(scheduler.schedule(graph))
         assert success is True
         
         # Cleanup
@@ -165,7 +168,7 @@ class TestScheduler:
         )
         graph = Graph(name="test", nodes={"high_priority_node": node})
         
-        success = scheduler.schedule(graph)
+        success = asyncio.run(scheduler.schedule(graph))
         assert success is True
         
         # Check priority was applied
@@ -182,7 +185,7 @@ class TestScheduler:
         node = Node(name="no_resource_node")  # No resource specified
         graph = Graph(name="test", nodes={"no_resource_node": node})
         
-        success = scheduler.schedule(graph)
+        success = asyncio.run(scheduler.schedule(graph))
         assert success is True
         
         # Should have default resource
@@ -204,7 +207,7 @@ class TestScheduler:
         }
         graph = Graph(name="multi", nodes=nodes)
         
-        success = scheduler.schedule(graph)
+        success = asyncio.run(scheduler.schedule(graph))
         assert success is True
         
         # Cleanup
@@ -237,7 +240,7 @@ class TestScheduler:
         node = Node(name="test", resource=ResourceSpec(num_cpus=1))
         graph = Graph(name="test", nodes={"test": node})
         
-        scheduler.schedule(graph)
+        asyncio.run(scheduler.schedule(graph))
         assert scheduler.get_allocated_resources("test") is not None
         
         scheduler.release_resources("test")
@@ -264,7 +267,7 @@ class TestScheduler:
             "low": Node(name="low", priority=ResourcePriority.LOW, resource=ResourceSpec(num_cpus=1)),
         }
         graph = Graph(name="test", nodes=nodes)
-        scheduler.schedule(graph)
+        asyncio.run(scheduler.schedule(graph))
         
         preemptable = scheduler.get_preemptable_spmds(ResourceSpec(num_cpus=1))
         assert preemptable[0] == "low"
@@ -289,7 +292,7 @@ class TestSchedulerWithSPMDManager:
         edges = [Edge(source_node="a", target_node="b")]
         graph = Graph(name="test", nodes=nodes, edges=edges)
         
-        success = scheduler.schedule(graph)
+        success = asyncio.run(scheduler.schedule(graph))
         assert success is True
         
         # Cleanup

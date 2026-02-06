@@ -56,6 +56,8 @@ class ReaderConfig(BaseModel):
     file_pattern: str = "*"                # File pattern for matching
     worker_count: int = 1                  # Number of reader workers
     encoding: str = "utf-8"                # File encoding
+    tensor_name: Optional[str] = None     # Tensor field name extracted from output_data_type (set during build)
+    tensor_type: Optional[Type] = None   # Tensor field type extracted from output_data_type (set during build)
 
 
 class MailboxStatus(BaseModel):
@@ -76,8 +78,19 @@ class SPMDConfig(BaseModel):
     user_forward_fn: Optional[Callable] = None
     user_backward_fn: Optional[Callable] = None
     user_update_fn: Optional[Callable] = None  # User-defined parameter update function
+    # Explicit OperatorMeta storage - ensures metadata survives Ray serialization
+    # (function attributes are lost when pickled by reference across processes)
+    forward_meta: Optional["OperatorMeta"] = None
+    backward_meta: Optional["OperatorMeta"] = None
+    update_meta: Optional["OperatorMeta"] = None
     max_async_steps: int = 1  # Maximum async steps between workers in the same SPMD
     params_update_steps: int = 1  # Sync barrier every N steps for parameter updates
+    # Whether to remap output step numbers.
+    # - Default False: output step should be consistent with the input/execution step.
+    # - If True:
+    #   - eager_trigger operators: output_step = total_rank * _current_step + local_rank
+    #   - non-eager operators: output_step = _current_step
+    enable_output_step_remap: bool = False
 
     @model_validator(mode="after")
     def _sync_worker_count_from_mesh(self) -> "SPMDConfig":
@@ -550,29 +563,107 @@ class RPCPayload(BaseModel):
 
 class TensorMeta(BaseModel):
     """
-    Tensor metadata for routing computation and backward dependency tracking.
+    Tensor metadata — the single descriptor that accompanies every tensor/shard.
     
-    Use cases:
-    1. sparse-to-dense routing: requires global_indices to compute target ranks
-    2. backward dependency on forward path: requires source tracking info
+    Lifecycle (four phases):
+    
+    1. **Routing meta** (``_build_routing_meta``):
+       Describes the **full output tensor** before routing.  Passed to the
+       routing function so it can decide where to send each slice.
+       - ``shape``   = full local tensor shape (pre-slicing)
+       - ``global_shape`` = global tensor shape (dense: inferred from spec;
+                            sparse output: propagated from input meta)
+       - ``global_indices`` = per-row global index (dense: from spec offset;
+                              sparse: from operator-produced indices)
+    
+    2. **Shard meta** (``_build_shard_meta``):
+       Derived from routing meta + one route's ``data_mask``.
+       Describes the **sliced shard** actually sent to a receiver.
+       - ``shape`` = shard shape (computed from data_mask)
+       - ``global_shape`` = inherited from routing meta (unchanged)
+       - ``global_indices`` = axis-0 slice of routing meta's global_indices
+    
+    3. **Assembled meta** (after reception / ``_assemble_*``):
+       Describes the **reconstructed local tensor** that the operator will consume.
+       - dense-to-dense: ``global_shape`` inferred from input spec
+       - sparse-to-dense: ``global_shape`` carried from sender's meta
+       - to-dynamic:     ``global_shape`` propagated, ``global_indices`` merged
+    
+    4. **Backward lookup** (``get_forward_step_meta``):
+       Backward uses ``forward_step`` to look up the corresponding forward
+       assembled meta from ``_meta_history`` for sparse reverse routing.
     """
     model_config = ConfigDict(arbitrary_types_allowed=True)
     
-    # Basic info
+    # Basic tensor description
     tensor_name: str = ""
-    shape: Tuple[int, ...] = ()
+    shape: Tuple[int, ...] = ()       # Shape of this tensor/shard
     dtype: str = "float32"
     
-    # Routing info (required for sparse-to-dense routing)
-    global_indices: Optional[np.ndarray] = None  # Original global indices for sparse data
+    # Global routing info — required when sparse routing is involved
+    global_indices: Optional[np.ndarray] = None   # Per-row global indices
+    global_shape: Optional[Tuple[int, ...]] = None # Global tensor shape
     
-    # Source tracking (required for backward dependency on forward path)
+    # Source tracking — required for backward reverse routing
     source_spmd_id: str = ""
     source_rank: int = -1
     forward_step: int = -1
     
-    # Data type flag
-    is_sparse: bool = False
+    # Flags
+    is_sparse: bool = False    # True if output via DynamicShardingSpec
+    is_empty: bool = False     # Empty packet for sparse routing sync
+
+
+class ShardOrigin(BaseModel):
+    """
+    Records the origin of a single received shard for backward reverse routing.
+    
+    During forward assembly, each non-empty received shard is recorded so that
+    backward can reverse-route gradients back to the exact source workers
+    without requiring a user-provided routing function.
+    
+    Key design (to support dynamic→static reordering):
+    - ``global_indices`` 记录该 shard 自己携带的全局索引（稀疏语义）。
+    - ``local_indices`` 记录在 **重排序之后**，该 shard 对应的行在本地
+      assembled tensor 中的下标位置（axis-0）。
+      这样反向时可以直接用 ``local_indices`` 在本地 dense tensor 上做切片/
+      gather，而不需要假设 shard 在重排序后仍然是连续区间。
+    
+    Fields:
+        source_spmd_id: SPMD that sent this shard.
+        source_rank:    Rank within the source SPMD.
+        global_indices: Global indices carried by this shard (sparse tensors).
+        shard_shape:    Shape of the received shard data.
+        local_indices:  1D array of row indices in the assembled local tensor
+                        (after any reordering).  ``None`` means “use full range”.
+    """
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    
+    source_spmd_id: str = ""
+    source_rank: int = -1
+    global_indices: Optional[np.ndarray] = None
+    shard_shape: Tuple[int, ...] = ()
+    local_indices: Optional[np.ndarray] = None
+
+
+class StepTensorMeta(BaseModel):
+    """
+    Per-step per-tensor metadata preserving both the assembled global view
+    and the per-shard origin info needed for backward reverse routing.
+
+    Stored in ``Worker._meta_history[op_type][step][tensor_name]``.
+
+    Fields:
+        assembled_meta: The assembled TensorMeta (merged global view).
+        shard_origins:  Per-shard origin records.  For backward reverse routing
+                        without a user route-fn, the worker iterates these to
+                        determine which slice of the backward output goes to
+                        which source worker.
+    """
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    assembled_meta: Optional[TensorMeta] = None
+    shard_origins: List[ShardOrigin] = Field(default_factory=list)
 
 
 # =============================================================================
@@ -596,24 +687,34 @@ class WorkerStatus(str, Enum):
 
 
 class ControllerState(str, Enum):
-    """Controller state machine states."""
-    INITIALIZING = "initializing"  # Initializing resources
-    PENDING = "pending"            # Waiting for all drivers to be ready
-    RUNNING = "running"            # Normal execution
-    BLOCKED = "blocked"            # Task blocked (handling exceptions)
-    RECOVERING = "recovering"      # Recovering from errors
-    COMPLETED = "completed"        # Task completed
-    FAILED = "failed"              # Task failed
+    """Controller state machine states.
+
+    Lifecycle:
+      INITIALIZING → PENDING → TOPOLOGY_REGISTERING → RUNNING
+                                                       ↓
+                                                    BLOCKED ↔ RECOVERING
+                                                       ↓
+                                                  COMPLETED / FAILED
+    """
+    INITIALIZING = "initializing"              # Allocating resources, starting SPMDs
+    PENDING = "pending"                        # Waiting for all drivers to init (workers_ready)
+    TOPOLOGY_REGISTERING = "topology_registering"  # Topology registration in progress
+    RUNNING = "running"                        # Normal execution
+    BLOCKED = "blocked"                        # Task blocked (handling exceptions)
+    RECOVERING = "recovering"                  # Recovering from errors
+    COMPLETED = "completed"                    # Task completed
+    FAILED = "failed"                          # Task failed
 
 
 class ControllerEvent(str, Enum):
     """Events that trigger controller state transitions."""
-    INIT_COMPLETE = "init_complete"           # Initialization completed
-    ALL_DRIVERS_READY = "all_drivers_ready"   # All drivers heartbeat normal
-    DRIVER_ERROR = "driver_error"             # Driver heartbeat timeout or error
-    DRIVER_RECOVERED = "driver_recovered"     # Abnormal driver recovered
-    ALL_DRIVERS_COMPLETED = "all_drivers_completed"  # All drivers report completion
-    RECOVERY_FAILED = "recovery_failed"       # Recovery failed
+    INIT_COMPLETE = "init_complete"                       # Resources allocated, SPMDs started
+    ALL_DRIVERS_READY = "all_drivers_ready"               # All drivers report workers_ready
+    ALL_SPMDS_TOPOLOGY_READY = "all_spmds_topology_ready" # All workers running after topology
+    DRIVER_ERROR = "driver_error"                         # Driver heartbeat timeout or error
+    DRIVER_RECOVERED = "driver_recovered"                 # Abnormal driver recovered
+    ALL_DRIVERS_COMPLETED = "all_drivers_completed"       # All drivers report completion
+    RECOVERY_FAILED = "recovery_failed"                   # Recovery failed
 
 
 class DriverState(str, Enum):

@@ -434,7 +434,7 @@ SPMD Worker 本质上是一个事件驱动的事件循环（Event Loop）。为�
 **伪代码实现**：
 
 ```
-@ray.remote()
+@ray.remote
 class SPMDWorker:
     control_mailbox = {}    # batch_id -> config
     control_events = {}     # batch_id -> Event

@@ -29,6 +29,12 @@ Usage:
 
 __version__ = "0.1.0"
 
+# Force logging to be visible across driver + Ray worker processes.
+# Users of this repo want INFO logs by default.
+from fluxway.common.utils.logging import ensure_logging_configured  # noqa: E402
+
+ensure_logging_configured()
+
 # Import decorators for top-level access
 from fluxway.common.decorators import data_type, spmd, operator
 

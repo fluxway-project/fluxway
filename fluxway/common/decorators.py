@@ -260,12 +260,75 @@ def operator(
         # We attach it to both the wrapper and the original function if possible
         setattr(func, "_flux_operator_meta", meta)
         
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            return func(*args, **kwargs)
+        # Check if function has 'self' parameter and convert to staticmethod
+        sig = inspect.signature(func)
+        params = list(sig.parameters.values())
+        has_self = params and params[0].name == 'self'
         
-        setattr(wrapper, "_flux_operator_meta", meta)
-        return wrapper
+        if has_self:
+            # Remove 'self' parameter from signature
+            new_params = params[1:]  # Skip 'self'
+            new_sig = sig.replace(parameters=new_params)
+            
+            # Get the class that contains this method for instance creation
+            qualname_parts = func.__qualname__.split('.')
+            module = inspect.getmodule(func)
+            spmd_class = None
+            if len(qualname_parts) >= 2 and module:
+                class_name = qualname_parts[-2]
+                spmd_class = getattr(module, class_name, None)
+            
+            # Create a wrapper function without 'self' parameter
+            # Use thread-local storage to ensure each thread gets its own instance
+            import threading
+            _local = threading.local()
+            
+            def wrapper(*args, **kwargs):
+                # Get or create thread-local instance
+                if not hasattr(_local, 'instance'):
+                    if spmd_class:
+                        try:
+                            _local.instance = spmd_class()
+                        except Exception:
+                            # If instance creation fails, create a minimal object
+                            class DummySelf:
+                                pass
+                            _local.instance = DummySelf()
+                    else:
+                        class DummySelf:
+                            pass
+                        _local.instance = DummySelf()
+                
+                # Call original function with instance as self
+                return func(_local.instance, *args, **kwargs)
+            
+            # Update function metadata
+            wrapper.__name__ = func.__name__
+            wrapper.__doc__ = func.__doc__
+            wrapper.__module__ = func.__module__
+            wrapper.__qualname__ = func.__qualname__
+            wrapper.__signature__ = new_sig
+            # Update annotations to exclude 'self'
+            if hasattr(func, '__annotations__'):
+                annotations = func.__annotations__.copy()
+                annotations.pop('self', None)
+                wrapper.__annotations__ = annotations
+            
+            # Preserve metadata
+            setattr(wrapper, "_flux_operator_meta", meta)
+            
+            # Convert to staticmethod
+            return staticmethod(wrapper)
+        else:
+            # No 'self' parameter, return as-is but ensure it's a staticmethod
+            @functools.wraps(func)
+            def wrapper(*args, **kwargs):
+                return func(*args, **kwargs)
+            
+            setattr(wrapper, "_flux_operator_meta", meta)
+            wrapper = staticmethod(wrapper)
+            setattr(wrapper.__func__, "_flux_operator_meta", meta)
+            return wrapper
     return decorator
 
 
@@ -376,7 +439,8 @@ def spmd(
     mesh_axis_names: Optional[Tuple[str, ...]] = None,
     mesh_axis_shapes: Optional[Tuple[int, ...]] = None,
     max_async_steps: int = 1,
-    params_update_steps: int = 1
+    params_update_steps: int = 1,
+    enable_output_step_remap: bool = False,
 ):
     """
     Decorator to mark a class with SPMD execution configuration.
@@ -398,6 +462,7 @@ def spmd(
         mesh_axis_shapes: Ordered tuple of mesh axis sizes (e.g., (4, 2))
         max_async_steps: Maximum async steps between workers
         params_update_steps: Sync barrier every N steps
+        enable_output_step_remap: Whether to remap output step numbers (see SPMDConfig.enable_output_step_remap)
         
     Returns:
         Decorated class with SPMD configuration
@@ -426,6 +491,7 @@ def spmd(
         cls._mesh = mesh
         cls._max_async_steps = max_async_steps
         cls._params_update_steps = params_update_steps
+        cls._enable_output_step_remap = enable_output_step_remap
         
         # Resolve operator sharding specs if mesh is available
         if mesh is not None:
@@ -436,6 +502,9 @@ def spmd(
         cls.get_mesh = classmethod(lambda c: c._mesh)
         cls.get_max_async_steps = classmethod(lambda c: c._max_async_steps)
         cls.get_params_update_steps = classmethod(lambda c: c._params_update_steps)
+        cls.get_enable_output_step_remap = classmethod(
+            lambda c: getattr(c, "_enable_output_step_remap", False)
+        )
         cls.is_fluxway_spmd = classmethod(lambda c: True)
 
         def get_operator_meta(c, op_type):
@@ -459,13 +528,24 @@ def spmd(
             forward_fn = getattr(c, OpType.FORWARD.name.lower(), None)
             backward_fn = getattr(c, OpType.BACKWARD.name.lower(), None)
             update_fn = getattr(c, OpType.UPDATE.name.lower(), None)
+            
+            # Extract OperatorMeta explicitly - ensures it survives Ray serialization
+            # (function attributes are lost when pickled by reference across processes)
+            forward_meta = getattr(forward_fn, "_flux_operator_meta", None) if forward_fn else None
+            backward_meta = getattr(backward_fn, "_flux_operator_meta", None) if backward_fn else None
+            update_meta = getattr(update_fn, "_flux_operator_meta", None) if update_fn else None
+            
             return SPMDConfig(
                 mesh=c._mesh,
                 user_forward_fn=forward_fn,
                 user_backward_fn=backward_fn,
                 user_update_fn=update_fn,
+                forward_meta=forward_meta,
+                backward_meta=backward_meta,
+                update_meta=update_meta,
                 max_async_steps=c._max_async_steps,
-                params_update_steps=c._params_update_steps
+                params_update_steps=c._params_update_steps,
+                enable_output_step_remap=c._enable_output_step_remap,
             )
         cls.get_spmd_config = classmethod(get_spmd_config)
         

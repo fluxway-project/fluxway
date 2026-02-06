@@ -106,6 +106,7 @@ class WorkerSynchronizer:
             op_type: Operation type
             step: Completed step number
         """
+        should_report = False
         with self._lock:
             if rank not in self._worker_steps:
                 logger.warning(f"Unknown worker rank {rank} reported op completion")

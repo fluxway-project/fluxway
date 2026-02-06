@@ -12,6 +12,7 @@ Responsibilities:
 """
 
 from typing import List, Optional, Any, Dict, TYPE_CHECKING
+import asyncio
 import logging
 
 try:
@@ -21,6 +22,7 @@ except ImportError:
     RAY_AVAILABLE = False
 
 from ...common.types import Graph, ResourceSpec, PlacementPlan, PlacementStrategy, ResourcePriority
+from ...common.types.data_types import NodeType
 from .pg_manager import PGManager
 
 if TYPE_CHECKING:
@@ -65,15 +67,19 @@ class Scheduler:
         """Get the PG manager."""
         return self._pg_manager
     
-    def schedule(self, graph: Graph) -> bool:
+    async def schedule(self, graph: Graph) -> bool:
         """
         Schedule resources and initialize SPMDs for the given graph.
         
         This method performs the complete scheduling workflow:
         1. Generate placement plan from graph
         2. Allocate resources via pg_pool_manager
-        3. Initialize SPMDs via spmd_manager
-        4. Establish SPMD topology
+        3. Build and establish SPMD topology (data structure only)
+        4. Initialize SPMDs via spmd_manager (fire-and-forget)
+        
+        Note: Topology registration to drivers is NOT done here.
+        It is triggered later by Controller when all drivers report ready
+        via heartbeat (event-driven).
         
         Args:
             graph: The task graph to schedule
@@ -87,19 +93,18 @@ class Scheduler:
             self._current_plan = plan
             
             # Step 2: Allocate resources via pg_pool_manager
-            if not self._allocate_resources(graph, plan):
+            if not await self.allocate_resources(graph):
                 logger.error("Failed to allocate resources")
                 return False
             
-            # Step 3: Initialize SPMDs via spmd_manager
-            if not self._init_spmds(graph, plan):
+            # Step 3: Build and establish topology (data structure only,
+            #         no remote calls to drivers yet)
+            self.build_and_establish_topology(graph)
+            
+            # Step 4: Initialize SPMDs via spmd_manager (fire-and-forget)
+            if not await self.init_spmds(graph):
                 logger.error("Failed to initialize SPMDs")
                 return False
-            
-            # Step 4: Establish topology
-            if self._spmd_manager is not None:
-                topology = self._build_topology(graph)
-                self._spmd_manager.establish_topology(topology)
             
             logger.info(f"Successfully scheduled {len(plan.spmd_placements)} SPMDs")
             return True
@@ -107,6 +112,58 @@ class Scheduler:
         except Exception as e:
             logger.error(f"Scheduling failed: {e}")
             return False
+    
+    async def allocate_resources(self, graph: Graph) -> bool:
+        """
+        Allocate resources for all SPMDs in the graph.
+        
+        Public interface for the resource allocation phase.
+        Must be called before init_spmds().
+        
+        Args:
+            graph: The task graph
+            
+        Returns:
+            True if all resources allocated successfully
+        """
+        if self._current_plan is None:
+            self._current_plan = self._generate_plan(graph)
+        return await self._allocate_resources(graph, self._current_plan)
+    
+    async def init_spmds(self, graph: Graph) -> bool:
+        """
+        Initialize SPMDs (fire-and-forget).
+        
+        Public interface for the SPMD initialization phase.
+        Must be called after allocate_resources().
+        Drivers will report readiness via heartbeat.
+        
+        Args:
+            graph: The task graph
+            
+        Returns:
+            True if SPMD init tasks were created successfully
+        """
+        if self._current_plan is None:
+            self._current_plan = self._generate_plan(graph)
+        return await self._init_spmds(graph, self._current_plan)
+    
+    def build_and_establish_topology(self, graph: Graph) -> None:
+        """
+        Build SPMD topology from graph edges and establish it in SPMDManager.
+        
+        This only builds the data structure (adjacency lists).
+        No remote calls to drivers are made.
+        Should be called before init_spmds() so that SPMDManager
+        can provide predecessor/successor info during driver creation.
+        
+        Args:
+            graph: The task graph
+        """
+        if self._spmd_manager is not None:
+            topology = self._build_topology(graph)
+            self._spmd_manager.establish_topology(topology)
+            logger.info(f"Topology established for {len(topology)} SPMDs")
     
     def _generate_plan(self, graph: Graph) -> PlacementPlan:
         """
@@ -138,13 +195,14 @@ class Scheduler:
             strategy=PlacementStrategy.PACK
         )
     
-    def _allocate_resources(self, graph: Graph, plan: PlacementPlan) -> bool:
+    async def _allocate_resources(self, graph: Graph, plan: PlacementPlan) -> bool:
         """
         Allocate resources via pg_pool_manager.
         
         Creates multi-bundle PG for each SPMD:
         - 1 driver bundle
-        - N worker bundles (based on spmd_config.worker_count)
+        - N worker bundles (based on reader_config.worker_count for Reader nodes,
+          or spmd_config.worker_count for SPMD nodes)
         
         Args:
             graph: The task graph (for worker_count info)
@@ -158,14 +216,21 @@ class Scheduler:
         for spmd_id, resource in plan.spmd_placements.items():
             priority = plan.spmd_priorities.get(spmd_id, ResourcePriority.MID)
             
-            # Get worker count from graph node's spmd_config
+            # Get worker count from graph node
+            # For Reader nodes, use reader_config.worker_count
+            # For SPMD nodes, use spmd_config.worker_count
             node = graph.nodes.get(spmd_id)
             worker_count = 1
-            if node and node.spmd_config:
-                worker_count = node.spmd_config.worker_count
+            if node:
+                if node.node_type == NodeType.READER and node.reader_config:
+                    # Reader nodes: use worker_count from ReaderConfig
+                    worker_count = node.reader_config.worker_count
+                elif node.spmd_config:
+                    # SPMD nodes: use worker_count from SPMDConfig
+                    worker_count = node.spmd_config.worker_count
             
             # Create PG via pg_pool_manager with multi-bundle support
-            pg = self._pg_manager.create_pg(
+            pg = await self._pg_manager.create_pg(
                 spmd_id=spmd_id,
                 resource=resource,
                 priority=priority,
@@ -179,7 +244,7 @@ class Scheduler:
         
         return success
     
-    def _init_spmds(self, graph: Graph, plan: PlacementPlan) -> bool:
+    async def _init_spmds(self, graph: Graph, plan: PlacementPlan) -> bool:
         """
         Initialize SPMDs via spmd_manager.
         
@@ -195,29 +260,33 @@ class Scheduler:
         if self._spmd_manager is None:
             logger.warning("No spmd_manager set, skipping SPMD initialization")
             return True
-        
+
+        # Start all SPMDs concurrently to reduce init latency.
+        # Fire-and-forget: we don't wait for individual start_spmd() completions here.
+        # Driver/worker readiness is tracked via their own heartbeats / FSM.
         for node_name, node in graph.nodes.items():
             spmd_config = node.spmd_config
             if spmd_config is None:
                 continue
-            
+
             # Get the allocated PG info for this SPMD
             pg_info = self._pg_manager.get_pg_info(node_name)
-            
+
             # Start SPMD via spmd_manager, passing PG and bundle info
             # Registration happens inside start_spmd
-            handle = self._spmd_manager.start_spmd(
-                spmd_id=node_name,
-                config=spmd_config,
-                placement_group=pg_info.get("pg") if pg_info else None,
-                worker_bundle_indices=pg_info.get("worker_bundle_indices") if pg_info else None,
-                driver_bundle_index=pg_info.get("driver_bundle_index", 0) if pg_info else 0,
-                checkpoint_id=None
+            asyncio.create_task(
+                self._spmd_manager.start_spmd(
+                    spmd_id=node_name,
+                    config=spmd_config,
+                    placement_group=pg_info.get("pg") if pg_info else None,
+                    worker_bundle_indices=pg_info.get("worker_bundle_indices") if pg_info else None,
+                    driver_bundle_index=pg_info.get("driver_bundle_index", 0) if pg_info else 0,
+                    checkpoint_id=None,
+                    node_type=node.node_type,
+                    reader_config=node.reader_config,
+                )
             )
-            
-            if handle is None:
-                logger.warning(f"Failed to start SPMD {node_name}")
-        
+
         return True
     
     def _build_topology(self, graph: Graph) -> Dict[str, List[str]]:

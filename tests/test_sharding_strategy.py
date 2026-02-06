@@ -196,5 +196,76 @@ class TestDenseShardingStrategy2D:
         assert set(strategy_2.dependent_ranks) == {2, 3}
 
 
+class TestHighDimTensorLowDimMesh:
+    """Test tensor dims > mesh dims (the original crash scenario)."""
+    
+    @pytest.fixture
+    def mesh_1d_4(self):
+        """1D mesh with 4 devices on 'data' axis."""
+        return LayoutMesh(axis_names=("data",), axis_shapes=(4,))
+    
+    def test_infer_global_shape_3d_on_1d(self, mesh_1d_4):
+        """3D tensor (batch, feature, embed) on 1D mesh: only dim 0 is sharded."""
+        spec = StaticShardingSpec(layout_mesh=mesh_1d_4, axis=Axis("data"))
+        
+        # local_shape = (7, 64, 128) on rank 0
+        # dim 0: sharded across 4 devices -> global = 7 * 4 = 28
+        # dim 1, 2: beyond mesh dims -> replicated -> 64, 128
+        global_shape = spec.infer_global_shape((7, 64, 128), rank_id=0)
+        assert global_shape == (28, 64, 128)
+    
+    def test_lower_3d_on_1d(self, mesh_1d_4):
+        """lower() should produce 3 slices for a 3D tensor on 1D mesh."""
+        spec = StaticShardingSpec(layout_mesh=mesh_1d_4, axis=Axis("data"))
+        
+        global_shape = (28, 64, 128)
+        # rank 0: dim 0 gets chunk [0, 7), dim 1/2 full range
+        layout_0 = spec.lower(global_shape, rank_id=0)
+        slices = layout_0.dense_slices
+        assert len(slices) == 3
+        assert (slices[0].start, slices[0].end) == (0, 7)
+        assert (slices[1].start, slices[1].end) == (0, 64)
+        assert (slices[2].start, slices[2].end) == (0, 128)
+        
+        # rank 2: dim 0 gets chunk [14, 21)
+        layout_2 = spec.lower(global_shape, rank_id=2)
+        slices_2 = layout_2.dense_slices
+        assert (slices_2[0].start, slices_2[0].end) == (14, 21)
+        assert (slices_2[1].start, slices_2[1].end) == (0, 64)
+        assert (slices_2[2].start, slices_2[2].end) == (0, 128)
+    
+    def test_compute_route_3d_on_1d_same_sharding(self, mesh_1d_4):
+        """Same sharding on both sides: each rank only sends to itself."""
+        src_spec = StaticShardingSpec(layout_mesh=mesh_1d_4, axis=Axis("data"))
+        dst_spec = StaticShardingSpec(layout_mesh=mesh_1d_4, axis=Axis("data"))
+        
+        for rank in range(4):
+            strategy = DenseShardingStrategy.from_specs(rank, src_spec, dst_spec)
+            assert strategy.dependent_ranks == [rank]
+            
+            # compute_route with 3D local shape
+            routes = strategy.compute_route((7, 64, 128))
+            assert len(routes) == 1
+            local_slices, dst_rank = routes[0]
+            assert dst_rank == rank
+            # Full local tensor is sent
+            assert local_slices == (slice(0, 7), slice(0, 64), slice(0, 128))
+    
+    def test_compute_route_3d_sharded_to_replicated(self, mesh_1d_4):
+        """Sharded src -> replicated dst: each rank sends to all dst ranks."""
+        src_spec = StaticShardingSpec(layout_mesh=mesh_1d_4, axis=Axis("data"))
+        dst_spec = StaticShardingSpec(layout_mesh=mesh_1d_4, axis=Axis(None))
+        
+        strategy = DenseShardingStrategy.from_specs(0, src_spec, dst_spec)
+        # Sharded src sends to all replicated dst ranks
+        assert set(strategy.dependent_ranks) == {0, 1, 2, 3}
+        
+        routes = strategy.compute_route((7, 64, 128))
+        assert len(routes) == 4
+        for local_slices, _ in routes:
+            # Each dst rank gets the full local tensor
+            assert local_slices == (slice(0, 7), slice(0, 64), slice(0, 128))
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

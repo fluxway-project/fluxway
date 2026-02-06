@@ -396,39 +396,48 @@ class StaticShardingSpec(ShardingSpec):
         Uses normalized_axes mask where:
         - 1 means the axis is sharded (apply block partitioning)
         - -1 means the axis is replicated (full range)
+        
+        Supports tensor dims > mesh dims: extra dimensions beyond mesh.ndim
+        are treated as replicated (full range, no sharding).
         """
         normalized_axes = self.normalized_axes
+        mesh_ndim = self.layout_mesh.ndim
         
-        if len(normalized_axes) != self.layout_mesh.ndim:
+        if len(normalized_axes) != mesh_ndim:
             raise ValueError(
                 f"normalized_axes length {len(normalized_axes)} does not match "
-                f"mesh.ndim {self.layout_mesh.ndim}"
+                f"mesh.ndim {mesh_ndim}"
             )
         
-        if len(global_shape) != self.layout_mesh.ndim:
+        if len(global_shape) < mesh_ndim:
             raise ValueError(
-                "Global shape must have same number of dimensions as mesh. "
-                f"Got {len(global_shape)} dimensions but mesh has {self.layout_mesh.ndim} dimensions."
+                "Global shape must have at least as many dimensions as mesh. "
+                f"Got {len(global_shape)} dimensions but mesh has {mesh_ndim} dimensions."
             )
         
         # Get rank's coordinate in mesh
         mesh_coords = self.layout_mesh.get_coordinate(rank_id)
         
         slices = []
-        for mesh_axis_idx, dim_len in enumerate(global_shape):
-            if normalized_axes[mesh_axis_idx] == -1:
-                # Replicated: full range
-                slices.append(DenseLayoutSlice(start=0, end=dim_len, axis_index=mesh_axis_idx))
+        for dim_idx, dim_len in enumerate(global_shape):
+            if dim_idx < mesh_ndim:
+                # Within mesh dimensions: apply sharding based on normalized_axes
+                if normalized_axes[dim_idx] == -1:
+                    # Replicated: full range
+                    slices.append(DenseLayoutSlice(start=0, end=dim_len, axis_index=dim_idx))
+                else:
+                    # Sharded: block partitioning
+                    num_devices = self.layout_mesh.axis_shapes[dim_idx]
+                    device_pos = mesh_coords[dim_idx]
+                    
+                    chunk_size = math.ceil(dim_len / num_devices)
+                    start = device_pos * chunk_size
+                    end = min(start + chunk_size, dim_len)
+                    
+                    slices.append(DenseLayoutSlice(start=start, end=end, axis_index=dim_idx))
             else:
-                # Sharded: block partitioning
-                num_devices = self.layout_mesh.axis_shapes[mesh_axis_idx]
-                device_pos = mesh_coords[mesh_axis_idx]
-                
-                chunk_size = math.ceil(dim_len / num_devices)
-                start = device_pos * chunk_size
-                end = min(start + chunk_size, dim_len)
-                
-                slices.append(DenseLayoutSlice(start=start, end=end, axis_index=mesh_axis_idx))
+                # Beyond mesh dimensions: replicated (full range)
+                slices.append(DenseLayoutSlice(start=0, end=dim_len, axis_index=dim_idx))
         
         return InternalLayout(
             type=LayoutType.DENSE,
@@ -448,6 +457,9 @@ class StaticShardingSpec(ShardingSpec):
         - 1 means the axis is sharded (multiply by num_devices)
         - -1 means the axis is replicated (keep local size)
         
+        Supports tensor dims > mesh dims: extra dimensions beyond mesh.ndim
+        are treated as replicated (global size = local size).
+        
         Args:
             local_shape: Shape of the local tensor shard
             rank_id: Rank ID of the worker holding this shard
@@ -456,28 +468,29 @@ class StaticShardingSpec(ShardingSpec):
             Inferred global shape
         """
         normalized_axes = self.normalized_axes
+        mesh_ndim = self.layout_mesh.ndim
         
-        if len(normalized_axes) != self.layout_mesh.ndim:
+        if len(normalized_axes) != mesh_ndim:
             raise ValueError(
                 f"normalized_axes length {len(normalized_axes)} does not match "
-                f"mesh.ndim {self.layout_mesh.ndim}"
+                f"mesh.ndim {mesh_ndim}"
             )
         
-        if len(local_shape) != self.layout_mesh.ndim:
+        if len(local_shape) < mesh_ndim:
             raise ValueError(
-                "Local shape must have same number of dimensions as mesh. "
-                f"Got {len(local_shape)} dimensions but mesh has {self.layout_mesh.ndim} dimensions."
+                "Local shape must have at least as many dimensions as mesh. "
+                f"Got {len(local_shape)} dimensions but mesh has {mesh_ndim} dimensions."
             )
         
         global_shape = []
-        for mesh_axis_idx, local_dim in enumerate(local_shape):
-            if normalized_axes[mesh_axis_idx] == -1:
-                # Replicated: global size equals local size
-                global_shape.append(local_dim)
-            else:
-                # Sharded: global size = local size * num_devices
-                num_devices = self.layout_mesh.axis_shapes[mesh_axis_idx]
+        for dim_idx, local_dim in enumerate(local_shape):
+            if dim_idx < mesh_ndim and normalized_axes[dim_idx] != -1:
+                # Within mesh dimensions and sharded: global size = local size * num_devices
+                num_devices = self.layout_mesh.axis_shapes[dim_idx]
                 global_shape.append(local_dim * num_devices)
+            else:
+                # Replicated or beyond mesh dims: global size equals local size
+                global_shape.append(local_dim)
         
         return tuple(global_shape)
 
@@ -508,9 +521,11 @@ class DynamicShardingSpec(ShardingSpec):
             fn=my_routing_fn,
         )
     """
-    # User-provided routing function
+    # User-provided routing function (optional).
     # fn(tensor, tensor_meta, post_sharding_spec) -> routing result
-    fn: DynamicRoutingFn
+    # When ``None``, backward reverse routing will use forward-step shard origins
+    # instead of calling a routing function.
+    fn: Optional[DynamicRoutingFn] = None
     
     def lower(self, global_shape: Tuple[int, ...], rank_id: int) -> InternalLayout:
         rule = SparseLayoutRule(
@@ -893,15 +908,16 @@ class DenseShardingStrategy(BaseModel):
         return results
     
     def _infer_global_shape(self, local_shape: Tuple[int, ...]) -> Tuple[int, ...]:
-        """从本地形状推导全局形状。"""
+        """从本地形状推导全局形状。支持 tensor 维度 > mesh 维度的情况。"""
+        mesh_ndim = self.src_mesh.ndim
         global_shape = []
         for dim_idx, local_dim in enumerate(local_shape):
-            if self.src_normalized_axes[dim_idx] == -1:
-                # 复制维度：全局大小等于本地大小
-                global_shape.append(local_dim)
-            else:
+            if dim_idx < mesh_ndim and self.src_normalized_axes[dim_idx] != -1:
                 # 切分维度：全局大小 = 本地大小 * 切片数
                 global_shape.append(local_dim * self.dim_infos[dim_idx].src_num_shards)
+            else:
+                # 复制维度或超出 mesh 维度：全局大小等于本地大小
+                global_shape.append(local_dim)
         return tuple(global_shape)
     
     def _compute_rank_slices(
@@ -911,13 +927,11 @@ class DenseShardingStrategy(BaseModel):
         normalized_axes: Tuple[int, ...],
         mesh: "LayoutMesh",
     ) -> List[Tuple[int, int]]:
-        """计算某个 rank 在全局坐标系下的切片范围。"""
+        """计算某个 rank 在全局坐标系下的切片范围。支持 tensor 维度 > mesh 维度。"""
+        mesh_ndim = mesh.ndim
         slices = []
         for dim_idx, dim_size in enumerate(global_shape):
-            if normalized_axes[dim_idx] == -1:
-                # 复制维度：整个范围
-                slices.append((0, dim_size))
-            else:
+            if dim_idx < mesh_ndim and normalized_axes[dim_idx] != -1:
                 # 切分维度：块分区
                 num_devices = mesh.axis_shapes[dim_idx]
                 device_pos = coords[dim_idx]
@@ -927,5 +941,8 @@ class DenseShardingStrategy(BaseModel):
                 end = min(start + chunk_size, dim_size)
                 
                 slices.append((start, end))
+            else:
+                # 复制维度或超出 mesh 维度：整个范围
+                slices.append((0, dim_size))
         
         return slices

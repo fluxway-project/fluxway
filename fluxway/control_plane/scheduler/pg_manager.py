@@ -11,11 +11,10 @@ Responsibilities:
 - Support multi-bundle PG for driver + workers
 """
 
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any
 import logging
 
 try:
-    import ray
     from ray.util.placement_group import PlacementGroup, placement_group, remove_placement_group
     RAY_AVAILABLE = True
 except ImportError:
@@ -51,7 +50,7 @@ class PGManager:
         # SPMD ID → driver resource mapping
         self._spmd_to_driver_resource: Dict[str, DriverResourceSpec] = {}
     
-    def create_pg(
+    async def create_pg(
         self,
         spmd_id: str,
         resource: ResourceSpec,
@@ -106,8 +105,8 @@ class PGManager:
                 strategy=strategy.value
             )
             
-            # Wait for placement group to be ready
-            ray.get(pg.ready())
+            # Wait for placement group to be ready (avoid blocking ray.get)
+            await pg.ready()
             
             # Store mappings
             self._spmd_to_pg[spmd_id] = pg

@@ -37,6 +37,7 @@ from ..common.types import (
     OpType,
     NodeType,
 )
+from ..common.utils import ensure_logging_configured
 from .monitor import Monitor
 from .scheduler import Scheduler
 from .spmd_manager import SPMDManager, SPMDHandle
@@ -49,7 +50,7 @@ logger = logging.getLogger(__name__)
 
 
 if RAY_AVAILABLE:
-    @ray.remote(max_concurrency=20)
+    @ray.remote
     class ControllerActor:
         """
         Central Controller for the Fluxway Control Plane (Ray Actor).
@@ -82,6 +83,9 @@ if RAY_AVAILABLE:
                 heartbeat_config: Heartbeat configuration
                 async_step_config: Async step configuration
             """
+            # Ray actors run in separate worker processes; ensure INFO logs are not dropped.
+            ensure_logging_configured()
+
             self._graph = graph
             self._heartbeat_config = heartbeat_config or HeartbeatConfig()
             self._async_step_config = async_step_config or AsyncStepConfig()
@@ -96,6 +100,7 @@ if RAY_AVAILABLE:
             self._heartbeat_manager = HeartbeatManager(
                 config=self._heartbeat_config,
                 on_all_ready=self._on_all_drivers_ready,
+                on_all_workers_running=self._on_all_workers_running,
                 on_driver_error=self._on_driver_error,
                 on_driver_recovered=self._on_driver_recovered,
             )
@@ -134,14 +139,22 @@ if RAY_AVAILABLE:
         
         async def initialize(self) -> bool:
             """
-            Initialize the Controller.
+            Initialize the Controller (event-driven).
             
             Performs:
             1. Set controller handle on spmd_manager
             2. Register SPMDs for heartbeat monitoring
-            3. Schedule resources and start SPMD drivers
-            4. Start heartbeat monitoring
-            5. Transition to PENDING state
+            3. Allocate resources
+            4. Build topology data structure (no remote calls)
+            5. Start SPMDs (fire-and-forget)
+            6. Transition to PENDING state
+            
+            Subsequent phases are driven by heartbeat events:
+            - PENDING → TOPOLOGY_REGISTERING: when all drivers report workers_ready
+            - TOPOLOGY_REGISTERING → RUNNING: when all workers are running
+            
+            Note: Heartbeat timeout monitoring starts in RUNNING state entry,
+            not here. Heartbeat *reception* works from the start.
             
             Returns:
                 True if initialization successful
@@ -155,24 +168,28 @@ if RAY_AVAILABLE:
                 for node_name in self._graph.nodes:
                     self._heartbeat_manager.register_spmd(node_name)
                 
-                # Schedule - handles resource allocation, SPMD init, and topology
-                # NOTE: Scheduler uses blocking Ray calls (e.g. ray.get(pg.ready())).
-                # Running it directly inside an async actor would block the event loop and
-                # Ray will warn: "Using blocking ray.get inside async actor".
-                # Offload to a thread to keep the ControllerActor event loop responsive.
-                success = await asyncio.to_thread(self._scheduler.schedule, self._graph)
-                if not success:
-                    logger.error("Failed to schedule graph")
+                # Allocate resources
+                if not await self._scheduler.allocate_resources(self._graph):
+                    logger.error("Failed to allocate resources")
                     return False
                 
-                # Start heartbeat monitoring
-                await self._heartbeat_manager.start_monitoring_async()
+                # Build and establish topology data structure
+                # (adjacency lists only, no remote calls to drivers)
+                self._scheduler.build_and_establish_topology(self._graph)
                 
-                # Transition state machine to PENDING
+                # Start SPMDs (fire-and-forget, readiness tracked via heartbeat)
+                if not await self._scheduler.init_spmds(self._graph):
+                    logger.error("Failed to start SPMDs")
+                    return False
+                
+                # Transition state machine: INITIALIZING → PENDING
                 await self._state_machine.trigger_event(ControllerEvent.INIT_COMPLETE)
                 
                 self._initialized = True
-                logger.info(f"Controller initialized with {len(self._graph.nodes)} SPMDs")
+                logger.info(
+                    f"Controller initialized with {len(self._graph.nodes)} SPMDs, "
+                    f"waiting for drivers to report ready via heartbeat"
+                )
                 return True
                 
             except Exception as e:
@@ -375,7 +392,9 @@ if RAY_AVAILABLE:
             self,
             source_spmd_id: str,
             target_spmd_id: str,
+            target_op: "OpType",
             state_name: str,
+            step: int,
             state_value: Any,
         ) -> None:
             """
@@ -387,7 +406,9 @@ if RAY_AVAILABLE:
             Args:
                 source_spmd_id: Source SPMD ID
                 target_spmd_id: Target SPMD ID
+                target_op: Target operator type on the receiving side
                 state_name: State variable name
+                step: Current step number
                 state_value: State value
             """
             target_driver = self._spmd_manager.get_driver_handle(target_spmd_id)
@@ -396,10 +417,12 @@ if RAY_AVAILABLE:
                 return
             
             try:
-                await target_driver.broadcast_state_argument.remote(state_name, state_value)
+                await target_driver.broadcast_state_argument.remote(
+                    target_op, state_name, step, state_value
+                )
                 logger.debug(
                     f"Forwarded state_argument '{state_name}' from {source_spmd_id} "
-                    f"to {target_spmd_id}"
+                    f"to {target_spmd_id}, target_op={target_op}, step={step}"
                 )
             except Exception as e:
                 logger.error(f"Failed to forward state_argument: {e}")
@@ -504,7 +527,7 @@ if RAY_AVAILABLE:
                 return False
             
             # Stop current SPMD
-            self._spmd_manager.stop_spmd(spmd_id, save_checkpoint=True)
+            await self._spmd_manager.stop_spmd(spmd_id, save_checkpoint=True)
             
             # Get PG info from scheduler
             pg_info = self._scheduler.pg_manager.get_pg_info(spmd_id)
@@ -525,9 +548,20 @@ if RAY_AVAILABLE:
         # =====================================================================
         
         async def _on_all_drivers_ready(self) -> None:
-            """Callback when all drivers are ready."""
-            logger.info("All drivers are ready")
+            """Callback when all drivers report workers_ready=True.
+            
+            Triggers: PENDING → TOPOLOGY_REGISTERING → _initiate_topology_registration()
+            """
+            logger.info("All drivers are ready (workers_ready=True), triggering topology registration")
             await self._state_machine.trigger_event(ControllerEvent.ALL_DRIVERS_READY)
+        
+        async def _on_all_workers_running(self) -> None:
+            """Callback when all drivers report workers_running=True.
+            
+            Triggers: TOPOLOGY_REGISTERING → RUNNING → start heartbeat monitoring
+            """
+            logger.info("All workers are running after topology registration")
+            await self._state_machine.trigger_event(ControllerEvent.ALL_SPMDS_TOPOLOGY_READY)
         
         async def _on_driver_error(self, spmd_id: str, error: str) -> None:
             """Callback when a driver has an error."""
@@ -624,7 +658,7 @@ if RAY_AVAILABLE:
             # Stop all SPMDs
             for spmd_id in self._spmd_manager.get_all_spmd_ids():
                 try:
-                    self._spmd_manager.stop_spmd(spmd_id, save_checkpoint=False)
+                    await self._spmd_manager.stop_spmd(spmd_id, save_checkpoint=False)
                 except Exception as e:
                     logger.error(f"Error stopping SPMD {spmd_id}: {e}")
             
@@ -700,7 +734,7 @@ if RAY_AVAILABLE:
                 await asyncio.sleep(1.0)
 
 
-def create_controller(
+async def create_controller(
     graph: Graph,
     heartbeat_config: Optional[HeartbeatConfig] = None,
     async_step_config: Optional[AsyncStepConfig] = None,
@@ -732,7 +766,7 @@ def create_controller(
     )
     
     # Initialize the actor
-    success = ray.get(controller.initialize.remote())
+    success = await controller.initialize.remote()
     if not success:
         raise RuntimeError("Failed to initialize controller")
     
