@@ -9,12 +9,12 @@ Features:
 
 Usage:
     import fluxway
-    
+
     @fluxway.data_type(state_argument=["id"], tensor_argument=["tensor"])
     class MyData:
         id: int
         tensor: torch.Tensor
-    
+
     @fluxway.spmd(
         resource={"nums_cpu": 4, "nums_gpu": 2},
         input_sharding={PartitionType.DP: 4},
@@ -41,25 +41,22 @@ from fluxway.common.types import (
 )
 
 # Import control plane components
-from fluxway.control_plane import (
-    GraphParser,
-    Builder,
-)
+from fluxway.control_plane import GraphParser, Builder
 
 __all__ = [
     # Version
-    '__version__',
+    "__version__",
     # Decorators
-    'data_type',
-    'spmd',
+    "data_type",
+    "spmd",
     # Types
-    'PartitionType',
-    'SPMDConfig',
-    'Graph',
-    'Node',
-    'Edge',
-    'ResourceSpec',
+    "PartitionType",
+    "SPMDConfig",
+    "Graph",
+    "Node",
+    "Edge",
+    "ResourceSpec",
     # Control Plane
-    'GraphParser',
-    'Builder',
+    "GraphParser",
+    "Builder",
 ]
