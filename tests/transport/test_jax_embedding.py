@@ -1,10 +1,10 @@
 import pytest
 import jax.numpy as jnp
-import numpy as np
-from typing import List, Dict, Any, Tuple
+
+from typing import List, Dict, Any
 
 from fluxway.transport.tensor import TransportTensor
-from fluxway.transport.sharding import ShardingSpec, DeviceMesh, Layout
+from fluxway.transport.sharding import ShardingSpec, DeviceMesh
 from fluxway.transport.communication import DataDistributor, DataReceiverMixin
 from fluxway.transport.backend import set_backend
 

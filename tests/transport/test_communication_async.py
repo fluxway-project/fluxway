@@ -45,7 +45,7 @@ class TestDataDistributor(unittest.TestCase):
 
         try:
             # New API: distribute(local_data, source, target, send_fn)
-            results = dist.distribute(
+            dist.distribute(
                 local_data=self.transport_tensor,
                 source=self.src_spec,
                 target=self.dst_spec,

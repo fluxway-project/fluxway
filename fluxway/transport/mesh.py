@@ -5,7 +5,7 @@ Device Mesh Abstraction.
 from __future__ import annotations
 
 import numpy as np
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple
 from dataclasses import dataclass
 
 
@@ -101,9 +101,6 @@ class DeviceMesh:
         if axis_name not in self.size_map:
             raise ValueError(f"Axis {axis_name} not found in mesh {self.axis_names}")
         return self.size_map[axis_name]
-
-    def get_coordinate(self, rank_id: int) -> Tuple[int, ...]:
-        """Get the multi-dimensional logical coordinates of a physical rank in the mesh."""
 
     def get_coordinate(self, rank_id: int) -> Tuple[int, ...]:
         """Get the multi-dimensional logical coordinates of a physical rank in the mesh."""

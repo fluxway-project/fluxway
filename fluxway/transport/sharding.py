@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import numpy as np
 
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Tuple, Union
 
 from fluxway.transport.backend import get_backend
 from fluxway.transport.mesh import DeviceMesh
-from functools import cached_property
 
 
 # ============================================================
@@ -37,10 +35,6 @@ class Layout:
     # Legacy compatibility (to be removed)
     replication_axes: Optional[List[str]] = None
     replication_factor: int = 1
-
-    def get_local_indices(self, rank: int) -> Any:
-        """Returns the global indices held by this rank."""
-        backend = get_backend()
 
     def get_local_indices(self, rank: int) -> Any:
         """Returns the global indices held by this rank."""
@@ -75,8 +69,6 @@ class Layout:
                         effective_world_size *= s
                 except ValueError:
                     pass
-
-        dim_size = self.data_shape[self.partition_dim]
 
         dim_size = self.data_shape[self.partition_dim]
 
@@ -310,7 +302,7 @@ class ShardingSpec:
         dependency: Any = None,
     ) -> Layout:
         """Evaluate partition function → Layout."""
-        backend = get_backend()
+
         if data_shape is None:
             if not self.is_content_addressable:
                 raise ValueError(
@@ -318,9 +310,6 @@ class ShardingSpec:
                 )
             # For content addressable, use dummy shape for partition_fn
             data_shape = (-1,) * (self.partition_dim + 1)
-
-        dim_size = data_shape[self.partition_dim]
-        indices = backend.arange(0, dim_size, dtype=backend.int32())
 
         # Determine effective world size for the partition function
         effective_world_size = world_size

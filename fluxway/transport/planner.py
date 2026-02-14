@@ -284,7 +284,6 @@ def _where_true(backend, mask: Any) -> Any:
 
     Uses backend boolean indexing (supported by both PyTorch and JAX).
     """
-    n = backend.shape(mask)[0]
     # Returns (N, 1) usually for 1D mask. flatten to 1D.
     nz = backend.nonzero(mask)
     if backend.shape(nz)[1] > 0:

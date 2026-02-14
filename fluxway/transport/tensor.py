@@ -1,4 +1,4 @@
-from typing import List, Any
+from typing import List, Any, Optional
 from fluxway.transport.backend import get_backend
 
 
@@ -9,9 +9,9 @@ class TransportTensor:
     ragged (flat_values 1D, nested_splits struct) layouts.
     """
 
-    def __init__(self, flat_values: Any, nested_splits: List[Any] = []):
+    def __init__(self, flat_values: Any, nested_splits: Optional[List[Any]] = None):
         self._flat_values = flat_values
-        self._nested_splits = nested_splits
+        self._nested_splits = nested_splits if nested_splits is not None else []
 
     @property
     def flat_values(self) -> Any:
@@ -173,24 +173,15 @@ class TransportTensor:
             if not backend.is_tensor(curr_size):
                 curr_size = backend.tensor(curr_size, dtype=backend.int32())
 
-            # Optimistically use dynamic_slice for splits if backend supports it efficiently
-            for i in range(len(self._nested_splits)):
-                curr_splits = self._nested_splits[i]
+            # Bridge to legacy slice implementation for robustness
+            s = int(backend.item(start)) if backend.is_tensor(start) else start
+            e = (
+                int(backend.item(size_tensor))
+                if backend.is_tensor(size_tensor)
+                else size_tensor
+            )
 
-                # Slice current splits: [curr_start_idx : curr_start_idx + curr_size + 1]
-                splits_slice = backend.dynamic_slice(
-                    curr_splits, [curr_start_idx], [curr_size + 1]
-                )
-
-                # Bridge to legacy slice implementation for robustness
-                s = int(backend.item(start)) if backend.is_tensor(start) else start
-                e = (
-                    int(backend.item(size_tensor))
-                    if backend.is_tensor(size_tensor)
-                    else size_tensor
-                )
-
-                return self.slice(s, s + e)
+            return self.slice(s, s + e)
 
     def slice(self, start: int, end: int) -> "TransportTensor":
         """Slices the tensor along the first dimension."""
