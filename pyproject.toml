@@ -42,6 +42,9 @@ afterray = ["psutil", "setproctitle"]
 # */__init__.py
 # For the rest we will gradually remove them from the blacklist as we
 # reformat the code to follow the style guide.
+[tool.ruff.format]
+skip-magic-trailing-comma = true
+
 [tool.ruff.lint.per-file-ignores]
 "doc/*" = ["I"]
 "fluxway/__init__.py" = ["I"]
