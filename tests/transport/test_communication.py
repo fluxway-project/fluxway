@@ -3,7 +3,8 @@ import jax.numpy as jnp
 import numpy as np
 
 from fluxway.transport.tensor import TransportTensor
-from fluxway.transport.sharding import ShardingSpec, DeviceMesh
+from fluxway.transport.sharding import ShardingSpec, P
+from fluxway.transport.mesh import DeviceMesh
 from fluxway.transport.communication import DataDistributor, DataReceiverMixin
 from fluxway.transport.backend import set_backend
 
@@ -32,19 +33,8 @@ def test_distributor_receiver_integration():
     src_mesh = DeviceMesh((1,), ("x",), jnp.array([0]))
     dst_mesh = DeviceMesh((2,), ("x",), jnp.array([0, 1]))
 
-    source_spec = ShardingSpec(
-        partition_fn=ShardingSpec.chunk(0).partition_fn,
-        partition_dim=0,
-        mesh=src_mesh,
-        sharding_axis="x",
-    )
-
-    target_spec = ShardingSpec(
-        partition_fn=ShardingSpec.chunk(0).partition_fn,
-        partition_dim=0,
-        mesh=dst_mesh,
-        sharding_axis="x",
-    )
+    source_spec = ShardingSpec.chunk(mesh=src_mesh, partition=P("x"))
+    target_spec = ShardingSpec.chunk(mesh=dst_mesh, partition=P("x"))
 
     # Mock Data: 2 rows with unequal lengths (Ragged)
     # Row 0: 60 elements

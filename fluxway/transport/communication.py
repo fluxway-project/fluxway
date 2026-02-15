@@ -12,8 +12,6 @@ from fluxway.transport.tensor import TransportTensor
 
 
 import asyncio
-import functools
-import operator
 from typing import Union
 
 from fluxway.transport.sharding import Layout
@@ -30,16 +28,8 @@ class BaseDataDistributor:
     ) -> Layout:
         if isinstance(spec_or_layout, Layout):
             return spec_or_layout
-
         if isinstance(spec_or_layout, ShardingSpec):
-            world_size = 1
-            if spec_or_layout.mesh:
-                world_size = functools.reduce(
-                    operator.mul, spec_or_layout.mesh.shape, 1
-                )
-
-            return spec_or_layout.compute_layout(data_shape, world_size)
-
+            return spec_or_layout._to_layout(data_shape)
         raise ValueError(f"Invalid type for source/target: {type(spec_or_layout)}")
 
     def _plan_and_shard(
@@ -47,55 +37,49 @@ class BaseDataDistributor:
         local_data: TransportTensor,
         source: Union[ShardingSpec, Layout],
         target: Union[ShardingSpec, Layout],
-        topology_meta: Any = None,
-        dependency: Any = None,
+        global_shape: Any = None,
     ):
         """Generates (targets, payload) pairs for distribution."""
         backend = get_backend()
 
-        # Determine data_shape from local_data
-        # If ShardingSpec is used, we infer layout based on local data shape.
-        # Ideally, ShardingSpec + Implicit Inference allows recovering global context.
+        # Derive context from TransportTensor (self-describing).
+        topology = local_data.topology
+        routing_indices = local_data.global_indices
 
+        # Local shape from data.
         if local_data.is_ragged:
             top_split = local_data.nested_splits[0]
             dim0 = backend.shape(top_split)[0] - 1
-            data_shape = (dim0,)
+            local_shape = (dim0,)
         else:
-            data_shape = tuple(backend.shape(local_data.flat_values))
+            local_shape = tuple(backend.shape(local_data.flat_values))
 
-        # Handle dependency or implicit inference
-        src_indices = dependency
+        # Routing indices or implicit inference.
+        src_indices = routing_indices
         if (
             src_indices is None
             and isinstance(source, ShardingSpec)
             and not source.is_content_addressable
         ):
-            dim_size = (
-                data_shape[source.partition_dim]
-                if source.partition_dim < len(data_shape)
-                else 0
-            )
+            dim_size = local_shape[source.dim] if source.dim < len(local_shape) else 0
             src_indices = source.get_expected_local_indices(self.local_rank, dim_size)
 
         src_shape_arg = (
             None
             if (isinstance(source, ShardingSpec) and source.is_content_addressable)
-            else data_shape
+            else local_shape
         )
         src_layout = self._ensure_layout(source, src_shape_arg)
 
-        dst_shape_arg = src_layout.data_shape
+        # For dst layout, prefer explicit global_shape, then src_layout.data_shape.
+        dst_shape_arg = (
+            global_shape if global_shape is not None else src_layout.data_shape
+        )
         if isinstance(target, ShardingSpec) and target.is_content_addressable:
             dst_shape_arg = None
 
         if isinstance(target, ShardingSpec):
-            w_size = 1
-            if target.mesh:
-                w_size = functools.reduce(operator.mul, target.mesh.shape, 1)
-            dst_layout = target.compute_layout(
-                dst_shape_arg, w_size, topology_meta, dependency
-            )
+            dst_layout = target._to_layout(dst_shape_arg, topology, routing_indices)
         else:
             dst_layout = target
 
@@ -155,7 +139,7 @@ class BaseDataDistributor:
                 current_offset += count
 
         else:
-            # Scatter-send
+            # Scatter-send: prefer self-describing shard indices, fall back to plan
             for device_id, count in enumerate(counts_host):
                 count = int(count)
                 if count == 0:
@@ -166,27 +150,26 @@ class BaseDataDistributor:
 
                 shard = reordered.dynamic_slice(offset_tensor, count_tensor)
 
-                global_offset = 0
-                if plan.global_indices is not None:
-                    sorted_globals = backend.take(
-                        plan.global_indices, plan.sort_indices
-                    )
-                    idx_tensor = backend.reshape(offset_tensor, (1,))
-                    global_offset = backend.take(sorted_globals, idx_tensor)
-                    if backend.shape(global_offset) == (1,):
-                        global_offset = backend.reshape(global_offset, ())
-                else:
-                    global_offset = backend.zeros((), dtype=backend.int32())
-
-                # Include indices if Planner says so (e.g. Combine)
-                shard_indices = None
-                if plan.global_indices is not None:
+                # Prefer shard's propagated indices; fall back to plan's indices
+                shard_indices = shard.global_indices
+                if shard_indices is None and plan.global_indices is not None:
                     sorted_globals = backend.take(
                         plan.global_indices, plan.sort_indices
                     )
                     shard_indices = backend.dynamic_slice(
                         sorted_globals, [offset_tensor], [count_tensor]
                     )
+
+                if shard_indices is not None:
+                    idx_tensor = backend.reshape(
+                        backend.take(
+                            shard_indices, backend.tensor(0, dtype=backend.int32())
+                        ),
+                        (),
+                    )
+                    global_offset = idx_tensor
+                else:
+                    global_offset = backend.zeros((), dtype=backend.int32())
 
                 payload = TransportPayload(
                     global_offset=global_offset,
@@ -207,13 +190,12 @@ class SyncDataDistributor(BaseDataDistributor):
         source: Union[ShardingSpec, Layout],
         target: Union[ShardingSpec, Layout],
         send_fn: Callable[[int, TransportPayload], Any],
-        topology_meta: Any = None,
-        dependency: Any = None,
+        global_shape: Any = None,
     ) -> List[Any]:
         """Performs synchronous distribution."""
         results = []
         for targets, payload in self._plan_and_shard(
-            local_data, source, target, topology_meta, dependency
+            local_data, source, target, global_shape
         ):
             for target_id in targets:
                 res = send_fn(target_id, payload)
@@ -230,13 +212,12 @@ class AsyncDataDistributor(BaseDataDistributor):
         source: Union[ShardingSpec, Layout],
         target: Union[ShardingSpec, Layout],
         send_fn: Callable[[int, TransportPayload], Coroutine[Any, Any, Any]],
-        topology_meta: Any = None,
-        dependency: Any = None,
+        global_shape: Any = None,
     ) -> List[Any]:
         """Performs asynchronous distribution."""
         tasks = []
         for targets, payload in self._plan_and_shard(
-            local_data, source, target, topology_meta, dependency
+            local_data, source, target, global_shape
         ):
             for target_id in targets:
                 tasks.append(send_fn(target_id, payload))

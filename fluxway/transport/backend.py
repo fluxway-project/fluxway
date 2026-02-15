@@ -169,6 +169,21 @@ class TensorBackend(ABC):
         """Count occurrences of each value in array of non-negative ints."""
         pass
 
+    @abstractmethod
+    def vmap(self, fun: Any, in_axes: Any = 0, out_axes: Any = 0) -> Any:
+        """Vectorizing map."""
+        pass
+
+    @abstractmethod
+    def tree_map(self, fun: Any, tree: Any) -> Any:
+        """Maps fun over pytree leaves."""
+        pass
+
+    @abstractmethod
+    def tile(self, x: Any, dims: Tuple[int, ...]) -> Any:
+        """Constructs a new tensor by repeating input."""
+        pass
+
 
 class TorchBackend(TensorBackend):
     def __init__(self):
@@ -311,6 +326,25 @@ class TorchBackend(TensorBackend):
 
     def bincount(self, x: Any, minlength: int = 0) -> Any:
         return self._torch.bincount(x, minlength=minlength)
+
+    def vmap(self, fun: Any, in_axes: Any = 0, out_axes: Any = 0) -> Any:
+        if hasattr(self._torch, "vmap"):
+            return self._torch.vmap(fun, in_dims=in_axes, out_dims=out_axes)
+        raise NotImplementedError("torch.vmap requires newer PyTorch version")
+
+    def tree_map(self, fun: Any, tree: Any) -> Any:
+        try:
+            import torch.utils._pytree as pytree
+
+            return pytree.tree_map(fun, tree)
+        except ImportError:
+            # Fallback for simple structures
+            if isinstance(tree, (list, tuple)):
+                return type(tree)(fun(x) for x in tree)
+            return fun(tree)
+
+    def tile(self, x: Any, dims: Tuple[int, ...]) -> Any:
+        return self._torch.tile(x, dims)
 
 
 class JaxBackend(TensorBackend):
@@ -467,6 +501,15 @@ class JaxBackend(TensorBackend):
 
     def bincount(self, x: Any, minlength: int = 0) -> Any:
         return self._jnp.bincount(x, length=minlength)
+
+    def vmap(self, fun: Any, in_axes: Any = 0, out_axes: Any = 0) -> Any:
+        return self._jax.vmap(fun, in_axes=in_axes, out_axes=out_axes)
+
+    def tree_map(self, fun: Any, tree: Any) -> Any:
+        return self._jax.tree.map(fun, tree)
+
+    def tile(self, x: Any, dims: Tuple[int, ...]) -> Any:
+        return self._jnp.tile(x, dims)
 
 
 _BACKEND: Optional[TensorBackend] = None

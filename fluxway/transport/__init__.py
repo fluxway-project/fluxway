@@ -2,10 +2,11 @@ from .tensor import TransportTensor
 from .sharding import (
     Layout,
     ShardingSpec,
-    chunk_partition,
-    cyclic_partition,
-    hash_partition,
-    greedy_partition,
+    PartitionStrategy,
+    ChunkPartition,
+    CyclicPartition,
+    HashPartition,
+    GreedyPartition,
 )
 from .planner import TransportPlanner, TransportPlan
 from .payload import TransportPayload
@@ -15,10 +16,11 @@ __all__ = [
     "TransportTensor",
     "Layout",
     "ShardingSpec",
-    "chunk_partition",
-    "cyclic_partition",
-    "hash_partition",
-    "greedy_partition",
+    "PartitionStrategy",
+    "ChunkPartition",
+    "CyclicPartition",
+    "HashPartition",
+    "GreedyPartition",
     "TransportPlanner",
     "TransportPlan",
     "TransportPayload",

@@ -1,12 +1,12 @@
 import pytest
-import jax.numpy as jnp
 
 from typing import List, Dict, Any
 
 from fluxway.transport.tensor import TransportTensor
-from fluxway.transport.sharding import ShardingSpec, DeviceMesh
+from fluxway.transport.sharding import ShardingSpec, P
+from fluxway.transport.mesh import DeviceMesh
 from fluxway.transport.communication import DataDistributor, DataReceiverMixin
-from fluxway.transport.backend import set_backend
+from fluxway.transport.backend import set_backend, get_backend
 
 
 # Force JAX backend
@@ -54,14 +54,15 @@ def test_embedding_lookup_flow():
     """Simulates a 3-step pipeline: Input (SPMD0) -> Embedding (SPMD1) -> Forward Output (SPMD2)."""
 
     # --- 1. Setup Global Data & Meshes ---
+    bk = get_backend()
 
     # Global Data: 12 keys, vocab size 8, dim 2.
-    global_keys = jnp.arange(12, dtype=jnp.int32)
+    global_keys = bk.arange(0, 12, dtype=bk.int32())
     vocab_size = 8
     emb_dim = 2
-    global_emb_table = jnp.arange(vocab_size * emb_dim, dtype=jnp.float32).reshape(
-        vocab_size, emb_dim
-    )
+    # reshape
+    _tmp = bk.arange(0, vocab_size * emb_dim, dtype=bk.float32())
+    global_emb_table = bk.reshape(_tmp, (vocab_size, emb_dim))
 
     global_ids = global_keys % vocab_size
     expected_global_output = global_emb_table[global_ids]
@@ -72,9 +73,9 @@ def test_embedding_lookup_flow():
     mesh2 = DeviceMesh((2,), ("z",), [0, 1])
 
     # Sharding Specs
-    spec0 = ShardingSpec.chunk(0, mesh=mesh0, axis="x")
-    spec1 = ShardingSpec.hash(0, mesh=mesh1, axis="y")
-    spec2 = ShardingSpec.chunk(0, mesh=mesh2, axis="z")
+    spec0 = ShardingSpec.chunk(mesh=mesh0, partition=P("x"))
+    spec1 = ShardingSpec.hash(mesh=mesh1, partition=P("y"))
+    spec2 = ShardingSpec.chunk(mesh=mesh2, partition=P("z"))
 
     # --- 2. Simulation Environment ---
 
@@ -131,10 +132,13 @@ def test_embedding_lookup_flow():
             all_keys.append(shard.data)
 
         if not all_keys:
-            spmd1_results[r] = (jnp.array([]), jnp.array([]))
+            spmd1_results[r] = (
+                bk.tensor([], dtype=bk.int32()),
+                bk.tensor([], dtype=bk.int32()),
+            )
             continue
 
-        local_keys = jnp.concatenate(all_keys)
+        local_keys = bk.cat(all_keys)
         local_indices = local_keys  # Key=Index
 
         # Lookup
@@ -154,7 +158,7 @@ def test_embedding_lookup_flow():
         if len(local_emb) == 0:
             continue
 
-        t_tensor = TransportTensor(local_emb)
+        t_tensor = TransportTensor(local_emb, global_indices=local_indices)
 
         dist = cluster[r].distributor
 
@@ -165,14 +169,12 @@ def test_embedding_lookup_flow():
             return True
 
         # Check 2: Content Addressable Source (Hash) -> Implicit Static Target (Chunk)
-        layout2_target = spec2.compute_layout((12, emb_dim), world_size=2)
-
         dist.distribute(
             local_data=t_tensor,
             source=spec1,
-            target=layout2_target,
+            target=spec2,
             send_fn=send_wrapper_combine,
-            dependency=local_indices,
+            global_shape=(12, emb_dim),
         )
 
     # --- 6. Verify Forward Output ---
@@ -182,30 +184,30 @@ def test_embedding_lookup_flow():
     # Verify Rank 0 (indices 0..5)
     rank0_vals = [p.data for p in output_shards[0]]
     if rank0_vals:
-        rank0_data = jnp.concatenate(rank0_vals)
+        rank0_data = bk.cat(rank0_vals)
     else:
-        rank0_data = jnp.array([])
+        rank0_data = bk.tensor([], dtype=bk.float32())
 
     expected_r0 = expected_global_output[:6]
     # Check shape
     assert rank0_data.shape[0] == 6, f"Rank 0 shape mismatch: {rank0_data.shape} vs 6"
 
     # Verify Values
-    r0_sorted = jnp.sort(rank0_data.flatten())
-    exp0_sorted = jnp.sort(expected_r0.flatten())
-    assert jnp.array_equal(r0_sorted, exp0_sorted), "Rank 0 Value Mismatch"
+    r0_sorted, _ = bk.sort(rank0_data.flatten())
+    exp0_sorted, _ = bk.sort(expected_r0.flatten())
+    assert bk.equal(r0_sorted, exp0_sorted), "Rank 0 Value Mismatch"
 
     # Verify Rank 1 (indices 6..11)
     rank1_vals = [p.data for p in output_shards[1]]
     if rank1_vals:
-        rank1_data = jnp.concatenate(rank1_vals)
+        rank1_data = bk.cat(rank1_vals)
     else:
-        rank1_data = jnp.array([])
+        rank1_data = bk.tensor([], dtype=bk.float32())
 
     assert rank1_data.shape[0] == 6, f"Rank 1 shape mismatch: {rank1_data.shape} vs 6"
-    r1_sorted = jnp.sort(rank1_data.flatten())
-    exp1_sorted = jnp.sort(expected_global_output[6:].flatten())
-    assert jnp.array_equal(r1_sorted, exp1_sorted), "Rank 1 Value Mismatch"
+    r1_sorted, _ = bk.sort(rank1_data.flatten())
+    exp1_sorted, _ = bk.sort(expected_global_output[6:].flatten())
+    assert bk.equal(r1_sorted, exp1_sorted), "Rank 1 Value Mismatch"
 
     # --- 7. Backward Pass: Gradients (SPMD2 -> SPMD1) ---
     # "Dispatch Gradients"
@@ -213,14 +215,16 @@ def test_embedding_lookup_flow():
     print("\n--- Phase 4: Backward Dispatch (SPMD2 -> SPMD1) ---")
 
     # Mock Gradients (Index based)
-    global_grads = jnp.tile(
-        global_keys.astype(jnp.float32).reshape(-1, 1), (1, emb_dim)
-    )
+    _tmp_casted = global_keys.astype(bk.float32())
+    _tmp_reshaped = bk.reshape(_tmp_casted, (-1, 1))
+
+    # Use backend tile
+    global_grads = bk.tile(_tmp_reshaped, (1, emb_dim))
 
     # Rank 0 Grads (0..5)
-    grads0 = TransportTensor(global_grads[:6])
+    grads0 = TransportTensor(global_grads[:6], global_indices=rank0_keys)
     # Rank 1 Grads (6..11)
-    grads1 = TransportTensor(global_grads[6:])
+    grads1 = TransportTensor(global_grads[6:], global_indices=rank1_keys)
 
     grad_acc = {r: [] for r in range(4)}
 
@@ -240,11 +244,7 @@ def test_embedding_lookup_flow():
     # We use spec2 here.
 
     dist_bk_0.distribute(
-        local_data=grads0,
-        source=spec2,
-        target=spec1,
-        send_fn=send_wrapper_bk_0,
-        dependency=rank0_keys,
+        local_data=grads0, source=spec2, target=spec1, send_fn=send_wrapper_bk_0
     )
 
     # Send from Rank 1
@@ -256,11 +256,7 @@ def test_embedding_lookup_flow():
         return True
 
     dist_bk_1.distribute(
-        local_data=grads1,
-        source=spec2,
-        target=spec1,
-        send_fn=send_wrapper_bk_1,
-        dependency=rank1_keys,
+        local_data=grads1, source=spec2, target=spec1, send_fn=send_wrapper_bk_1
     )
 
     # --- 8. Verify Backward Update (SPMD1) ---
@@ -270,9 +266,9 @@ def test_embedding_lookup_flow():
     for r in range(4):
         shards = grad_acc[r]
         if not shards:
-            local_grads = jnp.array([])
+            local_grads = bk.tensor([], dtype=bk.float32())
         else:
-            local_grads = jnp.concatenate([p.data for p in shards])
+            local_grads = bk.cat([p.data for p in shards])
 
         expected_indices = spmd1_results[r][1]
 
@@ -280,11 +276,12 @@ def test_embedding_lookup_flow():
             assert len(local_grads) == 0
             continue
 
-        expected_grads = jnp.tile(
-            expected_indices.reshape(-1, 1).astype(jnp.float32), (1, emb_dim)
-        )
+        _e_tmp = expected_indices.astype(bk.float32())
+        _e_reshaped = bk.reshape(_e_tmp, (-1, 1))
+        # Use backend tile
+        expected_grads = bk.tile(_e_reshaped, (1, emb_dim))
 
-        l_sorted = jnp.sort(local_grads.flatten())
-        e_sorted = jnp.sort(expected_grads.flatten())
+        l_sorted, _ = bk.sort(local_grads.flatten())
+        e_sorted, _ = bk.sort(expected_grads.flatten())
 
-        assert jnp.array_equal(l_sorted, e_sorted), f"Rank {r} Grad mismatch"
+        assert bk.equal(l_sorted, e_sorted), f"Rank {r} Grad mismatch"

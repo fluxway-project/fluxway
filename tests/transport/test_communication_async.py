@@ -4,7 +4,8 @@ from unittest.mock import MagicMock
 import jax.numpy as jnp
 
 from fluxway.transport.communication import SyncDataDistributor, AsyncDataDistributor
-from fluxway.transport.sharding import ShardingSpec, DeviceMesh
+from fluxway.transport.sharding import ShardingSpec, P
+from fluxway.transport.mesh import DeviceMesh
 from fluxway.transport.tensor import TransportTensor
 
 
@@ -20,21 +21,8 @@ class TestDataDistributor(unittest.TestCase):
         # Specs with Mesh for inference
         self.mesh = DeviceMesh((2,), ("x",), jnp.array([0, 1]))
 
-        # Create specs. Since ShardingSpec is not a dataclass with easy replace,
-        # we construct them.
-        chunk0 = ShardingSpec.chunk(0)
-        self.src_spec = ShardingSpec(
-            partition_fn=chunk0.partition_fn,
-            partition_dim=0,
-            mesh=self.mesh,
-            sharding_axis="x",
-        )
-        self.dst_spec = ShardingSpec(
-            partition_fn=chunk0.partition_fn,
-            partition_dim=0,
-            mesh=self.mesh,
-            sharding_axis="x",
-        )
+        self.src_spec = ShardingSpec.chunk(mesh=self.mesh, partition=P("x"))
+        self.dst_spec = ShardingSpec.chunk(mesh=self.mesh, partition=P("x"))
 
     def test_sync_distributor(self):
         # New API: init only needs local_rank
