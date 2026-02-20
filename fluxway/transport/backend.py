@@ -3,9 +3,30 @@ from typing import Any, List, Optional, Tuple
 import contextlib
 
 
-class TensorBackend(ABC):
+class DLPackObject:
+    """Wrapper to convert a PyCapsule into a DLPack-compatible object.
+
+    This facilitates zero-copy tensor sharing between different frameworks.
     """
-    Abstract interface for tensor operations.
+
+    def __init__(self, capsule, device=None):
+        self._capsule = capsule
+        self._device = device
+
+    def __dlpack__(self, stream=None):
+        return self._capsule
+
+    def __dlpack_device__(self):
+        if self._device is None:
+            return (1, 0)
+        return self._device
+
+
+class TensorBackend(ABC):
+    """Abstract interface for tensor operations across different frameworks.
+
+    This class defines a unified API for common tensor operations like creation,
+    manipulation, and mathematical functions, enabling backend-agnostic code.
     """
 
     @abstractmethod
@@ -165,6 +186,11 @@ class TensorBackend(ABC):
         pass
 
     @abstractmethod
+    def dynamic_slice_update(self, x: Any, update: Any, start: Any) -> Any:
+        """Update x starting at `start` with `update`. Returns updated tensor."""
+        pass
+
+    @abstractmethod
     def bincount(self, x: Any, minlength: int = 0) -> Any:
         """Count occurrences of each value in array of non-negative ints."""
         pass
@@ -182,6 +208,30 @@ class TensorBackend(ABC):
     @abstractmethod
     def tile(self, x: Any, dims: Tuple[int, ...]) -> Any:
         """Constructs a new tensor by repeating input."""
+        pass
+
+    @abstractmethod
+    def scan(self, f: Any, init: Any, xs: Any, length: Optional[int] = None) -> Any:
+        """
+        Scans a function over leading array axes while carrying along state.
+
+        Args:
+            f: Function of the form (carry, x) -> (carry, y)
+            init: Initial carry value
+            xs: Input arrays to scan over
+            length: Optional length of scan (if xs is None)
+
+        Returns:
+            (final_carry, stacked_outputs)
+        """
+        pass
+
+    @abstractmethod
+    def get_dlpack_slice(self, tensor: Any, indices: Optional[Any] = None) -> Any:
+        """
+        Returns a DLPack-compatible object viewing a slice of the tensor without copying.
+        Typically used for ragged/sparse transport optimization.
+        """
         pass
 
 
@@ -324,6 +374,34 @@ class TorchBackend(TensorBackend):
 
         return x
 
+    def dynamic_slice_update(self, x: Any, update: Any, start: Any) -> Any:
+        """Simulates dynamic update (in-place for Torch).
+
+        Args:
+            x: Target tensor to be updated.
+            update: Tensor containing the update values.
+            start: Tuple of starting indices.
+
+        Returns:
+            The updated tensor.
+        """
+        if isinstance(start, int):
+            x[start : start + update.shape[0]] = update
+        elif isinstance(start, (list, tuple)):
+            slices = []
+            for i, s in enumerate(start):
+                slice_len = update.shape[i]
+                slices.append(slice(s, s + slice_len))
+            x[tuple(slices)] = update
+        else:
+            if hasattr(start, "item"):
+                s = start.item()
+                x[s : s + update.shape[0]] = update
+            else:
+                raise NotImplementedError(f"Unsupported start type: {type(start)}")
+
+        return x
+
     def bincount(self, x: Any, minlength: int = 0) -> Any:
         return self._torch.bincount(x, minlength=minlength)
 
@@ -345,6 +423,57 @@ class TorchBackend(TensorBackend):
 
     def tile(self, x: Any, dims: Tuple[int, ...]) -> Any:
         return self._torch.tile(x, dims)
+
+    def scan(self, f: Any, init: Any, xs: Any, length: Optional[int] = None) -> Any:
+        """PyTorch implementation of scan using a simple loop."""
+        carry = init
+        ys = []
+
+        if xs is None:
+            if length is None:
+                raise ValueError("length must be provided if xs is None")
+            xs_iter = range(length)
+        else:
+            if self.is_tensor(xs):
+                xs_iter = xs
+            else:
+                raise NotImplementedError(
+                    "Tuple xs scan not fully supported in simple torch loop yet"
+                )
+
+        for x in xs_iter:
+            carry, y = f(carry, x)
+            ys.append(y)
+
+        if not ys:
+            return carry, []
+
+        return carry, self.stack(ys)
+
+    def get_dlpack_slice(self, tensor: Any, cursor: Optional[Any] = None) -> Any:
+        from torch.utils.dlpack import to_dlpack
+
+        sliced_tensor = tensor
+        if cursor is not None:
+            if isinstance(cursor, (int, slice, tuple, list)):
+                sliced_tensor = tensor[cursor]
+            else:
+                # Fallback for other types?
+                sliced_tensor = tensor[cursor]
+
+        # Helper to extract device tuple for DLPack
+        # DLDeviceType: kDLCPU=1, kDLCUDA=2, kDLCUDAHost=3, ...
+        # Torch devices map: cpu -> (1, 0), cuda:N -> (2, N)
+        device_tuple = (1, 0)
+        if sliced_tensor.is_cuda:
+            device_tuple = (
+                2,
+                sliced_tensor.device.index
+                if sliced_tensor.device.index is not None
+                else 0,
+            )
+
+        return DLPackObject(to_dlpack(sliced_tensor), device=device_tuple)
 
 
 class JaxBackend(TensorBackend):
@@ -497,7 +626,30 @@ class JaxBackend(TensorBackend):
         return self._jnp.argwhere(x)
 
     def dynamic_slice(self, x: Any, start: Any, size: Any) -> Any:
+        # Ensure start/size are tuples for JAX compatibility
+        ndim = x.ndim
+        if isinstance(start, (int, float)) or (
+            hasattr(start, "ndim") and start.ndim == 0
+        ):
+            start = (start,) + (0,) * (ndim - 1)
+
+        if (
+            isinstance(size, (int, float)) or (hasattr(size, "ndim") and size.ndim == 0)
+        ) and ndim == 1:
+            size = (size,)
+
         return self._jax.lax.dynamic_slice(x, start, size)
+
+    def dynamic_slice_update(self, x: Any, update: Any, start: Any) -> Any:
+        # Ensure start is a tuple matching input dimensions
+        if isinstance(start, int):
+            start = (start,) + (0,) * (x.ndim - 1)
+        elif hasattr(start, "ndim") and start.ndim == 0:
+            start = (start,) + (0,) * (x.ndim - 1)
+        elif isinstance(start, (list, tuple)) and len(start) < x.ndim:
+            start = tuple(start) + (0,) * (x.ndim - len(start))
+
+        return self._jax.lax.dynamic_update_slice(x, update, start)
 
     def bincount(self, x: Any, minlength: int = 0) -> Any:
         return self._jnp.bincount(x, length=minlength)
@@ -510,6 +662,113 @@ class JaxBackend(TensorBackend):
 
     def tile(self, x: Any, dims: Tuple[int, ...]) -> Any:
         return self._jnp.tile(x, dims)
+
+    def scan(self, f: Any, init: Any, xs: Any, length: Optional[int] = None) -> Any:
+        return self._jax.lax.scan(f, init, xs, length=length)
+
+    def get_dlpack_slice(self, tensor: Any, cursor: Optional[Any] = None) -> Any:
+        # returns a zero-copy wrapper for JAX
+        return JAXViewWrapper(tensor, cursor) if cursor is not None else tensor
+
+
+class JAXViewWrapper:
+    def __init__(self, arr, slices):
+        self.arr = arr
+        self.slices = slices  # int, slice, or tuple
+
+    @property
+    def __cuda_array_interface__(self):
+        if not hasattr(self.arr, "__cuda_array_interface__"):
+            raise AttributeError
+        desc = self.arr.__cuda_array_interface__.copy()
+        self._apply_slicing(desc)
+        return desc
+
+    @property
+    def __array_interface__(self):
+        if not hasattr(self.arr, "__array_interface__"):
+            raise AttributeError
+        desc = self.arr.__array_interface__.copy()
+        self._apply_slicing(desc)
+        return desc
+
+    def _apply_slicing(self, desc):
+        shape = desc["shape"]
+        strides = desc.get("strides")
+
+        if strides is None:
+            dtype_str = desc["typestr"]
+            itemsize = int(dtype_str[2:])
+
+            strides = []
+            st = itemsize
+            for d in reversed(shape):
+                strides.append(st)
+                st *= d
+            strides = tuple(reversed(strides))
+
+        if isinstance(self.slices, int):
+            key = (slice(0, self.slices, 1),)
+        elif isinstance(self.slices, slice):
+            key = (self.slices,)
+        elif isinstance(self.slices, (tuple, list)):
+            key = tuple(self.slices)
+        else:
+            raise ValueError(f"Unsupported slice type: {type(self.slices)}")
+
+        new_shape = []
+        new_strides = []
+        ptr_offset = 0
+        dim_idx = 0
+
+        for k in key:
+            if isinstance(k, int):
+                d_len = shape[dim_idx]
+                d_stride = strides[dim_idx]
+
+                idx = k + d_len if k < 0 else k
+                if idx < 0 or idx >= d_len:
+                    raise IndexError(
+                        f"Index {k} out of bounds for dim {dim_idx} size {d_len}"
+                    )
+
+                ptr_offset += idx * d_stride
+                dim_idx += 1
+
+            elif isinstance(k, slice):
+                d_len = shape[dim_idx]
+                d_stride = strides[dim_idx]
+
+                start, stop, step = k.indices(d_len)
+
+                if step > 0:
+                    new_len = (stop - start + step - 1) // step
+                    new_len = max(0, new_len)
+                else:
+                    new_len = len(range(start, stop, step))
+
+                new_shape.append(new_len)
+                new_strides.append(d_stride * step)
+
+                ptr_offset += start * d_stride
+                dim_idx += 1
+            else:
+                raise NotImplementedError(
+                    f"Slice type {type(k)} not supported in JAX zero-copy view"
+                )
+
+        # Append remaining dims
+        while dim_idx < len(shape):
+            new_shape.append(shape[dim_idx])
+            new_strides.append(strides[dim_idx])
+            dim_idx += 1
+
+        # Update desc
+        desc["shape"] = tuple(new_shape)
+        desc["strides"] = tuple(new_strides)
+
+        ptr, readonly = desc["data"]
+        desc["data"] = (ptr + ptr_offset, False)  # Force writeable as per previous hack
 
 
 _BACKEND: Optional[TensorBackend] = None

@@ -397,7 +397,7 @@ def test_slice_propagates_explicit_global_indices():
     data = backend.tensor([10.0, 20.0, 30.0, 40.0, 50.0])
     indices = backend.tensor([100, 101, 102, 103, 104], dtype=backend.int32())
 
-    tensor = TransportTensor(data, global_indices=indices)
+    tensor = TransportTensor(data, indices=indices)
     sliced = tensor.slice(1, 4)
 
     assert backend.equal(
@@ -414,7 +414,7 @@ def test_slice_propagates_descriptor():
     data = backend.tensor([10.0, 20.0, 30.0, 40.0, 50.0])
     desc = IndexDescriptor.chunk(start=50, count=5)
 
-    tensor = TransportTensor(data, index_descriptor=desc)
+    tensor = TransportTensor(data, indices=desc)
     sliced = tensor.slice(1, 4)
 
     # Should have a derived descriptor, not a materialized tensor
@@ -436,7 +436,7 @@ def test_dynamic_slice_propagates_descriptor():
     data = backend.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
     desc = IndexDescriptor.chunk(start=0, count=6)
 
-    tensor = TransportTensor(data, index_descriptor=desc)
+    tensor = TransportTensor(data, indices=desc)
     start = backend.tensor(2, dtype=backend.int32())
     size = backend.tensor(3, dtype=backend.int32())
     sliced = tensor.dynamic_slice(start, size)
@@ -454,7 +454,7 @@ def test_gather_propagates_global_indices():
     data = backend.tensor([10.0, 20.0, 30.0, 40.0])
     desc = IndexDescriptor.chunk(start=100, count=4)
 
-    tensor = TransportTensor(data, index_descriptor=desc)
+    tensor = TransportTensor(data, indices=desc)
     perm = backend.tensor([3, 1, 0, 2], dtype=backend.int32())
     gathered = tensor.gather(perm)
 
@@ -470,7 +470,7 @@ def test_gather_propagates_explicit_indices():
     data = backend.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
     indices = backend.tensor([10, 20, 30], dtype=backend.int32())
 
-    tensor = TransportTensor(data, global_indices=indices)
+    tensor = TransportTensor(data, indices=indices)
     perm = backend.tensor([2, 0], dtype=backend.int32())
     gathered = tensor.gather(perm)
 
@@ -501,7 +501,7 @@ def test_descriptor_serialization():
     data = backend.tensor([1.0, 2.0, 3.0])
     desc = IndexDescriptor.chunk(start=42, count=3)
 
-    tensor = TransportTensor(data, index_descriptor=desc)
+    tensor = TransportTensor(data, indices=desc)
 
     serialized = pickle.dumps(tensor)
     restored = pickle.loads(serialized)
@@ -523,7 +523,7 @@ def test_slice_then_gather_chain():
     data = backend.tensor([10.0, 20.0, 30.0, 40.0, 50.0, 60.0])
     desc = IndexDescriptor.chunk(start=0, count=6)
 
-    tensor = TransportTensor(data, index_descriptor=desc)
+    tensor = TransportTensor(data, indices=desc)
 
     # slice [1:5] → descriptor (start=1, count=4)
     sliced = tensor.slice(1, 5)
@@ -538,3 +538,28 @@ def test_slice_then_gather_chain():
     assert gathered.index_descriptor is None
     expected = backend.tensor([3, 1], dtype=backend.int32())
     assert backend.equal(gathered.global_indices, expected)
+
+
+def test_from_tensor_and_slice():
+    """Verify TransportTensor.from_tensor with slice objects."""
+    backend = get_backend()
+    data = backend.tensor([10.0, 20.0, 30.0, 40.0])
+
+    # Using slice for chunk descriptor
+    tensor = TransportTensor.from_tensor(data, indices=slice(100, 104))
+
+    assert tensor.index_descriptor is not None
+    assert tensor.index_descriptor.start == 100
+    assert tensor.index_descriptor.count == 4
+    assert tensor.index_descriptor.step == 1
+
+    # The materialized global indices should match
+    expected = backend.tensor([100, 101, 102, 103], dtype=backend.int32())
+    assert backend.equal(tensor.global_indices, expected)
+
+    # Using slice for cyclic descriptor
+    tensor_strided = TransportTensor.from_tensor(data, indices=slice(10, None, 2))
+    assert tensor_strided.index_descriptor is not None
+    assert tensor_strided.index_descriptor.start == 10
+    assert tensor_strided.index_descriptor.step == 2
+    assert tensor_strided.index_descriptor.count == 4

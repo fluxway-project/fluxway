@@ -15,12 +15,14 @@ from fluxway.transport.mesh import DeviceMesh
 
 
 class PartitionSpec:
-    """Maps tensor dimensions to mesh axes by position.
+    """Maps tensor dimensions to device mesh axes by position.
+
+    This specification aligns target tensor dimensions with distributed topology axes.
 
     Examples:
-        P('x')           → dim 0 sharded on axis 'x'
-        P(None, 'x')     → dim 1 sharded on axis 'x'
-        P(('x', 'y'))    → dim 0 sharded on axes ('x', 'y') jointly
+        P('x')           -> dimension 0 is sharded along device axis 'x'
+        P(None, 'x')     -> dimension 1 is sharded along device axis 'x'
+        P(('x', 'y'))    -> dimension 0 is jointly sharded along axes ('x', 'y')
     """
 
     def __init__(self, *specs: Optional[Union[str, Tuple[str, ...]]]):
@@ -59,7 +61,11 @@ P = PartitionSpec
 
 
 class PartitionStrategy:
-    """Base partition strategy. Encapsulates partitioning logic + metadata."""
+    """Base class for partitioning strategies.
+
+    Encapsulates core algorithm for determining rank assignments (partitioning logic)
+    along with derived metadata indicating how the topology should be interpreted.
+    """
 
     is_content_addressable: bool = False
 
@@ -196,7 +202,12 @@ def _ravel_multi_index(coords, sizes):
 
 @dataclass
 class Layout:
-    """Data distribution description."""
+    """Data distribution description describing physical placement on a DeviceMesh.
+
+    Combines the tensor characteristics (e.g. data shape, routing indices) with
+    the distributed architecture details (mesh, strategy) to fully describe
+    how data is or should be laid out across the cluster.
+    """
 
     dim: int
     data_shape: Tuple[int, ...]
@@ -207,7 +218,7 @@ class Layout:
     is_static: bool = True
     sharding_axes: Optional[Tuple[str, ...]] = None
     strategy: Optional[PartitionStrategy] = None
-    replication_axes: Optional[List[str]] = None
+    replication_axes: Optional[Tuple[str, ...]] = None
     replication_factor: int = 1
 
     @property
@@ -298,7 +309,11 @@ class Layout:
 
 
 class ShardingSpec:
-    """Algebraic partitioning description. Immutable value object."""
+    """Algebraic partitioning description linking a stragety, mesh, and specific layout.
+
+    This immutable value object contains all static information required to generate
+    a concrete layout execution plan, reducing overhead during dynamic evaluations.
+    """
 
     def __init__(
         self, strategy: PartitionStrategy, mesh: DeviceMesh, partition: PartitionSpec

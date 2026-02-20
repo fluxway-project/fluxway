@@ -53,12 +53,12 @@ class TestDataDistributor(unittest.TestCase):
         dist = AsyncDataDistributor(self.local_rank)
 
         # Mock async send_fn
-        async def async_send_fn(device_id, payload):
+        async def async_send_fn(device_id, tensors, counts):
             await asyncio.sleep(0.01)
             return f"ok_{device_id}"
 
         async def run_test():
-            results = await dist.distribute(
+            results, _ = await dist.distribute(
                 local_data=self.transport_tensor,
                 source=self.src_spec,
                 target=self.dst_spec,

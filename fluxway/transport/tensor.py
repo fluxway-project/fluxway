@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from enum import IntEnum
 from typing import List, Any, Optional
 from fluxway.transport.backend import get_backend
 
@@ -8,14 +9,21 @@ from fluxway.transport.backend import get_backend
 # ============================================================
 
 
+class IndexPattern(IntEnum):
+    CONTIGUOUS = 0
+    STRIDED = 1
+
+
 @dataclass(frozen=True)
 class IndexDescriptor:
     """Compact O(1) representation of regular index patterns.
 
-    Avoids materializing full index tensors for chunk/cyclic sharding.
+    Provides a lightweight representation for indexing operations.
+    By avoiding the materialization of full index tensors, it improves performance,
+    especially for chunk and cyclic sharding patterns.
     """
 
-    kind: str  # "chunk" | "cyclic"
+    pattern: IndexPattern
     start: int = 0
     step: int = 1
     count: int = 0
@@ -23,37 +31,61 @@ class IndexDescriptor:
     def materialize(self) -> Any:
         """Expand to a full index tensor (lazy evaluation endpoint)."""
         backend = get_backend()
-        if self.kind == "chunk":
+        if self.pattern == IndexPattern.CONTIGUOUS:
             return backend.arange(
                 self.start, self.start + self.count, dtype=backend.int32()
             )
-        elif self.kind == "cyclic":
+        elif self.pattern == IndexPattern.STRIDED:
             return backend.arange(
                 self.start,
                 self.start + self.step * self.count,
                 step=self.step,
                 dtype=backend.int32(),
             )
-        raise ValueError(f"Cannot materialize kind={self.kind}")
+        raise ValueError(f"Cannot materialize pattern={self.pattern}")
 
     def slice(self, start: int, end: int) -> "IndexDescriptor":
         """Derive descriptor for a sub-range. O(1) for chunk/cyclic."""
         size = end - start
-        if self.kind == "chunk":
-            return IndexDescriptor("chunk", self.start + start, 1, size)
-        elif self.kind == "cyclic":
+        if self.pattern == IndexPattern.CONTIGUOUS:
+            return IndexDescriptor(IndexPattern.CONTIGUOUS, self.start + start, 1, size)
+        elif self.pattern == IndexPattern.STRIDED:
             return IndexDescriptor(
-                "cyclic", self.start + start * self.step, self.step, size
+                IndexPattern.STRIDED, self.start + start * self.step, self.step, size
             )
-        raise ValueError(f"Cannot slice kind={self.kind}")
+        raise ValueError(f"Cannot slice pattern={self.pattern}")
 
     @staticmethod
     def chunk(start: int, count: int) -> "IndexDescriptor":
-        return IndexDescriptor("chunk", start=start, step=1, count=count)
+        return IndexDescriptor(
+            IndexPattern.CONTIGUOUS, start=start, step=1, count=count
+        )
 
     @staticmethod
     def cyclic(start: int, step: int, count: int) -> "IndexDescriptor":
-        return IndexDescriptor("cyclic", start=start, step=step, count=count)
+        return IndexDescriptor(
+            IndexPattern.STRIDED, start=start, step=step, count=count
+        )
+
+    @staticmethod
+    def from_slice(s: slice, size: int) -> "IndexDescriptor":
+        start = s.start if s.start is not None else 0
+        step = s.step if s.step is not None else 1
+        stop = s.stop if s.stop is not None else size
+
+        if step > 0:
+            count = max(0, (stop - start + step - 1) // step)
+        else:
+            count = max(0, (start - stop - step - 1) // (-step))
+
+        if step == 1:
+            return IndexDescriptor(
+                IndexPattern.CONTIGUOUS, start=start, step=1, count=count
+            )
+        else:
+            return IndexDescriptor(
+                IndexPattern.STRIDED, start=start, step=step, count=count
+            )
 
 
 # ============================================================
@@ -69,23 +101,72 @@ except ImportError:
 
 
 class TransportTensor:
-    """Unified tensor wrapper for distributed transport.
+    """Unified tensor wrapper for distributed data transport operations.
 
-    Supports both dense (flat_values multi-dim, empty splits) and
-    ragged (flat_values 1D, nested_splits struct) layouts.
+    This class abstracts the representation of both dense and ragged tensor layouts.
+    Dense tensors are represented via multi-dimensional `flat_values` and empty splits,
+    while ragged tensors use 1D `flat_values` accompanied by a `nested_splits` structure.
     """
 
     def __init__(
         self,
         flat_values: Any,
         nested_splits: Optional[List[Any]] = None,
-        global_indices: Any = None,
-        index_descriptor: Optional[IndexDescriptor] = None,
+        indices: Optional[Any] = None,
     ):
         self._flat_values = flat_values
         self._nested_splits = nested_splits if nested_splits is not None else []
-        self._global_indices = global_indices  # Explicit tensor, or None
-        self._index_descriptor = index_descriptor  # Compact O(1) representation
+
+        if isinstance(indices, IndexDescriptor):
+            self._global_indices = None
+            self._index_descriptor = indices
+        elif isinstance(indices, slice):
+            backend = get_backend()
+            if not self._nested_splits:
+                if isinstance(self._flat_values, list):
+                    count = len(self._flat_values)
+                else:
+                    count = int(backend.shape(self._flat_values)[0])
+            else:
+                if isinstance(self._nested_splits[0], list):
+                    count = len(self._nested_splits[0]) - 1
+                else:
+                    count = int(backend.shape(self._nested_splits[0])[0]) - 1
+
+            start = indices.start if indices.start is not None else 0
+            step = indices.step if indices.step is not None else 1
+            if indices.stop is not None:
+                expected_count = (
+                    max(0, (indices.stop - start + step - 1) // step)
+                    if step > 0
+                    else max(0, (start - indices.stop - step - 1) // (-step))
+                )
+                if expected_count != count:
+                    raise ValueError(
+                        f"Slice implies count={expected_count}, but tensor has local count={count}"
+                    )
+
+            if step == 1:
+                self._index_descriptor = IndexDescriptor.chunk(start, count)
+            else:
+                self._index_descriptor = IndexDescriptor.cyclic(start, step, count)
+            self._global_indices = None
+        else:
+            self._global_indices = indices
+            self._index_descriptor = None
+
+    @classmethod
+    def from_tensor(
+        cls, tensor: Any, indices: Optional[Any] = None
+    ) -> "TransportTensor":
+        """Creates a dense TransportTensor directly from a multi-dimensional tensor.
+
+        Args:
+            tensor: The dense data tensor.
+            indices: Global indices mapping. Can be a materialized tensor, an explicit
+                     IndexDescriptor, or a python `slice` object for O(1) regular patterns.
+        """
+        return cls(flat_values=tensor, nested_splits=[], indices=indices)
 
     @property
     def flat_values(self) -> Any:
@@ -130,9 +211,11 @@ class TransportTensor:
 
     @classmethod
     def from_lists(cls, data: List[Any], dtype=None) -> "TransportTensor":
-        """
-        Creates a TransportTensor from a nested list.
-        Automatically optimizes uniform-shaped data as dense tensors.
+        """Creates a TransportTensor from a nested list.
+
+        This constructor automatically inspects the input structure. If the data is
+        uniformly shaped, it optimizes the representation by creating a dense tensor.
+        Otherwise, it constructs a ragged tensor with computed splits.
         """
         backend = get_backend()
 
@@ -265,7 +348,9 @@ class TransportTensor:
 
         return None, None
 
-    def dynamic_slice(self, start: Any, size_tensor: Any) -> "TransportTensor":
+    def dynamic_slice(
+        self, start: Any, size_tensor: Any, unsafe: bool = False
+    ) -> "TransportTensor":
         """Slice with tensor arguments using zero-sync backend primitives."""
         backend = get_backend()
 
@@ -284,16 +369,22 @@ class TransportTensor:
                 start, size_tensor
             )
             return TransportTensor(
-                sliced_data, [], global_indices=new_indices, index_descriptor=new_desc
+                sliced_data,
+                [],
+                indices=new_desc if new_desc is not None else new_indices,
             )
 
         else:
             # Ragged case: requires processing nested splits.
             # We can now use slice() directly with tensors, as it avoids synchronization.
-            return self.slice(start, start + size_tensor)
+            return self.slice(start, start + size_tensor, unsafe=unsafe)
 
     def slice(
-        self, start: Any, end: Any, static_shape: Optional[Any] = None
+        self,
+        start: Any,
+        end: Any,
+        static_shape: Optional[Any] = None,
+        unsafe: bool = False,
     ) -> "TransportTensor":
         """Slices the tensor along the first dimension.
 
@@ -303,8 +394,18 @@ class TransportTensor:
             static_shape: Optional static shape constraint for JIT/vmap.
                           Can be an int (L0 length) or a tuple (L0 length, Values length, ...).
                           If tuple, enables JIT safe slicing for ragged tensors by padding values.
+            unsafe: If True, skips bounds checking and assumes indices are valid and within bounds.
+                    Enable this only when indices are guaranteed correct (e.g. from planner).
         """
         backend = get_backend()
+
+        # Check for integer/scalar optimization path
+        is_start_int = isinstance(start, int) or (
+            hasattr(start, "shape") and start.ndim == 0 and hasattr(start, "item")
+        )
+        is_end_int = isinstance(end, int) or (
+            hasattr(end, "shape") and end.ndim == 0 and hasattr(end, "item")
+        )
 
         # Parse static shape
         l0_static = None
@@ -320,32 +421,111 @@ class TransportTensor:
                 l0_static = static_shape
 
         # Input normalization for Tensor operations
+        # If unsafe is True and inputs are ints, we keep them as ints for native slicing
+        if not unsafe:
+            if not backend.is_tensor(start):
+                start = backend.tensor(start, dtype=backend.int32())
+            if not backend.is_tensor(end):
+                end = backend.tensor(end, dtype=backend.int32())
+
+        if not self._nested_splits:
+            # Dense Slice
+            size = end - start
+            return self.dynamic_slice(start, size, unsafe=unsafe)
+
+        # Ragged implementation
+        # Slicing along Level 0
+        l0_splits = self._nested_splits[0]
+
+        # Optimization: Use native slicing for integers if unsafe or backend supports it
+        # This is CRITICAL for Eager mode performance to avoid JIT/Graph tracing overhead.
+        if unsafe and is_start_int and is_end_int:
+            # Fast path for known valid integer indices
+            s = int(start)
+            e = int(end)
+
+            # Slice L0 splits directly
+            # For ragged, we need splits[start : end + 1]
+            spl_slice = l0_splits[s : e + 1]
+
+            # Normalize splits (subtract offset)
+            offset = spl_slice[0]
+            new_l0_splits = spl_slice - offset
+
+            new_nested_splits = [new_l0_splits]
+
+            # Determined range for next level
+            # range_start = l0_splits[s] -> which is offset (already fetched)
+            range_start = offset
+            range_end = l0_splits[e]
+
+            curr_start = range_start
+            curr_end = range_end
+
+            # Loop for nested levels
+            for i in range(1, len(self._nested_splits)):
+                curr_splits = self._nested_splits[i]
+
+                # For next levels, use dynamic slice logic but try to keep it cheap
+                count = curr_end - curr_start + 1
+                new_spl = backend.dynamic_slice(curr_splits, curr_start, count)
+
+                # Normalize
+                off = backend.take(new_spl, backend.tensor(0, dtype=backend.int32()))
+                new_spl = new_spl - off
+
+                new_nested_splits.append(new_spl)
+
+                # Update next range
+                curr_start = backend.take(curr_splits, curr_start)
+                curr_end = backend.take(curr_splits, curr_end)
+
+            # Slice Values
+            val_count = curr_end - curr_start
+            val_slice = backend.dynamic_slice(self._flat_values, curr_start, val_count)
+
+            # Propagate indices
+            new_indices = None
+            new_desc = None
+            if self._index_descriptor is not None:
+                new_desc = self._index_descriptor.slice(s, e)
+            elif self._global_indices is not None:
+                # Fast slice for indices
+                new_indices = self._global_indices[s:e]
+
+            return TransportTensor(
+                val_slice,
+                new_nested_splits,
+                indices=new_desc if new_desc is not None else new_indices,
+            )
+
+        # -------------------------------------------------------------------------
+        # Standard / JIT-Safe Path
+        # -------------------------------------------------------------------------
+
+        # Make sure inputs are tensors for safe path
         if not backend.is_tensor(start):
             start = backend.tensor(start, dtype=backend.int32())
         if not backend.is_tensor(end):
             end = backend.tensor(end, dtype=backend.int32())
 
-        if not self._nested_splits:
-            # Dense Slice
-            size = end - start
-            return self.dynamic_slice(start, size)
-
-        # Ragged implementation
-        # Slicing along Level 0
-        l0_splits = self._nested_splits[0]
         l0_len = backend.shape(l0_splits)[0] - 1
         l0_len_t = backend.tensor(l0_len, dtype=backend.int32())
         zero_t = backend.tensor(0, dtype=backend.int32())
 
-        # Clamp start/end without CPU sync
-        start = backend.where(start < zero_t, zero_t, start)
-        start = backend.where(start > l0_len_t, l0_len_t, start)
+        # Clamp start/end without CPU sync (only if not unsafe)
+        # If unsafe=True, we rely on caller guarantee and skip clamping to avoid kernels.
+
+        if not unsafe:
+            start = backend.where(start < zero_t, zero_t, start)
+            start = backend.where(start > l0_len_t, l0_len_t, start)
 
         if static_shape is None:
-            end = backend.where(end > l0_len_t, l0_len_t, end)
-            end = backend.where(end < start, start, end)
+            if not unsafe:
+                end = backend.where(end > l0_len_t, l0_len_t, end)
+                end = backend.where(end < start, start, end)
 
-            # Dynamic shape path
+            # Dynamic shape path (using arange)
             l0_indices = backend.arange(start, end + 1, dtype=backend.int32())
             spl_slice = backend.take(l0_splits, l0_indices)
         else:
@@ -429,9 +609,17 @@ class TransportTensor:
         return TransportTensor(
             val_slice,
             new_nested_splits,
-            global_indices=new_indices,
-            index_descriptor=new_desc,
+            indices=new_desc if new_desc is not None else new_indices,
         )
+
+    def as_dlpack_slice(self, cursor: Optional[Any] = None) -> Any:
+        """Returns a zero-copy DLPack-compatible slice of the tensor.
+
+        Args:
+             cursor: Slice argument (e.g. length of first dimension)
+        """
+        backend = get_backend()
+        return backend.get_dlpack_slice(self._flat_values, cursor)
 
     def compact(self) -> "TransportTensor":
         """Trims internal padding to match actual data size.
@@ -468,8 +656,9 @@ class TransportTensor:
             return TransportTensor(
                 new_values,
                 self._nested_splits,
-                global_indices=self._global_indices,
-                index_descriptor=self._index_descriptor,
+                indices=self._index_descriptor
+                if self._index_descriptor is not None
+                else self._global_indices,
             )
         return self
 
@@ -487,7 +676,7 @@ class TransportTensor:
         if not self._nested_splits:
             # Dense case (can be multi-dimensional)
             gathered = backend.take(self._flat_values, indices)
-            return TransportTensor(gathered, [], global_indices=new_global_indices)
+            return TransportTensor(gathered, [], indices=new_global_indices)
 
         current_indices = indices
         new_splits = []
@@ -548,9 +737,7 @@ class TransportTensor:
         # Finally gather flat values
         new_values = backend.take(self._flat_values, current_indices)
 
-        return TransportTensor(
-            new_values, new_splits, global_indices=new_global_indices
-        )
+        return TransportTensor(new_values, new_splits, indices=new_global_indices)
 
     def __reduce__(self):
         """Serialization interface for pickle/Ray."""
@@ -580,8 +767,7 @@ def _reconstruct_transport_tensor(
     return TransportTensor(
         flat_values,
         nested_splits,
-        global_indices=global_indices,
-        index_descriptor=index_descriptor,
+        indices=index_descriptor if index_descriptor is not None else global_indices,
     )
 
 
@@ -597,8 +783,7 @@ if _JAX_AVAILABLE:
         return TransportTensor(
             flat_values,
             nested_splits,
-            global_indices=global_indices,
-            index_descriptor=aux_data[0],
+            indices=aux_data[0] if aux_data[0] is not None else global_indices,
         )
 
     jax.tree_util.register_pytree_node(TransportTensor, _tt_flatten, _tt_unflatten)

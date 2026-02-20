@@ -118,15 +118,33 @@ class DeviceMesh:
 
     def coordinate_to_device(self, coords: Tuple[Any, ...]) -> Any:
         """Vectorized get_rank. coords elements can be tensors or numpy arrays."""
+        # Ensure we use JAX-compatible indexing if device_ids is a Tracer
+        # backend.take or simple indexing should work.
         return self.device_ids[coords]
 
     def unravel_index(self, ranks: Any) -> Tuple[Any, ...]:
         """Convert physical ranks to multi-dimensional logical coordinates."""
-        return np.unravel_index(ranks, self.shape)
+        from fluxway.transport.backend import get_backend
+
+        try:
+            backend = get_backend()
+            return backend.unravel_index(ranks, self.shape)
+        except Exception:
+            # Fallback for simple numpy usage if backend fails or not set
+            return np.unravel_index(ranks, self.shape)
 
     def flatten(self) -> List[int]:
         """Return a flattened list of physical device IDs."""
-        return self.device_ids.flatten().tolist()
+        from fluxway.transport.backend import get_backend
+
+        try:
+            backend = get_backend()
+            # If device_ids is tracer, to_numpy will fail, but flatten() usage implies host-side often.
+            # If used in JIT, we return list? No, JIT can't return list of ints derived from tracers.
+            # Assume flatten is for eager use.
+            return backend.to_numpy(self.device_ids).flatten().tolist()
+        except Exception:
+            return self.device_ids.flatten().tolist()
 
     def __repr__(self) -> str:
         return f"DeviceMesh(shape={self.shape}, axis_names={self.axis_names})"
@@ -134,3 +152,38 @@ class DeviceMesh:
     def to_backend_mesh(self, backend_engine: Any = None):
         """Convert to the mesh representation of the corresponding backend framework (e.g. JAX Mesh or PyTorch DeviceMesh)."""
         raise NotImplementedError("Backend conversion not implemented yet.")
+
+
+# JAX Pytree Registration
+try:
+    import jax
+
+    def _dm_flatten(v):
+        children = (v.device_ids,)
+        aux_data = (v.shape, v.axis_names)
+        return children, aux_data
+
+    def _dm_unflatten(aux_data, children):
+        # Reconstruct without invoking __init__ (avoids numpy conversion of Tracers)
+        obj = object.__new__(DeviceMesh)
+        obj.shape, obj.axis_names = aux_data
+        obj.device_ids = children[0]
+
+        # Restore derived maps (static)
+        obj.axis_map = dict(zip(obj.axis_names, range(len(obj.axis_names))))
+        obj.size_map = dict(zip(obj.axis_names, obj.shape))
+
+        # _inverse_map relies on iterating device_ids.
+        # If device_ids is a Tracer, we CANNOT iterate it.
+        # So _inverse_map will be empty or invalid inside JIT.
+        # BUT _inverse_map is only used by `get_coordinate` (scalar) and `get_rank` (via logic).
+        # Vectorized methods (unravel_index, coordinate_to_device) use tensor ops (backend)
+        # and do NOT use _inverse_map.
+        # So it is safe to skip _inverse_map construction inside JIT.
+        obj._inverse_map = {}
+
+        return obj
+
+    jax.tree_util.register_pytree_node(DeviceMesh, _dm_flatten, _dm_unflatten)
+except ImportError:
+    pass

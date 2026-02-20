@@ -9,8 +9,7 @@ from .sharding import (
     GreedyPartition,
 )
 from .planner import TransportPlanner, TransportPlan
-from .payload import TransportPayload
-from .communication import DataDistributor, DataReceiverMixin
+from .communication import DataDistributor, TransportReceiver
 
 __all__ = [
     "TransportTensor",
@@ -23,7 +22,6 @@ __all__ = [
     "GreedyPartition",
     "TransportPlanner",
     "TransportPlan",
-    "TransportPayload",
     "DataDistributor",
-    "DataReceiverMixin",
+    "TransportReceiver",
 ]
