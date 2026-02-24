@@ -63,10 +63,7 @@ def ensure_logging_configured(
     # Make logs visible even in Ray worker processes.
     # If force=True, this overrides any existing handlers in the process.
     logging.basicConfig(
-        level=resolved_level,
-        format=log_format,
-        datefmt=datefmt,
-        force=resolved_force,
+        level=resolved_level, format=log_format, datefmt=datefmt, force=resolved_force
     )
 
     # Ensure the root logger and all existing handlers honour the resolved level.
@@ -89,7 +86,9 @@ def ensure_logging_configured(
         pass
 
 
-def ensure_logger_info_visible(logger: logging.Logger, *, level: int = logging.INFO) -> None:
+def ensure_logger_info_visible(
+    logger: logging.Logger, *, level: int = logging.INFO
+) -> None:
     """
     Ensure the given logger will emit INFO logs in this process.
 
@@ -128,4 +127,3 @@ def _parse_log_level(value: str | None) -> int:
 
     name = raw.upper()
     return getattr(logging, name, logging.INFO)
-

@@ -1,9 +1,8 @@
 """Control Plane: Core coordination layer for the training framework."""
 
 # Ensure INFO logs are visible even when importing this subpackage directly.
-from ..common.utils.logging import ensure_logging_configured  # noqa: E402
+from ..common.utils.logging import ensure_logging_configured
 
-ensure_logging_configured()
 
 from .graph import GraphParser, Builder
 from .scheduler import Scheduler
@@ -36,3 +35,5 @@ __all__ = [
     "ControllerActor",
     "create_controller",
 ]
+
+ensure_logging_configured()

@@ -78,8 +78,10 @@ class DeviceMesh:
             )
 
         self.axis_names = tuple(axis_names)
-        self.axis_map = dict(zip(self.axis_names, range(len(self.axis_names))))
-        self.size_map = dict(zip(self.axis_names, self.shape))
+        self.axis_map = dict(
+            zip(self.axis_names, range(len(self.axis_names)), strict=False)
+        )
+        self.size_map = dict(zip(self.axis_names, self.shape, strict=False))
 
         # Inverse map: rank -> coordinates (cached)
         self._inverse_map = {}
@@ -170,8 +172,10 @@ try:
         obj.device_ids = children[0]
 
         # Restore derived maps (static)
-        obj.axis_map = dict(zip(obj.axis_names, range(len(obj.axis_names))))
-        obj.size_map = dict(zip(obj.axis_names, obj.shape))
+        obj.axis_map = dict(
+            zip(obj.axis_names, range(len(obj.axis_names)), strict=False)
+        )
+        obj.size_map = dict(zip(obj.axis_names, obj.shape, strict=False))
 
         # _inverse_map relies on iterating device_ids.
         # If device_ids is a Tracer, we CANNOT iterate it.

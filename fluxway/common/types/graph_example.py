@@ -1,3 +1,9 @@
+import fluxway
+import torch
+from typing import Optional
+from enum import Enum
+from fluxway import Builder
+
 ## 用户构建 graph 的相关 api 示例
 # 1. 定义数据类型：
 #   ActionState1/ActionState2/Gradient2/ActionState3/Gradient3 均为用户自定义的数据传输类，
@@ -5,43 +11,34 @@
 #   其中 state_argument 表示状态参数，tensor_argument 表示张量参数。分别对应两种传输模式，对应文档 ARCHITECTURE.md 3.2.2 所说的双流汇聚传输策略。
 #   state_argument 指定的参数通过控制流传递，tensor_argument 指定的参数通过数据流传递。
 
-@fluxway.data_type{
-    state_argument: ["id"],
-    tensor_argument: ["tensor"]
-    static_argument: ["static"]
-}
+
+@fluxway.data_type(
+    state_argument=["id"], tensor_argument=["tensor"], static_argument=["static"]
+)
 class ActionState1:
     id: int
     tensor: torch.Tensor
 
-@fluxway.data_type{
-    state_argument: ["id"],
-    tensor_argument: ["tensor"]
-}
+
+@fluxway.data_type(state_argument=["id"], tensor_argument=["tensor"])
 class ActionState2:
     id: int
     tensor: torch.Tensor
 
-@fluxway.data_type{
-    state_argument: ["id"],
-    tensor_argument: ["tensor"]
-}
+
+@fluxway.data_type(state_argument=["id"], tensor_argument=["tensor"])
 class Gradient2:
     id: int
     tensor: torch.Tensor
 
-@fluxway.data_type{
-    state_argument: ["id"],
-    tensor_argument: ["tensor"]
-}
+
+@fluxway.data_type(state_argument=["id"], tensor_argument=["tensor"])
 class ActionState3:
     id: int
     tensor: torch.Tensor
 
-@fluxway.data_type{
-    state_argument: ["id"],
-    tensor_argument: ["tensor"]
-}
+
+@fluxway.data_type(state_argument=["id"], tensor_argument=["tensor"])
 class Gradient3:
     id: int
     tensor: torch.Tensor
@@ -63,36 +60,35 @@ class Gradient3:
 #   state_argument 指定的参数通过控制流传递，tensor_argument 指定的参数通过数据流传递。
 #   如果不是用 @flux.data_type 注解的数据类型，则默认通过控制流传递。
 
-@fluxway.spmd{
-    resource: {
-        nums_cpu: int,
-        nums_gpu: int,
-        memory: int,
-        cnt: int
-    },
-    mesh: Dict[PartitionType, int]
-    input_sharding: Dict[PartitionType, int],
-    output_sharding: Dict[PartitionType, int],
-    max_async_steps: 10,
-    params_update_steps: 1,
-}
+
+@fluxway.spmd(
+    resource={"nums_cpu": 1, "nums_gpu": 0, "memory": 1, "cnt": 1},
+    mesh_axis_names=("dp",),
+    mesh_axis_shapes=(1,),
+    max_async_steps=10,
+    params_update_steps=1,
+)
+class DataSource:
+    pass
+
+
+def read_from_datasource(ds: DataSource) -> ActionState1:
+    return ActionState1(id=1, tensor=torch.tensor([1.0]))
+
+
 class SPMD1:
     @fluxway.operator(name="forward")
     def forward(self, datasource: DataSource) -> ActionState1:
         return read_from_datasource(datasource)
 
 
-@fluxway.spmd{
-    resource: {
-        nums_cpu: int,
-        nums_gpu: int,
-        memory: int,
-        cnt: int
-    },
-    mesh: Dict[PartitionType, int]
-    max_async_steps: 10,
-    params_update_steps: 1,
-}
+@fluxway.spmd(
+    resource={"nums_cpu": 1, "nums_gpu": 0, "memory": 1, "cnt": 1},
+    mesh_axis_names=("dp",),
+    mesh_axis_shapes=(1,),
+    max_async_steps=10,
+    params_update_steps=1,
+)
 class SPMD2:
     @fluxway.operator(name="forward")
     def forward(self, state: ActionState1) -> ActionState2:
@@ -114,12 +110,7 @@ class PartitionType(str, Enum):
 
 
 @fluxway.spmd(
-    resource={
-        "nums_cpu": 4,
-        "nums_gpu": 2,
-        "memory": 16,
-        "cnt": 1
-    },
+    resource={"nums_cpu": 4, "nums_gpu": 2, "memory": 16, "cnt": 1},
     mesh_axis_names=("dp", "tp"),
     mesh_axis_shapes=(4, 2),
     max_async_steps=10,
@@ -130,15 +121,15 @@ class SPMD3:
         name="forward",
         input_sharding={
             "id": {"type": "dense", "axis": [None]},  # Replicate
-            "tensor": {"type": "dense", "axis": ["dp"]}  # Shard along dp axis
+            "tensor": {"type": "dense", "axis": ["dp"]},  # Shard along dp axis
         },
         output_sharding={
             "id": {"type": "dense", "axis": [None]},  # Replicate
-            "tensor": {"type": "dense", "axis": ["dp"]}  # Shard along dp axis
+            "tensor": {"type": "dense", "axis": ["dp"]},  # Shard along dp axis
             # For sparse sharding, use fn:
             # "tensor": {"type": "sparse", "axis": ["dp"], "fn": my_routing_fn}
             # where fn(tensor, tensor_meta, post_spec) -> List[(slice, rank)]
-        }
+        },
     )
     def forward(self, state: ActionState1) -> ActionState3:
         return ActionState3(id=state.id, tensor=state.tensor)
@@ -147,11 +138,14 @@ class SPMD3:
     def backward(self, state: ActionState3) -> Optional[Gradient3]:
         pass
 
+
 def check(state: ActionState1) -> bool:
     return state.id == 1
 
+
 def check1(state: ActionState1) -> bool:
     return state.id != 1
+
 
 # 构造器方法构造 graph
 builder = Builder()
@@ -161,17 +155,10 @@ builder.add_node("SPMD2", SPMD2, "description2")
 builder.add_node("SPMD3", SPMD3, "description3")
 
 # 定义 SPMD1 和 SPMD2、SPMD3 之间的前向条件边
-builder.add_forward_conditional_edge("SPMD1", check, {
-    True: "SPMD2",
-    False: "SPMD3"
-})
+builder.add_forward_conditional_edge("SPMD1", check, {True: "SPMD2", False: "SPMD3"})
 # 等价于
-builder.add_forward_conditional_edge("SPMD1", check, {
-    True: "SPMD2"
-})
-builder.add_forward_conditional_edge("SPMD1", check, {
-    False: "SPMD3"
-})
+builder.add_forward_conditional_edge("SPMD1", check, {True: "SPMD2"})
+builder.add_forward_conditional_edge("SPMD1", check, {False: "SPMD3"})
 # 等价于
 builder.add_forward_conditional_edge("SPMD1", check, "SPMD2")
 builder.add_forward_conditional_edge("SPMD1", check1, "SPMD3")
@@ -190,29 +177,3 @@ builder.add_backward_edge("SPMD2", "SPMD2")
 builder.add_backward_edge("SPMD3", "SPMD3")
 
 builder.build(name="test")
-
-class Graph:
-    name: str
-    nodes: List[Node]
-    edges: List[Edge]
-
-class Node:
-    name: str
-    description: str
-    resource: ResourceSpec
-    spmd_config: SPMDConfig
-    forward_edges: Optional[List[Edge]]
-    backward_edges: Optional[List[Edge]]
-
-class Edge:
-    source_node: str
-    target_node: str
-    condition_fn: Optional[Callable[..., bool]]
-
-class SPMDConfig:
-    sharding: ShardingSpec
-    mesh: MeshConfig
-    user_forward_fn: Optional[Callable]
-    user_backward_fn: Optional[Callable]
-    max_async_steps: int = 1
-    params_update_steps: int = 1

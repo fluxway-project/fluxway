@@ -18,14 +18,21 @@ def _load_compute_output_step():
     for node in tree.body:
         if isinstance(node, ast.ClassDef) and node.name == "SPMDWorker":
             for item in node.body:
-                if isinstance(item, ast.FunctionDef) and item.name == "compute_output_step":
+                if (
+                    isinstance(item, ast.FunctionDef)
+                    and item.name == "compute_output_step"
+                ):
                     method_node = item
                     break
-    assert method_node is not None, "SPMDWorker.compute_output_step not found in worker.py"
+    assert method_node is not None, (
+        "SPMDWorker.compute_output_step not found in worker.py"
+    )
 
     module = types.ModuleType("fluxway_worker_step_extract")
     # Compile the method as a standalone function (first arg is `self`).
-    compiled = compile(ast.Module(body=[method_node], type_ignores=[]), str(worker_path), "exec")
+    compiled = compile(
+        ast.Module(body=[method_node], type_ignores=[]), str(worker_path), "exec"
+    )
     exec(compiled, module.__dict__)
     return module.compute_output_step
 
@@ -35,7 +42,9 @@ compute_output_step = _load_compute_output_step()
 
 class _DummyWorker:
     def __init__(self, *, enable_output_step_remap: bool, total_rank: int, rank: int):
-        self.config = types.SimpleNamespace(enable_output_step_remap=enable_output_step_remap)
+        self.config = types.SimpleNamespace(
+            enable_output_step_remap=enable_output_step_remap
+        )
         self._total_rank = total_rank
         self.rank = rank
 
@@ -84,4 +93,3 @@ def test_compute_output_step_regenerate_on_eager_uses_global_step_formula() -> N
         )
         == 8 * 12 + 3
     )
-

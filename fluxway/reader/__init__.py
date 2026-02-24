@@ -6,9 +6,8 @@ including various datasource implementations.
 """
 
 # Ensure INFO logs are visible even when importing this subpackage directly.
-from ..common.utils.logging import ensure_logging_configured  # noqa: E402
+from ..common.utils.logging import ensure_logging_configured
 
-ensure_logging_configured()
 
 from .datasource import (
     BaseSource,
@@ -27,3 +26,5 @@ __all__ = [
     "FileReadTask",
     "create_datasource",
 ]
+
+ensure_logging_configured()

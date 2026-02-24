@@ -368,7 +368,7 @@ class TorchBackend(TensorBackend):
     def dynamic_slice(self, x: Any, start: Any, size: Any) -> Any:
         """Simulates dynamic slicing using index_select."""
         # Note: robust for dynamic start without CPU sync if we index manually
-        for i, (s, l) in enumerate(zip(start, size)):
+        for i, (s, l) in enumerate(zip(start, size, strict=True)):
             idx = self._torch.arange(l, device=x.device, dtype=self._torch.int64) + s
             x = self._torch.index_select(x, i, idx)
 

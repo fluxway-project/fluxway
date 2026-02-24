@@ -235,7 +235,7 @@ class TransportPlanner:
             if not isinstance(unraveled, tuple):
                 unraveled = (unraveled,)
 
-            for ax_idx, coord_tensor in zip(axis_indices, unraveled):
+            for ax_idx, coord_tensor in zip(axis_indices, unraveled, strict=False):
                 # Only attempt JAX broadcast reshaping if the coordinate array is pure 1D and we
                 # actually have multiple disjoint partitions mapping independently.
                 # Otherwise, 1D array matches perfectly (e.g., dynamically flattened Payload).
@@ -295,7 +295,7 @@ class TransportPlanner:
                 )
                 if not isinstance(rep_unraveled, tuple):
                     rep_unraveled = (rep_unraveled,)
-                for ax_id, r_coord in zip(rep_axis_idx, rep_unraveled):
+                for ax_id, r_coord in zip(rep_axis_idx, rep_unraveled, strict=False):
                     expanded_coords[ax_id] = backend.reshape(r_coord, (1, num_replicas))
 
             dest_devices = mesh.coordinate_to_device(tuple(expanded_coords))

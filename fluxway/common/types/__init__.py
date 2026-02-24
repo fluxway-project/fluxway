@@ -69,7 +69,6 @@ from .sharding import (
     GreedyPartition,
     Layout,
     ShardingSpec,
-
 )
 
 __all__ = [
@@ -137,5 +136,4 @@ __all__ = [
     "GreedyPartition",
     "Layout",
     "ShardingSpec",
-
 ]

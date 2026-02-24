@@ -14,7 +14,7 @@ Usage:
     class MyData:
         id: int
         tensor: torch.Tensor
-    
+
     # Use tuple-based mesh with user-defined axis names
     @fluxway.spmd(
         resource={"nums_cpu": 4, "nums_gpu": 2},
@@ -31,9 +31,8 @@ __version__ = "0.1.0"
 
 # Force logging to be visible across driver + Ray worker processes.
 # Users of this repo want INFO logs by default.
-from fluxway.common.utils.logging import ensure_logging_configured  # noqa: E402
+from fluxway.common.utils.logging import ensure_logging_configured
 
-ensure_logging_configured()
 
 # Import decorators for top-level access
 from fluxway.common.decorators import data_type, spmd, operator
@@ -73,14 +72,16 @@ __all__ = [
     "Edge",
     "ResourceSpec",
     # Sharding
-    'Layout',
-    'ShardingSpec',
-    'PartitionSpec',
-    'ChunkPartition',
-    'CyclicPartition',
-    'IndexedPartition',
-    'GreedyPartition',
+    "Layout",
+    "ShardingSpec",
+    "PartitionSpec",
+    "ChunkPartition",
+    "CyclicPartition",
+    "IndexedPartition",
+    "GreedyPartition",
     # Control Plane
     "GraphParser",
     "Builder",
 ]
+
+ensure_logging_configured()

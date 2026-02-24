@@ -46,4 +46,3 @@ def infer_fluxway_output_fields(spmd_class: Type, method_name: str) -> List[str]
             continue
         fields.append(var_name)
     return fields
-

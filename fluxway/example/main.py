@@ -33,6 +33,7 @@ if str(project_root) not in sys.path:
 
 try:
     import ray
+
     RAY_AVAILABLE = True
 except ImportError:
     RAY_AVAILABLE = False
@@ -47,9 +48,7 @@ from fluxway.common.types import Graph, HeartbeatConfig, AsyncStepConfig  # noqa
 from fluxway.common.types.data_types import OpType  # noqa: E402
 
 # Use absolute imports to support both module and direct execution
-from fluxway.example.spmd_modules import (  # noqa: E402
-    PreprocessingSPMD, EmbeddingSPMD, ModelSPMD,
-)
+from fluxway.example.spmd_modules import PreprocessingSPMD, EmbeddingSPMD, ModelSPMD  # noqa: E402
 from fluxway.example.data_types import TensorOnly  # noqa: E402
 
 # Use the global Fluxway logging configuration (respects FLUXWAY_LOG_LEVEL / FLUXWAY_LOG_FORCE)
@@ -59,7 +58,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_SRC_DIR = "/data/chiave-workspace/tmp/recsys/src_dir"
 
 
-def build_example_graph(*, batch_size: int = 1, src_dir: str = DEFAULT_SRC_DIR) -> Graph:
+def build_example_graph(
+    *, batch_size: int = 1, src_dir: str = DEFAULT_SRC_DIR
+) -> Graph:
     """
     Build the example graph with:
     - Reader -> Preprocessing -> Embedding -> Model
@@ -68,61 +69,67 @@ def build_example_graph(*, batch_size: int = 1, src_dir: str = DEFAULT_SRC_DIR) 
     - Preprocessing is eager mode
     """
     builder = Builder()
-    
+
     # Add Reader node using the new add_reader() API
     logger.info("Building graph nodes...")
-    
+
     # Add Reader node
     # This creates a Reader node that actively reads data from files
     builder.add_reader(
         name="Reader",
-        src_dir=src_dir,                          # Source data directory
-        data_type="json",                       # Data format
-        batch_size=batch_size,                  # Batch size for reading
-        file_pattern="*.json",                  # File pattern to match
-        worker_count=2,                         # Number of reader workers
+        src_dir=src_dir,  # Source data directory
+        data_type="json",  # Data format
+        batch_size=batch_size,  # Batch size for reading
+        file_pattern="*.json",  # File pattern to match
+        worker_count=2,  # Number of reader workers
         resource={"nums_cpu": 1, "nums_gpu": 0, "memory": 10},
         description="Data reader node for reading JSON files",
         output_data_type=TensorOnly,  # Output type: TensorOnly (only tensor field)
     )
-    
+
     # Add SPMD nodes
-    builder.add_node("Preprocessing", PreprocessingSPMD, "Preprocessing SPMD (Eager mode)")
+    builder.add_node(
+        "Preprocessing", PreprocessingSPMD, "Preprocessing SPMD (Eager mode)"
+    )
     builder.add_node("Embedding", EmbeddingSPMD, "Embedding SPMD")
     builder.add_node("Model", ModelSPMD, "Model SPMD")
-    
+
     # Forward edges
     logger.info("Building forward edges...")
     # Reader -> Preprocessing (eager)
     builder.add_forward_edge("Reader", "Preprocessing")
-    
+
     # Preprocessing -> Embedding
     builder.add_forward_edge("Preprocessing", "Embedding")
-    
+
     # Embedding -> Model
     builder.add_forward_edge("Embedding", "Model")
-    
+
     # Backward edges
     logger.info("Building backward edges...")
     # Model forward -> Model backward (self-loop)
     builder.add_func_edge("Model", OpType.FORWARD, "Model", OpType.BACKWARD)
-    
+
     # Model -> Embedding
     builder.add_backward_edge("Model", "Embedding")
-    
+
     # Note: No backward edge from Embedding to Preprocessing (eager node doesn't need backward)
     # Note: No backward edge from Reader (Reader is a source)
 
     # Build graph
     graph = builder.build(name="example_graph")
-    logger.info(f"Graph built successfully with {len(graph.nodes)} nodes and {len(graph.edges)} edges")
-    
+    logger.info(
+        f"Graph built successfully with {len(graph.nodes)} nodes and {len(graph.edges)} edges"
+    )
+
     return graph
 
 
-def create_example_data(*, num_files: int = 4, records_per_file: int = 25, src_dir: str = DEFAULT_SRC_DIR) -> None:
+def create_example_data(
+    *, num_files: int = 4, records_per_file: int = 25, src_dir: str = DEFAULT_SRC_DIR
+) -> None:
     """Create example JSON data files for testing.
-    
+
     Args:
         num_files: Number of JSON input files to create.
         records_per_file: Number of records in each JSON file.
@@ -130,36 +137,45 @@ def create_example_data(*, num_files: int = 4, records_per_file: int = 25, src_d
     """
     import json
     import os
-    
+
     data_dir = src_dir
     os.makedirs(data_dir, exist_ok=True)
-    
+
     # Create a few example JSON files
     for i in range(num_files):
         file_path = os.path.join(data_dir, f"data_{i}.json")
         data = [
             {
-                "tensor": [[float(j + i * records_per_file) for _ in range(8)] for _ in range(4)],
-                "metadata": f"sample_data_{i}_{j}"
+                "tensor": [
+                    [float(j + i * records_per_file) for _ in range(8)]
+                    for _ in range(4)
+                ],
+                "metadata": f"sample_data_{i}_{j}",
             }
             for j in range(records_per_file)
         ]
-        with open(file_path, 'w') as f:
+        with open(file_path, "w") as f:
             json.dump(data, f)
-    
+
     logger.info(
         f"Created example data files in {data_dir} "
         f"(num_files={num_files}, records_per_file={records_per_file})"
     )
 
 
-async def run_example(*, num_files: int = 4, records_per_file: int = 25, batch_size: int = 1, src_dir: str = DEFAULT_SRC_DIR):
+async def run_example(
+    *,
+    num_files: int = 4,
+    records_per_file: int = 25,
+    batch_size: int = 1,
+    src_dir: str = DEFAULT_SRC_DIR,
+):
     """Run the example with Ray and Controller."""
     start_time = time.time()
     logger.info("=" * 80)
     logger.info("Starting Fluxway Example")
     logger.info("=" * 80)
-    
+
     # Initialize Ray
     if not ray.is_initialized():
         logger.info("Initializing Ray...")
@@ -167,6 +183,7 @@ async def run_example(*, num_files: int = 4, records_per_file: int = 25, batch_s
         # Controller/Driver/Worker actors can also honour FLUXWAY_LOG_LEVEL /
         # FLUXWAY_LOG_FORCE and emit DEBUG logs when requested.
         import os
+
         # NOTE: Ray expects env vars under the "env_vars" key in runtime_env.
         # Using "env" (what we had before) does NOT propagate variables to workers,
         # which is why Controller/Driver/Worker saw env_level=None in logs.
@@ -183,113 +200,111 @@ async def run_example(*, num_files: int = 4, records_per_file: int = 25, batch_s
             runtime_env=runtime_env,
         )
         logger.info("Ray initialized successfully")
-    
+
     try:
         # Create example data files for the Reader
         logger.info("Creating example data files...")
-        create_example_data(num_files=num_files, records_per_file=records_per_file, src_dir=src_dir)
-        
+        create_example_data(
+            num_files=num_files, records_per_file=records_per_file, src_dir=src_dir
+        )
+
         # Build graph
         graph = build_example_graph(batch_size=batch_size, src_dir=src_dir)
-        
+
         # Create controller
         logger.info("Creating ControllerActor...")
         heartbeat_config = HeartbeatConfig(
-            heartbeat_interval=5.0,
-            heartbeat_timeout=15.0,
-            max_missed_heartbeats=3
+            heartbeat_interval=5.0, heartbeat_timeout=15.0, max_missed_heartbeats=3
         )
         async_step_config = AsyncStepConfig(
-            max_forward_step_diff=2,
-            max_backward_step_diff=2,
-            min_lock_duration=1.0
+            max_forward_step_diff=2, max_backward_step_diff=2, min_lock_duration=1.0
         )
-        
+
         controller = ControllerActor.remote(
             graph=graph,
             heartbeat_config=heartbeat_config,
-            async_step_config=async_step_config
+            async_step_config=async_step_config,
         )
         logger.info("ControllerActor created")
-        
+
         # Initialize controller
         logger.info("Initializing controller...")
         init_start = time.time()
         init_success = await controller.initialize.remote()
         init_duration = time.time() - init_start
-        
+
         if not init_success:
             logger.error("Controller initialization failed")
             return
-        
+
         logger.info(f"Controller initialized in {init_duration:.2f}s")
-        
+
         # Wait for all drivers to be ready
         logger.info("Waiting for all SPMD drivers to be ready...")
         wait_start = time.time()
-        
+
         # Poll controller state until RUNNING
         max_wait_time = 60.0  # 60 seconds timeout
         poll_interval = 1.0
-        
+
         while time.time() - wait_start < max_wait_time:
             state = await controller.get_state.remote()
             logger.info(f"Controller state: {state}")
-            
+
             if state == "running":
                 logger.info("All drivers are ready, controller is running")
                 break
-            
+
             await asyncio.sleep(poll_interval)
         else:
             logger.warning("Timeout waiting for controller to reach RUNNING state")
-        
+
         wait_duration = time.time() - wait_start
         logger.info(f"Waited {wait_duration:.2f}s for drivers to be ready")
-        
+
         # Start execution by sending data to source nodes
         logger.info("Starting execution by sending data to source nodes...")
         exec_start = time.time()
-        
+
         # Get source node handles
         source_spmd_handle = await controller.get_spmd_handle.remote("Reader")
         if source_spmd_handle is None:
             logger.error("Failed to get source SPMD handle")
             return
-        
+
         # Reader node will automatically read data from files
         # The Reader uses the new add_reader() API with backpressure support
         logger.info("Reader node will read data from files automatically...")
         logger.info("Backpressure handling is enabled between Reader and SPMD nodes...")
         logger.info("Waiting for data processing to complete...")
-        
+
         # Wait a bit for data generation to start
         await asyncio.sleep(2.0)
-        
+
         exec_duration = time.time() - exec_start
         logger.info(f"Execution phase completed in {exec_duration:.2f}s")
-        
+
         # Wait for completion
         logger.info("Waiting for all tasks to complete...")
         completion_start = time.time()
-        
+
         # Poll until all tasks are completed
         max_completion_time = 120.0  # 2 minutes timeout
         while time.time() - completion_start < max_completion_time:
             state = await controller.get_state.remote()
             logger.info(f"Controller state: {state}")
-            
+
             if state == "completed":
                 logger.info("All tasks completed successfully")
                 break
-            
+
             await asyncio.sleep(poll_interval)
         else:
             logger.warning("Timeout waiting for tasks to complete")
-        
+
         completion_duration = time.time() - completion_start
         logger.info(f"Waited {completion_duration:.2f}s for completion")
-        
+
         # Summary
         total_duration = time.time() - start_time
         logger.info("=" * 80)
@@ -304,7 +319,7 @@ async def run_example(*, num_files: int = 4, records_per_file: int = 25, batch_s
         logger.info("Example completed successfully!")
         logger.info("Check Ray Dashboard for detailed metrics and performance data")
         logger.info("=" * 80)
-        
+
     except Exception as e:
         logger.error(f"Example execution failed: {e}", exc_info=True)
         raise
@@ -319,7 +334,7 @@ async def run_example(*, num_files: int = 4, records_per_file: int = 25, batch_s
 def main():
     """Main entry point."""
     import argparse
-    
+
     parser = argparse.ArgumentParser(description="Run Fluxway example.")
     parser.add_argument(
         "--num-files",
@@ -352,10 +367,15 @@ def main():
         raise ValueError("--records-per-file must be > 0")
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be > 0")
-    
+
     try:
         asyncio.run(
-            run_example(num_files=args.num_files, records_per_file=args.records_per_file, batch_size=args.batch_size, src_dir=args.src_dir)
+            run_example(
+                num_files=args.num_files,
+                records_per_file=args.records_per_file,
+                batch_size=args.batch_size,
+                src_dir=args.src_dir,
+            )
         )
     except KeyboardInterrupt:
         logger.info("Example interrupted by user")
