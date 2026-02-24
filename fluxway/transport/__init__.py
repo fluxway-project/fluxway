@@ -4,7 +4,7 @@
 from ..common.utils.logging import ensure_logging_configured
 
 
-from .tensor import TransportTensor
+from fluxway.common.types import TransportTensor
 from fluxway.common.types.sharding import (
     Layout,
     ShardingSpec,

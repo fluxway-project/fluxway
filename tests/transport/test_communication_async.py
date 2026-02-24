@@ -6,7 +6,7 @@ import jax.numpy as jnp
 from fluxway.transport.communication import SyncDataDistributor, AsyncDataDistributor
 from fluxway.common.types.sharding import ShardingSpec, P
 from fluxway.common.mesh import DeviceMesh
-from fluxway.transport.tensor import TransportTensor
+from fluxway.common.types.tensor import TransportTensor
 
 
 class TestDataDistributor(unittest.TestCase):

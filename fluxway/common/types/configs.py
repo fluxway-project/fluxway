@@ -5,9 +5,8 @@ Based on ARCHITECTURE.md sections 2.1.1, 3.2.1, 4.2, 4.3
 """
 
 from enum import IntEnum
-from typing import Callable, Dict, List, Optional, Any, Tuple, Type
+from typing import Callable, Dict, List, Optional, Any, Type
 
-import numpy as np
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 
 
@@ -228,25 +227,16 @@ class ArgumentType(str, Enum):
 
 
 class EdgeShardingInfo(BaseModel):
-    """
-    Sharding information for a single logical edge (including conditional edges).
-
-    一个 SPMD operator 的前驱 / 后继边，可能是条件边，也可能是非条件边。
-    - 对于同一对 (source_spmd_id, target_spmd_id)，可能存在多条条件边，
-      因此需要用 List[EdgeShardingInfo] 来描述每一条边。
-    - 条件信息直接记录为 condition_fn，便于在运行时根据实际执行路径选择。
-    """
+    """Sharding information for a single edge between SPMDs."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    # 条件函数，如果为 None 表示无条件边（始终生效）
-    condition_fn: Optional[Callable[..., bool]] = None
-    # 对应这条边上，当前 operator 视角下相关 tensor 的 sharding 规格
-    # 例如：前驱边写入到 input_pre_sharding 时，是「前驱输出 tensor 的 sharding」；
-    #       后继边写入到 output_post_sharding 时，是「后继输入 tensor 的 sharding」。
+    # Tensor sharding for this edge: {tensor_name: ShardingSpec}
     tensor_sharding: Dict[str, ShardingSpec] = Field(default_factory=dict)
-    # 目标节点的 op 类型（用于跨 op 类型连边，如 forward->backward）
+    # Target node's op type (for cross-op-type edges like forward->backward)
     target_op: OpType = OpType.FORWARD
+    # Condition function for conditional edges
+    condition_fn: Optional[Callable[..., bool]] = None
 
 
 class OperatorMeta(BaseModel):
@@ -255,13 +245,6 @@ class OperatorMeta(BaseModel):
     model_config = {"arbitrary_types_allowed": True}
 
     name: str
-    # Raw sharding specs (from @operator decorator, mesh-independent)
-    # Each value is a dict with keys: type ("dense"|"sparse"), axis (list), fn (optional)
-    input_sharding_raw: Dict[str, Any] = Field(default_factory=dict)
-    output_sharding_raw: Dict[str, Any] = Field(default_factory=dict)
-    # Resolved sharding specs (from @spmd decorator, mesh-aware): new algebraic ShardingSpec
-    input_sharding: Optional[Dict[str, ShardingSpec]] = None
-    output_sharding: Optional[Dict[str, ShardingSpec]] = None
     # Keys use ArgumentType.value (i.e. "state" | "tensor" | "static") to avoid enum
     # serialization / circular import surprises across control-plane and worker.
     input_arguments: Optional[Dict[str, List[str]]]
@@ -298,30 +281,9 @@ class OperatorMeta(BaseModel):
     # Compare / validate helpers (used by control-plane graph builder)
     # ---------------------------------------------------------------------
 
-    def tensor_names(self, is_output: bool) -> List[str]:
-        """Get tensor argument names from input/output arguments."""
-        return self.get_arguments(is_output=is_output, arg_type=ArgumentType.TENSOR)
-
     def state_names(self, is_output: bool) -> List[str]:
         """Get state argument names from input/output arguments."""
         return self.get_arguments(is_output=is_output, arg_type=ArgumentType.STATE)
-
-    def validate_tensor_io_match(
-        self, dst_meta: "OperatorMeta", src_is_output: bool, ctx: str
-    ) -> None:
-        """
-        Validate tensor variable names match between src and dst (io semantics).
-
-        - If src_is_output=True: compare src.output tensor vs dst.input tensor
-        - If src_is_output=False: compare src.input tensor vs dst.output tensor
-        """
-        src_names = set(self.tensor_names(is_output=src_is_output))
-        dst_names = set(dst_meta.tensor_names(is_output=not src_is_output))
-        if src_names != dst_names:
-            raise ValueError(
-                f"Tensor names mismatch in {ctx}: "
-                f"source={sorted(src_names)}, target={sorted(dst_names)}"
-            )
 
     def validate_and_update_state_output_match_dest_input(
         self,
@@ -537,38 +499,35 @@ class ControlConfig(BaseModel):
     # TODO: Add more control parameters as needed
 
 
-# =============================================================================
-# ULP Protocol Types (Section 4.2, 4.3)
-# =============================================================================
+class PartitionOp(str, Enum):
+    """Vectorized partition operations for routing."""
 
-
-class PartitionOp(IntEnum):
-    """
-    Partition operator enum for routing computation.
-
-    Determines how data is partitioned and routed to target workers.
-    """
-
-    DIV_MOD = 0  # Dense/Slicing: PID = (val // params[0]) % params[1]
-    HASH_MOD = 1  # Sparse/Embedding: PID = hash(val) % params[0]
-    LOOKUP = 2  # MoE/Irregular: PID = params[val]
-    REPLICATE = 3  # Broadcast: PID = All Target Ranks
+    DIV_MOD = "div_mod"  # Dense/Slicing: (val // p0) % p1
+    HASH_MOD = "hash_mod"  # Sparse/Embedding: hash(val) % p0
+    REPLICATE = "replicate"  # Broadcast to all target_ranks
 
 
 class LayoutSpec(BaseModel):
-    """
-    Sender-side view defining how data maps to physical nodes.
-
-    All fields must be static native arrays (NumPy/JAX/Torch Tensor),
-    no Python List/Dict allowed.
-    """
+    """Receiver-side layout specification for a batch."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    op_type: PartitionOp = PartitionOp.DIV_MOD
-    op_params: Optional[np.ndarray] = None  # Static parameters for the operator
-    topology_map: Optional[np.ndarray] = None  # Logical PID -> Physical Rank mapping
-    target_ranks: Optional[np.ndarray] = None  # Only for REPLICATE mode
+    op: PartitionOp
+    params: List[int] = Field(default_factory=list)
+    topology_map: Optional[List[int]] = None  # PID -> physical rank
+    target_ranks: Optional[List[int]] = None  # For REPLICATE mode
+
+
+class RPCPayload(BaseModel):
+    """Payload for tensor data transfer via RPC."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    op_type: OpType
+    name: str
+    step: int
+    sender_rank: int
+    data: Any
 
 
 class DependencySpec(BaseModel):
@@ -579,136 +538,6 @@ class DependencySpec(BaseModel):
     """
 
     expected_shards: int = 0  # Ticket threshold (usually = sender world size)
-
-
-class RPCPayload(BaseModel):
-    """
-    RPC payload for data transmission.
-
-    Kept minimal to reduce transmission overhead.
-    """
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    batch_id: str = ""
-    data: Optional[np.ndarray] = None  # Data shard (Tensor)
-    global_indices: Optional[np.ndarray] = (
-        None  # Original indices for Sparse->Dense restoration
-    )
-    # Note: No sender_id or complex metadata needed
-
-
-# =============================================================================
-# Tensor Metadata Types (for routing and backward dependency tracking)
-# =============================================================================
-
-
-class TensorMeta(BaseModel):
-    """
-    Tensor metadata — the single descriptor that accompanies every tensor/shard.
-
-    Lifecycle (four phases):
-
-    1. **Routing meta** (``_build_routing_meta``):
-       Describes the **full output tensor** before routing.  Passed to the
-       routing function so it can decide where to send each slice.
-       - ``shape``   = full local tensor shape (pre-slicing)
-       - ``global_shape`` = global tensor shape (dense: inferred from spec;
-                            sparse output: propagated from input meta)
-       - ``global_indices`` = per-row global index (dense: from spec offset;
-                              sparse: from operator-produced indices)
-
-    2. **Shard meta** (``_build_shard_meta``):
-       Derived from routing meta + one route's ``data_mask``.
-       Describes the **sliced shard** actually sent to a receiver.
-       - ``shape`` = shard shape (computed from data_mask)
-       - ``global_shape`` = inherited from routing meta (unchanged)
-       - ``global_indices`` = axis-0 slice of routing meta's global_indices
-
-    3. **Assembled meta** (after reception / ``_assemble_*``):
-       Describes the **reconstructed local tensor** that the operator will consume.
-       - dense-to-dense: ``global_shape`` inferred from input spec
-       - sparse-to-dense: ``global_shape`` carried from sender's meta
-       - to-dynamic:     ``global_shape`` propagated, ``global_indices`` merged
-
-    4. **Backward lookup** (``get_forward_step_meta``):
-       Backward uses ``forward_step`` to look up the corresponding forward
-       assembled meta from ``_meta_history`` for sparse reverse routing.
-    """
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    # Basic tensor description
-    tensor_name: str = ""
-    shape: Tuple[int, ...] = ()  # Shape of this tensor/shard
-    dtype: str = "float32"
-
-    # Global routing info — required when sparse routing is involved
-    global_indices: Optional[np.ndarray] = None  # Per-row global indices
-    global_shape: Optional[Tuple[int, ...]] = None  # Global tensor shape
-
-    # Source tracking — required for backward reverse routing
-    source_spmd_id: str = ""
-    source_rank: int = -1
-    forward_step: int = -1
-
-    # Flags
-    is_sparse: bool = False  # True if output via dynamic (indexed/hash) ShardingSpec
-    is_empty: bool = False  # Empty packet for sparse routing sync
-
-
-class ShardOrigin(BaseModel):
-    """
-    Records the origin of a single received shard for backward reverse routing.
-
-    During forward assembly, each non-empty received shard is recorded so that
-    backward can reverse-route gradients back to the exact source workers
-    without requiring a user-provided routing function.
-
-    Key design (to support dynamic→static reordering):
-    - ``global_indices`` 记录该 shard 自己携带的全局索引（稀疏语义）。
-    - ``local_indices`` 记录在 **重排序之后**，该 shard 对应的行在本地
-      assembled tensor 中的下标位置（axis-0）。
-      这样反向时可以直接用 ``local_indices`` 在本地 dense tensor 上做切片/
-      gather，而不需要假设 shard 在重排序后仍然是连续区间。
-
-    Fields:
-        source_spmd_id: SPMD that sent this shard.
-        source_rank:    Rank within the source SPMD.
-        global_indices: Global indices carried by this shard (sparse tensors).
-        shard_shape:    Shape of the received shard data.
-        local_indices:  1D array of row indices in the assembled local tensor
-                        (after any reordering).  ``None`` means “use full range”.
-    """
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    source_spmd_id: str = ""
-    source_rank: int = -1
-    global_indices: Optional[np.ndarray] = None
-    shard_shape: Tuple[int, ...] = ()
-    local_indices: Optional[np.ndarray] = None
-
-
-class StepTensorMeta(BaseModel):
-    """
-    Per-step per-tensor metadata preserving both the assembled global view
-    and the per-shard origin info needed for backward reverse routing.
-
-    Stored in ``Worker._meta_history[op_type][step][tensor_name]``.
-
-    Fields:
-        assembled_meta: The assembled TensorMeta (merged global view).
-        shard_origins:  Per-shard origin records.  For backward reverse routing
-                        without a user route-fn, the worker iterates these to
-                        determine which slice of the backward output goes to
-                        which source worker.
-    """
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    assembled_meta: Optional[TensorMeta] = None
-    shard_origins: List[ShardOrigin] = Field(default_factory=list)
 
 
 # =============================================================================

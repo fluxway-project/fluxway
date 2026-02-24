@@ -45,7 +45,7 @@ except ImportError:
 from fluxway import Builder  # noqa: E402
 from fluxway.control_plane import ControllerActor  # noqa: E402
 from fluxway.common.types import Graph, HeartbeatConfig, AsyncStepConfig  # noqa: E402
-from fluxway.common.types.data_types import OpType  # noqa: E402
+from fluxway.common.types.configs import OpType  # noqa: E402
 
 # Use absolute imports to support both module and direct execution
 from fluxway.example.spmd_modules import PreprocessingSPMD, EmbeddingSPMD, ModelSPMD  # noqa: E402

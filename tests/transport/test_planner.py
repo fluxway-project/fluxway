@@ -7,7 +7,7 @@ from fluxway.common.backend import set_backend
 from fluxway.common.mesh import DeviceMesh
 from fluxway.transport.planner import TransportPlanner
 from fluxway.common.types.sharding import ShardingSpec, P
-from fluxway.transport.tensor import TransportTensor
+from fluxway.common.types.tensor import TransportTensor
 from fluxway.common.topology import RaggedTopology, IndexedTopology
 
 

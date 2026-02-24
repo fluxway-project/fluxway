@@ -1,4 +1,4 @@
-from typing import List, Any, Optional
+from typing import List, Any, Optional, Tuple
 from fluxway.common.backend import get_backend
 from fluxway.common.topology import ContinuousTopology
 
@@ -20,9 +20,11 @@ class TransportTensor:
         flat_values: Any,
         nested_splits: Optional[List[Any]] = None,
         indices: Optional[Any] = None,
+        global_shape: Optional[Tuple[int, ...]] = None,
     ):
         self._flat_values = flat_values
         self._nested_splits = nested_splits if nested_splits is not None else []
+        self._global_shape = global_shape
 
         if isinstance(indices, ContinuousTopology):
             self._global_indices = None
@@ -64,7 +66,10 @@ class TransportTensor:
 
     @classmethod
     def from_tensor(
-        cls, tensor: Any, indices: Optional[Any] = None
+        cls,
+        tensor: Any,
+        indices: Optional[Any] = None,
+        global_shape: Optional[Tuple[int, ...]] = None,
     ) -> "TransportTensor":
         """Creates a dense TransportTensor directly from a multi-dimensional tensor.
 
@@ -72,8 +77,14 @@ class TransportTensor:
             tensor: The dense data tensor.
             indices: Global indices mapping. Can be a materialized tensor, an explicit
                      ContinuousTopology, or a python `slice` object for O(1) regular patterns.
+            global_shape: Optional global shape of the full tensor.
         """
-        return cls(flat_values=tensor, nested_splits=[], indices=indices)
+        return cls(
+            flat_values=tensor,
+            nested_splits=[],
+            indices=indices,
+            global_shape=global_shape,
+        )
 
     @property
     def flat_values(self) -> Any:
@@ -109,7 +120,23 @@ class TransportTensor:
             return self._global_indices
         if self._index_descriptor is not None:
             return self._index_descriptor.materialize()
-        return None
+
+    @property
+    def global_shape(self) -> Optional[Tuple[int, ...]]:
+        """Global shape of the full tensor across all ranks."""
+        return self._global_shape
+
+    @property
+    def shape(self) -> Tuple[int, ...]:
+        """Local shape of the data shard."""
+        backend = get_backend()
+        return backend.shape(self._flat_values)
+
+    @property
+    def dtype(self) -> Any:
+        """Data type of the tensor."""
+        backend = get_backend()
+        return backend.dtype(self._flat_values)
 
     @property
     def topology(self) -> Optional[List[Any]]:

@@ -44,7 +44,7 @@ def operator(
         They are dynamically resolved by the AsyncDataDistributor when
         routing tensors between SPMD pipeline stages.
     """
-    from fluxway.common.types.data_types import ArgumentType
+    from fluxway.common.types.configs import ArgumentType
 
     def decorator(func):
         # Import here to avoid circular imports at module import time
@@ -491,7 +491,7 @@ def spmd(
             from fluxway.common.types import (
                 OperatorMeta,
             )  # runtime import to avoid circular refs
-            from fluxway.common.types.data_types import OpType
+            from fluxway.common.types.configs import OpType
 
             if not isinstance(op_type, OpType):
                 raise TypeError(f"op_type must be OpType, got {type(op_type)}")
@@ -507,7 +507,7 @@ def spmd(
         cls.get_operator_meta = classmethod(get_operator_meta)
 
         def get_spmd_config(c) -> SPMDConfig:
-            from fluxway.common.types.data_types import OpType
+            from fluxway.common.types.configs import OpType
 
             forward_fn = getattr(c, OpType.FORWARD.name.lower(), None)
             backward_fn = getattr(c, OpType.BACKWARD.name.lower(), None)

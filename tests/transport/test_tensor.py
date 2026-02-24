@@ -1,7 +1,7 @@
 import pytest
 import pickle
 import jax.numpy as jnp
-from fluxway.transport.tensor import TransportTensor
+from fluxway.common.types.tensor import TransportTensor
 from fluxway.common.backend import set_backend, get_backend
 
 
@@ -328,7 +328,7 @@ def test_ragged_dynamic_slice_interface():
 
 def test_index_descriptor_chunk_materialize():
     """Chunk descriptor materializes to contiguous range."""
-    from fluxway.transport.tensor import ContinuousTopology
+    from fluxway.common.types.tensor import ContinuousTopology
 
     desc = ContinuousTopology.chunk(start=10, count=5)
     indices = desc.materialize()
@@ -340,7 +340,7 @@ def test_index_descriptor_chunk_materialize():
 
 def test_index_descriptor_cyclic_materialize():
     """Cyclic descriptor materializes to strided range."""
-    from fluxway.transport.tensor import ContinuousTopology
+    from fluxway.common.types.tensor import ContinuousTopology
 
     desc = ContinuousTopology.cyclic(start=1, step=4, count=3)
     indices = desc.materialize()
@@ -408,7 +408,7 @@ def test_slice_propagates_explicit_global_indices():
 
 def test_slice_propagates_descriptor():
     """Slicing a tensor with ContinuousTopology derives O(1) sub-descriptor."""
-    from fluxway.transport.tensor import ContinuousTopology
+    from fluxway.common.types.tensor import ContinuousTopology
 
     backend = get_backend()
     data = backend.tensor([10.0, 20.0, 30.0, 40.0, 50.0])
@@ -430,7 +430,7 @@ def test_slice_propagates_descriptor():
 
 def test_dynamic_slice_propagates_descriptor():
     """dynamic_slice with tensor args also propagates descriptor."""
-    from fluxway.transport.tensor import ContinuousTopology
+    from fluxway.common.types.tensor import ContinuousTopology
 
     backend = get_backend()
     data = backend.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
@@ -448,7 +448,7 @@ def test_dynamic_slice_propagates_descriptor():
 
 def test_gather_propagates_global_indices():
     """Gather reorders global_indices correctly, destroys descriptor."""
-    from fluxway.transport.tensor import ContinuousTopology
+    from fluxway.common.types.tensor import ContinuousTopology
 
     backend = get_backend()
     data = backend.tensor([10.0, 20.0, 30.0, 40.0])
@@ -517,7 +517,7 @@ def test_descriptor_serialization():
 
 def test_slice_then_gather_chain():
     """Chain: slice (preserves descriptor) → gather (materializes)."""
-    from fluxway.transport.tensor import ContinuousTopology
+    from fluxway.common.types.tensor import ContinuousTopology
 
     backend = get_backend()
     data = backend.tensor([10.0, 20.0, 30.0, 40.0, 50.0, 60.0])

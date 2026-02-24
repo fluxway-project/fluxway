@@ -22,7 +22,7 @@ import numpy as np  # used indirectly via tensor operations
 
 from fluxway.common.decorators import spmd, operator
 from fluxway.common.types import ShardingSpec
-from .data_types import TensorOnly, DataState1, DataState2, DataState3, Gradient2
+from .configs import TensorOnly, DataState1, DataState2, DataState3, Gradient2
 
 
 logger = logging.getLogger(__name__)

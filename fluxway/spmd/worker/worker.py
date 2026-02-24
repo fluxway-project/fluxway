@@ -21,23 +21,16 @@ See: https://docs.ray.io/en/latest/ray-core/actors/async_api.html
 
 from fluxway.common.types.sharding import ShardingSpec
 from typing import Any, Dict, List, Optional, Tuple
+from fluxway.common.backend import get_backend
 import asyncio
 import logging
 import time
-import numpy as np
 
 import ray
 
 from ...common.types import SPMDConfig, WorkerHeartbeat, WorkerStatus, WorkerTelemetry
-from ...common.types.data_types import (
-    OpType,
-    TensorMeta,
-    NodeType,
-    ReaderConfig,
-    MailboxStatus,
-    ShardOrigin,
-    StepTensorMeta,
-)
+from ...common.types.configs import OpType, NodeType, ReaderConfig, MailboxStatus
+from ...common.types.tensor import TransportTensor
 from ...common.utils import ensure_logging_configured
 from .mailbox import WorkerMailbox
 from .operator_manager import OperatorManager
@@ -182,20 +175,15 @@ class SPMDWorker:
         self._expected_predecessor_count: int = 0
         self._expected_successor_count: int = 0
 
-        # Cached assembled input metas: {op_type: {tensor_name: TensorMeta}}
-        # Updated by _assemble_input, used by _send_output for global_shape / global_indices
-        self._last_assembled_metas: Dict[OpType, Dict[str, Optional[TensorMeta]]] = {
-            OpType.FORWARD: {},
-            OpType.BACKWARD: {},
-            OpType.UPDATE: {},
-        }
+        # Cached assembled input tensors: {op_type: {tensor_name: TransportTensor}}
+        # Updated by _assemble_input, used by _send_output for pass-through metadata
+        self._last_assembled_tensors: Dict[
+            OpType, Dict[str, Optional[TransportTensor]]
+        ] = {OpType.FORWARD: {}, OpType.BACKWARD: {}, OpType.UPDATE: {}}
 
-        # Per-step meta history for backward reverse routing
-        # Structure: {op_type: {step: {tensor_name: StepTensorMeta}}}
-        # Each StepTensorMeta preserves both the assembled global view AND
-        # per-shard origin info (source_spmd_id, source_rank, global_indices,
-        # row range) so that backward can reverse-route without a route_fn.
-        self._meta_history: Dict[OpType, Dict[int, Dict[str, StepTensorMeta]]] = {
+        # Per-step tensor history for backward reverse routing
+        # Structure: {op_type: {step: {tensor_name: TransportTensor}}}
+        self._tensor_history: Dict[OpType, Dict[int, Dict[str, TransportTensor]]] = {
             OpType.FORWARD: {},
             OpType.BACKWARD: {},
             OpType.UPDATE: {},
@@ -463,8 +451,7 @@ class SPMDWorker:
         name: str,
         step: int,
         sender_rank: int,
-        data: Any,
-        meta: Optional[TensorMeta] = None,
+        tensor: TransportTensor,
     ) -> None:
         """
         Receive tensor data from upstream worker (data plane).
@@ -474,8 +461,7 @@ class SPMDWorker:
             name: Tensor variable name
             step: Step number (ignored for eager_trigger operators)
             sender_rank: Sender's rank
-            data: Tensor shard
-            meta: Optional tensor metadata (for routing and backward tracking)
+            tensor: TransportTensor object containing data and metadata
         """
         # Check if this op is in eager_trigger mode
         is_eager = (
@@ -489,7 +475,7 @@ class SPMDWorker:
             self._eager_input_steps[op_type] += 1  # Increment for next input
 
             await self._mailbox.put_tensor(
-                op_type, name, input_step, sender_rank, data, meta
+                op_type, name, input_step, sender_rank, tensor
             )
             logger.debug(
                 f"[spmd_id={self.spmd_id}] Eager receive tensor: op={op_type.name}, name={name}, "
@@ -513,10 +499,10 @@ class SPMDWorker:
         self._ensure_step_declared(op_type, step)
 
         # Cache in mailbox — barrier fires on_ready automatically
-        await self._mailbox.put_tensor(op_type, name, step, sender_rank, data, meta)
+        await self._mailbox.put_tensor(op_type, name, step, sender_rank, tensor)
         logger.debug(
             f"[spmd_id={self.spmd_id}] Worker {self.rank} received tensor: op={op_type.name}, name={name}, "
-            f"step={step}, sender_rank={sender_rank}, has_meta={meta is not None}, data={data}"
+            f"step={step}, sender_rank={sender_rank}"
         )
 
     def _ensure_step_declared(self, op_type: OpType, step: int) -> None:
@@ -833,22 +819,8 @@ class SPMDWorker:
         # Batch is already converted by datasource to the target type (e.g., np.ndarray)
         data_to_send = batch
 
-        # Build tensor metadata
-        shape = ()
-        dtype = "object"
-        if isinstance(data_to_send, np.ndarray):
-            shape = data_to_send.shape
-            dtype = str(data_to_send.dtype)
-
-        meta = TensorMeta(
-            tensor_name=tensor_name,
-            shape=shape,
-            dtype=dtype,
-            source_spmd_id=self.spmd_id,
-            source_rank=self.rank,
-            forward_step=step,
-            is_sparse=False,
-        )
+        # Wrap in TransportTensor
+        transport_tensor = TransportTensor.from_tensor(data_to_send)
 
         # Send to all downstream SPMDs (round-robin to workers within each SPMD)
         for spmd_id, handlers in self._successor_handlers.items():
@@ -864,7 +836,7 @@ class SPMDWorker:
                 # Send as forward op data
                 # data_to_send is already converted to the target type by datasource
                 handler.receive_tensor_data.remote(
-                    OpType.FORWARD, tensor_name, step, self.rank, data_to_send, meta
+                    OpType.FORWARD, tensor_name, step, self.rank, transport_tensor
                 )
             except Exception as e:
                 logger.error(
@@ -886,15 +858,7 @@ class SPMDWorker:
         logger.info(f"[spmd_id={self.spmd_id}] Worker {self.rank} stopping")
 
     async def _check_all_empty(self, op_type: OpType, step: int) -> bool:
-        """
-        Check if ALL received tensor shards for this step are empty packets.
-
-        Returns True only when every shard of every expected tensor carries
-        ``is_empty=True`` in its meta — meaning no real data was routed to
-        this worker for this step.
-        """
-        if self._op_manager is None:
-            return False
+        """Check if all received shards for a step are empty packets."""
         expected_tensor_names = self._op_manager.get_expected_tensor_names(op_type)
         if not expected_tensor_names:
             return False
@@ -903,62 +867,27 @@ class SPMDWorker:
 
         for tensor_name in expected_tensor_names:
             if tensor_name not in all_tensor_shards:
-                return False  # Missing tensor is not "all empty"
+                return False
             shards = all_tensor_shards[tensor_name]
             if not shards:
-                return False  # No shards at all
-            for rank, (data, meta) in shards.items():
-                if meta is None or not meta.is_empty:
-                    return False  # At least one non-empty shard
+                return False
+            for rank, tensor in shards.items():
+                backend = get_backend()
+                shape = backend.shape(tensor.flat_values)
+                if shape and shape[0] > 0:
+                    return False
         return True
 
     async def _propagate_empty_packets(self, op_type: OpType, step: int) -> None:
-        """
-        Forward empty packets to successor SPMDs when sparse routing is involved.
-
-        Called when this worker received only empty packets for all tensors at
-        a given step.  The rule is:
-
-        - Dense-to-Dense (output_spec=Static, post_spec=Static): ignore, no
-          forwarding needed because the downstream dense assembler doesn't
-          require a packet from every rank.
-        - Any sparse involvement (output_spec=Dynamic OR post_spec=Dynamic):
-          forward an empty packet to **every** target rank so that the
-          downstream sparse assembler (which waits for a packet from every
-          source) doesn't hang.
-        """
+        """Forward empty packets to successor SPMDs."""
         if self._op_manager is None:
-            return
-
-        # enable_output_step_remap=True means multiple upstream ranks map to
-        # different output steps; the downstream assembler never expects a
-        # packet from every rank at the same step, so empty packets are
-        # unnecessary and would cause step-number confusion.
-        if getattr(self.config, "enable_output_step_remap", False):
-            logger.debug(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] _propagate_empty: skipped because "
-                f"enable_output_step_remap=True (op={op_type.name}, step={step})"
-            )
             return
 
         output_sharding = self._op_manager.get_output_sharding(op_type)
         successor_ids = self._op_manager.get_successor_ids(op_type)
-
         if not successor_ids:
             return
 
-        # Collect base metas from received empty packets (for global_shape propagation)
-        expected_tensor_names = self._op_manager.get_expected_tensor_names(op_type)
-        all_tensor_shards = await self._mailbox.get_all_tensor_shards(op_type, step)
-        received_metas: Dict[str, TensorMeta] = {}
-        for tensor_name in expected_tensor_names:
-            shards = all_tensor_shards.get(tensor_name, {})
-            for rank, (data, meta) in shards.items():
-                if meta is not None:
-                    received_metas[tensor_name] = meta
-                    break
-
-        # Compute output_step consistently with the normal execution path
         is_eager = self._op_manager.is_eager_trigger(op_type)
         current_step = self._current_steps[op_type]
         output_step = self.compute_output_step(
@@ -971,78 +900,28 @@ class SPMDWorker:
                 continue
 
             target_op = succ_info.target_op
-
             for tensor_name in output_sharding:
-                output_spec = output_sharding.get(tensor_name)
-                post_spec = succ_info.tensor_sharding.get(tensor_name)
-
-                is_sparse_routing = getattr(
-                    output_spec, "is_content_addressable", False
-                ) or getattr(post_spec, "is_content_addressable", False)
-
-                # For self_loop, always send empty packets even for Dense-to-Dense
-                # For non-self_loop, skip Dense-to-Dense (no forwarding needed)
-                if not is_sparse_routing and not succ_info.is_self_loop:
-                    # Dense-to-dense (non-self_loop): ignore empty packets, no forwarding needed
-                    logger.debug(
-                        f"[spmd_id={self.spmd_id} rank={self.rank}] _propagate_empty: dense-to-dense for tensor "
-                        f"{tensor_name} to successor {spmd_id}, skipping (step={step})"
-                    )
-                    continue
-
-                # Build base_meta from received empty packets for global_shape propagation
-                base_meta = received_metas.get(tensor_name)
-                if base_meta is None:
-                    # Fallback: create minimal meta
-                    base_meta = TensorMeta(
-                        tensor_name=tensor_name,
-                        forward_step=output_step,
-                        is_sparse=getattr(output_spec, "is_content_addressable", False),
-                    )
+                # Create an empty TransportTensor
+                backend = get_backend()
+                empty_tensor = TransportTensor.from_tensor(
+                    backend.zeros((0,), dtype=backend.float32())
+                )
 
                 if succ_info.is_self_loop:
-                    logger.debug(
-                        f"[spmd_id={self.spmd_id} rank={self.rank}] _propagate_empty: self_loop for tensor "
-                        f"{tensor_name} to successor {spmd_id}, forwarding empty packets "
-                        f"(step={step}, output_step={output_step}, "
-                        f"global_shape={base_meta.global_shape})"
-                    )
-                else:
-                    logger.debug(
-                        f"[spmd_id={self.spmd_id} rank={self.rank}] _propagate_empty: sparse routing for tensor "
-                        f"{tensor_name} to successor {spmd_id}, forwarding empty packets "
-                        f"(step={step}, output_step={output_step}, "
-                        f"global_shape={base_meta.global_shape})"
-                    )
-
-                if succ_info.is_self_loop:
-                    empty_meta = TensorMeta(
-                        tensor_name=base_meta.tensor_name,
-                        shape=(0,),
-                        dtype=base_meta.dtype,
-                        global_shape=base_meta.global_shape,
-                        source_spmd_id=self.spmd_id,
-                        source_rank=self.rank,
-                        forward_step=output_step,
-                        is_sparse=base_meta.is_sparse,
-                        is_empty=True,
-                    )
-                    self._self_receive_tensor(
-                        target_op, tensor_name, output_step, np.array([]), empty_meta
+                    await self._self_receive_tensor(
+                        target_op, tensor_name, output_step, empty_tensor
                     )
                 else:
                     handlers = self._successor_handlers.get(spmd_id, {})
                     for target_rank in range(succ_info.total_rank):
                         handler = handlers.get(target_rank)
                         if handler is not None:
-                            self._send_empty_packet(
-                                handler,
+                            handler.receive_tensor_data.remote(
                                 target_op,
                                 tensor_name,
                                 output_step,
-                                base_meta,
-                                spmd_id,
-                                target_rank,
+                                self.rank,
+                                empty_tensor,
                             )
 
     async def _execute_operator(self, op_type: OpType, step: int) -> None:
@@ -1145,9 +1024,6 @@ class SPMDWorker:
         is_eager = self._op_manager.is_eager_trigger(op_type)
 
         tensor_args = {}
-        tensor_metas: Dict[str, Optional[TensorMeta]] = {}
-        tensor_shard_origins: Dict[str, List[ShardOrigin]] = {}
-
         for tensor_name in expected_tensor_names:
             if tensor_name not in all_tensor_shards:
                 raise ValueError(
@@ -1159,63 +1035,27 @@ class SPMDWorker:
             if is_eager:
                 # Eager mode: use first shard directly, no assembly needed
                 first_rank = next(iter(shards.keys()))
-                shard_data, shard_meta = shards[first_rank]
-                tensor_args[tensor_name] = shard_data
-                tensor_metas[tensor_name] = shard_meta
-                # Record single shard origin for eager mode.
-                # Eager 下没有装配/重排序，整个 tensor 视为一个 shard，
-                # local_indices 即 [0, 1, ..., num_rows-1]。
-                shard_shape = (
-                    tuple(shard_data.shape) if hasattr(shard_data, "shape") else ()
-                )
-                num_rows = shard_shape[0] if shard_shape else 0
-                local_indices = (
-                    np.arange(num_rows, dtype=np.int64) if num_rows > 0 else None
-                )
-                tensor_shard_origins[tensor_name] = [
-                    ShardOrigin(
-                        source_spmd_id=shard_meta.source_spmd_id if shard_meta else "",
-                        source_rank=shard_meta.source_rank
-                        if shard_meta
-                        else first_rank,
-                        global_indices=shard_meta.global_indices
-                        if shard_meta
-                        else None,
-                        shard_shape=shard_shape,
-                        local_indices=local_indices,
-                    )
-                ]
+                tensor_args[tensor_name] = shards[first_rank]
             else:
                 # Normal mode: assemble tensor based on sharding
-                (
-                    assembled_tensor,
-                    assembled_meta,
-                    shard_origins,
-                ) = await self._assemble_tensor(op_type, tensor_name, shards)
-                tensor_args[tensor_name] = assembled_tensor
-                tensor_metas[tensor_name] = assembled_meta
-                tensor_shard_origins[tensor_name] = shard_origins
-
-        # Cache assembled metas for use in _send_output (global_shape / global_indices)
-        self._last_assembled_metas[op_type] = tensor_metas
-        # Store per-step history with shard origins for backward reverse routing
-        step_meta_history: Dict[str, StepTensorMeta] = {}
-        for tn in tensor_metas:
-            step_meta_history[tn] = StepTensorMeta(
-                assembled_meta=tensor_metas[tn],
-                shard_origins=tensor_shard_origins.get(tn, []),
-            )
-        self._meta_history[op_type][step] = step_meta_history
-
-        for tn, tm in tensor_metas.items():
-            if tm is not None:
-                origins = tensor_shard_origins.get(tn, [])
-                logger.debug(
-                    f"[spmd_id={self.spmd_id} rank={self.rank}] _assemble_input cached meta: op={op_type.name}, step={step}, "
-                    f"tensor={tn}, shape={tm.shape}, global_shape={tm.global_shape}, "
-                    f"global_indices_len={len(tm.global_indices) if tm.global_indices is not None else None}, "
-                    f"is_sparse={tm.is_sparse}, shard_origins_count={len(origins)}"
+                assembled_tensor = await self._assemble_tensor(
+                    op_type, tensor_name, shards
                 )
+                tensor_args[tensor_name] = assembled_tensor
+
+        # Cache assembled tensors (they carry their own indices/meta)
+        self._last_assembled_tensors[op_type] = tensor_args
+        # Store per-step history for backward reverse routing
+        self._tensor_history[op_type][step] = tensor_args
+
+        # Free tensor history that is no longer needed (based on config)
+        # TODO: Implement granular history management
+
+        for tn, tensor in tensor_args.items():
+            logger.debug(
+                f"[spmd_id={self.spmd_id} rank={self.rank}] _assemble_input cached tensor: op={op_type.name}, step={step}, "
+                f"tensor={tn}, has_indices={tensor.global_indices is not None}"
+            )
 
         # Task 5: Construct final data_type object
         input_type = self._op_manager.get_operator_input_type(op_type)
@@ -1255,569 +1095,169 @@ class SPMDWorker:
         return input_obj
 
     async def _assemble_tensor(
-        self,
-        op_type: OpType,
-        tensor_name: str,
-        shards: Dict[int, Tuple[Any, Optional[TensorMeta]]],
-    ) -> Tuple[Any, Optional[TensorMeta], List[ShardOrigin]]:
-        """
-        Assemble tensor shards into a complete tensor based on sharding specs.
-
-        Handles three cases:
-        1. static -> static (Dense-to-Dense): Use DenseShardingStrategy
-        2. dynamic -> static (Sparse-to-Dense): Reconstruct from global_indices
-        3. to dynamic (Any -> Sparse): Merge all shards
-
-        Args:
-            op_type: Operator type
-            tensor_name: Tensor name
-            shards: Dict of {rank: (data, meta)}
-
-        Returns:
-            Tuple of (assembled_tensor, assembled_meta, shard_origins)
-        """
+        self, op_type: OpType, tensor_name: str, shards: Dict[int, TransportTensor]
+    ) -> TransportTensor:
+        """Assemble tensor shards into a complete TransportTensor."""
         input_sharding = self._op_manager.get_input_sharding(op_type)
         input_spec = input_sharding.get(tensor_name)
 
         if input_spec is None:
-            # No input sharding specified, treat as to dynamic (merge all)
+            # Fallback: merge all shards
             return self._assemble_to_dynamic_tensor(tensor_name, shards)
 
         if not input_spec.is_content_addressable:
-            # Check if any predecessor is dynamic (sparse)
+            # Check for dynamic predecessors
             predecessor_topology = self._op_manager.get_predecessor_topology(op_type)
-            has_dynamic_predecessor = False
-
-            for pre_spmd_id, pre_info in predecessor_topology.items():
-                pre_sharding = pre_info.tensor_sharding.get(tensor_name)
-                if pre_sharding is not None and pre_sharding.is_content_addressable:
-                    has_dynamic_predecessor = True
-                    break
+            has_dynamic_predecessor = any(
+                p.tensor_sharding.get(tensor_name).is_content_addressable
+                if p.tensor_sharding.get(tensor_name)
+                else False
+                for p in predecessor_topology.values()
+            )
 
             if has_dynamic_predecessor:
-                # Case 2: dynamic -> static
                 return self._assemble_dynamic_to_static_tensor(
                     tensor_name, shards, input_spec
                 )
             else:
-                # Case 1: static -> static
                 return await self._assemble_static_to_static_tensor(
                     op_type, tensor_name, shards, input_spec, predecessor_topology
                 )
         else:
-            # Case 3: to dynamic
             return self._assemble_to_dynamic_tensor(tensor_name, shards)
 
     async def _assemble_static_to_static_tensor(
         self,
         op_type: OpType,
         tensor_name: str,
-        shards: Dict[int, Tuple[Any, Optional[TensorMeta]]],
+        shards: Dict[int, TransportTensor],
         input_spec: ShardingSpec,
         predecessor_topology: Dict[str, Any],
-    ) -> Tuple[Any, Optional[TensorMeta], List[ShardOrigin]]:
-        """
-        Assemble static-to-static (Dense-to-Dense) tensor.
-
-        Uses DenseShardingStrategy to determine which shards to use and how to assemble them.
-        """
-        # Collect shards from all predecessors based on routing strategies
-        all_shards_to_assemble: List[
-            Tuple[int, Tuple[Any, Optional[TensorMeta]], str]
-        ] = []
-
+    ) -> TransportTensor:
+        """Assemble static-to-static tensor using shards."""
+        backend = get_backend()
+        shard_list = []
         for pre_spmd_id, pre_info in predecessor_topology.items():
-            pre_sharding = pre_info.tensor_sharding.get(tensor_name)
-            if pre_sharding is None or getattr(
-                pre_sharding, "is_content_addressable", False
-            ):
-                continue
-
-            # Get input routing strategy
             strategy = self._op_manager.get_input_routing_strategy(
                 op_type, pre_spmd_id, tensor_name
             )
-
-            if strategy is None:
-                # Fallback: use all shards from this predecessor
-                logger.warning(
-                    f"No routing strategy for {pre_spmd_id}:{tensor_name}, "
-                    f"using all shards as fallback"
-                )
-                for rank in range(pre_info.total_rank):
-                    if rank in shards:
-                        all_shards_to_assemble.append((rank, shards[rank], pre_spmd_id))
-            else:
-                # Use dependent_ranks from strategy
+            if strategy:
                 for rank in strategy.dependent_ranks:
                     if rank in shards:
-                        all_shards_to_assemble.append((rank, shards[rank], pre_spmd_id))
+                        shard_list.append(shards[rank])
+            else:
+                for rank in range(pre_info.total_rank):
+                    if rank in shards:
+                        shard_list.append(shards[rank])
 
-        if not all_shards_to_assemble:
-            raise ValueError(
-                f"No shards found for tensor '{tensor_name}' in static-to-static assembly"
-            )
+        if not shard_list:
+            raise ValueError(f"No shards for {tensor_name}")
 
-        # Extract data and meta
-        shard_data = [item[1][0] for item in all_shards_to_assemble]
-        shard_metas = [
-            item[1][1] for item in all_shards_to_assemble if item[1][1] is not None
-        ]
+        if len(shard_list) == 1:
+            return shard_list[0]
 
-        # Build shard origins (track local row indices in assembled tensor).
-        # Static-to-static 装配没有重排序，所有 shard 只是简单按轴 0 拼接，
-        # 因此每个 shard 在 assembled tensor 中对应一个连续区间：
-        #   [row_offset, row_offset + num_rows)
-        shard_origins: List[ShardOrigin] = []
-        row_offset = 0
-        for rank, (data, meta), pre_spmd_id in all_shards_to_assemble:
-            s_shape = tuple(data.shape) if hasattr(data, "shape") else ()
-            num_rows = s_shape[0] if s_shape else 0
-            local_indices = (
-                np.arange(row_offset, row_offset + num_rows, dtype=np.int64)
-                if num_rows > 0
-                else None
-            )
-            shard_origins.append(
-                ShardOrigin(
-                    source_spmd_id=meta.source_spmd_id if meta else pre_spmd_id,
-                    source_rank=meta.source_rank if meta else rank,
-                    global_indices=meta.global_indices if meta else None,
-                    shard_shape=s_shape,
-                    local_indices=local_indices,
-                )
-            )
-            row_offset += num_rows
+        # Concatenate shards using backend
+        flat_values = [s.flat_values for s in shard_list]
+        merged_values = backend.cat(flat_values, dim=0)
 
-        # For now, simple concatenation along first axis
-        # TODO: Implement proper assembly based on dim_infos and sharding spec
-        # This is a simplified version - full implementation would need to:
-        # 1. Determine assembly order based on dim_infos
-        # 2. Handle reshape/transpose if needed
-        # 3. Concatenate/stack along appropriate axes
+        merged_indices = None
+        if all(s.global_indices is not None for s in shard_list):
+            merged_indices = backend.cat([s.global_indices for s in shard_list], dim=0)
 
-        if len(shard_data) == 1:
-            assembled_tensor = shard_data[0]
-        else:
-            # Simple concatenation (assumes shards can be concatenated)
-            try:
-                assembled_tensor = np.concatenate(shard_data, axis=0)
-            except ValueError:
-                # If concatenation fails, try stacking
-                assembled_tensor = np.stack(shard_data, axis=0)
+        # Propagate global_shape from shards
+        global_shape = shard_list[0].global_shape
 
-        # Build assembled meta with correct shape and global_shape
-        first_meta = shard_metas[0] if shard_metas else None
-        assembled_shape = (
-            tuple(assembled_tensor.shape) if hasattr(assembled_tensor, "shape") else ()
+        return TransportTensor(
+            merged_values, indices=merged_indices, global_shape=global_shape
         )
-        assembled_dtype = (
-            str(assembled_tensor.dtype)
-            if hasattr(assembled_tensor, "dtype")
-            else "unknown"
-        )
-
-        # Infer global_shape from input_spec (assembled local shape → global shape)
-        global_shape: Optional[Tuple[int, ...]] = None
-        if not input_spec.is_content_addressable and assembled_shape:
-            # We don't have infer_global_shape on ShardingSpec right now.
-            # We'll use the assembled shape directly, assuming no other axes are sharded.
-            global_shape = assembled_shape
-        elif first_meta is not None:
-            global_shape = first_meta.global_shape
-
-        assembled_meta = TensorMeta(
-            tensor_name=tensor_name,
-            shape=assembled_shape,
-            dtype=assembled_dtype,
-            global_shape=global_shape,
-            source_spmd_id=first_meta.source_spmd_id if first_meta else "",
-            source_rank=first_meta.source_rank if first_meta else -1,
-            forward_step=first_meta.forward_step if first_meta else -1,
-            is_sparse=False,
-        )
-
-        logger.debug(
-            f"[spmd_id={self.spmd_id} rank={self.rank}] _assemble_static_to_static: tensor={tensor_name}, "
-            f"num_shards={len(shard_data)}, assembled_shape={assembled_shape}, "
-            f"global_shape={global_shape}, input_spec={type(input_spec).__name__ if input_spec else None}, "
-            f"shard_origins={len(shard_origins)}"
-        )
-
-        return assembled_tensor, assembled_meta, shard_origins
 
     def _assemble_dynamic_to_static_tensor(
         self,
         tensor_name: str,
-        shards: Dict[int, Tuple[Any, Optional[TensorMeta]]],
+        shards: Dict[int, TransportTensor],
         input_spec: ShardingSpec,
-    ) -> Tuple[Any, Optional[TensorMeta], List[ShardOrigin]]:
-        """
-        Assemble dynamic-to-static (Sparse-to-Dense) tensor.
+    ) -> TransportTensor:
+        """Assemble dynamic-to-static (Sparse-to-Dense) tensor using global_indices."""
+        backend = get_backend()
 
-        Reconstructs LOCAL dense tensor from sparse shards.
-        The received sparse data has already been filtered by routing function,
-        so we only need to convert global_indices to local_indices and reconstruct.
-
-        Key insight: We need global_shape to compute local range, then convert
-        global_indices to local_indices for local dense tensor reconstruction.
-        """
-        # Collect all sparse shards, filtering out empty packets.
-        #
-        # 对于 dynamic→static，我们需要：
-        #   1) 保留业务逻辑：按 global_indices 排序重建本地 dense tensor。
-        #   2) 为每个 shard 记录 **重排序之后** 在本地 tensor 中的行下标
-        #      (local_indices)，以便 backward 通过 local_indices 做精确切片。
-        all_values: List[np.ndarray] = []
-        all_indices: List[np.ndarray] = []
-        all_metas: List[Optional[TensorMeta]] = []
-        shard_datas: List[np.ndarray] = []
-        shard_metas: List[Optional[TensorMeta]] = []
-
-        for rank, (data, meta) in shards.items():
-            # Filter empty packets
-            if meta is not None and meta.is_empty:
-                logger.debug(
-                    f"[spmd_id={self.spmd_id} rank={self.rank}] "
-                    f"Filtered empty packet from sender_rank={rank}"
-                )
-                continue
-
-            s_shape = tuple(data.shape) if hasattr(data, "shape") else ()
-            num_rows = s_shape[0] if s_shape else 0
-            if num_rows == 0:
-                continue
-
-            if meta is None or meta.global_indices is None:
-                # No global_indices — still include the data, and generate
-                # sequential fallback indices so that dense reconstruction
-                # and local_indices 推导可以继续。
-                logger.debug(
-                    f"[spmd_id={self.spmd_id} rank={self.rank}] Missing global_indices for "
-                    f"sparse tensor '{tensor_name}' from rank {rank}, generating "
-                    f"fallback indices. This should never happen, please check the "
-                    f"sharding spec"
-                )
-                if all_indices:
-                    max_prev = int(np.max(np.concatenate(all_indices))) + 1
-                else:
-                    max_prev = 0
-                indices = np.arange(max_prev, max_prev + num_rows, dtype=np.int64)
-            else:
-                indices = meta.global_indices.astype(np.int64, copy=False)
-
-            shard_datas.append(data)
-            shard_metas.append(meta)
-            all_values.append(data)
-            all_indices.append(indices)
-            all_metas.append(meta)
-
-        if not all_values:
-            # All shards were empty — return empty result with propagated meta
-            logger.debug(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] _assemble_dynamic_to_static: all shards empty "
-                f"for tensor '{tensor_name}', returning empty result"
+        # Merge all non-empty shards
+        valid_shards = [
+            s for s in shards.values() if backend.shape(s.flat_values)[0] > 0
+        ]
+        if not valid_shards:
+            return TransportTensor.from_tensor(
+                backend.zeros((0,), dtype=backend.float32())
             )
-            # Propagate global_shape from any received empty meta
-            global_shape = None
-            for rank, (data, meta) in shards.items():
-                if meta is not None and meta.global_shape is not None:
-                    global_shape = meta.global_shape
-                    break
-            empty_meta = TensorMeta(
-                tensor_name=tensor_name,
-                shape=(0,),
-                dtype="float32",
-                global_shape=global_shape,
-                is_sparse=False,
-                is_empty=True,
-            )
-            # 对于全空的情况，不存在任何 shard，返回空的 shard_origins。
-            return np.array([]), empty_meta, []
 
-        # Merge all indices and values, **and按 global_indices 排序**。
-        cat_indices = (
-            np.concatenate(all_indices, axis=0)
-            if len(all_indices) > 1
-            else all_indices[0]
-        )
-        cat_values = (
-            np.concatenate(all_values, axis=0) if len(all_values) > 1 else all_values[0]
-        )
+        # Simple 1D path for now (Sparse-to-Dense typically assumes 1D indices for scattering)
+        all_values = backend.cat([s.flat_values for s in valid_shards], dim=0)
+        # Materialize indices if needed
+        all_indices_list = []
+        for s in valid_shards:
+            idx = s.global_indices
+            if idx is None:
+                # Should not happen for sparse, fallback to arange if absolutely needed
+                num = backend.shape(s.flat_values)[0]
+                idx = backend.arange(0, num, dtype=backend.int32())
+            all_indices_list.append(idx)
+        all_indices = backend.cat(all_indices_list, dim=0)
 
-        # 为了在排序后还能知道每一行属于哪个 shard，我们并行维护一个
-        # owner_id 向量：owner_ids[i] = 第 i 行来源的 shard 下标。
-        owner_id_chunks: List[np.ndarray] = []
-        shard_row_counts: List[int] = []
-        for shard_idx, data in enumerate(shard_datas):
-            s_shape = tuple(data.shape) if hasattr(data, "shape") else ()
-            num_rows = s_shape[0] if s_shape else 0
-            shard_row_counts.append(num_rows)
-            owner_id_chunks.append(np.full((num_rows,), shard_idx, dtype=np.int64))
-        owner_ids = (
-            np.concatenate(owner_id_chunks, axis=0)
-            if len(owner_id_chunks) > 1
-            else owner_id_chunks[0]
-        )
+        # Infer global length to compute local range
+        max_idx = int(backend.item(backend.max(all_indices)))
+        global_shape = (max_idx + 1,)
 
-        # 按 global_indices 排序，保证业务上的全局顺序。
-        if len(cat_indices.shape) == 1:
-            sort_order = np.argsort(cat_indices)
-        else:
-            # Multi-dimensional indices: lexicographic sort
-            sort_order = np.lexsort(cat_indices.T[::-1])
-
-        merged_indices = cat_indices[sort_order]
-        merged_values = cat_values[sort_order]
-        sorted_owner_ids = owner_ids[sort_order]
-
-        # Get global_shape from meta (required to compute local range)
-        global_shape = None
-        for meta in all_metas:
-            if meta.global_shape is not None:
-                global_shape = meta.global_shape
-                break
-
-        # If global_shape not in meta, try to infer from global_indices
-        if global_shape is None:
-            if merged_indices is not None and len(merged_indices.shape) > 0:
-                if merged_indices.shape[0] > 0:
-                    # For 1D indices, global_shape = [max_index + 1]
-                    if len(merged_indices.shape) == 1:
-                        max_idx = int(np.max(merged_indices))
-                        global_shape = (max_idx + 1,)
-                    else:
-                        # For multi-dimensional indices, take max along each dimension
-                        max_indices = np.max(merged_indices, axis=0)
-                        global_shape = tuple(int(x) + 1 for x in max_indices)
-
-        if global_shape is None:
-            # Cannot infer global_shape – 这里仍然返回 dense 形式的数据，但
-            # global_shape 为空，仅用于本地计算，不影响后续利用 local_indices
-            # 做反向切片。
-            logger.debug(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] _assemble_dynamic_to_static: "
-                f"cannot infer global_shape for tensor '{tensor_name}', using "
-                f"merged_values.shape as local dense shape"
-            )
-            global_shape = merged_values.shape
-
-        # Compute local range using input_spec.lower(global_shape, rank)
-        # This gives us the slices for each dimension
         internal_layout = input_spec.lower(global_shape, self.rank)
         local_shape = internal_layout.get_local_shape()
         dense_slices = internal_layout.dense_slices
 
-        if dense_slices is None:
-            raise ValueError(
-                f"Cannot compute local range for tensor '{tensor_name}': "
-                f"input_spec.lower() did not return dense_slices"
+        slice_start = dense_slices[0].start
+        slice_end = dense_slices[0].end
+
+        mask = (all_indices >= slice_start) & (all_indices < slice_end)
+        local_indices = all_indices[mask] - slice_start
+        local_values = all_values[mask]
+
+        assembled_data = backend.zeros(local_shape, dtype=all_values.dtype)
+        # Reconstruct (scatter)
+        # Backend should support indexed assignment or scatter
+        # For simplicity, use a generic scatter-like logic
+        # assembled_data[local_indices] = local_values
+        # Note: index_update is a common functional pattern
+        try:
+            assembled_data = backend.index_update(
+                assembled_data, local_indices, local_values
             )
+        except AttributeError:
+            # Fallback to numpy if backend lacks index_update (eager/fallback)
+            arr = backend.to_numpy(assembled_data)
+            arr[backend.to_numpy(local_indices)] = backend.to_numpy(local_values)
+            assembled_data = backend.tensor(arr)
 
-        # Filter indices that fall into this worker's local range (axis-0).
-        if len(merged_indices.shape) == 1:
-            slice_start = dense_slices[0].start
-            slice_end = dense_slices[0].end
-            mask = (merged_indices >= slice_start) & (merged_indices < slice_end)
-        else:
-            # Multi-dimensional: 仍旧只用第 0 维来决定本地 batch 范围。
-            slice_start = dense_slices[0].start
-            slice_end = dense_slices[0].end
-            dim0 = merged_indices[:, 0]
-            mask = (dim0 >= slice_start) & (dim0 < slice_end)
-
-        local_indices = merged_indices[mask] - slice_start
-        local_values = merged_values[mask]
-
-        # Reconstruct LOCAL dense tensor from sparse data
-        assembled_tensor = np.zeros(local_shape, dtype=merged_values.dtype)
-        assembled_tensor[local_indices] = local_values
-
-        # Build shard origins with **local_indices**: 对于排序后的 local dense
-        # tensor，统计每个 shard 在 axis-0 上对应的行坐标。
-        shard_origins: List[ShardOrigin] = []
-        num_shards = len(shard_datas)
-        # 对于每个 shard，下标 j 的行属于该 shard 的位置即：
-        #   np.nonzero(sorted_owner_ids[mask] == j)[0]
-        for shard_idx in range(num_shards):
-            data = shard_datas[shard_idx]
-            meta = shard_metas[shard_idx]
-            s_shape = tuple(data.shape) if hasattr(data, "shape") else ()
-            if s_shape and s_shape[0] > 0:
-                local_pos = np.nonzero(sorted_owner_ids[mask] == shard_idx)[0]
-                local_indices_for_shard: Optional[np.ndarray]
-                if local_pos.size > 0:
-                    local_indices_for_shard = local_pos.astype(np.int64, copy=False)
-                else:
-                    local_indices_for_shard = None
-            else:
-                local_indices_for_shard = None
-
-            shard_origins.append(
-                ShardOrigin(
-                    source_spmd_id=meta.source_spmd_id if meta else "",
-                    source_rank=meta.source_rank if meta else -1,
-                    global_indices=(
-                        meta.global_indices.copy()
-                        if (meta is not None and meta.global_indices is not None)
-                        else None
-                    ),
-                    shard_shape=s_shape,
-                    local_indices=local_indices_for_shard,
-                )
-            )
-
-        # Create new meta for local dense tensor
-        assembled_meta = TensorMeta(
-            tensor_name=tensor_name,
-            shape=assembled_tensor.shape,
-            dtype=str(assembled_tensor.dtype),
-            global_shape=global_shape,  # Keep global_shape for reference
-            is_sparse=False,
-        )
-
-        logger.debug(
-            f"[spmd_id={self.spmd_id} rank={self.rank}] _assemble_dynamic_to_static: tensor={tensor_name}, "
-            f"num_shards={len(all_values)}, global_shape={global_shape}, "
-            f"local_shape={assembled_tensor.shape}, "
-            f"merged_indices_len={len(merged_indices) if merged_indices is not None else 0}, "
-            f"shard_origins={len(shard_origins)}"
-        )
-
-        return assembled_tensor, assembled_meta, shard_origins
+        return TransportTensor.from_tensor(assembled_data, global_shape=global_shape)
 
     def _assemble_to_dynamic_tensor(
-        self, tensor_name: str, shards: Dict[int, Tuple[Any, Optional[TensorMeta]]]
-    ) -> Tuple[Any, TensorMeta, List[ShardOrigin]]:
-        """
-        Assemble to-dynamic (Any -> Sparse) tensor.
+        self, tensor_name: str, shards: Dict[int, TransportTensor]
+    ) -> TransportTensor:
+        """Assemble to-dynamic (Any -> Sparse) tensor by merging shards."""
+        backend = get_backend()
+        shard_list = sorted(shards.items())
+        valid_tensors = [
+            t for r, t in shard_list if backend.shape(t.flat_values)[0] > 0
+        ]
 
-        Simply merges all shards and their metadata.
-        Also collects per-shard origins for backward reverse routing.
-        """
-        # Collect all shards, filtering out empty packets
-        all_data = []
-        all_metas = []
-        shard_origins: List[ShardOrigin] = []
-        row_offset = 0
-
-        for rank in sorted(shards.keys()):
-            data, meta = shards[rank]
-            # Filter empty packets
-            if meta is not None and meta.is_empty:
-                logger.debug(
-                    f"[spmd_id={self.spmd_id} rank={self.rank}] "
-                    f"Filtered empty packet from sender_rank={rank}"
-                )
-                continue
-            s_shape = tuple(data.shape) if hasattr(data, "shape") else ()
-            num_rows = s_shape[0] if s_shape else 0
-            local_indices = (
-                np.arange(row_offset, row_offset + num_rows, dtype=np.int64)
-                if num_rows > 0
-                else None
-            )
-            shard_origins.append(
-                ShardOrigin(
-                    source_spmd_id=meta.source_spmd_id if meta else "",
-                    source_rank=meta.source_rank if meta else rank,
-                    global_indices=(
-                        meta.global_indices.copy()
-                        if (meta and meta.global_indices is not None)
-                        else None
-                    ),
-                    shard_shape=s_shape,
-                    local_indices=local_indices,
-                )
-            )
-            row_offset += num_rows
-            all_data.append(data)
-            if meta is not None:
-                all_metas.append(meta)
-
-        if not all_data:
-            # All shards were empty — return empty result with propagated meta
-            logger.debug(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] _assemble_to_dynamic: all shards empty "
-                f"for tensor '{tensor_name}', returning empty result"
-            )
-            global_shape = None
-            for rank, (data, meta) in shards.items():
-                if meta is not None and meta.global_shape is not None:
-                    global_shape = meta.global_shape
-                    break
-            empty_meta = TensorMeta(
-                tensor_name=tensor_name,
-                shape=(0,),
-                dtype="float32",
-                global_shape=global_shape,
-                is_sparse=True,
-                is_empty=True,
-            )
-            return np.array([]), empty_meta, shard_origins
-
-        # Merge data
-        if len(all_data) == 1:
-            merged_data = all_data[0]
-        else:
-            merged_data = np.concatenate(all_data, axis=0)
-
-        # Merge metadata
-        if all_metas:
-            # Merge global_indices
-            all_indices = []
-            for meta in all_metas:
-                if meta.global_indices is not None:
-                    all_indices.append(meta.global_indices)
-
-            merged_indices = (
-                np.concatenate(all_indices, axis=0)
-                if len(all_indices) > 1
-                else all_indices[0]
-                if all_indices
-                else None
+        if not valid_tensors:
+            return TransportTensor.from_tensor(
+                backend.zeros((0,), dtype=backend.float32())
             )
 
-            # Use first meta as base, update with merged info, propagate global_shape
-            base_meta = all_metas[0]
-            # Propagate global_shape from any shard that carries it
-            global_shape = None
-            for meta in all_metas:
-                if meta.global_shape is not None:
-                    global_shape = meta.global_shape
-                    break
-            merged_meta = TensorMeta(
-                tensor_name=tensor_name,
-                shape=merged_data.shape,
-                dtype=str(merged_data.dtype),
-                global_indices=merged_indices,
-                global_shape=global_shape,
-                source_spmd_id=base_meta.source_spmd_id,
-                source_rank=base_meta.source_rank,
-                forward_step=base_meta.forward_step,
-                is_sparse=True,
-            )
-            logger.debug(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] _assemble_to_dynamic: tensor={tensor_name}, "
-                f"num_shards={len(all_data)}, merged_shape={merged_data.shape}, "
-                f"global_shape={global_shape}, "
-                f"merged_indices_len={len(merged_indices) if merged_indices is not None else None}, "
-                f"shard_origins={len(shard_origins)}"
-            )
-        else:
-            # Create new meta if none available
-            merged_meta = TensorMeta(
-                tensor_name=tensor_name,
-                shape=merged_data.shape,
-                dtype=str(merged_data.dtype),
-                is_sparse=True,
-            )
-            logger.debug(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] _assemble_to_dynamic: tensor={tensor_name}, "
-                f"num_shards={len(all_data)}, merged_shape={merged_data.shape}, no shard metas"
+        merged_values = backend.cat([t.flat_values for t in valid_tensors], dim=0)
+        merged_indices = None
+        if all(t.global_indices is not None for t in valid_tensors):
+            merged_indices = backend.cat(
+                [t.global_indices for t in valid_tensors], dim=0
             )
 
-        return merged_data, merged_meta, shard_origins
+        return TransportTensor(merged_values, indices=merged_indices)
 
     async def _advance_step(self, op_type: OpType) -> None:
         """Advance execution step counter for an operator."""
@@ -1877,232 +1317,91 @@ class SPMDWorker:
         *,
         exec_step: Optional[int] = None,
     ) -> None:
-        """
-        Send output to successor SPMDs.
-
-        Uses OperatorManager.get_successor_target_route() for routing.
-        Handles self-loops (same node, different op) by calling _self_receive_tensor.
-
-        Routing strategy (refined for backward ops):
-
-        1. **Dense-to-dense** — always use sharding-based geometric routing.
-        2. **Sparse involved**:
-           2.1. If the relevant ``DynamicShardingSpec`` carries a user-provided
-                ``fn`` → delegate to ``get_successor_target_route`` (calls fn).
-           2.2. If **no** route fn → reverse-route using the forward step's
-                per-shard origin metadata stored in ``_meta_history``.
-
-        Meta lifecycle in this method:
-        1. Build one ``routing_meta`` per tensor (full output description)
-        2. Pass ``routing_meta`` to routing function for route computation
-        3. Derive ``shard_meta`` = ``_build_shard_meta(routing_meta, data_mask)`` per route
-
-        Args:
-            op_type: Current operator type
-            step: Output step number (may differ from execution step in eager mode)
-            result: Operator output
-            exec_step: The actual execution step (for forward meta lookup).
-                       Defaults to ``step`` when not provided.
-        """
+        """Send output to successor SPMDs using TransportTensor."""
         if exec_step is None:
             exec_step = step
 
         output_sharding = self._op_manager.get_output_sharding(op_type)
-
-        # Extract tensors from result
         tensors_to_send = self._extract_tensors(result, output_sharding)
-
-        # Get successor IDs from OperatorManager
         successor_ids = self._op_manager.get_successor_ids(op_type)
+        input_tensors = self._last_assembled_tensors.get(op_type, {})
 
-        # Cached input metas for global_shape / global_indices computation
-        input_metas = self._last_assembled_metas.get(op_type, {})
-
-        logger.debug(
-            f"[spmd_id={self.spmd_id} rank={self.rank}] _send_output: op={op_type.name}, step={step}, "
-            f"exec_step={exec_step}, tensors={list(tensors_to_send.keys())}, successors={successor_ids}"
-        )
-
-        # --- Phase 1: Build routing metas (once per tensor, independent of successor) ---
-        # Use output-to-input tensor name mapping so that when an operator's
-        # input and output tensor names differ (e.g. input="input", output="tensor"),
-        # the correct input meta is found for global_shape / global_indices propagation.
-        output_to_input_mapping = self._op_manager.get_output_to_input_tensor_mapping(
-            op_type
-        )
-
-        # Determine whether this operator is an "origin tensor" source:
-        # eager_trigger + enable_output_step_remap means the SPMD produces
-        # initial tensors whose shape IS the global_shape and indices are un-sharded.
-        is_eager = (
-            self._op_manager.is_eager_trigger(op_type) if self._op_manager else False
-        )
-        enable_remap = getattr(self.config, "enable_output_step_remap", False)
-        is_origin_tensor = is_eager and enable_remap
-
-        routing_metas: Dict[str, TensorMeta] = {}
-        for tensor_name, tensor_data in tensors_to_send.items():
-            # Look up the corresponding input tensor name via the mapping
-            input_tensor_name = output_to_input_mapping.get(tensor_name, tensor_name)
-            input_meta = input_metas.get(input_tensor_name)
-            output_spec = output_sharding.get(tensor_name)
-            routing_metas[tensor_name] = self._build_routing_meta(
-                tensor_name,
-                tensor_data,
-                step,
-                output_spec,
-                input_meta,
-                is_origin_tensor=is_origin_tensor,
-            )
-
-        # --- Phase 2: For each successor, route and send ---
         for spmd_id in successor_ids:
-            # Get successor topology info (contains target_op and is_self_loop)
             succ_info = self._op_manager.get_successor_info(op_type, spmd_id)
             if succ_info is None:
-                logger.warning(
-                    f"[spmd_id={self.spmd_id} rank={self.rank}] No topology info for successor {spmd_id}"
-                )
                 continue
 
-            # Check condition if exists
-            if succ_info.condition_fn is not None:
-                if not succ_info.condition_fn(result):
-                    logger.debug(
-                        f"[spmd_id={self.spmd_id} rank={self.rank}] Condition not met for successor {spmd_id}, skipping"
-                    )
-                    continue
-
-            # Get target op type from topology
             target_op = succ_info.target_op
 
-            # Send each tensor
             for tensor_name, tensor_data in tensors_to_send.items():
-                routing_meta = routing_metas[tensor_name]
-                output_spec = output_sharding.get(tensor_name)
-                post_spec = succ_info.tensor_sharding.get(tensor_name)
+                # Wrap in TransportTensor
+                # Try to propagate indices from input if it's a pass-through
+                input_tensor = input_tensors.get(tensor_name)
+                indices = (
+                    input_tensor.global_indices if input_tensor is not None else None
+                )
 
-                # Handle self-loop: directly call data receive interface
+                transport_tensor = TransportTensor.from_tensor(
+                    tensor_data, indices=indices
+                )
+
                 if succ_info.is_self_loop:
-                    shard_meta = self._build_shard_meta(routing_meta, None)
-                    self._self_receive_tensor(
-                        target_op, tensor_name, step, tensor_data, shard_meta
+                    await self._self_receive_tensor(
+                        target_op, tensor_name, step, transport_tensor
                     )
                     continue
 
-                # Cross-node: send via handlers
                 handlers = self._successor_handlers.get(spmd_id, {})
                 if not handlers:
-                    logger.warning(
-                        f"[spmd_id={self.spmd_id} rank={self.rank}] No handlers for successor {spmd_id}"
-                    )
                     continue
 
-                is_sparse_routing = (
-                    output_spec.is_content_addressable if output_spec else False
-                ) or (post_spec.is_content_addressable if post_spec else False)
+                from fluxway.transport.communication import AsyncDataDistributor
 
-                # For backward with sparse routing and NO route fn, use
-                # forward-step shard origins for reverse routing.
-                use_reverse_routing = False
-                if is_sparse_routing and op_type == OpType.BACKWARD:
-                    has_fn = (
-                        getattr(post_spec.strategy if post_spec else None, "fn", None)
-                        is not None
-                        or getattr(
-                            output_spec.strategy if output_spec else None, "fn", None
+                distributor = AsyncDataDistributor(self.rank)
+
+                async def _send_fn(
+                    target_rank: int,
+                    tensors: list,
+                    counts: list,
+                    *,
+                    _handlers=handlers,
+                    _target_op=target_op,
+                    _tensor_name=tensor_name,
+                    _step=step,
+                ) -> bool:
+                    handler = _handlers.get(target_rank)
+                    if handler is None:
+                        return False
+
+                    # Package received slices back into a TransportTensor for the receiver
+                    count = int(counts[0]) if counts else 0
+                    if count == 0:
+                        backend = get_backend()
+                        empty_tensor = TransportTensor.from_tensor(
+                            backend.zeros((0,), dtype=backend.float32())
                         )
-                        is not None
-                    )
-                    if not has_fn:
-                        use_reverse_routing = True
-
-                if use_reverse_routing:
-                    await self._send_backward_via_reverse_route(
-                        forward_step=exec_step,
-                        tensor_name=tensor_name,
-                        tensor_data=tensor_data,
-                        routing_meta=routing_meta,
-                        target_op=target_op,
-                        output_step=step,
-                        successor_spmd_id=spmd_id,
-                        handlers=handlers,
-                        succ_total_rank=succ_info.total_rank,
-                    )
-                else:
-                    from fluxway.transport.communication import AsyncDataDistributor
-                    from fluxway.transport.tensor import TransportTensor
-
-                    transport_tensor = TransportTensor(
-                        data=tensor_data, indices=routing_meta.global_indices
-                    )
-
-                    distributor = AsyncDataDistributor(self.rank)
-
-                    async def _send_fn(
-                        target_rank: int,
-                        tensors: list,
-                        counts: list,
-                        *,
-                        _handlers=handlers,
-                        _target_op=target_op,
-                        _tensor_name=tensor_name,
-                        _step=step,
-                        _routing_meta=routing_meta,
-                        _successor_spmd_id=spmd_id,
-                    ) -> bool:
-                        handler = _handlers.get(target_rank)
-                        if handler is None:
-                            return False
-                        count = int(counts[0]) if counts else 0
-                        if count == 0:
-                            return True
-                        # tensors[0] is the (padded) data buffer
-                        raw_data = tensors[0][:count]
-                        # If routing indices were transmitted (last buffer when
-                        # the target spec is content-addressable), recover them.
-                        global_indices = None
-                        if len(tensors) > 1:
-                            global_indices = np.asarray(tensors[-1][:count])
-                        shard_meta = self._build_shard_meta(_routing_meta, None)
-                        if global_indices is not None:
-                            shard_meta = TensorMeta(
-                                tensor_name=shard_meta.tensor_name,
-                                shape=getattr(raw_data, "shape", shard_meta.shape),
-                                dtype=shard_meta.dtype,
-                                global_indices=global_indices,
-                                global_shape=shard_meta.global_shape,
-                                source_spmd_id=self.spmd_id,
-                                source_rank=self.rank,
-                                forward_step=_step,
-                                is_sparse=shard_meta.is_sparse,
-                            )
                         handler.receive_tensor_data.remote(
-                            _target_op,
-                            _tensor_name,
-                            _step,
-                            self.rank,
-                            raw_data,
-                            shard_meta,
-                        )
-                        logger.debug(
-                            "[spmd_id=%s rank=%d] _send_fn → %s rank=%d "
-                            "count=%d tensor=%s",
-                            self.spmd_id,
-                            self.rank,
-                            _successor_spmd_id,
-                            target_rank,
-                            count,
-                            _tensor_name,
+                            _target_op, _tensor_name, _step, self.rank, empty_tensor
                         )
                         return True
 
-                    await distributor.distribute(
-                        local_data=transport_tensor,
-                        source=output_spec,
-                        target=post_spec,
-                        send_fn=_send_fn,
+                    data_payload = tensors[0][:count]
+                    indices_payload = tensors[1][:count] if len(tensors) > 1 else None
+
+                    received_tensor = TransportTensor(
+                        data_payload, indices=indices_payload
                     )
+                    handler.receive_tensor_data.remote(
+                        _target_op, _tensor_name, _step, self.rank, received_tensor
+                    )
+                    return True
+
+                await distributor.distribute(
+                    transport_tensor,
+                    dest_topology={spmd_id: succ_info},
+                    tensor_name=tensor_name,
+                    send_fn=_send_fn,
+                )
 
         # --- Send state_argument via control plane ---
         # State arguments are sent through: rank0-worker -> driver -> controller -> target-driver -> all-workers
@@ -2165,686 +1464,36 @@ class SPMDWorker:
 
         return tensors
 
-    def _build_routing_meta(
-        self,
-        tensor_name: str,
-        tensor_data: Any,
-        step: int,
-        output_spec: Optional[ShardingSpec],
-        input_meta: Optional[TensorMeta],
-        *,
-        is_origin_tensor: bool = False,
-    ) -> TensorMeta:
-        """
-        Build **routing meta** — describes the full output tensor before routing/slicing.
-
-        This meta is passed to routing functions for sparse routing decisions.
-        For dense-to-dense routing, only ``shape`` is actually used.
-
-        Args:
-            tensor_name: Tensor name
-            tensor_data: Operator output tensor (may be ``(data, indices)`` tuple for sparse)
-            step: Execution step
-            output_spec: Output sharding spec of current operator
-            input_meta: Cached assembled input meta (from ``_last_assembled_metas``)
-            is_origin_tensor: If True, this tensor is the origin of the data pipeline
-                (eager + enable_output_step_remap).  Its shape IS the global_shape
-                and its indices cover the full un-sharded range.
-
-        Returns:
-            TensorMeta describing the full (pre-routing) output tensor
-        """
-        # --- Unwrap sparse tuple convention: (data, indices) ---
-        actual_data = tensor_data
-        output_global_indices: Optional[np.ndarray] = None
-        if isinstance(tensor_data, tuple) and len(tensor_data) == 2:
-            data_part, indices_part = tensor_data
-            if isinstance(indices_part, np.ndarray):
-                actual_data = data_part
-                output_global_indices = indices_part
-
-        # --- shape / dtype from actual data ---
-        shape = tuple(actual_data.shape) if hasattr(actual_data, "shape") else ()
-        dtype = str(actual_data.dtype) if hasattr(actual_data, "dtype") else "unknown"
-
-        # --- global_shape ---
-        # Dense output: infer from output_spec;  Sparse output: propagate from input
-        global_shape: Optional[Tuple[int, ...]] = None
-        if output_spec is not None and not output_spec.is_content_addressable and shape:
-            # We don't have infer_global_shape on ShardingSpec right now.
-            # We'll use the local shape directly, assuming no other axes are sharded.
-            global_shape = shape
-        elif input_meta is not None and input_meta.global_shape is not None:
-            global_shape = input_meta.global_shape
-
-        # --- global_indices ---
-        # Priority: operator-produced (sparse output) > input meta > dense spec offset
-        global_indices: Optional[np.ndarray] = None
-        if output_global_indices is not None:
-            # Sparse output: operator explicitly produced indices
-            global_indices = output_global_indices
-        elif input_meta is not None and input_meta.global_indices is not None:
-            # Propagate from input (e.g., sparse-input → dense-output pass-through)
-            global_indices = input_meta.global_indices
-        elif (
-            output_spec is not None and not output_spec.is_content_addressable and shape
-        ):
-            # Dense output: compute from spec's axis-0 global position
-            axis0_offset = self._compute_axis0_global_offset(output_spec, actual_data)
-            if shape:
-                global_indices = np.arange(
-                    axis0_offset, axis0_offset + shape[0], dtype=np.int64
-                )
-
-        is_sparse = output_spec is not None and output_spec.is_content_addressable
-
-        # Origin tensor: when the SPMD is eager + enable_output_step_remap, the
-        # output tensor is the initial tensor in the pipeline.  Its shape IS the
-        # global_shape and its indices cover the full un-sharded range.
-        if is_origin_tensor and shape and shape[0] > 0:
-            if global_shape is None:
-                global_shape = shape
-            if global_indices is None:
-                global_indices = np.arange(shape[0], dtype=np.int64)
-            logger.debug(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] _build_routing_meta: "
-                f"origin tensor '{tensor_name}': global_shape={global_shape}, "
-                f"global_indices_len={len(global_indices)}"
-            )
-
-        logger.debug(
-            f"[spmd_id={self.spmd_id} rank={self.rank}] _build_routing_meta: tensor={tensor_name}, step={step}, "
-            f"shape={shape}, dtype={dtype}, global_shape={global_shape}, "
-            f"global_indices_len={len(global_indices) if global_indices is not None else None}, "
-            f"is_sparse={is_sparse}, "
-            f"output_spec={type(output_spec).__name__ if output_spec else None}, "
-            f"has_input_meta={input_meta is not None}"
-        )
-
-        return TensorMeta(
-            tensor_name=tensor_name,
-            shape=shape,
-            dtype=dtype,
-            global_indices=global_indices,
-            global_shape=global_shape,
-            source_spmd_id=self.spmd_id,
-            source_rank=self.rank,
-            forward_step=step,
-            is_sparse=is_sparse,
-        )
-
-    def _build_shard_meta(
-        self,
-        routing_meta: TensorMeta,
-        # NOTE:
-        # ``data_mask`` is conceptually a tuple of slices selecting a shard of the
-        # local tensor.  For dynamic sparse routing we also allow numpy / sequence
-        # indices on axis 0 (e.g. ``(np.ndarray,)``) for fancy indexing.
-        # The implementation below supports both.
-        data_mask: Optional[Tuple[Any, ...]],
-    ) -> TensorMeta:
-        """
-        Build **shard meta** — describes one sliced shard actually sent to a receiver.
-
-        Derived from ``routing_meta`` (full output tensor meta) by applying the
-        route's ``data_mask`` (tuple of slices).
-
-        - ``shape``: computed from data_mask
-        - ``global_shape``: preserved from routing_meta
-        - ``global_indices``: axis-0 slice of routing_meta's global_indices
-
-        Args:
-            routing_meta: Pre-routing meta from ``_build_routing_meta``
-            data_mask: Tuple of slices from routing (``None`` = full tensor, no slicing)
-
-        Returns:
-            TensorMeta for the shard
-        """
-        if data_mask is None:
-            # No slicing — send the full tensor
-            logger.debug(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] _build_shard_meta: tensor={routing_meta.tensor_name}, "
-                f"no data_mask, returning routing_meta as-is (shape={routing_meta.shape})"
-            )
-            return routing_meta
-
-        # --- Sliced shape ---
-        # Handle several cases:
-        # - slice(None) (i.e. [:]) → use routing_meta.shape for extent
-        # - slice(a, b) → b - a
-        # - np.ndarray / sequence of indices → len(indices)
-        # - scalar index (int) → 1
-        def _slice_extent(s: Any, dim_idx: int) -> int:
-            import numpy as np
-
-            if isinstance(s, slice):
-                start = s.start if s.start is not None else 0
-                if s.stop is not None:
-                    return s.stop - start
-                # stop is None → full dimension extent
-                if routing_meta.shape and dim_idx < len(routing_meta.shape):
-                    return routing_meta.shape[dim_idx] - start
-                return 1  # fallback
-
-            # Fancy indexing with an integer array / list of indices
-            if isinstance(s, np.ndarray):
-                return int(s.shape[0])
-            if isinstance(s, (list, tuple)):
-                return len(s)
-
-            # Scalar index
-            return 1
-
-        sliced_shape = tuple(_slice_extent(s, i) for i, s in enumerate(data_mask))
-
-        # --- Slice global_indices on axis-0 ---
-        global_indices: Optional[np.ndarray] = None
-        if routing_meta.global_indices is not None and len(data_mask) > 0:
-            axis0 = data_mask[0]
-            if isinstance(axis0, slice):
-                start = axis0.start if axis0.start is not None else 0
-                end = axis0.stop  # routing always sets explicit stop
-                global_indices = routing_meta.global_indices[start:end]
-            else:
-                # Support fancy indexing masks such as np.ndarray or list / tuple
-                global_indices = routing_meta.global_indices[axis0]
-
-        logger.debug(
-            f"[spmd_id={self.spmd_id} rank={self.rank}] _build_shard_meta: tensor={routing_meta.tensor_name}, "
-            f"data_mask={data_mask}, routing_shape={routing_meta.shape} -> shard_shape={sliced_shape}, "
-            f"global_indices_len={len(global_indices) if global_indices is not None else None}, "
-            f"global_shape={routing_meta.global_shape}"
-        )
-
-        return TensorMeta(
-            tensor_name=routing_meta.tensor_name,
-            shape=sliced_shape,
-            dtype=routing_meta.dtype,
-            global_indices=global_indices,
-            global_shape=routing_meta.global_shape,
-            source_spmd_id=routing_meta.source_spmd_id,
-            source_rank=routing_meta.source_rank,
-            forward_step=routing_meta.forward_step,
-            is_sparse=routing_meta.is_sparse,
-        )
-
-    def _compute_axis0_global_offset(
-        self, output_spec: Optional[ShardingSpec], tensor_data: Any
-    ) -> int:
-        """
-        Compute the global offset for axis 0 based on output sharding spec.
-
-        For a Dense ShardingSpec with axis 0 sharded, computes where this rank's
-        local data starts in the global tensor on axis 0.
-
-        Args:
-            output_spec: Output sharding spec
-            tensor_data: The tensor data (needed for local shape)
-
-        Returns:
-            Global offset for axis 0 (0 if axis 0 is replicated or spec is None)
-        """
-        if output_spec is None or output_spec.is_content_addressable:
-            return 0
-
-        # We assume the only partitioned axis is axis 0 for this legacy function.
-        if "axis_0" not in output_spec.partition:
-            # Axis 0 is not sharded (replicated)
-            return 0
-
-        if not hasattr(tensor_data, "shape") or len(tensor_data.shape) == 0:
-            return 0
-
-        local_axis0 = tensor_data.shape[0]
-        num_devices_axis0 = output_spec.mesh.axis_shapes[0]
-        local_axis0 * num_devices_axis0
-
-        # WARNING: This assumes a simple chunk sharding on axis 0.
-        # This will be entirely removed once AsyncDataDistributor fully takes over.
-        return self.rank * local_axis0
-
     # =========================================================================
-    # Meta History (for backward reverse routing)
+    # Step Management
     # =========================================================================
 
-    def get_forward_step_meta(
-        self, forward_step: int, tensor_name: str
-    ) -> Optional[StepTensorMeta]:
-        """
-        Look up forward step's metadata (assembled meta + shard origins)
-        for backward reverse routing.
-
-        When backward encounters sparse routing without a route fn, it uses
-        the shard_origins recorded here to reverse-route gradients back to
-        the original source workers.
-
-        Args:
-            forward_step: The forward step whose meta is needed
-            tensor_name: Tensor name
-
-        Returns:
-            StepTensorMeta with assembled meta and shard origins, or None
-        """
-        step_metas = self._meta_history[OpType.FORWARD].get(forward_step, {})
-        stm = step_metas.get(tensor_name)
-        if stm is not None:
-            meta = stm.assembled_meta
-            logger.debug(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] get_forward_step_meta: forward_step={forward_step}, "
-                f"tensor={tensor_name}, found=True, shard_origins={len(stm.shard_origins)}"
-                + (
-                    f", shape={meta.shape}, global_shape={meta.global_shape}"
-                    if meta
-                    else ""
-                )
-            )
-        else:
-            logger.debug(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] get_forward_step_meta: forward_step={forward_step}, "
-                f"tensor={tensor_name}, found=False"
-            )
-        return stm
-
-    def get_step_meta(
-        self, op_type: OpType, step: int, tensor_name: str
-    ) -> Optional[StepTensorMeta]:
-        """
-        Look up metadata for any (op_type, step).
-
-        Generalised version of ``get_forward_step_meta``.
-        """
-        step_metas = self._meta_history[op_type].get(step, {})
-        stm = step_metas.get(tensor_name)
-        logger.debug(
-            f"[spmd_id={self.spmd_id} rank={self.rank}] get_step_meta: op={op_type.name}, step={step}, "
-            f"tensor={tensor_name}, found={stm is not None}"
-        )
-        return stm
-
-    def clear_meta_history(
+    def clear_tensor_history(
         self, op_type: OpType, up_to_step: Optional[int] = None
     ) -> None:
-        """
-        Free meta history that is no longer needed.
-
-        Args:
-            op_type: Operator type whose history to clear
-            up_to_step: If given, only clear steps <= this value.
-                        If None, clear all history for this op_type.
-        """
+        """Free tensor history that is no longer needed."""
         if up_to_step is None:
-            num_cleared = len(self._meta_history[op_type])
-            self._meta_history[op_type].clear()
-            logger.debug(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] clear_meta_history: op={op_type.name}, "
-                f"cleared all ({num_cleared} steps)"
-            )
+            self._tensor_history[op_type].clear()
         else:
             steps_to_remove = [
-                s for s in self._meta_history[op_type] if s <= up_to_step
+                s for s in self._tensor_history[op_type] if s <= up_to_step
             ]
             for s in steps_to_remove:
-                del self._meta_history[op_type][s]
-            logger.debug(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] clear_meta_history: op={op_type.name}, "
-                f"up_to_step={up_to_step}, cleared {len(steps_to_remove)} steps, "
-                f"remaining={list(self._meta_history[op_type].keys())}"
-            )
+                del self._tensor_history[op_type][s]
 
     # =========================================================================
     # Backward Reverse Routing (using forward shard origins)
     # =========================================================================
 
-    async def _send_backward_via_reverse_route(
-        self,
-        *,
-        forward_step: int,
-        tensor_name: str,
-        tensor_data: Any,
-        routing_meta: TensorMeta,
-        target_op: OpType,
-        output_step: int,
-        successor_spmd_id: str,
-        handlers: Dict[int, Any],
-        succ_total_rank: int,
+    async def _self_receive_tensor(
+        self, target_op: OpType, name: str, step: int, tensor: TransportTensor
     ) -> None:
-        """
-        Send backward output using forward-step shard origins (reverse routing).
-
-        When the backward operator's sparse edge has **no route fn**, we look up
-        the per-shard origin records saved during the corresponding forward
-        assembly.  For each shard origin whose ``source_spmd_id`` matches the
-        target successor, we slice the backward output tensor at the same row
-        range (for dynamic-assembled tensors) or gather using the original
-        ``global_indices`` (for dense-assembled tensors), then send the slice
-        to the original ``source_rank``.
-
-        Target ranks that are NOT present in the shard origins receive an empty
-        packet so that sparse synchronisation is maintained.
-
-        Args:
-            forward_step: The forward execution step whose shard origins to use.
-            tensor_name: Tensor name.
-            tensor_data: The full backward output tensor.
-            routing_meta: Pre-routing meta for the backward output.
-            target_op: Successor's target operator type.
-            output_step: The step number to stamp on outgoing packets.
-            successor_spmd_id: SPMD id of the backward successor.
-            handlers: ``{rank: handler}`` for the successor SPMD.
-            succ_total_rank: Total number of ranks in the successor SPMD.
-        """
-        # Look up forward shard origins
-        step_tensor_meta = self.get_forward_step_meta(forward_step, tensor_name)
-        if step_tensor_meta is None or not step_tensor_meta.shard_origins:
-            logger.warning(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] _send_backward_via_reverse_route: "
-                f"no forward shard origins for step={forward_step}, tensor={tensor_name}. "
-                f"Falling back to broadcast (sending full tensor to all successor ranks)."
-            )
-            # Fallback: broadcast full tensor to every successor rank
-            for target_rank in range(succ_total_rank):
-                handler = handlers.get(target_rank)
-                if handler is None:
-                    continue
-                shard_meta = self._build_shard_meta(routing_meta, None)
-                self._send_tensor(
-                    handler,
-                    target_op,
-                    tensor_name,
-                    output_step,
-                    tensor_data,
-                    (),
-                    shard_meta,
-                    successor_spmd_id,
-                    target_rank,
-                )
-            return
-
-        # Filter shard origins belonging to the target successor SPMD
-        relevant_origins = [
-            origin
-            for origin in step_tensor_meta.shard_origins
-            if origin.source_spmd_id == successor_spmd_id
-        ]
-
-        logger.debug(
-            f"[spmd_id={self.spmd_id} rank={self.rank}] _send_backward_via_reverse_route: "
-            f"forward_step={forward_step}, tensor={tensor_name}, successor={successor_spmd_id}, "
-            f"total_origins={len(step_tensor_meta.shard_origins)}, "
-            f"relevant_origins={len(relevant_origins)}"
-        )
-
-        # Build a set of target ranks that will receive actual data
-        routed_ranks: set = set()
-
-        for origin in relevant_origins:
-            target_rank = origin.source_rank
-            routed_ranks.add(target_rank)
-            handler = handlers.get(target_rank)
-            if handler is None:
-                logger.warning(
-                    f"[spmd_id={self.spmd_id} rank={self.rank}] reverse_route: no handler "
-                    f"for target_rank={target_rank} in {successor_spmd_id}"
-                )
-                continue
-
-            # Determine how to slice the backward output
-            # Determine how to slice the backward output.
-            if origin.local_indices is not None:
-                # 使用 forward 记录的 local_indices 在当前 backward 输出 tensor
-                # 上进行精确 gather。这里直接先 gather 出一个子 tensor，再以
-                # “整体发送”的形式交给 _send_tensor（slices=()）。
-                try:
-                    ndim = len(routing_meta.shape) if routing_meta.shape else 1
-                    index_tuple = (origin.local_indices,) + tuple(
-                        slice(None) for _ in range(ndim - 1)
-                    )
-                    gathered_tensor = tensor_data[index_tuple]
-                except Exception as e:
-                    logger.warning(
-                        f"[spmd_id={self.spmd_id} rank={self.rank}] reverse_route: "
-                        f"failed to gather by local_indices for tensor={tensor_name}, "
-                        f"falling back to full tensor. error={e}"
-                    )
-                    gathered_tensor = tensor_data
-                    index_tuple = ()
-
-                # 基于 routing_meta 构造 shard_meta，并覆盖 shape/global_indices。
-                shard_meta = self._build_shard_meta(
-                    routing_meta,
-                    None,  # 我们已经在 data 里做了 gather，这里不再依赖 slice mask
-                )
-                shard_meta = TensorMeta(
-                    tensor_name=shard_meta.tensor_name,
-                    shape=getattr(gathered_tensor, "shape", shard_meta.shape),
-                    dtype=shard_meta.dtype,
-                    global_indices=origin.global_indices,
-                    global_shape=shard_meta.global_shape,
-                    source_spmd_id=self.spmd_id,
-                    source_rank=self.rank,
-                    forward_step=forward_step,
-                    is_sparse=False,
-                )
-
-                self._send_tensor(
-                    handler,
-                    target_op,
-                    tensor_name,
-                    output_step,
-                    gathered_tensor,
-                    (),
-                    shard_meta,
-                    successor_spmd_id,
-                    target_rank,
-                )
-            elif origin.global_indices is not None:
-                # 兼容旧逻辑：没有 local_indices 但有 global_indices 的情况，
-                # 仍然退化为发送完整 tensor，由接收端自行根据 global_indices 过滤。
-                data_mask: Tuple[slice, ...] = (
-                    (slice(0, routing_meta.shape[0]),) if routing_meta.shape else ()
-                )
-                shard_meta = self._build_shard_meta(
-                    routing_meta, data_mask if data_mask else None
-                )
-                shard_meta = TensorMeta(
-                    tensor_name=shard_meta.tensor_name,
-                    shape=shard_meta.shape,
-                    dtype=shard_meta.dtype,
-                    global_indices=origin.global_indices,
-                    global_shape=shard_meta.global_shape,
-                    source_spmd_id=self.spmd_id,
-                    source_rank=self.rank,
-                    forward_step=forward_step,
-                    is_sparse=shard_meta.is_sparse,
-                )
-                self._send_tensor(
-                    handler,
-                    target_op,
-                    tensor_name,
-                    output_step,
-                    tensor_data,
-                    data_mask,
-                    shard_meta,
-                    successor_spmd_id,
-                    target_rank,
-                )
-            else:
-                # 既没有 local_indices 也没有 global_indices，退化为广播。
-                data_mask = ()
-                shard_meta = self._build_shard_meta(routing_meta, None)
-                self._send_tensor(
-                    handler,
-                    target_op,
-                    tensor_name,
-                    output_step,
-                    tensor_data,
-                    data_mask,
-                    shard_meta,
-                    successor_spmd_id,
-                    target_rank,
-                )
-
-        # Send empty packets to successor ranks NOT covered by shard_origins
-        for target_rank in range(succ_total_rank):
-            if target_rank in routed_ranks:
-                continue
-            handler = handlers.get(target_rank)
-            if handler is not None:
-                self._send_empty_packet(
-                    handler,
-                    target_op,
-                    tensor_name,
-                    output_step,
-                    routing_meta,
-                    successor_spmd_id,
-                    target_rank,
-                )
-
-    def _get_successor_op_type(self, current_op: OpType) -> OpType:
-        """Map current op type to successor's op type (deprecated - use topology target_op)."""
-        return current_op
-
-    def _self_receive_tensor(
-        self, target_op: OpType, name: str, step: int, data: Any, meta: TensorMeta
-    ) -> None:
-        """
-        Self-loop data passing - directly call data receive interface.
-
-        For same-node edges (e.g., forward -> backward), this method
-        maintains the data-driven execution model by calling receive_tensor_data
-        on self rather than sending via handlers.
-
-        Args:
-            target_op: Target operator type (e.g., BACKWARD for forward->backward edge)
-            name: Tensor name
-            step: Current step number
-            data: Tensor data to pass
-            meta: Tensor metadata
-        """
+        """Self-loop data passing - directly call data receive interface."""
         logger.debug(
             f"[spmd_id={self.spmd_id} rank={self.rank}] Self-loop data passing: {name} step={step} "
             f"-> {target_op.name}"
         )
-
-        # Directly call receive_tensor_data to trigger target op's data readiness check
-        asyncio.create_task(
-            self.receive_tensor_data(
-                op_type=target_op,
-                name=name,
-                step=step,
-                sender_rank=self.rank,
-                data=data,
-                meta=meta,
-            )
-        )
-
-    def _send_tensor(
-        self,
-        handler: Any,
-        op_type: OpType,
-        name: str,
-        step: int,
-        data: Any,
-        slices: Tuple[slice, ...],
-        meta: TensorMeta,
-        target_spmd_id: str,
-        target_rank: int,
-    ) -> None:
-        """
-        Send tensor data to a worker handler.
-
-        First slices the tensor according to the slice tuple, then sends the sliced data.
-
-        Args:
-            handler: Target worker handler
-            op_type: Operator type
-            name: Tensor name
-            step: Step number
-            data: Full tensor data
-            slices: Tuple of slice objects for each dimension (can be used directly for indexing)
-            meta: Tensor metadata
-        """
-        if handler is None:
-            return
-
-        # Slice tensor directly using the slice tuple
-        try:
-            sliced_data = data[slices] if slices else data
-        except (TypeError, IndexError):
-            # If slicing fails (e.g., non-array type), use original data
-            logger.warning(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] Failed to slice tensor with slices {slices}, sending original data"
-            )
-            sliced_data = data
-
-        if hasattr(handler, "receive_tensor_data"):
-            handler.receive_tensor_data.remote(
-                op_type, name, step, self.rank, sliced_data, meta
-            )
-            logger.debug(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] Worker sending tensor: "
-                f"op={op_type.name}, name={name}, step={step}, "
-                f"target_spmd_id={target_spmd_id}, target_rank={target_rank}, "
-                f"slices={slices}, data_shape={getattr(sliced_data, 'shape', 'N/A')}, "
-                f"meta.shape={meta.shape}, meta.global_shape={meta.global_shape}, "
-                f"meta.global_indices_len={len(meta.global_indices) if meta.global_indices is not None else None}, "
-                f"meta.is_sparse={meta.is_sparse}"
-            )
-        else:
-            logger.debug(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] Would send tensor {name} to handler: "
-                f"step={step}, target_spmd_id={target_spmd_id}, target_rank={target_rank}"
-            )
-
-    def _send_empty_packet(
-        self,
-        handler: Any,
-        op_type: OpType,
-        name: str,
-        step: int,
-        base_meta: TensorMeta,
-        target_spmd_id: str,
-        target_rank: int,
-    ) -> None:
-        """
-        Send empty packet to target worker for sparse routing.
-
-        For sparse routing, all target ranks must receive either actual data or
-        an empty packet to ensure proper synchronization.
-
-        Args:
-            handler: Target worker handler
-            op_type: Operator type
-            name: Tensor name
-            step: Step number
-            base_meta: Base tensor metadata to copy from
-        """
-        if handler is None:
-            return
-
-        empty_meta = TensorMeta(
-            tensor_name=base_meta.tensor_name,
-            shape=(0,),
-            dtype=base_meta.dtype,
-            global_shape=base_meta.global_shape,
-            source_spmd_id=self.spmd_id,
-            source_rank=self.rank,
-            forward_step=base_meta.forward_step,
-            is_sparse=base_meta.is_sparse,
-            is_empty=True,
-        )
-        empty_data = np.array([])
-
-        if hasattr(handler, "receive_tensor_data"):
-            handler.receive_tensor_data.remote(
-                op_type, name, step, self.rank, empty_data, empty_meta
-            )
-            logger.debug(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] Worker sent empty packet: "
-                f"op={op_type.name}, name={name}, step={step}, "
-                f"target_spmd_id={target_spmd_id}, target_rank={target_rank}, "
-                f"global_shape={empty_meta.global_shape}, is_sparse={empty_meta.is_sparse}"
-            )
+        await self.receive_tensor_data(target_op, name, step, self.rank, tensor)
 
     async def _self_receive_state(
         self, target_op: OpType, name: str, step: int, data: Any

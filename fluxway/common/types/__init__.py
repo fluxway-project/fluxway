@@ -1,6 +1,6 @@
 """Common type definitions for Fluxway framework."""
 
-from .data_types import (
+from .configs import (
     # SPMD Configuration
     SPMDConfig,
     OpType,
@@ -31,8 +31,6 @@ from .data_types import (
     LayoutSpec,
     DependencySpec,
     RPCPayload,
-    # Tensor Metadata (for routing and backward tracking)
-    TensorMeta,
     # Operator metadata
     EdgeShardingInfo,
     OperatorMeta,
@@ -71,6 +69,9 @@ from .sharding import (
     ShardingSpec,
 )
 
+# Unified tensor wrapper
+from .tensor import TransportTensor
+
 __all__ = [
     # SPMD Configuration
     "SPMDConfig",
@@ -102,8 +103,6 @@ __all__ = [
     "LayoutSpec",
     "DependencySpec",
     "RPCPayload",
-    # Tensor Metadata
-    "TensorMeta",
     # Operator metadata
     "EdgeShardingInfo",
     "OperatorMeta",
@@ -136,4 +135,5 @@ __all__ = [
     "GreedyPartition",
     "Layout",
     "ShardingSpec",
+    "TransportTensor",
 ]

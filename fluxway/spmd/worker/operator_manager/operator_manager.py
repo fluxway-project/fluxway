@@ -15,7 +15,7 @@ import threading
 import logging
 import inspect
 
-from fluxway.common.types.data_types import ArgumentType, OpType
+from fluxway.common.types.configs import ArgumentType, OpType
 from fluxway.common.types.sharding import ShardingSpec
 from fluxway.common.mesh import DeviceMesh
 

@@ -7,7 +7,7 @@ from typing import Any, Callable, Coroutine, List, Tuple
 from fluxway.common.backend import get_backend
 from fluxway.transport.planner import TransportPlanner
 from fluxway.common.types.sharding import ShardingSpec
-from fluxway.transport.tensor import TransportTensor
+from fluxway.common.types.tensor import TransportTensor
 from fluxway.common.execution import compile
 
 

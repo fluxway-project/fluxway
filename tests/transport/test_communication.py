@@ -2,7 +2,7 @@ import pytest
 import jax.numpy as jnp
 import numpy as np
 
-from fluxway.transport.tensor import TransportTensor
+from fluxway.common.types.tensor import TransportTensor
 from fluxway.common.types.sharding import ShardingSpec, P
 from fluxway.common.mesh import DeviceMesh
 from fluxway.transport.communication import DataDistributor, TransportReceiver

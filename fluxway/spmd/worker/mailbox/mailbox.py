@@ -14,16 +14,16 @@ Zero-copy shard writing is supported via TransportReceiver delegation.
 
 import asyncio
 import logging
-from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
-from fluxway.common.types.data_types import OpType
+from fluxway.common.types.configs import OpType
 from fluxway.common.sync import ArrivalBarrier
 from fluxway.transport.communication import TransportReceiver
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from fluxway.common.types.data_types import TensorMeta
+    from fluxway.common.types.tensor import TransportTensor
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +132,7 @@ class WorkerMailbox:
 
         # Data plane (buffered path)
         self._tensor_slots: Dict[
-            OpType, Dict[str, Dict[int, Dict[int, Tuple[Any, Optional["TensorMeta"]]]]]
+            OpType, Dict[str, Dict[int, Dict[int, "TransportTensor"]]]
         ] = {op: {} for op in OpType}
 
         # Completion barriers: {op_type: {step: StepBarrier}}
@@ -227,7 +227,7 @@ class WorkerMailbox:
 
     def _buffered_slot(
         self, op_type: OpType, name: str, step: int
-    ) -> Dict[int, Tuple[Any, Optional["TensorMeta"]]]:
+    ) -> Dict[int, "TransportTensor"]:
         return self._tensor_slots[op_type].setdefault(name, {}).setdefault(step, {})
 
     async def put_tensor(
@@ -236,8 +236,7 @@ class WorkerMailbox:
         name: str,
         step: int,
         rank: int,
-        data: Any,
-        meta: Optional["TensorMeta"] = None,
+        tensor: "TransportTensor",
     ) -> None:
         """
         Cache a tensor shard and notify the step barrier.
@@ -248,14 +247,25 @@ class WorkerMailbox:
         async with self._lock:
             zc = self._zc_receivers[op_type].get(name, {}).get(step)
             if zc is not None:
+                # For zero-copy, we extract data and lengths from TransportTensor
+                if tensor.nested_splits:
+                    # If ragged, we might need lengths. For now, assume dense or handle ragged lengths
+                    pass
+
+                # Simplified for refactoring: delegate to receiver
+                # Use tensor.flat_values and length if dense
                 count = (
-                    data.shape[0]
-                    if hasattr(data, "shape") and data.shape
-                    else (len(data) if isinstance(data, (list, tuple)) else 1)
+                    tensor.flat_values.shape[0]
+                    if hasattr(tensor.flat_values, "shape") and tensor.flat_values.shape
+                    else (
+                        len(tensor.flat_values)
+                        if isinstance(tensor.flat_values, (list, tuple))
+                        else 1
+                    )
                 )
-                zc.receive_slices(rank, [data], [count])
+                zc.receive_slices(rank, [tensor.flat_values], [count])
             else:
-                self._buffered_slot(op_type, name, step)[rank] = (data, meta)
+                self._buffered_slot(op_type, name, step)[rank] = tensor
 
             barrier = self._barriers[op_type].get(step)
             if barrier is not None:
@@ -264,34 +274,28 @@ class WorkerMailbox:
                     self._on_ready(op_type, step)
 
         logger.debug(
-            "Mailbox put_tensor: op=%s name=%s step=%d rank=%d has_meta=%s",
+            "Mailbox put_tensor: op=%s name=%s step=%d rank=%d",
             op_type.name,
             name,
             step,
             rank,
-            meta is not None,
         )
 
     async def get_tensor_shard(
         self, op_type: OpType, name: str, step: int, rank: int
-    ) -> Tuple[Optional[Any], Optional["TensorMeta"]]:
+    ) -> Optional["TransportTensor"]:
         async with self._lock:
-            return (
-                self._tensor_slots[op_type]
-                .get(name, {})
-                .get(step, {})
-                .get(rank, (None, None))
-            )
+            return self._tensor_slots[op_type].get(name, {}).get(step, {}).get(rank)
 
     async def get_tensor_shards(
         self, op_type: OpType, name: str, step: int
-    ) -> Dict[int, Tuple[Any, Optional["TensorMeta"]]]:
+    ) -> Dict[int, "TransportTensor"]:
         async with self._lock:
             return dict(self._tensor_slots[op_type].get(name, {}).get(step, {}))
 
     async def get_all_tensor_shards(
         self, op_type: OpType, step: int
-    ) -> Dict[str, Dict[int, Tuple[Any, Optional["TensorMeta"]]]]:
+    ) -> Dict[str, Dict[int, "TransportTensor"]]:
         async with self._lock:
             return {
                 name: dict(step_dict[step])

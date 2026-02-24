@@ -29,7 +29,7 @@ from ...common.types import (
     PlacementStrategy,
     ResourcePriority,
 )
-from ...common.types.data_types import NodeType
+from ...common.types.configs import NodeType
 from .pg_manager import PGManager
 
 if TYPE_CHECKING:
