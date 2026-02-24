@@ -20,9 +20,9 @@ class Topology:
         raise NotImplementedError
 
 
-class IndexPattern(enum.IntEnum):
-    CONTIGUOUS = 0
-    STRIDED = 1
+class IndexPattern(enum.Enum):
+    CONTIGUOUS = enum.auto()
+    STRIDED = enum.auto()
 
 
 @dataclass(frozen=True)

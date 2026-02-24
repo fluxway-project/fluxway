@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple, Union
 
 from fluxway.transport.backend import get_backend
 from fluxway.transport.sharding import ShardingSpec, Layout
@@ -75,27 +75,30 @@ class TransportPlanner:
         data_values: Optional[Any] = None,
     ) -> TransportPlan:
         """Diff(L_src, L_dst) using pre-computed Layouts."""
+        # N-D Native logic extracts the correct dimensionalities implicitly.
+        # Default destination dimension 0 is passed to respect returning a legacy single
+        # dimension for 1D layout serialization/inspection in tests.
+        routing_dim = (
+            dst_layout.routing_dim if dst_layout.routing_dim is not None else 0
+        )
+
         # Call internal static method (JIT-friendly)
         (
             sort_indices,
             dest_devices,
             send_counts,
             global_indices,
-            dim,
             target_world_size,
-            replication_factor,
+            replica_size,
         ) = TransportPlanner._compute_plan_internal(
             src_indices=src_indices,
             data_values=data_values,
             dst_topology=dst_layout.topology,
-            dst_dim=dst_layout.dim,
+            dst_routing_dim=routing_dim,
             dst_data_shape=dst_layout.data_shape,
-            dst_world_size=dst_layout.world_size,
-            dst_is_content_addressable=dst_layout.is_content_addressable,
             dst_strategy=dst_layout.strategy,
-            dst_replication_factor=dst_layout.replication_factor,
-            dst_replication_axes=dst_layout.replication_axes,
             dst_mesh=dst_layout.mesh,
+            dst_partitions=dst_layout.partitions,
             src_layout_local_indices_fn=src_layout.get_local_indices,
             local_rank=local_rank,
         )
@@ -104,9 +107,9 @@ class TransportPlanner:
             sort_indices=sort_indices,
             dest_devices=dest_devices,
             send_counts=send_counts,
-            dim=dim,
+            dim=routing_dim,
             target_world_size=target_world_size,
-            replication_factor=replication_factor,
+            replication_factor=replica_size,
             global_indices=global_indices,
         )
 
@@ -115,90 +118,187 @@ class TransportPlanner:
         src_indices: Optional[Any],
         data_values: Optional[Any],
         dst_topology: Any,
-        dst_dim: int,
+        dst_routing_dim: Optional[Union[int, Tuple[int, ...]]],
         dst_data_shape: Tuple[int, ...],
-        dst_world_size: int,
-        dst_is_content_addressable: bool,
         dst_strategy: Optional[Callable],
-        dst_replication_factor: int,
-        dst_replication_axes: Optional[Tuple[str, ...]],
         dst_mesh: Optional[Any],
-        src_layout_local_indices_fn: Callable[[int], Any],
+        dst_partitions: Optional[dict],
+        src_layout_local_indices_fn: Callable[[int, int], Any],
         local_rank: int,
-    ) -> Tuple[Any, Any, Any, Any, int, int, int]:
+    ) -> Tuple[Any, Any, Any, Any, int, int]:
         """Internal static logical core for JIT compilation."""
         backend = get_backend()
 
+        dst_world_size = dst_mesh.size if dst_mesh else 1
+        dst_is_content_addressable = (
+            getattr(dst_strategy, "routing_paradigm", None) is not None
+            and dst_strategy.routing_paradigm.name == "DYNAMIC"
+        )
+
+        dst_replica_axes = None
+        dst_replica_size = 1
+        if dst_mesh and dst_partitions:
+            used = set()
+            for axes in dst_partitions.values():
+                used.update(axes)
+            all_axes = set(dst_mesh.axis_names)
+            repl = sorted(all_axes - used, key=lambda x: dst_mesh.axis_names.index(x))
+            if repl:
+                dst_replica_axes = repl
+                for ax in repl:
+                    dst_replica_size *= dst_mesh.shape[dst_mesh.axis_names.index(ax)]
+
         # Step 1: Recover global indices held by this rank
+        # Standardize routing_dims to tuple for multi-axis dynamic routing
+        # (Where certain dimensions route by value, and others locally by chunk)
+        routing_dims = (
+            (dst_routing_dim,)
+            if isinstance(dst_routing_dim, int)
+            else (dst_routing_dim or (0,))
+        )
+
+        # Fallback for explicit src_indices overriding the primary dimension.
+        primary_dim = routing_dims[0] if routing_dims else 0
         if src_indices is not None:
-            src_global_indices = src_indices
+            primary_src_global_indices = src_indices
         else:
-            # Note: calling src_layout.get_local_indices inside JIT might be tricky
-            # if it's not a Pytree or simple function.
-            # Assuming get_local_indices returns a tensor or we passed it in.
-            # If src_layout is complex, this callback might fail JIT.
-            # Ideally src_indices should be passed pre-computed if dynamic.
-            src_global_indices = src_layout_local_indices_fn(local_rank)
+            primary_src_global_indices = src_layout_local_indices_fn(
+                local_rank, primary_dim
+            )
 
-        # Step 2: Compute target devices
+        # =====================================================================
+        # [ N-D Cross-Mesh Routing & Cartesian Broadcasting ]
+        #
+        # This section determines which physical device (rank) each piece of data
+        # should be sent to. Instead of writing slow Python `for` loops to calculate
+        # this for every item, we use mathematical "Cartesian Products" via JAX's
+        # Array Broadcasting. This makes the compilation O(1) complexity.
+        #
+        # Let's look at a beginner-friendly example:
+        # Imagine a 2D DeviceMesh with shape [2, 4] (axis names: 'x', 'y').
+        # Our data tensor has 2 dimensions: [Batch, Sequence].
+        #
+        # Dim 0 (Batch): We want to route this dynamically (e.g., Hash routing based on values).
+        #   -> The Strategy calculates destination indices for the 'x' axis: [N_items]
+        # Dim 1 (Sequence): We want to route this statically (e.g., Chunk slicing).
+        #   -> The Strategy calculates destination indices for the 'y' axis: [M_items]
+        #
+        # How JAX Broadcasting (Cartesian Product) works here:
+        # 1. We reshape the Dim 0 result from [N] to [N, 1].
+        # 2. We reshape the Dim 1 result from [M] to [1, M].
+        # 3. We let JAX combine them! -> [N, M].
+        # Every pair (n, m) now perfectly describes the 2D coordinate on the Mesh.
+        # =====================================================================
 
-        if dst_is_content_addressable and data_values is not None:
-            if dst_strategy is None:
-                raise ValueError("Content-addressable layout must have strategy")
+        ndim = len(dst_data_shape)
+        mesh_coords = [None] * len(dst_mesh.shape) if dst_mesh else []
 
-            indices_for_routing = data_values
-            if src_indices is not None:
+        from fluxway.transport.sharding import ChunkPartition
+
+        _CHUNK = ChunkPartition()
+
+        # Step 2: Compute target devices across all topological constraints (Cartesian Mapping)
+        for d in range(ndim):
+            if not dst_partitions or d not in dst_partitions:
+                continue
+
+            is_dynamic_dim = dst_is_content_addressable and (d in routing_dims)
+            strategy = (
+                dst_strategy
+                if is_dynamic_dim
+                else (dst_strategy if not dst_is_content_addressable else _CHUNK)
+            )
+
+            if d == primary_dim and src_indices is not None:
                 indices_for_routing = src_indices
-            if indices_for_routing is None:
-                raise ValueError("Content routing requires indices or values")
+            elif is_dynamic_dim and data_values is not None:
+                indices_for_routing = data_values
+            else:
+                indices_for_routing = src_layout_local_indices_fn(local_rank, d)
 
-            primary_dest = dst_strategy(
+            # Identify sub-mesh assigned to this tensor dimension
+            axes = dst_partitions[d]
+            axis_indices = [dst_mesh.axis_names.index(ax) for ax in axes]
+            sub_mesh_shape = tuple(dst_mesh.shape[idx] for idx in axis_indices)
+            sub_world_size = 1
+            for s in sub_mesh_shape:
+                sub_world_size *= s
+
+            logical_ranks_d = strategy(
                 indices_for_routing,
-                dim_size=backend.shape(indices_for_routing)[dst_dim],
-                world_size=dst_world_size,
-                topology=dst_topology,
+                dim_size=dst_data_shape[d],
+                world_size=sub_world_size,
+                topology=dst_topology if is_dynamic_dim else None,
             )
 
-            # Note: logical_to_physical mapping is assumed to be identity or handled by strategy
-            # for content-addressable layouts in the current JIT-compiled path.
-            dest_devices = primary_dest
+            unraveled = backend.unravel_index(logical_ranks_d, sub_mesh_shape)
+            if not isinstance(unraveled, tuple):
+                unraveled = (unraveled,)
 
+            for ax_idx, coord_tensor in zip(axis_indices, unraveled):
+                # Only attempt JAX broadcast reshaping if the coordinate array is pure 1D and we
+                # actually have multiple disjoint partitions mapping independently.
+                # Otherwise, 1D array matches perfectly (e.g., dynamically flattened Payload).
+                if len(dst_partitions) == 1:
+                    mesh_coords[ax_idx] = coord_tensor
+                else:
+                    if len(backend.shape(coord_tensor)) == 1:
+                        rs = [1] * ndim
+                        rs[d] = -1
+                        mesh_coords[ax_idx] = backend.reshape(coord_tensor, rs)
+                    else:
+                        mesh_coords[ax_idx] = coord_tensor
+
+        for i in range(len(mesh_coords)):
+            if mesh_coords[i] is None:
+                mesh_coords[i] = backend.zeros((1,), dtype=backend.int32())
+
+        if dst_mesh:
+            primary_dest = dst_mesh.coordinate_to_device(tuple(mesh_coords))
         else:
-            dim_size = dst_data_shape[dst_dim]
-            primary_dest = dst_strategy(
-                src_global_indices,
-                dim_size=dim_size,
-                world_size=dst_world_size,
-                topology=dst_topology,
-            )
-            dest_devices = primary_dest
+            primary_dest = backend.zeros((1,), dtype=backend.int32())
 
-        # Note: We assume `dest_devices` contains physical rank IDs.
-        # If a mesh with non-identity logical-to-physical mapping is used,
-        # the strategy or a pre-processing step must handle the translation
-        # before this point, as `Layout` objects are not fully JIT-traced yet.
+        dest_devices = primary_dest
 
-        # Step 3: Handle Replication
-        num_replicas = dst_replication_factor
+        # Step 3: Handle Replication (Cartesian Product / Broadcast)
+        #
+        # If the Layout requires replicas (e.g., repeating the same data across multiple devices),
+        # we use the exact same Cartesian broadcasting trick!
+        #
+        # Example:
+        # Imagine we have 1 Device computed above, but need 2 replicas across the 'z' axis.
+        # We take our existing coordinate array [N, M] and expand it to [N, M, 1].
+        # We generate a replica index array [0, 1] and reshape it to [1, 1, 2].
+        # JAX broadcasts them together, instantly generating actual device coordinates
+        # formatted as [N, M, 2]!
+        #
+        num_replicas = dst_replica_size
 
-        if dst_replication_axes and dst_mesh:
+        if dst_replica_axes and dst_mesh:
             mesh = dst_mesh
             primary_coords = mesh.unravel_index(dest_devices)
 
-            rep_axis = dst_replication_axes[0]
-            rep_axis_idx = mesh.axis_names.index(rep_axis)
-            rep_size = mesh.shape[rep_axis_idx]
+            expanded_coords = [backend.reshape(c, (-1, 1)) for c in primary_coords]
 
-            replica_cols = []
-            for r in range(rep_size):
-                current_coords = list(primary_coords)
-                current_coords[rep_axis_idx] = backend.full(
-                    backend.shape(dest_devices), r, dtype=backend.int32()
+            rep_axis_idx = [mesh.axis_names.index(ax) for ax in dst_replica_axes]
+            rep_shape = [mesh.shape[idx] for idx in rep_axis_idx]
+
+            rep_flat_indices = backend.arange(0, num_replicas, dtype=backend.int32())
+
+            if len(dst_replica_axes) == 1:
+                expanded_coords[rep_axis_idx[0]] = backend.reshape(
+                    rep_flat_indices, (1, num_replicas)
                 )
-                col_ids = mesh.coordinate_to_device(tuple(current_coords))
-                replica_cols.append(col_ids)
+            else:
+                rep_unraveled = backend.unravel_index(
+                    rep_flat_indices, tuple(rep_shape)
+                )
+                if not isinstance(rep_unraveled, tuple):
+                    rep_unraveled = (rep_unraveled,)
+                for ax_id, r_coord in zip(rep_axis_idx, rep_unraveled):
+                    expanded_coords[ax_id] = backend.reshape(r_coord, (1, num_replicas))
 
-            dest_devices = backend.stack(replica_cols, dim=1)
+            dest_devices = mesh.coordinate_to_device(tuple(expanded_coords))
         else:
             dest_devices = backend.reshape(dest_devices, (-1, 1))
 
@@ -208,6 +308,7 @@ class TransportPlanner:
             if num_replicas == 1
             else backend.reshape(backend.select(dest_devices, dim=1, index=0), (-1,))
         )
+
         sort_indices = backend.argsort(primary_dest_flat, dim=0, stable=True)
 
         # Step 5: Compute send counts
@@ -220,8 +321,7 @@ class TransportPlanner:
             sort_indices,
             dest_devices,
             send_counts,
-            src_global_indices,
-            dst_dim,
+            primary_src_global_indices,
             dst_world_size,
             num_replicas,
         )

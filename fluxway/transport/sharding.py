@@ -47,18 +47,15 @@ class PartitionSpec:
         self.specs = specs
 
     @property
-    def dim(self) -> int:
+    def partitions(self):
+        """Returns a mapping from tensor dimension index to mesh axis names."""
+        result = {}
         for i, s in enumerate(self.specs):
             if s is not None:
-                return i
-        raise ValueError("PartitionSpec must have at least one non-None axis")
-
-    @property
-    def sharding_axes(self) -> Tuple[str, ...]:
-        for s in self.specs:
-            if s is not None:
-                return (s,) if isinstance(s, str) else tuple(s)
-        raise ValueError("PartitionSpec must have at least one non-None axis")
+                result[i] = (s,) if isinstance(s, str) else tuple(s)
+        if not result:
+            pass  # P() implies complete replication, valid.
+        return result
 
     def __repr__(self) -> str:
         return f"P({', '.join(repr(s) for s in self.specs)})"
@@ -200,21 +197,16 @@ def _ravel_multi_index(coords, sizes):
 
 @dataclass
 class Layout:
-    """Data distribution description describing physical placement on a DeviceMesh.
+    """Data distribution description describing physical placement on a DeviceMesh."""
 
-    Combines the tensor characteristics (e.g. data shape, routing indices) with
-    the distributed architecture details (mesh, strategy) to fully describe
-    how data is or should be laid out across the cluster.
-    """
-
-    dim: int
     data_shape: Tuple[int, ...]
     mesh: DeviceMesh
     topology: Optional[Topology] = None
-    sharding_axes: Optional[Tuple[str, ...]] = None
+    partitions: Optional[dict] = None  # Dict[int, Tuple[str, ...]]
     strategy: Optional[PartitionStrategy] = None
-    replication_axes: Optional[Tuple[str, ...]] = None
-    replication_factor: int = 1
+    routing_dim: Optional[int] = None
+    replica_axes: Optional[Tuple[str, ...]] = None
+    replica_size: int = 1
 
     @property
     def topology_morphology(self) -> TopologyMorphology:
@@ -232,51 +224,65 @@ class Layout:
     def world_size(self) -> int:
         return self.mesh.size
 
-    @property
-    def effective_world_size(self) -> int:
-        if not self.sharding_axes:
-            return self.mesh.size
+    def shard_size(self, dim: int) -> int:
+        """Returns the effective size of the sub-mesh assigned to a given dimension."""
+        if not self.partitions or dim not in self.partitions:
+            return 1
         result = 1
-        for ax in self.sharding_axes:
+        for ax in self.partitions[dim]:
             result *= self.mesh.shape[self.mesh.axis_names.index(ax)]
         return result
 
-    def get_effective_rank(self, physical_rank: int) -> int:
-        if not self.sharding_axes:
-            return physical_rank
+    def get_shard_rank(self, physical_rank: int, dim: int) -> int:
+        """Projects a physical mesh rank down to the logical 1D rank for a given dimension."""
+        if not self.partitions or dim not in self.partitions:
+            return 0
         try:
             coords = self.mesh.get_coordinate(physical_rank)
         except ValueError:
-            return physical_rank
+            return 0
         sub_coords = []
         sub_sizes = []
-        for ax in self.sharding_axes:
+        for ax in self.partitions[dim]:
             axis_idx = self.mesh.axis_names.index(ax)
             sub_coords.append(coords[axis_idx])
             sub_sizes.append(self.mesh.shape[axis_idx])
         return _ravel_multi_index(sub_coords, sub_sizes)
 
-    def logical_to_physical(self, logical_ranks: Any) -> Any:
+    def logical_to_physical(self, logical_ranks: Any, dim: int) -> Any:
         """Map logical partition ranks to physical device ranks via mesh."""
         backend = get_backend()
-        if not self.sharding_axes:
-            return logical_ranks
+        if not self.partitions or dim not in self.partitions:
+            return backend.zeros_like(logical_ranks)
         coords = [
             backend.zeros(backend.shape(logical_ranks), dtype=backend.int32())
             for _ in self.mesh.shape
         ]
-        axis_name = self.sharding_axes[0]
+        # In multi-axis mode per dim, reverse unravel is needed.
+        # For our main flows (dynamic routing) it's mostly single axis routing,
+        # but we handle the single axis case cleanly here. Complex multi-axis reverse
+        # routing may require unravel_index over sub-mesh.
+        axes = self.partitions[dim]
+        if len(axes) > 1:
+            raise NotImplementedError(
+                "logical_to_physical not fully supported for multi-axis joint routing yet."
+            )
+        axis_name = axes[0]
         axis_idx = self.mesh.axis_names.index(axis_name)
         coords[axis_idx] = logical_ranks
         mesh_ids = backend.tensor(self.mesh.device_ids, dtype=backend.int32())
         return mesh_ids[tuple(coords)]
 
-    def get_local_indices(self, rank: int) -> Any:
-        """Returns the global indices held by this rank."""
+    def get_local_indices(self, rank: int, dim: int) -> Any:
+        """Returns the global indices held by this rank along a specific dimension."""
         backend = get_backend()
-        effective_rank = self.get_effective_rank(rank)
-        ews = self.effective_world_size
-        dim_size = self.data_shape[self.dim]
+        effective_rank = self.get_shard_rank(rank, dim)
+        ews = self.shard_size(dim)
+        dim_size = self.data_shape[dim]
+
+        # Standard full replication or not partitioned on this dim
+        if ews == 1 or not self.partitions or dim not in self.partitions:
+            return backend.arange(0, dim_size, dtype=backend.int32())
 
         fn = self.strategy
         if isinstance(fn, ChunkPartition):
@@ -313,58 +319,49 @@ class Layout:
 
 
 class ShardingSpec:
-    """Algebraic partitioning description linking a stragety, mesh, and specific layout.
-
-    This immutable value object contains all static information required to generate
-    a concrete layout execution plan, reducing overhead during dynamic evaluations.
-    """
+    """Algebraic partitioning description linking a stragety, mesh, and specific layout."""
 
     def __init__(
-        self, strategy: PartitionStrategy, mesh: DeviceMesh, partition: PartitionSpec
+        self,
+        strategy: PartitionStrategy,
+        mesh: DeviceMesh,
+        partition: PartitionSpec,
+        routing_dim: Optional[int] = None,
     ):
         self.strategy = strategy
         self.mesh = mesh
         self.partition = partition
+        self.routing_dim = routing_dim
 
         # Pre-compute immutable derived properties.
+        used = set()
+        for axes in self.partition.partitions.values():
+            used.update(axes)
+
         all_axes = set(mesh.axis_names)
-        used = set(self.partition.sharding_axes)
         repl = sorted(all_axes - used, key=lambda x: mesh.axis_names.index(x))
-        self._replication_axes: Optional[List[str]] = repl if repl else None
+        self._replica_axes: Optional[List[str]] = repl if repl else None
 
-        self._replication_factor = 1
-        if self._replication_axes:
-            for ax in self._replication_axes:
-                self._replication_factor *= mesh.shape[mesh.axis_names.index(ax)]
-
-        # Effective world size (product of sharding axis sizes).
-        self._effective_world_size = 1
-        for ax in self.partition.sharding_axes:
-            self._effective_world_size *= mesh.shape[mesh.axis_names.index(ax)]
+        self._replica_size = 1
+        if self._replica_axes:
+            for ax in self._replica_axes:
+                self._replica_size *= mesh.shape[mesh.axis_names.index(ax)]
 
     @property
-    def dim(self) -> int:
-        return self.partition.dim
-
-    @property
-    def sharding_axes(self) -> Tuple[str, ...]:
-        return self.partition.sharding_axes
+    def partitions(self):
+        return self.partition.partitions
 
     @property
     def is_content_addressable(self) -> bool:
         return self.strategy.routing_paradigm == RoutingParadigm.DYNAMIC
 
     @property
-    def replication_axes(self) -> Optional[List[str]]:
-        return self._replication_axes
+    def replica_axes(self) -> Optional[List[str]]:
+        return self._replica_axes
 
     @property
-    def replication_factor(self) -> int:
-        return self._replication_factor
-
-    @property
-    def effective_world_size(self) -> int:
-        return self._effective_world_size
+    def replica_size(self) -> int:
+        return self._replica_size
 
     def _to_layout(
         self,
@@ -375,31 +372,41 @@ class ShardingSpec:
         if data_shape is None:
             if not self.is_content_addressable:
                 raise ValueError("data_shape is required for static sharding")
-            data_shape = (-1,) * (self.dim + 1)
+            data_shape = (-1,)
+
+        # Infer routing_dim if not provided but topology requires it
+        target_routing_dim = self.routing_dim
+        if target_routing_dim is None and self.is_content_addressable:
+            target_routing_dim = (
+                0  # Graceful fallback for legacy codes that didn't provide arg
+            )
 
         return Layout(
-            dim=self.dim,
             data_shape=data_shape,
             mesh=self.mesh,
             topology=topology,
-            sharding_axes=self.sharding_axes,
+            partitions=self.partitions,
             strategy=self.strategy,
-            replication_axes=self._replication_axes,
-            replication_factor=self._replication_factor,
+            routing_dim=target_routing_dim,
+            replica_axes=self._replica_axes,
+            replica_size=self._replica_size,
         )
 
     def get_expected_local_indices(
-        self, rank: int, local_dim_size: int
+        self, rank: int, local_dim_size: int, dim: int = 0
     ) -> Optional[Any]:
         """Returns expected global indices for implicit mesh inference (chunk only)."""
         backend = get_backend()
         if not isinstance(self.strategy, ChunkPartition):
             return None
 
+        if not self.partitions or dim not in self.partitions:
+            return backend.arange(0, local_dim_size, dtype=backend.int32())
+
         coords = self.mesh.get_coordinate(rank)
         sub_coords = []
         sub_sizes = []
-        for ax in self.sharding_axes:
+        for ax in self.partitions[dim]:
             axis_idx = self.mesh.axis_names.index(ax)
             sub_coords.append(coords[axis_idx])
             sub_sizes.append(self.mesh.shape[axis_idx])
@@ -418,18 +425,30 @@ class ShardingSpec:
         return ShardingSpec(_CYCLIC, mesh=mesh, partition=partition)
 
     @staticmethod
-    def index(mesh: DeviceMesh, partition: PartitionSpec) -> ShardingSpec:
+    def index(
+        mesh: DeviceMesh, partition: PartitionSpec, routing_dim: int = 0
+    ) -> ShardingSpec:
         """Dynamic: routing based on explicit array/tuple indices."""
-        return ShardingSpec(_INDEXED, mesh=mesh, partition=partition)
+        return ShardingSpec(
+            _INDEXED, mesh=mesh, partition=partition, routing_dim=routing_dim
+        )
 
     @staticmethod
-    def hash(mesh: DeviceMesh, partition: PartitionSpec) -> ShardingSpec:
+    def hash(
+        mesh: DeviceMesh, partition: PartitionSpec, routing_dim: int = 0
+    ) -> ShardingSpec:
         """Dynamic: routing based on element values directly."""
-        return ShardingSpec(_INDEXED, mesh=mesh, partition=partition)
+        return ShardingSpec(
+            _INDEXED, mesh=mesh, partition=partition, routing_dim=routing_dim
+        )
 
     @staticmethod
-    def greedy(mesh: DeviceMesh, partition: PartitionSpec) -> ShardingSpec:
-        return ShardingSpec(_GREEDY, mesh=mesh, partition=partition)
+    def greedy(
+        mesh: DeviceMesh, partition: PartitionSpec, routing_dim: int = 0
+    ) -> ShardingSpec:
+        return ShardingSpec(
+            _GREEDY, mesh=mesh, partition=partition, routing_dim=routing_dim
+        )
 
     # ---- Dependency ----
 
@@ -455,14 +474,17 @@ class ShardingSpec:
             def name(self):
                 return f"Follow({captured_strategy.name})"
 
-        # Reconstruct PartitionSpec at the target dim
+        # Reconstruct PartitionSpec at the target dim (Note: Follow only tracks single dimension)
         specs = [None] * (dim + 1)
-        axes = source_layout.sharding_axes
-        if axes:
+        if source_layout.partitions and dim in source_layout.partitions:
+            axes = source_layout.partitions[dim]
             specs[dim] = axes[0] if len(axes) == 1 else axes
 
         return ShardingSpec(
-            _FollowPartition(), mesh=source_layout.mesh, partition=PartitionSpec(*specs)
+            _FollowPartition(),
+            mesh=source_layout.mesh,
+            partition=PartitionSpec(*specs),
+            routing_dim=dim,
         )
 
     @staticmethod
@@ -484,6 +506,6 @@ class ShardingSpec:
             f"partition={self.partition}",
             f"mesh={self.mesh.shape}",
         ]
-        if self._replication_axes:
-            parts.append(f"repl={self._replication_axes}")
+        if self._replica_axes:
+            parts.append(f"repl={self._replica_axes}")
         return f"ShardingSpec({', '.join(parts)})"

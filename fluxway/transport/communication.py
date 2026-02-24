@@ -71,8 +71,17 @@ class BaseDataDistributor:
             and isinstance(source, ShardingSpec)
             and not source.is_content_addressable
         ):
-            dim_size = local_shape[source.dim] if source.dim < len(local_shape) else 0
-            src_indices = source.get_expected_local_indices(self.local_rank, dim_size)
+            source_routing_dim = (
+                source.routing_dim if source.routing_dim is not None else 0
+            )
+            dim_size = (
+                local_shape[source_routing_dim]
+                if source_routing_dim < len(local_shape)
+                else 0
+            )
+            src_indices = source.get_expected_local_indices(
+                self.local_rank, dim_size, source_routing_dim
+            )
 
         src_shape_arg = (
             None
@@ -92,6 +101,13 @@ class BaseDataDistributor:
             dst_layout = target._to_layout(dst_shape_arg, topology=None)
         else:
             dst_layout = target
+
+        routing_dim = dst_layout.routing_dim
+        if routing_dim is None:
+            if dst_layout.partitions:
+                routing_dim = next(iter(dst_layout.partitions.keys()))
+            else:
+                routing_dim = 0
 
         # Set capacity bucket
         actual_req = local_shape[0] if local_shape else 1
@@ -120,6 +136,14 @@ class BaseDataDistributor:
 
         payloads_tuple = tuple(payloads)
 
+        dst_partitions_tuple = (
+            tuple(sorted(dst_layout.partitions.items()))
+            if dst_layout.partitions
+            else None
+        )
+
+        routing_dim = dst_layout.routing_dim
+
         # Compute plan and sequence packing (JIT compiled)
         (
             padded_buffers_lists,  # List of (padded_data, padded_lengths)
@@ -133,14 +157,11 @@ class BaseDataDistributor:
             payloads_tuple,
             src_indices,
             dst_layout.topology,
-            dst_layout.dim,
+            routing_dim,
             dst_layout.data_shape,
-            dst_layout.world_size,
-            dst_layout.is_content_addressable,
             dst_layout.strategy,
-            dst_layout.replication_factor,
-            dst_layout.replication_axes,
             dst_layout.mesh,
+            dst_partitions_tuple,
             src_layout.get_local_indices,
             self.local_rank,
             primary.flat_values if dst_layout.is_content_addressable else None,
@@ -362,19 +383,16 @@ class TransportReceiver:
         return ret
 
 
-@compile(static_argnums=(3, 4, 5, 6, 7, 8, 9, 11, 12, 14))
+@compile(static_argnums=(3, 4, 5, 7, 8, 9, 11))
 def _jit_plan_and_pack(
     payloads_tuple: Tuple[Tuple[Any, Optional[Any]], ...],
     src_indices: Any,
     dst_topology: Any,
-    dst_dim: int,
+    dst_routing_dim: Optional[Union[int, Tuple[int, ...]]],
     dst_data_shape: Tuple[int, ...],
-    dst_world_size: int,
-    dst_is_content_addressable: bool,
     dst_strategy: Callable,
-    dst_replication_factor: int,
-    dst_replication_axes: Tuple[str, ...],
     dst_mesh: Any,
+    dst_partitions: Any,
     src_layout_local_indices_fn: Callable,
     local_rank: int,
     dst_routing_values: Any,
@@ -394,21 +412,17 @@ def _jit_plan_and_pack(
         dest_devices,
         send_counts,
         global_indices,
-        dim,
         target_world_size,
-        replication_factor,
+        replica_size,
     ) = TransportPlanner._compute_plan_internal(
         src_indices=src_indices,
         data_values=dst_routing_values,
         dst_topology=dst_topology,
-        dst_dim=dst_dim,
+        dst_routing_dim=dst_routing_dim,
         dst_data_shape=dst_data_shape,
-        dst_world_size=dst_world_size,
-        dst_is_content_addressable=dst_is_content_addressable,
         dst_strategy=dst_strategy,
-        dst_replication_factor=dst_replication_factor,
-        dst_replication_axes=dst_replication_axes,
         dst_mesh=dst_mesh,
+        dst_partitions=dict(dst_partitions) if dst_partitions else None,
         src_layout_local_indices_fn=src_layout_local_indices_fn,
         local_rank=local_rank,
     )
@@ -486,7 +500,7 @@ def _jit_plan_and_pack(
         padded_buffers_lists,
         send_counts,
         dest_devices,
-        replication_factor,
+        replica_size,
         global_indices,
         padded_routing,
         sort_indices,
