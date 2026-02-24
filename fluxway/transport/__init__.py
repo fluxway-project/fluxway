@@ -5,7 +5,7 @@ from .sharding import (
     PartitionStrategy,
     ChunkPartition,
     CyclicPartition,
-    HashPartition,
+    IndexedPartition,
     GreedyPartition,
 )
 from .planner import TransportPlanner, TransportPlan
@@ -18,7 +18,7 @@ __all__ = [
     "PartitionStrategy",
     "ChunkPartition",
     "CyclicPartition",
-    "HashPartition",
+    "IndexedPartition",
     "GreedyPartition",
     "TransportPlanner",
     "TransportPlan",

@@ -322,15 +322,15 @@ def test_ragged_dynamic_slice_interface():
 
 
 # ============================================================
-# IndexDescriptor tests
+# ContinuousTopology tests
 # ============================================================
 
 
 def test_index_descriptor_chunk_materialize():
     """Chunk descriptor materializes to contiguous range."""
-    from fluxway.transport.tensor import IndexDescriptor
+    from fluxway.transport.tensor import ContinuousTopology
 
-    desc = IndexDescriptor.chunk(start=10, count=5)
+    desc = ContinuousTopology.chunk(start=10, count=5)
     indices = desc.materialize()
 
     backend = get_backend()
@@ -340,9 +340,9 @@ def test_index_descriptor_chunk_materialize():
 
 def test_index_descriptor_cyclic_materialize():
     """Cyclic descriptor materializes to strided range."""
-    from fluxway.transport.tensor import IndexDescriptor
+    from fluxway.transport.tensor import ContinuousTopology
 
-    desc = IndexDescriptor.cyclic(start=1, step=4, count=3)
+    desc = ContinuousTopology.cyclic(start=1, step=4, count=3)
     indices = desc.materialize()
 
     backend = get_backend()
@@ -352,13 +352,13 @@ def test_index_descriptor_cyclic_materialize():
 
 def test_index_descriptor_chunk_slice():
     """Chunk descriptor slice is O(1) — returns a new descriptor, not a tensor."""
-    from fluxway.transport.tensor import IndexDescriptor, IndexPattern
+    from fluxway.transport.topology import ContinuousTopology
 
-    desc = IndexDescriptor.chunk(start=100, count=10)
+    desc = ContinuousTopology.chunk(start=100, count=10)
     sub = desc.slice(2, 5)  # indices [102, 103, 104]
 
-    assert isinstance(sub, IndexDescriptor)
-    assert sub.pattern == IndexPattern.CONTIGUOUS
+    assert isinstance(sub, ContinuousTopology)
+    assert sub.pattern.name == "CONTIGUOUS"
     assert sub.start == 102
     assert sub.count == 3
 
@@ -369,14 +369,14 @@ def test_index_descriptor_chunk_slice():
 
 def test_index_descriptor_cyclic_slice():
     """Cyclic descriptor slice is O(1)."""
-    from fluxway.transport.tensor import IndexDescriptor, IndexPattern
+    from fluxway.transport.topology import ContinuousTopology
 
-    desc = IndexDescriptor.cyclic(start=0, step=4, count=8)
+    desc = ContinuousTopology.cyclic(start=0, step=4, count=8)
     # Original: [0, 4, 8, 12, 16, 20, 24, 28]
     sub = desc.slice(2, 5)  # elements at positions 2,3,4 → [8, 12, 16]
 
-    assert isinstance(sub, IndexDescriptor)
-    assert sub.pattern == IndexPattern.STRIDED
+    assert isinstance(sub, ContinuousTopology)
+    assert sub.pattern.name == "STRIDED"
     assert sub.start == 8
     assert sub.step == 4
     assert sub.count == 3
@@ -407,12 +407,12 @@ def test_slice_propagates_explicit_global_indices():
 
 
 def test_slice_propagates_descriptor():
-    """Slicing a tensor with IndexDescriptor derives O(1) sub-descriptor."""
-    from fluxway.transport.tensor import IndexDescriptor
+    """Slicing a tensor with ContinuousTopology derives O(1) sub-descriptor."""
+    from fluxway.transport.tensor import ContinuousTopology
 
     backend = get_backend()
     data = backend.tensor([10.0, 20.0, 30.0, 40.0, 50.0])
-    desc = IndexDescriptor.chunk(start=50, count=5)
+    desc = ContinuousTopology.chunk(start=50, count=5)
 
     tensor = TransportTensor(data, indices=desc)
     sliced = tensor.slice(1, 4)
@@ -430,11 +430,11 @@ def test_slice_propagates_descriptor():
 
 def test_dynamic_slice_propagates_descriptor():
     """dynamic_slice with tensor args also propagates descriptor."""
-    from fluxway.transport.tensor import IndexDescriptor
+    from fluxway.transport.tensor import ContinuousTopology
 
     backend = get_backend()
     data = backend.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
-    desc = IndexDescriptor.chunk(start=0, count=6)
+    desc = ContinuousTopology.chunk(start=0, count=6)
 
     tensor = TransportTensor(data, indices=desc)
     start = backend.tensor(2, dtype=backend.int32())
@@ -448,11 +448,11 @@ def test_dynamic_slice_propagates_descriptor():
 
 def test_gather_propagates_global_indices():
     """Gather reorders global_indices correctly, destroys descriptor."""
-    from fluxway.transport.tensor import IndexDescriptor
+    from fluxway.transport.tensor import ContinuousTopology
 
     backend = get_backend()
     data = backend.tensor([10.0, 20.0, 30.0, 40.0])
-    desc = IndexDescriptor.chunk(start=100, count=4)
+    desc = ContinuousTopology.chunk(start=100, count=4)
 
     tensor = TransportTensor(data, indices=desc)
     perm = backend.tensor([3, 1, 0, 2], dtype=backend.int32())
@@ -494,12 +494,12 @@ def test_no_indices_stays_none():
 
 
 def test_descriptor_serialization():
-    """IndexDescriptor survives pickle round-trip."""
-    from fluxway.transport.tensor import IndexDescriptor, IndexPattern
+    """ContinuousTopology survives pickle round-trip."""
+    from fluxway.transport.topology import ContinuousTopology
 
     backend = get_backend()
     data = backend.tensor([1.0, 2.0, 3.0])
-    desc = IndexDescriptor.chunk(start=42, count=3)
+    desc = ContinuousTopology.chunk(start=42, count=3)
 
     tensor = TransportTensor(data, indices=desc)
 
@@ -507,7 +507,7 @@ def test_descriptor_serialization():
     restored = pickle.loads(serialized)
 
     assert restored.index_descriptor is not None
-    assert restored.index_descriptor.pattern == IndexPattern.CONTIGUOUS
+    assert restored.index_descriptor.pattern.name == "CONTIGUOUS"
     assert restored.index_descriptor.start == 42
     assert restored.index_descriptor.count == 3
 
@@ -517,11 +517,11 @@ def test_descriptor_serialization():
 
 def test_slice_then_gather_chain():
     """Chain: slice (preserves descriptor) → gather (materializes)."""
-    from fluxway.transport.tensor import IndexDescriptor
+    from fluxway.transport.tensor import ContinuousTopology
 
     backend = get_backend()
     data = backend.tensor([10.0, 20.0, 30.0, 40.0, 50.0, 60.0])
-    desc = IndexDescriptor.chunk(start=0, count=6)
+    desc = ContinuousTopology.chunk(start=0, count=6)
 
     tensor = TransportTensor(data, indices=desc)
 

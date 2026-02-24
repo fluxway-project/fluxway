@@ -8,6 +8,7 @@ from fluxway.transport.mesh import DeviceMesh
 from fluxway.transport.planner import TransportPlanner
 from fluxway.transport.sharding import ShardingSpec, P
 from fluxway.transport.tensor import TransportTensor
+from fluxway.transport.topology import RaggedTopology, IndexedTopology
 
 
 @pytest.fixture(autouse=True)
@@ -75,7 +76,7 @@ def test_static_to_dynamic_hash():
         dst_spec=dst_spec,
         data_shape=(4,),
         local_rank=0,
-        topology=splits,
+        topology=RaggedTopology(splits=splits),
     )
 
     counts = plan.send_counts.tolist()
@@ -97,7 +98,7 @@ def test_dynamic_to_static():
         dst_spec=dst_spec,
         data_shape=(6,),
         local_rank=0,
-        routing_indices=dep,
+        topology=IndexedTopology(indices=dep),
     )
 
     counts = plan.send_counts.tolist()
@@ -120,7 +121,7 @@ def test_dynamic_to_dynamic():
         dst_spec=dst_spec,
         data_shape=(3,),
         local_rank=0,
-        topology=splits,
+        topology=RaggedTopology(splits=splits),
     )
 
     counts = plan.send_counts.tolist()
@@ -139,7 +140,7 @@ def test_routing_indices_dual_tensor():
     val_spec = ShardingSpec.derive_from(
         driver_spec=ShardingSpec.hash(mesh=mesh, partition=P("x")),
         driver_data_shape=(4,),
-        driver_topology=key_data,
+        driver_topology=IndexedTopology(indices=key_data),
         follow_dim=0,
     )
 

@@ -56,9 +56,6 @@ class BaseDataDistributor:
         # Primary tensor drives routing
         primary = tensors_to_pack[0]
 
-        topology = primary.topology
-        routing_indices = primary.global_indices
-
         # Local shape from primary data.
         if primary.is_ragged:
             top_split = primary.nested_splits[0]
@@ -68,7 +65,7 @@ class BaseDataDistributor:
             local_shape = tuple(backend.shape(primary.flat_values))
 
         # Routing indices or implicit inference.
-        src_indices = routing_indices
+        src_indices = primary.global_indices
         if (
             src_indices is None
             and isinstance(source, ShardingSpec)
@@ -92,7 +89,7 @@ class BaseDataDistributor:
             dst_shape_arg = None
 
         if isinstance(target, ShardingSpec):
-            dst_layout = target._to_layout(dst_shape_arg, topology, routing_indices)
+            dst_layout = target._to_layout(dst_shape_arg, topology=None)
         else:
             dst_layout = target
 

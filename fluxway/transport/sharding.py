@@ -3,10 +3,28 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import enum
 from typing import Any, List, Optional, Tuple, Union
 
 from fluxway.transport.backend import get_backend
 from fluxway.transport.mesh import DeviceMesh
+from fluxway.transport.topology import (
+    TopologyMorphology,
+    Topology,
+    IndexedTopology,
+    RaggedTopology,
+    CallableTopology,
+)
+
+
+# ============================================================
+# Enums — Routing Semantics
+# ============================================================
+
+
+class RoutingParadigm(enum.Enum):
+    STATIC = enum.auto()
+    DYNAMIC = enum.auto()
 
 
 # ============================================================
@@ -67,26 +85,16 @@ class PartitionStrategy:
     along with derived metadata indicating how the topology should be interpreted.
     """
 
-    is_content_addressable: bool = False
+    routing_paradigm: RoutingParadigm = RoutingParadigm.STATIC
 
     def __call__(
         self,
         indices: Any,
         dim_size: int,
         world_size: int,
-        topology: Any = None,
-        routing_indices: Any = None,
+        topology: Optional[Topology] = None,
     ) -> Any:
         raise NotImplementedError
-
-    def topology_kind(self, topology: Any = None) -> str:
-        """Infer topology kind from metadata."""
-        if topology is not None:
-            if isinstance(topology, list):
-                return "ragged"
-            elif isinstance(topology, tuple):
-                return "sparse"
-        return "hash" if self.is_content_addressable else "dense"
 
     @property
     def name(self) -> str:
@@ -99,9 +107,7 @@ class PartitionStrategy:
 class ChunkPartition(PartitionStrategy):
     """Chunk partitioning: idx → idx // chunk_size"""
 
-    def __call__(
-        self, indices, dim_size, world_size, topology=None, routing_indices=None
-    ):
+    def __call__(self, indices, dim_size, world_size, topology=None):
         backend = get_backend()
         chunk_size = max((dim_size + world_size - 1) // world_size, 1)
         ranks = indices // chunk_size
@@ -115,34 +121,26 @@ class ChunkPartition(PartitionStrategy):
 class CyclicPartition(PartitionStrategy):
     """Cyclic partitioning: idx → idx % world_size"""
 
-    def __call__(
-        self, indices, dim_size, world_size, topology=None, routing_indices=None
-    ):
+    def __call__(self, indices, dim_size, world_size, topology=None):
         backend = get_backend()
         return backend.mod(indices, world_size)
 
 
-class HashPartition(PartitionStrategy):
-    """Hash partitioning. Priority: routing_indices > custom hash_fn > topology splits > default."""
+class IndexedPartition(PartitionStrategy):
+    """Dynamic partitioning based on values or lookup tables."""
 
-    is_content_addressable = True
+    routing_paradigm = RoutingParadigm.DYNAMIC
 
-    def __call__(
-        self, indices, dim_size, world_size, topology=None, routing_indices=None
-    ):
+    def __call__(self, indices, dim_size, world_size, topology=None):
         backend = get_backend()
 
-        if routing_indices is not None:
-            values = routing_indices
-        elif topology is not None and isinstance(topology, dict):
-            hash_fn = topology.get("hash_fn")
-            values = hash_fn(indices) if hash_fn is not None else indices
-        elif topology is not None:
-            if isinstance(topology, list):
-                starts = topology[0][:-1]
-                values = backend.take(starts, indices)
-            else:
-                values = backend.take(topology, indices)
+        if isinstance(topology, IndexedTopology):
+            values = topology.indices
+        elif isinstance(topology, CallableTopology):
+            values = topology.hash_fn(indices)
+        elif isinstance(topology, RaggedTopology):
+            starts = topology.splits[0][:-1]
+            values = backend.take(starts, indices)
         else:
             values = indices
 
@@ -152,17 +150,17 @@ class HashPartition(PartitionStrategy):
 class GreedyPartition(PartitionStrategy):
     """Greedy load balancing partitioning."""
 
-    def __call__(
-        self, indices, dim_size, world_size, topology=None, routing_indices=None
-    ):
+    routing_paradigm = RoutingParadigm.DYNAMIC
+
+    def __call__(self, indices, dim_size, world_size, topology=None):
         backend = get_backend()
 
-        if topology is not None:
-            if isinstance(topology, list):
-                splits = topology[0]
-                lengths = splits[1:] - splits[:-1]
-            else:
-                lengths = topology
+        if isinstance(topology, RaggedTopology):
+            splits = topology.splits[0]
+            lengths = splits[1:] - splits[:-1]
+            lengths_list = backend.to_numpy(lengths).tolist()
+        elif isinstance(topology, IndexedTopology):
+            lengths = topology.indices
             lengths_list = backend.to_numpy(lengths).tolist()
         else:
             lengths_list = [1] * dim_size
@@ -180,7 +178,7 @@ class GreedyPartition(PartitionStrategy):
 # Singleton instances for common strategies.
 _CHUNK = ChunkPartition()
 _CYCLIC = CyclicPartition()
-_HASH = HashPartition()
+_INDEXED = IndexedPartition()
 _GREEDY = GreedyPartition()
 
 
@@ -212,14 +210,23 @@ class Layout:
     dim: int
     data_shape: Tuple[int, ...]
     mesh: DeviceMesh
-    topology_kind: str = "dense"
-    topology: Optional[Any] = None
-    routing_indices: Optional[Any] = None
-    is_static: bool = True
+    topology: Optional[Topology] = None
     sharding_axes: Optional[Tuple[str, ...]] = None
     strategy: Optional[PartitionStrategy] = None
     replication_axes: Optional[Tuple[str, ...]] = None
     replication_factor: int = 1
+
+    @property
+    def topology_morphology(self) -> TopologyMorphology:
+        if self.topology is not None:
+            return self.topology.morphology
+        if self.strategy and self.strategy.routing_paradigm == RoutingParadigm.DYNAMIC:
+            return TopologyMorphology.INDEXED
+        return TopologyMorphology.CONTINUOUS
+
+    @property
+    def is_static(self) -> bool:
+        return self.topology is None
 
     @property
     def world_size(self) -> int:
@@ -287,20 +294,17 @@ class Layout:
 
         # Fallback: materialize and filter
         indices = backend.arange(0, dim_size, dtype=backend.int32())
-        target_ranks = fn(
-            indices,
-            dim_size,
-            ews,
-            topology=self.topology,
-            routing_indices=self.routing_indices,
-        )
+        target_ranks = fn(indices, dim_size, ews, topology=self.topology)
         mask = target_ranks == effective_rank
         nz = backend.nonzero(mask)
         return backend.reshape(nz, (-1,))
 
     @property
     def is_content_addressable(self) -> bool:
-        return self.topology_kind in ("ragged", "sparse", "hash")
+        return self.topology_morphology in (
+            TopologyMorphology.RAGGED,
+            TopologyMorphology.INDEXED,
+        )
 
 
 # ============================================================
@@ -348,7 +352,7 @@ class ShardingSpec:
 
     @property
     def is_content_addressable(self) -> bool:
-        return self.strategy.is_content_addressable
+        return self.strategy.routing_paradigm == RoutingParadigm.DYNAMIC
 
     @property
     def replication_axes(self) -> Optional[List[str]]:
@@ -365,8 +369,7 @@ class ShardingSpec:
     def _to_layout(
         self,
         data_shape: Optional[Tuple[int, ...]] = None,
-        topology: Any = None,
-        routing_indices: Any = None,
+        topology: Optional[Topology] = None,
     ) -> Layout:
         """Internal: evaluate specification into a concrete Layout."""
         if data_shape is None:
@@ -374,16 +377,11 @@ class ShardingSpec:
                 raise ValueError("data_shape is required for static sharding")
             data_shape = (-1,) * (self.dim + 1)
 
-        topology_kind = self.strategy.topology_kind(topology)
-
         return Layout(
             dim=self.dim,
             data_shape=data_shape,
             mesh=self.mesh,
-            topology_kind=topology_kind,
             topology=topology,
-            routing_indices=routing_indices,
-            is_static=(topology is None and routing_indices is None),
             sharding_axes=self.sharding_axes,
             strategy=self.strategy,
             replication_axes=self._replication_axes,
@@ -420,8 +418,14 @@ class ShardingSpec:
         return ShardingSpec(_CYCLIC, mesh=mesh, partition=partition)
 
     @staticmethod
+    def index(mesh: DeviceMesh, partition: PartitionSpec) -> ShardingSpec:
+        """Dynamic: routing based on explicit array/tuple indices."""
+        return ShardingSpec(_INDEXED, mesh=mesh, partition=partition)
+
+    @staticmethod
     def hash(mesh: DeviceMesh, partition: PartitionSpec) -> ShardingSpec:
-        return ShardingSpec(_HASH, mesh=mesh, partition=partition)
+        """Dynamic: routing based on element values directly."""
+        return ShardingSpec(_INDEXED, mesh=mesh, partition=partition)
 
     @staticmethod
     def greedy(mesh: DeviceMesh, partition: PartitionSpec) -> ShardingSpec:
@@ -441,23 +445,11 @@ class ShardingSpec:
         class _FollowPartition(PartitionStrategy):
             """Wraps a captured strategy with bound topology."""
 
-            is_content_addressable = captured_strategy.is_content_addressable
+            routing_paradigm = captured_strategy.routing_paradigm
 
-            def __call__(
-                self, indices, dim_size, world_size, topology=None, routing_indices=None
-            ):
+            def __call__(self, indices, dim_size, world_size, topology=None):
                 meta = captured_meta if captured_meta is not None else topology
-                return captured_strategy(
-                    indices,
-                    dim_size,
-                    world_size,
-                    topology=meta,
-                    routing_indices=routing_indices,
-                )
-
-            def topology_kind(self, topology=None):
-                meta = captured_meta if captured_meta is not None else topology
-                return captured_strategy.topology_kind(meta)
+                return captured_strategy(indices, dim_size, world_size, topology=meta)
 
             @property
             def name(self):

@@ -233,11 +233,10 @@ class TransportPlanner:
         data_shape: Tuple[int, ...],
         local_rank: int,
         topology: Any = None,
-        routing_indices: Any = None,
     ) -> TransportPlan:
         """High-level Diff API."""
-        src_layout = src_spec._to_layout(data_shape, topology, routing_indices)
-        dst_layout = dst_spec._to_layout(data_shape, topology, routing_indices)
+        src_layout = src_spec._to_layout(data_shape, topology)
+        dst_layout = dst_spec._to_layout(data_shape, topology)
         return TransportPlanner.compute_plan(src_layout, dst_layout, local_rank)
 
 

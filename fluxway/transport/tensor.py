@@ -1,103 +1,10 @@
-from dataclasses import dataclass
-from enum import IntEnum
 from typing import List, Any, Optional
 from fluxway.transport.backend import get_backend
-
-
-# ============================================================
-# IndexDescriptor — Compact index pattern representation
-# ============================================================
-
-
-class IndexPattern(IntEnum):
-    CONTIGUOUS = 0
-    STRIDED = 1
-
-
-@dataclass(frozen=True)
-class IndexDescriptor:
-    """Compact O(1) representation of regular index patterns.
-
-    Provides a lightweight representation for indexing operations.
-    By avoiding the materialization of full index tensors, it improves performance,
-    especially for chunk and cyclic sharding patterns.
-    """
-
-    pattern: IndexPattern
-    start: int = 0
-    step: int = 1
-    count: int = 0
-
-    def materialize(self) -> Any:
-        """Expand to a full index tensor (lazy evaluation endpoint)."""
-        backend = get_backend()
-        if self.pattern == IndexPattern.CONTIGUOUS:
-            return backend.arange(
-                self.start, self.start + self.count, dtype=backend.int32()
-            )
-        elif self.pattern == IndexPattern.STRIDED:
-            return backend.arange(
-                self.start,
-                self.start + self.step * self.count,
-                step=self.step,
-                dtype=backend.int32(),
-            )
-        raise ValueError(f"Cannot materialize pattern={self.pattern}")
-
-    def slice(self, start: int, end: int) -> "IndexDescriptor":
-        """Derive descriptor for a sub-range. O(1) for chunk/cyclic."""
-        size = end - start
-        if self.pattern == IndexPattern.CONTIGUOUS:
-            return IndexDescriptor(IndexPattern.CONTIGUOUS, self.start + start, 1, size)
-        elif self.pattern == IndexPattern.STRIDED:
-            return IndexDescriptor(
-                IndexPattern.STRIDED, self.start + start * self.step, self.step, size
-            )
-        raise ValueError(f"Cannot slice pattern={self.pattern}")
-
-    @staticmethod
-    def chunk(start: int, count: int) -> "IndexDescriptor":
-        return IndexDescriptor(
-            IndexPattern.CONTIGUOUS, start=start, step=1, count=count
-        )
-
-    @staticmethod
-    def cyclic(start: int, step: int, count: int) -> "IndexDescriptor":
-        return IndexDescriptor(
-            IndexPattern.STRIDED, start=start, step=step, count=count
-        )
-
-    @staticmethod
-    def from_slice(s: slice, size: int) -> "IndexDescriptor":
-        start = s.start if s.start is not None else 0
-        step = s.step if s.step is not None else 1
-        stop = s.stop if s.stop is not None else size
-
-        if step > 0:
-            count = max(0, (stop - start + step - 1) // step)
-        else:
-            count = max(0, (start - stop - step - 1) // (-step))
-
-        if step == 1:
-            return IndexDescriptor(
-                IndexPattern.CONTIGUOUS, start=start, step=1, count=count
-            )
-        else:
-            return IndexDescriptor(
-                IndexPattern.STRIDED, start=start, step=step, count=count
-            )
-
+from fluxway.transport.topology import ContinuousTopology
 
 # ============================================================
 # TransportTensor — Unified tensor wrapper
 # ============================================================
-
-try:
-    import jax
-
-    _JAX_AVAILABLE = True
-except ImportError:
-    _JAX_AVAILABLE = False
 
 
 class TransportTensor:
@@ -117,7 +24,7 @@ class TransportTensor:
         self._flat_values = flat_values
         self._nested_splits = nested_splits if nested_splits is not None else []
 
-        if isinstance(indices, IndexDescriptor):
+        if isinstance(indices, ContinuousTopology):
             self._global_indices = None
             self._index_descriptor = indices
         elif isinstance(indices, slice):
@@ -147,9 +54,9 @@ class TransportTensor:
                     )
 
             if step == 1:
-                self._index_descriptor = IndexDescriptor.chunk(start, count)
+                self._index_descriptor = ContinuousTopology.chunk(start, count)
             else:
-                self._index_descriptor = IndexDescriptor.cyclic(start, step, count)
+                self._index_descriptor = ContinuousTopology.cyclic(start, step, count)
             self._global_indices = None
         else:
             self._global_indices = indices
@@ -164,7 +71,7 @@ class TransportTensor:
         Args:
             tensor: The dense data tensor.
             indices: Global indices mapping. Can be a materialized tensor, an explicit
-                     IndexDescriptor, or a python `slice` object for O(1) regular patterns.
+                     ContinuousTopology, or a python `slice` object for O(1) regular patterns.
         """
         return cls(flat_values=tensor, nested_splits=[], indices=indices)
 
@@ -187,7 +94,7 @@ class TransportTensor:
         return len(self._nested_splits) > 0
 
     @property
-    def index_descriptor(self) -> Optional[IndexDescriptor]:
+    def index_descriptor(self) -> Optional[ContinuousTopology]:
         """Compact index pattern descriptor, if available."""
         return self._index_descriptor
 
@@ -770,6 +677,13 @@ def _reconstruct_transport_tensor(
         indices=index_descriptor if index_descriptor is not None else global_indices,
     )
 
+
+try:
+    import jax
+
+    _JAX_AVAILABLE = True
+except ImportError:
+    _JAX_AVAILABLE = False
 
 if _JAX_AVAILABLE:
 

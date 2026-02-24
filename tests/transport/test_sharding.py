@@ -6,6 +6,12 @@ import jax.numpy as jnp
 from fluxway.transport.backend import set_backend
 from fluxway.transport.mesh import DeviceMesh
 from fluxway.transport.sharding import ShardingSpec, P
+from fluxway.transport.topology import (
+    TopologyMorphology,
+    RaggedTopology,
+    IndexedTopology,
+    CallableTopology,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -26,7 +32,7 @@ def test_chunk_layout_dense():
     assert layout.dim == 0
     assert layout.world_size == 2
     assert layout.is_static is True
-    assert layout.topology_kind == "dense"
+    assert layout.topology_morphology == TopologyMorphology.CONTINUOUS
 
     indices0 = layout.get_local_indices(0)
     indices1 = layout.get_local_indices(1)
@@ -55,7 +61,7 @@ def test_chunk_layout_ragged():
     splits = [jnp.array([0, 3, 5], dtype=jnp.int32)]
     mesh = DeviceMesh(device_shape=(2,), axis_names=("x",))
     spec = ShardingSpec.chunk(mesh=mesh, partition=P("x"))
-    layout = spec._to_layout(data_shape=(2,), topology=splits)
+    layout = spec._to_layout(data_shape=(2,), topology=RaggedTopology(splits=splits))
 
     indices0 = layout.get_local_indices(0)
     indices1 = layout.get_local_indices(1)
@@ -88,7 +94,7 @@ def test_hash_layout_with_topology():
     splits = [jnp.array([0, 10, 20], dtype=jnp.int32)]
     mesh = DeviceMesh(device_shape=(3,), axis_names=("x",))
     spec = ShardingSpec.hash(mesh=mesh, partition=P("x"))
-    layout = spec._to_layout(data_shape=(2,), topology=splits)
+    layout = spec._to_layout(data_shape=(2,), topology=RaggedTopology(splits=splits))
 
     indices0 = layout.get_local_indices(0)
     indices1 = layout.get_local_indices(1)
@@ -96,8 +102,9 @@ def test_hash_layout_with_topology():
 
     assert jnp.array_equal(indices0, jnp.array([0], dtype=jnp.int32))
     assert jnp.array_equal(indices1, jnp.array([1], dtype=jnp.int32))
-    assert len(indices2) == 0
+    assert tuple(indices2.tolist()) == ()
     assert layout.is_static is False
+    assert layout.topology_morphology == TopologyMorphology.RAGGED
 
 
 def test_hash_layout_with_routing_indices():
@@ -105,7 +112,7 @@ def test_hash_layout_with_routing_indices():
     dep = jnp.array([5, 3, 7, 2], dtype=jnp.int32)
     mesh = DeviceMesh(device_shape=(3,), axis_names=("x",))
     spec = ShardingSpec.hash(mesh=mesh, partition=P("x"))
-    layout = spec._to_layout(data_shape=(4,), routing_indices=dep)
+    layout = spec._to_layout(data_shape=(4,), topology=IndexedTopology(indices=dep))
 
     indices0 = layout.get_local_indices(0)
     indices1 = layout.get_local_indices(1)
@@ -124,7 +131,9 @@ def test_hash_layout_with_custom_function():
 
     mesh = DeviceMesh(device_shape=(3,), axis_names=("x",))
     spec = ShardingSpec.hash(mesh=mesh, partition=P("x"))
-    layout = spec._to_layout(data_shape=(4,), topology={"hash_fn": custom_hash})
+    layout = spec._to_layout(
+        data_shape=(4,), topology=CallableTopology(hash_fn=custom_hash)
+    )
 
     indices0 = layout.get_local_indices(0)
     indices1 = layout.get_local_indices(1)
@@ -158,7 +167,7 @@ def test_greedy_layout():
     splits = [jnp.array([0, 10, 30, 40], dtype=jnp.int32)]
     mesh = DeviceMesh(device_shape=(2,), axis_names=("x",))
     spec = ShardingSpec.greedy(mesh=mesh, partition=P("x"))
-    layout = spec._to_layout(data_shape=(3,), topology=splits)
+    layout = spec._to_layout(data_shape=(3,), topology=RaggedTopology(splits=splits))
 
     indices0 = layout.get_local_indices(0)
     indices1 = layout.get_local_indices(1)
@@ -175,7 +184,8 @@ def test_follow_layout():
     mesh = DeviceMesh(device_shape=(2,), axis_names=("x",))
     src_spec = ShardingSpec.hash(mesh=mesh, partition=P("x"))
     src_layout = src_spec._to_layout(
-        data_shape=(4,), routing_indices=jnp.array([0, 1, 0, 1], dtype=jnp.int32)
+        data_shape=(4,),
+        topology=IndexedTopology(indices=jnp.array([0, 1, 0, 1], dtype=jnp.int32)),
     )
 
     follow_spec = ShardingSpec.follow(src_layout, dim=0)
@@ -198,7 +208,7 @@ def test_derive_from():
     val_spec = ShardingSpec.derive_from(
         driver_spec=ShardingSpec.hash(mesh=mesh, partition=P("x")),
         driver_data_shape=(4,),
-        driver_topology=key_data,
+        driver_topology=IndexedTopology(indices=key_data),
         follow_dim=0,
     )
 
