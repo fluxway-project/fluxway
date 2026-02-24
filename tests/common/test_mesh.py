@@ -4,7 +4,7 @@ Unit tests for DeviceMesh.
 
 import pytest
 import numpy as np
-from fluxway.transport.mesh import DeviceMesh
+from fluxway.common.mesh import DeviceMesh
 
 
 def test_device_mesh_initialization():

@@ -1,6 +1,6 @@
 import pytest
 import numpy as np
-from fluxway.transport.backend import get_backend, use_backend
+from fluxway.common.backend import get_backend, use_backend
 
 
 def test_jax_dlpack_slice_multidim():

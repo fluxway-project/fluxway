@@ -1,6 +1,6 @@
 from typing import List, Any, Optional
-from fluxway.transport.backend import get_backend
-from fluxway.transport.topology import ContinuousTopology
+from fluxway.common.backend import get_backend
+from fluxway.common.topology import ContinuousTopology
 
 # ============================================================
 # TransportTensor — Unified tensor wrapper

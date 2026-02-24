@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 import enum
 from typing import Any, List, Callable
-from fluxway.transport.backend import get_backend
+from fluxway.common.backend import get_backend
 
 
 class TopologyMorphology(enum.Enum):

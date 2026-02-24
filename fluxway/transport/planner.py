@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Tuple, Union
 
-from fluxway.transport.backend import get_backend
-from fluxway.transport.sharding import ShardingSpec, Layout
+from fluxway.common.backend import get_backend
+from fluxway.common.types.sharding import ShardingSpec, Layout
 
 
 # ============================================================
@@ -193,7 +193,7 @@ class TransportPlanner:
         ndim = len(dst_data_shape)
         mesh_coords = [None] * len(dst_mesh.shape) if dst_mesh else []
 
-        from fluxway.transport.sharding import ChunkPartition
+        from fluxway.common.types.sharding import ChunkPartition
 
         _CHUNK = ChunkPartition()
 

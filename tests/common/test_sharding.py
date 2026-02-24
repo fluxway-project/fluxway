@@ -3,10 +3,10 @@
 import pytest
 import jax.numpy as jnp
 
-from fluxway.transport.backend import set_backend
-from fluxway.transport.mesh import DeviceMesh
-from fluxway.transport.sharding import ShardingSpec, P
-from fluxway.transport.topology import (
+from fluxway.common.backend import set_backend
+from fluxway.common.mesh import DeviceMesh
+from fluxway.common.types.sharding import ShardingSpec, P
+from fluxway.common.topology import (
     TopologyMorphology,
     RaggedTopology,
     IndexedTopology,

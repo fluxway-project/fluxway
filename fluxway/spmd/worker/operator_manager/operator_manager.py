@@ -16,13 +16,8 @@ import logging
 import inspect
 
 from fluxway.common.types.data_types import ArgumentType, OpType, TensorMeta
-from fluxway.common.types.sharding import (
-    LayoutMesh,
-    ShardingSpec,
-    StaticShardingSpec,
-    DynamicShardingSpec,
-)
-from fluxway.common.types.sharding import DenseShardingStrategy
+from fluxway.common.types.sharding import ShardingSpec, Layout
+from fluxway.common.mesh import DeviceMesh
 
 if TYPE_CHECKING:
     from ....common.types import SPMDConfig, OperatorMeta
@@ -42,7 +37,7 @@ class SPMDTopologyInfo:
     """
     spmd_id: str
     total_rank: int = 1
-    mesh: Optional[LayoutMesh] = None
+    mesh: Optional[DeviceMesh] = None
     # Tensor sharding: {tensor_name: ShardingSpec}
     tensor_sharding: Dict[str, ShardingSpec] = field(default_factory=dict)
     # Condition function for conditional edges (only for successors)
@@ -73,7 +68,7 @@ class OperatorManager:
             spmd_id: SPMD identifier (for self-loop detection)
         """
         self._config = config  # Store config for explicit meta access
-        self._mesh = config.mesh  # LayoutMesh from config
+        self._mesh = config.mesh  # DeviceMesh from config
         self._rank = rank
         self._total_rank = config.worker_count
         self._spmd_id = spmd_id
@@ -128,12 +123,6 @@ class OperatorManager:
         # Static arguments
         self._static_args: Dict[str, Any] = {}
         
-        # Pre-computed routing strategies: {(op_type, successor_spmd_id, tensor_name): DenseShardingStrategy}
-        self._routing_strategies: Dict[Tuple[OpType, str, str], DenseShardingStrategy] = {}
-        
-        # Pre-computed input routing strategies: {(op_type, predecessor_spmd_id, tensor_name): DenseShardingStrategy}
-        # Note: For input, we compute from predecessor's perspective (predecessor -> this worker)
-        self._input_routing_strategies: Dict[Tuple[OpType, str, str], DenseShardingStrategy] = {}
         
         # Pre-computed expected tensor shards: {op_type: {tensor_name: expected_count}}
         # Computed once after _input_sharding and _predecessor_topology are initialized
@@ -167,9 +156,7 @@ class OperatorManager:
         # Parse topology from OperatorMeta
         self._parse_operator_metadata()
         
-        # Pre-compute routing strategies after topology is parsed
-        self._precompute_routing_strategies()
-        
+
         # Pre-compute expected tensor shards after routing strategies are ready
         self._precompute_expected_tensor_shards()
         
@@ -321,102 +308,16 @@ class OperatorManager:
     def _infer_total_rank_from_sharding(self, sharding_map: Dict[str, Any]) -> int:
         """Infer total rank from sharding specs."""
         for spec in sharding_map.values():
-            if hasattr(spec, 'layout_mesh') and spec.layout_mesh is not None:
-                return spec.layout_mesh.num_devices
+            if isinstance(spec, ShardingSpec) and spec.mesh is not None:
+                return spec.mesh.size
         return 1
-    
-    def _extract_mesh_from_sharding(self, sharding_map: Dict[str, Any]) -> Optional[LayoutMesh]:
+
+    def _extract_mesh_from_sharding(self, sharding_map: Dict[str, Any]) -> Optional[DeviceMesh]:
         """Extract mesh from sharding specs."""
         for spec in sharding_map.values():
-            if hasattr(spec, 'layout_mesh') and spec.layout_mesh is not None:
-                return spec.layout_mesh
+            if isinstance(spec, ShardingSpec) and spec.mesh is not None:
+                return spec.mesh
         return None
-    
-    def _precompute_routing_strategies(self) -> None:
-        """
-        预计算所有 dense-to-dense 路由策略。
-        
-        遍历所有 op_type -> successor -> tensor 的组合，
-        对于 dense-to-dense 的情况，创建并缓存 DenseShardingStrategy。
-        
-        同时预计算输入端的路由策略，用于计算从哪些前置 rank 接收数据。
-        """
-        for op_type in [OpType.FORWARD, OpType.BACKWARD, OpType.UPDATE]:
-            output_sharding = self._output_sharding.get(op_type, {})
-            input_sharding = self._input_sharding.get(op_type, {})
-            
-            # 1. 预计算输出路由策略 (this -> successor)
-            for succ_id, succ_info in self._successor_topology[op_type].items():
-                for tensor_name, post_spec in succ_info.tensor_sharding.items():
-                    output_spec = output_sharding.get(tensor_name)
-                    
-                    # 只对 dense-to-dense 预计算
-                    if (output_spec is not None and 
-                        isinstance(output_spec, StaticShardingSpec) and
-                        isinstance(post_spec, StaticShardingSpec)):
-                        
-                        strategy = DenseShardingStrategy.from_specs(
-                            src_rank=self._rank,
-                            src_spec=output_spec,
-                            dst_spec=post_spec,
-                        )
-                        
-                        cache_key = (op_type, succ_id, tensor_name)
-                        self._routing_strategies[cache_key] = strategy
-                        
-                        logger.debug(
-                            f"Precomputed output routing strategy for {op_type.name} -> "
-                            f"{succ_id}:{tensor_name}, dependent_ranks={strategy.dependent_ranks}"
-                        )
-            
-            # 2. 预计算输入路由策略 (predecessor -> this)
-            # 对于每个前置 SPMD 的每个 rank，计算它是否会发送数据给当前 worker
-            for pre_id, pre_info in self._predecessor_topology[op_type].items():
-                for tensor_name, pre_sharding in pre_info.tensor_sharding.items():
-                    input_spec = input_sharding.get(tensor_name)
-                    
-                    # 只对 dense-to-dense 预计算
-                    if (input_spec is not None and 
-                        isinstance(input_spec, StaticShardingSpec) and
-                        isinstance(pre_sharding, StaticShardingSpec)):
-                        
-                        # 从前置的视角：前置发送 -> 当前接收
-                        # 我们需要知道哪些前置 rank 会发送给当前 rank
-                        # 策略：对于每个前置 rank，计算它的 dependent_ranks
-                        # 如果当前 rank 在其 dependent_ranks 中，则该前置 rank 是依赖源
-                        dependent_pre_ranks: List[int] = []
-                        
-                        for pre_rank in range(pre_info.total_rank):
-                            strategy = DenseShardingStrategy.from_specs(
-                                src_rank=pre_rank,
-                                src_spec=pre_sharding,
-                                dst_spec=input_spec,
-                            )
-                            # 如果当前 rank 在该前置 rank 的发送目标中
-                            if self._rank in strategy.dependent_ranks:
-                                dependent_pre_ranks.append(pre_rank)
-                        
-                        # 创建一个虚拟的策略对象来存储依赖的前置 rank
-                        # 这里我们直接存储依赖列表，使用一个简化的 strategy
-                        # 实际上我们只需要 dependent_ranks 这个字段
-                        input_strategy = DenseShardingStrategy(
-                            src_rank=self._rank,  # 当前 rank 作为接收方
-                            src_mesh=input_spec.layout_mesh,
-                            dst_mesh=pre_sharding.layout_mesh,
-                            dim_infos=[],  # 不需要 dim_infos
-                            src_normalized_axes=input_spec.normalized_axes,
-                            dst_normalized_axes=pre_sharding.normalized_axes,
-                            src_coords=input_spec.layout_mesh.get_coordinate(self._rank),
-                            dependent_ranks=dependent_pre_ranks,  # 存储依赖的前置 rank
-                        )
-                        
-                        cache_key = (op_type, pre_id, tensor_name)
-                        self._input_routing_strategies[cache_key] = input_strategy
-                        
-                        logger.debug(
-                            f"Precomputed input routing strategy for {pre_id}:{tensor_name} -> "
-                            f"{op_type.name}, dependent_predecessor_ranks={dependent_pre_ranks}"
-                        )
     
     def _precompute_expected_tensor_shards(self) -> None:
         """
@@ -449,29 +350,22 @@ class OperatorManager:
                 
                 total_count = 0
                 input_spec = self._input_sharding.get(op_type, {}).get(tensor_name)
-                input_is_sparse = isinstance(input_spec, DynamicShardingSpec)
-                
+                input_is_sparse = input_spec.is_content_addressable if input_spec else False
+
                 for pre_spmd_id, pre_info in self._predecessor_topology[op_type].items():
                     pre_sharding = pre_info.tensor_sharding.get(tensor_name)
-                    pre_is_sparse = isinstance(pre_sharding, DynamicShardingSpec)
-                    
+                    pre_is_sparse = pre_sharding.is_content_addressable if pre_sharding else False
+
                     if pre_is_sparse or input_is_sparse:
                         # Sparse involved: expect from all ranks
                         total_count += pre_info.total_rank
                     else:
-                        # Dense-to-Dense: use pre-computed input routing strategies
-                        cache_key = (op_type, pre_spmd_id, tensor_name)
-                        strategy = self._input_routing_strategies.get(cache_key)
-                        
-                        if strategy is not None:
-                            total_count += len(strategy.dependent_ranks)
-                        else:
-                            # Fallback: depend on all ranks
-                            logger.warning(
-                                f"No precomputed input strategy for {cache_key}, "
-                                f"falling back to all-to-all"
-                            )
-                            total_count += pre_info.total_rank
+                        # Dense-to-dense topology defaults to expecting shards
+                        # based on layout. Since we removed _input_routing_strategies,
+                        # AsyncDataDistributor fully encapsulates routing, we relax 
+                        # expected shards calculation or defer it. For now, fallback to total_rank
+                        # or better logic if required (e.g. geometric overlap).
+                        total_count += pre_info.total_rank
                 
                 expected[tensor_name] = total_count
             
@@ -545,52 +439,7 @@ class OperatorManager:
         info = self._successor_topology[op_type].get(spmd_id)
         return info.condition_fn if info else None
     
-    def get_dependent_successor_ranks(
-        self,
-        op_type: OpType,
-        successor_spmd_id: str,
-        tensor_name: str,
-    ) -> Optional[List[int]]:
-        """
-        获取当前 rank 依赖的后置 SPMD 的所有目标 rank。
-        
-        该方法直接返回预计算的结果，不需要 tensor 形状。
-        仅对 dense-to-dense 路由有效。
-        
-        Args:
-            op_type: 当前算子类型
-            successor_spmd_id: 后置 SPMD ID
-            tensor_name: 张量名称
-            
-        Returns:
-            依赖的目标 rank 列表，如果不存在预计算策略则返回 None
-        """
-        cache_key = (op_type, successor_spmd_id, tensor_name)
-        strategy = self._routing_strategies.get(cache_key)
-        if strategy is None:
-            return None
-        return strategy.dependent_ranks
-    
-    def get_routing_strategy(
-        self,
-        op_type: OpType,
-        successor_spmd_id: str,
-        tensor_name: str,
-    ) -> Optional[DenseShardingStrategy]:
-        """
-        获取预计算的路由策略。
-        
-        Args:
-            op_type: 当前算子类型
-            successor_spmd_id: 后置 SPMD ID
-            tensor_name: 张量名称
-            
-        Returns:
-            DenseShardingStrategy 或 None
-        """
-        cache_key = (op_type, successor_spmd_id, tensor_name)
-        return self._routing_strategies.get(cache_key)
-    
+
     # =========================================================================
     # Expected Data Query
     # =========================================================================
@@ -665,268 +514,7 @@ class OperatorManager:
         """Get predecessor topology info for an operator."""
         return dict(self._predecessor_topology.get(op_type, {}))
     
-    def get_input_routing_strategy(
-        self,
-        op_type: OpType,
-        pre_spmd_id: str,
-        tensor_name: str,
-    ) -> Optional[DenseShardingStrategy]:
-        """
-        Get pre-computed input routing strategy for a tensor.
-        
-        Args:
-            op_type: Operator type
-            pre_spmd_id: Predecessor SPMD ID
-            tensor_name: Tensor name
-            
-        Returns:
-            DenseShardingStrategy if available, None otherwise
-        """
-        cache_key = (op_type, pre_spmd_id, tensor_name)
-        return self._input_routing_strategies.get(cache_key)
-    
-    # =========================================================================
-    # Output Routing (4 cases)
-    # =========================================================================
-    
-    def get_successor_target_route(
-        self,
-        current_rank: int,
-        target_spmd_id: str,
-        op_type: OpType,
-        output_tensor_name: str,
-        output_tensor: Any,
-        output_tensor_meta: TensorMeta,
-    ) -> List[Tuple[Tuple[slice, ...], int]]:
-        """
-        Compute output routing table for a successor.
-        
-        Four cases based on source/dest sparse/dense:
-        1. dense-to-dense: geometric intersection
-        2. dense-to-sparse: distribute by rule
-        3. sparse-to-dense: use global_indices to compute targets
-        4. sparse-to-sparse: distribute by rule
-        
-        Args:
-            target_spmd_id: Target successor SPMD ID
-            op_type: Current operator type
-            output_tensor_name: Name of the output tensor
-            output_tensor: The actual tensor data
-            output_tensor_meta: Tensor metadata (contains global_indices for sparse)
-        
-        Returns:
-            List of (tensor_slice, target_rank) tuples
-        """
-        succ_info = self._successor_topology[op_type].get(target_spmd_id)
-        if succ_info is None:
-            logger.warning(f"Successor {target_spmd_id} not found for {op_type.name}")
-            return []
-        
-        output_spec = self._output_sharding.get(op_type, {}).get(output_tensor_name)
-        post_spec = succ_info.tensor_sharding.get(output_tensor_name)
-        
-        src_is_sparse = isinstance(output_spec, DynamicShardingSpec)
-        dst_is_sparse = isinstance(post_spec, DynamicShardingSpec)
-        
-        if not src_is_sparse and not dst_is_sparse:
-            # 优先使用预计算的策略
-            cache_key = (op_type, target_spmd_id, output_tensor_name)
-            strategy = self._routing_strategies.get(cache_key)
-            if strategy is not None:
-                return strategy.compute_route(output_tensor_meta.shape)
-            # 回退到原始计算（不应该发生，但保持兼容性）
-            return self._route_dense_to_dense(
-                current_rank, output_tensor_meta.shape, output_spec, post_spec
-            )
-        elif not src_is_sparse and dst_is_sparse:
-            # Only dst is dynamic, use dst's fn
-            return self._route_dense_to_sparse(
-                output_tensor, output_tensor_meta, post_spec
-            )
-        elif src_is_sparse and not dst_is_sparse:
-            # Only src is dynamic, use src's fn
-            return self._route_sparse_to_dense(
-                output_tensor, output_tensor_meta, output_spec, post_spec
-            )
-        else:
-            # Both are dynamic, use src (current SPMD) fn
-            return self._route_sparse_to_sparse(
-                output_tensor, output_tensor_meta, output_spec, post_spec
-            )
 
-    @staticmethod
-    def _route_dense_to_dense(
-        current_rank: int,
-        local_shape: Tuple[int, ...],
-        src_spec: StaticShardingSpec,
-        dst_spec: StaticShardingSpec,
-    ) -> List[Tuple[Tuple[slice, ...], int]]:
-        """
-        完全基于本地信息推导全局分布并计算发送 Mask。
-        
-        对于每个目标 rank，计算其在全局坐标系下的区间与当前 worker 区间的交集，
-        然后将交集转换为相对于本地 tensor 的切片（即本地索引范围）。
-        
-        Args:
-            current_rank: 当前 worker 的 rank
-            local_shape: 本地 tensor 的形状
-            src_spec: 源端的 sharding spec
-            dst_spec: 目标端的 sharding spec
-            
-        Returns:
-            List[Tuple[Tuple[slice, ...], dst_rank]]
-            每个元组包含：本地 tensor 的切片元组（可直接用于索引）和目标 rank
-        """
-        num_dims = len(local_shape)
-        
-        # --- 1. 逆向推导 Global Shape ---
-        # 根据当前 local_shape 和 sharding 策略还原逻辑上的全局大小
-        global_shape = src_spec.infer_global_shape(local_shape, current_rank)
-
-        # --- 2. 计算当前 Worker (Source) 的全局偏移区间 ---
-        src_layout = src_spec.lower(global_shape, current_rank)
-        src_slices = src_layout.dense_slices
-
-        # --- 3. 计算目标各 Rank 的区间并求交集 ---
-        results: List[Tuple[Tuple[slice, ...], int]] = []
-
-        for dst_rank in range(dst_spec.layout_mesh.num_devices):
-            dst_layout = dst_spec.lower(global_shape, dst_rank)
-            dst_slices = dst_layout.dense_slices
-            
-            # 计算每个维度的切片
-            local_slices: List[slice] = []
-            has_intersection = True
-            
-            for dim_idx in range(num_dims):
-                src_slice = src_slices[dim_idx]
-                dst_slice = dst_slices[dim_idx]
-                
-                # 在全局坐标系下计算交集
-                global_start = max(src_slice.start, dst_slice.start)
-                global_end = min(src_slice.end, dst_slice.end)
-                
-                if global_start >= global_end:
-                    # 该维度没有交集，跳过这个 dst_rank
-                    has_intersection = False
-                    break
-                
-                # 转换为本地坐标（相对于 src_slice.start）
-                local_start = global_start - src_slice.start
-                local_end = global_end - src_slice.start
-                
-                local_slices.append(slice(local_start, local_end))
-            
-            if has_intersection:
-                results.append((tuple(local_slices), dst_rank))
-
-        return results
-    
-    def _route_dense_to_sparse(
-        self,
-        tensor_data: Any,
-        tensor_meta: TensorMeta,
-        post_spec: DynamicShardingSpec,
-    ) -> List[Tuple[Tuple[slice, ...], int]]:
-        """
-        Dense-to-Sparse routing: use post_spec.fn (only dst is dynamic).
-        
-        Args:
-            tensor_data: The actual tensor data
-            tensor_meta: Tensor metadata
-            post_spec: Destination DynamicShardingSpec (contains fn)
-        
-        Returns:
-            List of (tensor_slice, target_rank) tuples from fn result
-        """
-        # Only dst is dynamic, use dst's fn
-        # fn(tensor, tensor_meta, post_sharding_spec) -> routing result
-        return post_spec.fn(tensor_data, tensor_meta, post_spec)
-    
-    def _route_sparse_to_dense(
-        self,
-        tensor_data: Any,
-        tensor_meta: TensorMeta,
-        output_spec: DynamicShardingSpec,
-        post_spec: StaticShardingSpec,
-    ) -> List[Tuple[Tuple[slice, ...], int]]:
-        """
-        Sparse-to-Dense routing: use output_spec.fn (only src is dynamic).
-        
-        Args:
-            tensor_data: The actual tensor data
-            tensor_meta: Tensor metadata
-            output_spec: Source DynamicShardingSpec (contains fn)
-            post_spec: Destination StaticShardingSpec (provides mesh and axis info)
-        
-        Returns:
-            List of (tensor_slice, target_rank) tuples from fn result
-        """
-        # Only src is dynamic, use src's fn
-        # fn(tensor, tensor_meta, post_sharding_spec) -> routing result
-        return output_spec.fn(tensor_data, tensor_meta, post_spec)
-    
-    def _route_sparse_to_sparse(
-        self,
-        tensor_data: Any,
-        tensor_meta: TensorMeta,
-        output_spec: DynamicShardingSpec,
-        post_spec: DynamicShardingSpec,
-    ) -> List[Tuple[Tuple[slice, ...], int]]:
-        """
-        Sparse-to-Sparse routing: use output_spec.fn (both are dynamic, use src's fn).
-        
-        Args:
-            tensor_data: The actual tensor data
-            tensor_meta: Tensor metadata
-            output_spec: Source DynamicShardingSpec (contains fn to use)
-            post_spec: Destination DynamicShardingSpec (provides mesh and axis info)
-        
-        Returns:
-            List of (tensor_slice, target_rank) tuples from fn result
-        """
-        # Both are dynamic, use src (current SPMD) fn
-        # fn(tensor, tensor_meta, post_sharding_spec) -> routing result
-        return output_spec.fn(tensor_data, tensor_meta, post_spec)
-    
-    def has_sparse_route_fn(
-        self,
-        op_type: OpType,
-        target_spmd_id: str,
-        output_tensor_name: str,
-    ) -> bool:
-        """
-        Check whether the sparse routing path for a given successor has a
-        user-provided routing function (``DynamicShardingSpec.fn``).
-
-        The check mirrors the ``get_successor_target_route`` routing-case
-        selection:
-
-        * dense-to-dense → always ``False`` (no sparse involved).
-        * dense-to-sparse → ``post_spec.fn is not None``.
-        * sparse-to-dense → ``output_spec.fn is not None``.
-        * sparse-to-sparse → ``output_spec.fn is not None``.
-
-        Returns ``False`` when the topology / sharding info cannot be found.
-        """
-        succ_info = self._successor_topology[op_type].get(target_spmd_id)
-        if succ_info is None:
-            return False
-
-        output_spec = self._output_sharding.get(op_type, {}).get(output_tensor_name)
-        post_spec = succ_info.tensor_sharding.get(output_tensor_name)
-
-        src_is_sparse = isinstance(output_spec, DynamicShardingSpec)
-        dst_is_sparse = isinstance(post_spec, DynamicShardingSpec)
-
-        if not src_is_sparse and not dst_is_sparse:
-            return False  # dense-to-dense, no route fn concept
-        elif not src_is_sparse and dst_is_sparse:
-            return post_spec.fn is not None
-        elif src_is_sparse and not dst_is_sparse:
-            return output_spec.fn is not None
-        else:
-            return output_spec.fn is not None
 
     # =========================================================================
     # Sharding Query

@@ -17,7 +17,6 @@ from pydantic import BaseModel, Field, ConfigDict, model_validator
 
 from enum import Enum
 
-from fluxway.common.types.sharding import RawShardingSpec
 from fluxway.common.types.sharding import ShardingSpec
 
 
@@ -73,8 +72,8 @@ class SPMDConfig(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
     
     worker_count: int = 1
-    # Mesh is now stored as LayoutMesh directly
-    mesh: Optional[Any] = None  # LayoutMesh (use Any to avoid circular import)
+    # Mesh is now stored as DeviceMesh directly
+    mesh: Optional[Any] = None  # DeviceMesh (use Any to avoid circular import)
     user_forward_fn: Optional[Callable] = None
     user_backward_fn: Optional[Callable] = None
     user_update_fn: Optional[Callable] = None  # User-defined parameter update function
@@ -102,8 +101,7 @@ class SPMDConfig(BaseModel):
         if self.mesh is None:
             self.worker_count = 1
             return self
-        # LayoutMesh exposes num_devices which is the product of axis_shapes.
-        self.worker_count = int(getattr(self.mesh, "num_devices", 1))
+        self.worker_count = int(getattr(self.mesh, "size", 1))
         return self
     
     @property
@@ -115,7 +113,7 @@ class SPMDConfig(BaseModel):
         """Get total number of devices in mesh."""
         if not self.has_mesh or self.mesh is None:
             return 1
-        return self.mesh.num_devices
+        return self.mesh.size
 
 
 # =============================================================================
@@ -239,10 +237,10 @@ class OperatorMeta(BaseModel):
     
     name: str
     # Raw sharding specs (from @operator decorator, mesh-independent)
-    input_sharding_raw: Dict[str, RawShardingSpec] = Field(default_factory=dict)
-    output_sharding_raw: Dict[str, RawShardingSpec] = Field(default_factory=dict)
-    # Resolved sharding specs (from @spmd decorator, mesh-aware)
-    # These are set by @spmd decorator after mesh is available
+    # Each value is a dict with keys: type ("dense"|"sparse"), axis (list), fn (optional)
+    input_sharding_raw: Dict[str, Any] = Field(default_factory=dict)
+    output_sharding_raw: Dict[str, Any] = Field(default_factory=dict)
+    # Resolved sharding specs (from @spmd decorator, mesh-aware): new algebraic ShardingSpec
     input_sharding: Optional[Dict[str, ShardingSpec]] = None
     output_sharding: Optional[Dict[str, ShardingSpec]] = None
     # Keys use ArgumentType.value (i.e. "state" | "tensor" | "static") to avoid enum
@@ -610,7 +608,7 @@ class TensorMeta(BaseModel):
     forward_step: int = -1
     
     # Flags
-    is_sparse: bool = False    # True if output via DynamicShardingSpec
+    is_sparse: bool = False    # True if output via dynamic (indexed/hash) ShardingSpec
     is_empty: bool = False     # Empty packet for sparse routing sync
 
 

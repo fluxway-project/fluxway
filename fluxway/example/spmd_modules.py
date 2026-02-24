@@ -139,7 +139,7 @@ def modulo_routing_fn(
         tuple of slices selecting a row from the local tensor.
     """
     import math
-    from fluxway.common.types.sharding import StaticShardingSpec
+    from fluxway.common.types.sharding import ShardingSpec
 
     global_shape = tensor_meta.global_shape
     global_indices = tensor_meta.global_indices
@@ -153,7 +153,7 @@ def modulo_routing_fn(
     num_ranks = post_spec.layout_mesh.num_devices
     results: List[Tuple[Tuple[slice, ...], int]] = []
 
-    if isinstance(post_spec, StaticShardingSpec):
+    if not post_spec.is_content_addressable:
         # Use post_spec.lower() to get each rank's axis-0 range
         for rank in range(num_ranks):
             layout = post_spec.lower(global_shape, rank)

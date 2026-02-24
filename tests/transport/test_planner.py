@@ -3,12 +3,12 @@
 import pytest
 import jax.numpy as jnp
 
-from fluxway.transport.backend import set_backend
-from fluxway.transport.mesh import DeviceMesh
+from fluxway.common.backend import set_backend
+from fluxway.common.mesh import DeviceMesh
 from fluxway.transport.planner import TransportPlanner
-from fluxway.transport.sharding import ShardingSpec, P
+from fluxway.common.types.sharding import ShardingSpec, P
 from fluxway.transport.tensor import TransportTensor
-from fluxway.transport.topology import RaggedTopology, IndexedTopology
+from fluxway.common.topology import RaggedTopology, IndexedTopology
 
 
 @pytest.fixture(autouse=True)

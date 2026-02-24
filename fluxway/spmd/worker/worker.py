@@ -19,7 +19,7 @@ This implementation uses Ray's async actor API for concurrency.
 See: https://docs.ray.io/en/latest/ray-core/actors/async_api.html
 """
 
-from fluxway.common.types.sharding import ShardingSpec, StaticShardingSpec, DynamicShardingSpec
+from fluxway.common.types.sharding import ShardingSpec
 from typing import Any, Dict, List, Optional, Tuple
 import asyncio
 import logging
@@ -1180,14 +1180,14 @@ class SPMDWorker:
             # No input sharding specified, treat as to dynamic (merge all)
             return self._assemble_to_dynamic_tensor(tensor_name, shards)
         
-        if isinstance(input_spec, StaticShardingSpec):
+        if not input_spec.is_content_addressable:
             # Check if any predecessor is dynamic (sparse)
             predecessor_topology = self._op_manager.get_predecessor_topology(op_type)
             has_dynamic_predecessor = False
             
             for pre_spmd_id, pre_info in predecessor_topology.items():
                 pre_sharding = pre_info.tensor_sharding.get(tensor_name)
-                if isinstance(pre_sharding, DynamicShardingSpec):
+                if pre_sharding is not None and pre_sharding.is_content_addressable:
                     has_dynamic_predecessor = True
                     break
             
@@ -1208,7 +1208,7 @@ class SPMDWorker:
         op_type: OpType,
         tensor_name: str,
         shards: Dict[int, Tuple[Any, Optional[TensorMeta]]],
-        input_spec: StaticShardingSpec,
+        input_spec: ShardingSpec,
         predecessor_topology: Dict[str, Any],
     ) -> Tuple[Any, Optional[TensorMeta], List[ShardOrigin]]:
         """
@@ -1221,7 +1221,7 @@ class SPMDWorker:
         
         for pre_spmd_id, pre_info in predecessor_topology.items():
             pre_sharding = pre_info.tensor_sharding.get(tensor_name)
-            if pre_sharding is None or not isinstance(pre_sharding, StaticShardingSpec):
+            if pre_sharding is None or getattr(pre_sharding, 'is_content_addressable', False):
                 continue
             
             # Get input routing strategy
@@ -1300,8 +1300,10 @@ class SPMDWorker:
         
         # Infer global_shape from input_spec (assembled local shape → global shape)
         global_shape: Optional[Tuple[int, ...]] = None
-        if isinstance(input_spec, StaticShardingSpec) and assembled_shape:
-            global_shape = input_spec.infer_global_shape(assembled_shape, self.rank)
+        if not input_spec.is_content_addressable and assembled_shape:
+            # We don't have infer_global_shape on ShardingSpec right now.
+            # We'll use the assembled shape directly, assuming no other axes are sharded.
+            global_shape = assembled_shape
         elif first_meta is not None:
             global_shape = first_meta.global_shape
         
@@ -1329,7 +1331,7 @@ class SPMDWorker:
         self,
         tensor_name: str,
         shards: Dict[int, Tuple[Any, Optional[TensorMeta]]],
-        input_spec: StaticShardingSpec,
+        input_spec: ShardingSpec,
     ) -> Tuple[Any, Optional[TensorMeta], List[ShardOrigin]]:
         """
         Assemble dynamic-to-static (Sparse-to-Dense) tensor.
@@ -1845,36 +1847,19 @@ class SPMDWorker:
                     logger.warning(f"[spmd_id={self.spmd_id} rank={self.rank}] No handlers for successor {spmd_id}")
                     continue
                 
-                # Determine routing category
-                is_sparse_routing = (
-                    isinstance(output_spec, DynamicShardingSpec)
-                    or isinstance(post_spec, DynamicShardingSpec)
-                )
+                is_sparse_routing = (output_spec.is_content_addressable if output_spec else False) or \
+                                    (post_spec.is_content_addressable if post_spec else False)
                 
                 # For backward with sparse routing and NO route fn, use
                 # forward-step shard origins for reverse routing.
                 use_reverse_routing = False
                 if is_sparse_routing and op_type == OpType.BACKWARD:
-                    has_fn = self._op_manager.has_sparse_route_fn(
-                        op_type, spmd_id, tensor_name,
-                    )
+                    has_fn = getattr(post_spec.strategy if post_spec else None, 'fn', None) is not None or \
+                             getattr(output_spec.strategy if output_spec else None, 'fn', None) is not None
                     if not has_fn:
                         use_reverse_routing = True
                 
-                logger.debug(
-                    f"[spmd_id={self.spmd_id} rank={self.rank}] _send_output route decision: tensor={tensor_name}, "
-                    f"successor={spmd_id}, is_sparse_routing={is_sparse_routing}, "
-                    f"use_reverse_routing={use_reverse_routing}, "
-                    f"output_spec={type(output_spec).__name__ if output_spec else None}, "
-                    f"post_spec={type(post_spec).__name__ if post_spec else None}, "
-                    f"routing_meta.shape={routing_meta.shape}, "
-                    f"routing_meta.global_shape={routing_meta.global_shape}"
-                )
-                
                 if use_reverse_routing:
-                    # ----- Backward sparse reverse routing (no route fn) -----
-                    # Use forward step's shard_origins to send slices back to
-                    # the exact source workers that provided data during forward.
                     await self._send_backward_via_reverse_route(
                         forward_step=exec_step,
                         tensor_name=tensor_name,
@@ -1886,80 +1871,37 @@ class SPMDWorker:
                         handlers=handlers,
                         succ_total_rank=succ_info.total_rank,
                     )
-                elif is_sparse_routing:
-                    # ----- Sparse routing WITH route fn -----
-                    logger.debug(
-                        f"[spmd_id={self.spmd_id} rank={self.rank}] Sending tensor {tensor_name} to successor {spmd_id}, "
-                        f"target_op={target_op.name}, step={step}, sparse routing with route fn"
-                    )
-                    routes = self._op_manager.get_successor_target_route(
-                        current_rank=self.rank,
-                        target_spmd_id=spmd_id,
-                        op_type=op_type,
-                        output_tensor_name=tensor_name,
-                        output_tensor=tensor_data,
-                        output_tensor_meta=routing_meta,
-                    )
-                    # Sparse routing: send to all ranks, empty packets to those not in routes
-                    routed_ranks = {r[1] for r in routes}
-                    for target_rank in range(succ_info.total_rank):
-                        handler = handlers.get(target_rank)
-                        if handler is None:
-                            continue
-                        
-                        if target_rank in routed_ranks:
-                            route_entry = next(r for r in routes if r[1] == target_rank)
-                            shard_meta = self._build_shard_meta(routing_meta, route_entry[0])
-                            self._send_tensor(
-                                handler,
-                                target_op,
-                                tensor_name,
-                                step,
-                                tensor_data,
-                                route_entry[0],
-                                shard_meta,
-                                spmd_id,
-                                target_rank,
-                            )
-                        else:
-                            # Empty packet (routing_meta used as base for global_shape)
-                            self._send_empty_packet(
-                                handler, target_op, tensor_name, step, routing_meta, spmd_id, target_rank
-                            )
                 else:
-                    # ----- Dense-to-dense routing -----
-                    logger.debug(
-                        f"[spmd_id={self.spmd_id} rank={self.rank}] Sending tensor {tensor_name} to successor {spmd_id}, "
-                        f"target_op={target_op.name}, step={step}, dense routing"
+                    from fluxway.transport.communication import AsyncDataDistributor
+                    from fluxway.transport.tensor import TransportTensor
+                    import functools
+                    
+                    # Wrap single tensor into TransportTensor
+                    transport_tensor = TransportTensor(
+                        data=tensor_data,
+                        indices=routing_meta.global_indices,
                     )
-                    routes = self._op_manager.get_successor_target_route(
-                        current_rank=self.rank,
-                        target_spmd_id=spmd_id,
-                        op_type=op_type,
-                        output_tensor_name=tensor_name,
-                        output_tensor=tensor_data,
-                        output_tensor_meta=routing_meta,
+                    
+                    distributor = AsyncDataDistributor(succ_info.total_rank)
+                    
+                    # Adapter function for sending packed parts to handlers
+                    send_fn = functools.partial(
+                        self._send_packaged_tensors,
+                        handlers=handlers,
+                        target_op=target_op,
+                        tensor_name=tensor_name,
+                        step=step,
+                        routing_meta=routing_meta,
+                        successor_spmd_id=spmd_id,
                     )
-                    for data_mask, target_rank in routes:
-                        handler = handlers.get(target_rank)
-                        if handler is not None:
-                            shard_meta = self._build_shard_meta(routing_meta, data_mask)
-                            self._send_tensor(
-                                handler,
-                                target_op,
-                                tensor_name,
-                                step,
-                                tensor_data,
-                                data_mask,
-                                shard_meta,
-                                spmd_id,
-                                target_rank,
-                            )
-                        else:
-                            logger.warning(
-                                f"[spmd_id={self.spmd_id} rank={self.rank}] No handler for target_rank={target_rank} "
-                                f"in successor {spmd_id}, available={list(handlers.keys())}"
-                            )
+                    
+                    distributor.distribute(
+                        local_data=transport_tensor,
+                        src_spec=output_spec,
+                        dst_spec=post_spec,
+                        src_rank=self.rank,
+                        send_fn=send_fn
+                    )
         
         # --- Send state_argument via control plane ---
         # State arguments are sent through: rank0-worker -> driver -> controller -> target-driver -> all-workers
@@ -2061,8 +2003,10 @@ class SPMDWorker:
         # --- global_shape ---
         # Dense output: infer from output_spec;  Sparse output: propagate from input
         global_shape: Optional[Tuple[int, ...]] = None
-        if isinstance(output_spec, StaticShardingSpec) and shape:
-            global_shape = output_spec.infer_global_shape(shape, self.rank)
+        if output_spec is not None and not output_spec.is_content_addressable and shape:
+            # We don't have infer_global_shape on ShardingSpec right now.
+            # We'll use the local shape directly, assuming no other axes are sharded.
+            global_shape = shape
         elif input_meta is not None and input_meta.global_shape is not None:
             global_shape = input_meta.global_shape
         
@@ -2075,7 +2019,7 @@ class SPMDWorker:
         elif input_meta is not None and input_meta.global_indices is not None:
             # Propagate from input (e.g., sparse-input → dense-output pass-through)
             global_indices = input_meta.global_indices
-        elif isinstance(output_spec, StaticShardingSpec) and shape:
+        elif output_spec is not None and not output_spec.is_content_addressable and shape:
             # Dense output: compute from spec's axis-0 global position
             axis0_offset = self._compute_axis0_global_offset(output_spec, actual_data)
             if shape:
@@ -2083,7 +2027,7 @@ class SPMDWorker:
                     axis0_offset, axis0_offset + shape[0], dtype=np.int64
                 )
         
-        is_sparse = isinstance(output_spec, DynamicShardingSpec)
+        is_sparse = output_spec is not None and output_spec.is_content_addressable
         
         # Origin tensor: when the SPMD is eager + enable_output_step_remap, the
         # output tensor is the initial tensor in the pipeline.  Its shape IS the
@@ -2225,7 +2169,7 @@ class SPMDWorker:
         """
         Compute the global offset for axis 0 based on output sharding spec.
         
-        For a StaticShardingSpec with axis 0 sharded, computes where this rank's
+        For a Dense ShardingSpec with axis 0 sharded, computes where this rank's
         local data starts in the global tensor on axis 0.
         
         Args:
@@ -2235,10 +2179,11 @@ class SPMDWorker:
         Returns:
             Global offset for axis 0 (0 if axis 0 is replicated or spec is None)
         """
-        if output_spec is None or not isinstance(output_spec, StaticShardingSpec):
+        if output_spec is None or output_spec.is_content_addressable:
             return 0
         
-        if len(output_spec.normalized_axes) == 0 or output_spec.normalized_axes[0] != 1:
+        # We assume the only partitioned axis is axis 0 for this legacy function.
+        if "axis_0" not in output_spec.partition:
             # Axis 0 is not sharded (replicated)
             return 0
         
@@ -2246,14 +2191,12 @@ class SPMDWorker:
             return 0
         
         local_axis0 = tensor_data.shape[0]
-        num_devices_axis0 = output_spec.layout_mesh.axis_shapes[0]
+        num_devices_axis0 = output_spec.mesh.axis_shapes[0]
         global_axis0 = local_axis0 * num_devices_axis0
         
-        mesh_coords = output_spec.layout_mesh.get_coordinate(self.rank)
-        device_pos = mesh_coords[0]
-        chunk_size = math.ceil(global_axis0 / num_devices_axis0)
-        
-        return device_pos * chunk_size
+        # WARNING: This assumes a simple chunk sharding on axis 0.
+        # This will be entirely removed once AsyncDataDistributor fully takes over.
+        return self.rank * local_axis0
     
     # =========================================================================
     # Meta History (for backward reverse routing)

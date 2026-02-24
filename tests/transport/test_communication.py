@@ -3,10 +3,10 @@ import jax.numpy as jnp
 import numpy as np
 
 from fluxway.transport.tensor import TransportTensor
-from fluxway.transport.sharding import ShardingSpec, P
-from fluxway.transport.mesh import DeviceMesh
+from fluxway.common.types.sharding import ShardingSpec, P
+from fluxway.common.mesh import DeviceMesh
 from fluxway.transport.communication import DataDistributor, TransportReceiver
-from fluxway.transport.backend import set_backend
+from fluxway.common.backend import set_backend
 
 
 # Force JAX backend

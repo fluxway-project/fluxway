@@ -4,8 +4,8 @@ from unittest.mock import MagicMock
 import jax.numpy as jnp
 
 from fluxway.transport.communication import SyncDataDistributor, AsyncDataDistributor
-from fluxway.transport.sharding import ShardingSpec, P
-from fluxway.transport.mesh import DeviceMesh
+from fluxway.common.types.sharding import ShardingSpec, P
+from fluxway.common.mesh import DeviceMesh
 from fluxway.transport.tensor import TransportTensor
 
 

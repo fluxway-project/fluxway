@@ -3,7 +3,7 @@
 from typing import Any, Callable, Optional
 import functools
 
-from fluxway.transport.backend import get_backend
+from fluxway.common.backend import get_backend
 
 
 def shield(func: Optional[Callable] = None, *, result_shape: Any = None):

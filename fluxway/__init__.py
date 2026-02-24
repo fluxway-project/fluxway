@@ -46,14 +46,13 @@ from fluxway.common.types import (
     Edge,
     ResourceSpec,
     # Sharding types
-    LayoutMesh,
-    LayoutOp,
-    LayoutType,
+    Layout,
     ShardingSpec,
-    StaticShardingSpec,
-    DynamicShardingSpec,
-    DynamicRoutingFn,
-    create_mesh,
+    PartitionSpec,
+    ChunkPartition,
+    CyclicPartition,
+    IndexedPartition,
+    GreedyPartition,
 )
 
 # Import control plane components
@@ -74,14 +73,13 @@ __all__ = [
     "Edge",
     "ResourceSpec",
     # Sharding
-    'LayoutMesh',
-    'LayoutOp',
-    'LayoutType',
+    'Layout',
     'ShardingSpec',
-    'StaticShardingSpec',
-    'DynamicShardingSpec',
-    'DynamicRoutingFn',
-    'create_mesh',
+    'PartitionSpec',
+    'ChunkPartition',
+    'CyclicPartition',
+    'IndexedPartition',
+    'GreedyPartition',
     # Control Plane
     "GraphParser",
     "Builder",

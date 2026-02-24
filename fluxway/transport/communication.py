@@ -4,17 +4,17 @@ from __future__ import annotations
 
 from typing import Any, Callable, Coroutine, List, Tuple
 
-from fluxway.transport.backend import get_backend
+from fluxway.common.backend import get_backend
 from fluxway.transport.planner import TransportPlanner
-from fluxway.transport.sharding import ShardingSpec
+from fluxway.common.types.sharding import ShardingSpec
 from fluxway.transport.tensor import TransportTensor
-from fluxway.transport.execution import compile
+from fluxway.common.execution import compile
 
 
 import asyncio
 from typing import Union, Optional
 
-from fluxway.transport.sharding import Layout
+from fluxway.common.types.sharding import Layout
 
 
 class BaseDataDistributor:

@@ -124,7 +124,7 @@ class DeviceMesh:
 
     def unravel_index(self, ranks: Any) -> Tuple[Any, ...]:
         """Convert physical ranks to multi-dimensional logical coordinates."""
-        from fluxway.transport.backend import get_backend
+        from fluxway.common.backend import get_backend
 
         try:
             backend = get_backend()
@@ -135,7 +135,7 @@ class DeviceMesh:
 
     def flatten(self) -> List[int]:
         """Return a flattened list of physical device IDs."""
-        from fluxway.transport.backend import get_backend
+        from fluxway.common.backend import get_backend
 
         try:
             backend = get_backend()

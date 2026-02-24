@@ -25,6 +25,9 @@ import tempfile
 import pytest
 
 
+def dummy_my_function():
+    pass
+
 class TestPickleBehavior:
     """Tests demonstrating Python pickle behavior with function attributes."""
 
@@ -34,8 +37,7 @@ class TestPickleBehavior:
         
         This works because pickle returns the same object reference.
         """
-        def my_function():
-            pass
+        my_function = dummy_my_function
         
         my_function.meta = {"key": "original"}
         my_function.meta["key"] = "modified"
@@ -138,6 +140,24 @@ print(repr(restored_fn.meta))
                 os.unlink(pickle_path)
 
 
+from pydantic import BaseModel, Field, ConfigDict
+from typing import Dict, List, Any, Optional, Callable
+
+class DummyEdgeShardingInfo(BaseModel):
+    tensor_sharding: Dict[str, Any] = Field(default_factory=dict)
+
+class DummyOperatorMeta(BaseModel):
+    name: str
+    input_pre_sharding: Dict[str, List[DummyEdgeShardingInfo]] = Field(default_factory=dict)
+
+class DummySPMDConfig(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    user_forward_fn: Optional[Callable] = None
+    forward_meta: Optional[DummyOperatorMeta] = None
+
+def dummy_forward(x):
+    return x
+
 class TestOperatorMetaSerialization:
     """Tests for OperatorMeta serialization in SPMDConfig."""
     
@@ -147,19 +167,9 @@ class TestOperatorMetaSerialization:
         
         This is why storing OperatorMeta explicitly in SPMDConfig works.
         """
-        from pydantic import BaseModel, Field
-        from typing import Dict, List, Any
-        
-        class EdgeShardingInfo(BaseModel):
-            tensor_sharding: Dict[str, Any] = Field(default_factory=dict)
-        
-        class OperatorMeta(BaseModel):
-            name: str
-            input_pre_sharding: Dict[str, List[EdgeShardingInfo]] = Field(default_factory=dict)
-        
         # Create and modify meta
-        meta = OperatorMeta(name="forward")
-        edge_info = EdgeShardingInfo(tensor_sharding={'tensor': 'some_spec'})
+        meta = DummyOperatorMeta(name="forward")
+        edge_info = DummyEdgeShardingInfo(tensor_sharding={'tensor': 'some_spec'})
         meta.input_pre_sharding['Preprocessing'] = [edge_info]
         
         # Pickle and unpickle
@@ -176,36 +186,19 @@ class TestOperatorMetaSerialization:
         
         This is the solution implemented to fix the sharding issue.
         """
-        from pydantic import BaseModel, Field, ConfigDict
-        from typing import Dict, List, Any, Optional, Callable
+        my_forward = dummy_forward
         
-        class EdgeShardingInfo(BaseModel):
-            tensor_sharding: Dict[str, Any] = Field(default_factory=dict)
-        
-        class OperatorMeta(BaseModel):
-            name: str
-            input_pre_sharding: Dict[str, List[EdgeShardingInfo]] = Field(default_factory=dict)
-        
-        class SPMDConfig(BaseModel):
-            model_config = ConfigDict(arbitrary_types_allowed=True)
-            user_forward_fn: Optional[Callable] = None
-            forward_meta: Optional[OperatorMeta] = None  # Explicit storage
-        
-        # Create meta and attach to function
-        def my_forward(x):
-            return x
-        
-        meta = OperatorMeta(name="forward")
+        meta = DummyOperatorMeta(name="forward")
         my_forward._flux_operator_meta = meta
         
         # Create config with explicit meta (simulating get_spmd_config)
-        config = SPMDConfig(
+        config = DummySPMDConfig(
             user_forward_fn=my_forward,
             forward_meta=meta  # Store explicitly
         )
         
         # Modify meta after config creation (simulating Builder)
-        edge_info = EdgeShardingInfo(tensor_sharding={'tensor': 'some_spec'})
+        edge_info = DummyEdgeShardingInfo(tensor_sharding={'tensor': 'some_spec'})
         meta.input_pre_sharding['Preprocessing'] = [edge_info]
         
         # Pickle and unpickle (simulating Ray serialization)

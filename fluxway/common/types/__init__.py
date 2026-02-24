@@ -57,23 +57,19 @@ from .data_types import (
     MailboxStatus,
 )
 
-# Sharding types
+# Sharding types: algebraic layer
 from .sharding import (
-    LayoutMesh,
-    LayoutOp,
-    LayoutType,
+    # Algebraic sharding (data-plane)
+    PartitionSpec,
+    P,
+    PartitionStrategy,
+    ChunkPartition,
+    CyclicPartition,
+    IndexedPartition,
+    GreedyPartition,
+    Layout,
     ShardingSpec,
-    StaticShardingSpec,
-    DynamicShardingSpec,
-    DynamicRoutingFn,
-    RawShardingSpec,
-    RawShardingDependency,
-    Axis,
-    create_mesh,
-    # Sharding strategy types (migrated from sharding_strategy.py)
-    DenseShardingStrategy,
-    DimShardingInfo,
-    _compute_intersection_range,
+
 )
 
 __all__ = [
@@ -131,19 +127,15 @@ __all__ = [
     "ReaderConfig",
     "ReaderState",
     "MailboxStatus",
-    # Sharding types
-    "LayoutMesh",
-    "LayoutOp",
-    "LayoutType",
+    # Sharding types: algebraic (data-plane)
+    "PartitionSpec",
+    "P",
+    "PartitionStrategy",
+    "ChunkPartition",
+    "CyclicPartition",
+    "IndexedPartition",
+    "GreedyPartition",
+    "Layout",
     "ShardingSpec",
-    "StaticShardingSpec",
-    "DynamicShardingSpec",
-    "DynamicRoutingFn",
-    "RawShardingSpec",
-    "RawShardingDependency",
-    "Axis",
-    "create_mesh",
-    # Sharding strategy types
-    "DenseShardingStrategy",
-    "DimShardingInfo",
+
 ]

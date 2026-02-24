@@ -39,12 +39,11 @@ def operator(
             for all expected shards.
     
     Note:
-        Raw sharding specs are validated and stored as RawShardingSpec objects.
-        They are converted to ShardingSpec (StaticShardingSpec/DynamicShardingSpec)
-        in @spmd decorator when mesh is available.
+        Raw sharding specs are validated and stored as basic dicts.
+        They are dynamically resolved by the AsyncDataDistributor when
+        routing tensors between SPMD pipeline stages.
     """
     from fluxway.common.types.data_types import ArgumentType
-    from fluxway.common.types.sharding import RawShardingSpec
     
     def decorator(func):
         # Import here to avoid circular imports at module import time
@@ -206,47 +205,38 @@ def operator(
                     f"output_sharding specifies keys {extra_in_sharding} which do not exist in the output data fields "
                     f"for operator '{func.__qualname__}'"
                 )
-        # Parse and validate raw sharding specs
-        input_sharding_parsed = {}
+        # Store raw sharding specs as plain dicts (serializable, mesh-independent)
+        input_sharding_raw: Dict[str, Any] = {}
         if input_sharding:
             for tensor_name, raw_spec in input_sharding.items():
-                if isinstance(raw_spec, dict):
-                    # Validate and parse raw spec
-                    input_sharding_parsed[tensor_name] = RawShardingSpec(**raw_spec)
-                elif isinstance(raw_spec, RawShardingSpec):
-                    input_sharding_parsed[tensor_name] = raw_spec
-                else:
-                    raise TypeError(
-                        f"input_sharding['{tensor_name}'] must be a dict with basic types or a RawShardingSpec, "
-                        f"got {type(raw_spec)}"
+                spec_dict = raw_spec if isinstance(raw_spec, dict) else raw_spec.__dict__
+                if spec_dict.get('type') not in ('dense', 'sparse'):
+                    raise ValueError(
+                        f"input_sharding['{tensor_name}'] type must be 'dense' or 'sparse'"
                     )
-        
-        output_sharding_parsed = {}
+                input_sharding_raw[tensor_name] = spec_dict
+
+        output_sharding_raw: Dict[str, Any] = {}
         if output_sharding:
             for tensor_name, raw_spec in output_sharding.items():
-                if isinstance(raw_spec, dict):
-                    # Validate and parse raw spec
-                    output_sharding_parsed[tensor_name] = RawShardingSpec(**raw_spec)
-                elif isinstance(raw_spec, RawShardingSpec):
-                    output_sharding_parsed[tensor_name] = raw_spec
-                else:
-                    raise TypeError(
-                        f"output_sharding['{tensor_name}'] must be a dict with basic types or a RawShardingSpec, "
-                        f"got {type(raw_spec)}"
+                spec_dict = raw_spec if isinstance(raw_spec, dict) else raw_spec.__dict__
+                if spec_dict.get('type') not in ('dense', 'sparse'):
+                    raise ValueError(
+                        f"output_sharding['{tensor_name}'] type must be 'dense' or 'sparse'"
                     )
-        
+                output_sharding_raw[tensor_name] = spec_dict
+
         # Prepare output_arguments
         output_args = None
         if output_sharding:
             output_args = {
                 ArgumentType.TENSOR.value: list(output_sharding.keys()),
             }
-        
+
         meta = OperatorMeta(
             name=name,
-            # Store RawShardingSpec objects directly; no need to model_dump here.
-            input_sharding_raw=input_sharding_parsed,
-            output_sharding_raw=output_sharding_parsed,
+            input_sharding_raw=input_sharding_raw,
+            output_sharding_raw=output_sharding_raw,
             input_arguments={
                 ArgumentType.STATE.value: state_argument or [],
                 ArgumentType.TENSOR.value: tensor_argument or [],
@@ -377,57 +367,7 @@ def data_type():
     return decorator
 
 
-# =============================================================================
-# Helper function to resolve operator sharding
-# =============================================================================
 
-def _resolve_operator_sharding(cls: Type, mesh: Any) -> None:
-    """
-    Resolve raw sharding specs to ShardingSpec for all operators in the class.
-    
-    This function reads raw sharding specs from operator metadata and converts
-    them to ShardingSpec (StaticShardingSpec/DynamicShardingSpec) using the mesh.
-    The resolved specs are then stored back in the operator metadata.
-    
-    Args:
-        cls: SPMD class with operator methods
-        mesh: LayoutMesh instance
-    """
-    # Check all operator methods using OpType names (forward, backward, update, etc.)
-    from fluxway.common.types.data_types import OpType
-    operator_methods = [op.name.lower() for op in OpType]
-    
-    for method_name in operator_methods:
-        method = getattr(cls, method_name, None)
-        if method is None:
-            continue
-        
-        # Get operator metadata
-        meta = getattr(method, "_flux_operator_meta", None)
-        if meta is None:
-            raise ValueError(f"Operator method '{method_name}' in class {cls.__name__} has no metadata")
-        
-        # Raw sharding objects are stored directly on the metadata
-        input_raw_objects = getattr(meta, "input_sharding_raw", {}) or {}
-        output_raw_objects = getattr(meta, "output_sharding_raw", {}) or {}
-        
-        # Convert raw specs to ShardingSpec
-        input_sharding_resolved = {}
-        for tensor_name, raw_spec in input_raw_objects.items():
-            input_sharding_resolved[tensor_name] = raw_spec.to_sharding_spec(mesh)
-        
-        output_sharding_resolved = {}
-        for tensor_name, raw_spec in output_raw_objects.items():
-            output_sharding_resolved[tensor_name] = raw_spec.to_sharding_spec(mesh)
-        
-        # Update metadata with resolved sharding specs
-        meta.input_sharding = input_sharding_resolved
-        meta.output_sharding = output_sharding_resolved
-        
-        # Update metadata on both method and wrapper if exists
-        setattr(method, "_flux_operator_meta", meta)
-        if hasattr(method, '__wrapped__'):
-            setattr(method.__wrapped__, "_flux_operator_meta", meta)
 
 
 # =============================================================================
@@ -467,7 +407,7 @@ def spmd(
     Returns:
         Decorated class with SPMD configuration
     """
-    from fluxway.common.types import ResourceSpec, SPMDConfig, LayoutMesh  # Internal import
+    from fluxway.common.types import ResourceSpec, SPMDConfig, DeviceMesh  # Internal import
     
     T = TypeVar('T')
 
@@ -480,10 +420,10 @@ def spmd(
             memory_gb=resource.get('memory', resource.get('memory_gb', 0.0))
         )
     
-    # Create LayoutMesh from axis tuples
+    # Create DeviceMesh from axis tuples
     mesh = None
     if mesh_axis_names is not None and mesh_axis_shapes is not None:
-        mesh = LayoutMesh(axis_names=mesh_axis_names, axis_shapes=mesh_axis_shapes)
+        mesh = DeviceMesh(axis_names=mesh_axis_names, device_shape=mesh_axis_shapes)
     
     def decorator(cls: Type[T]) -> Type[T]:
         # Add attributes directly to the class
@@ -493,9 +433,7 @@ def spmd(
         cls._params_update_steps = params_update_steps
         cls._enable_output_step_remap = enable_output_step_remap
         
-        # Resolve operator sharding specs if mesh is available
-        if mesh is not None:
-            _resolve_operator_sharding(cls, mesh)
+        cls._enable_output_step_remap = enable_output_step_remap
         
         # Add methods directly to the class
         cls.get_resource = classmethod(lambda c: c._resource)

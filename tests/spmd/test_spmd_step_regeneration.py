@@ -9,7 +9,7 @@ def _load_compute_output_step():
 
     We parse `worker.py` and exec only the function definition.
     """
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = Path(__file__).resolve().parents[2]
     worker_path = repo_root / "fluxway" / "spmd" / "worker" / "worker.py"
     source = worker_path.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(worker_path))

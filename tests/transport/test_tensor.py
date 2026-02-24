@@ -2,7 +2,7 @@ import pytest
 import pickle
 import jax.numpy as jnp
 from fluxway.transport.tensor import TransportTensor
-from fluxway.transport.backend import set_backend, get_backend
+from fluxway.common.backend import set_backend, get_backend
 
 
 # Force JAX backend
@@ -352,7 +352,7 @@ def test_index_descriptor_cyclic_materialize():
 
 def test_index_descriptor_chunk_slice():
     """Chunk descriptor slice is O(1) — returns a new descriptor, not a tensor."""
-    from fluxway.transport.topology import ContinuousTopology
+    from fluxway.common.topology import ContinuousTopology
 
     desc = ContinuousTopology.chunk(start=100, count=10)
     sub = desc.slice(2, 5)  # indices [102, 103, 104]
@@ -369,7 +369,7 @@ def test_index_descriptor_chunk_slice():
 
 def test_index_descriptor_cyclic_slice():
     """Cyclic descriptor slice is O(1)."""
-    from fluxway.transport.topology import ContinuousTopology
+    from fluxway.common.topology import ContinuousTopology
 
     desc = ContinuousTopology.cyclic(start=0, step=4, count=8)
     # Original: [0, 4, 8, 12, 16, 20, 24, 28]
@@ -495,7 +495,7 @@ def test_no_indices_stays_none():
 
 def test_descriptor_serialization():
     """ContinuousTopology survives pickle round-trip."""
-    from fluxway.transport.topology import ContinuousTopology
+    from fluxway.common.topology import ContinuousTopology
 
     backend = get_backend()
     data = backend.tensor([1.0, 2.0, 3.0])
