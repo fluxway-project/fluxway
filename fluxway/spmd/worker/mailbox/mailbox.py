@@ -1,25 +1,24 @@
 """
 Mailbox module for dual-stream convergence.
 
-Based on ARCHITECTURE.md Section 3.2.2
+Data plane: tensor shards from upstream workers, indexed by (op_type, name, step).
+Control plane: state scalars from Driver.
 
-Implements dual-stream data caching:
-- WorkerMailbox: Data plane (tensor data from upstream workers)
-- ControlMailbox: Control plane (state data from Driver)
+Completion tracking is event-driven, not polled:
+  - Each (op_type, step) has a StepBarrier composed of ArrivalBarriers.
+  - When all expected shards and states arrive, the barrier fires automatically.
+  - Worker registers an on_ready callback; no _check_and_enqueue polling needed.
 
-Key technical points:
-1. Unique Alignment ID: Data and control converge via batch_id + global_step
-2. Credit-based Flow Control: Prevent speed mismatch between Controller and data
-3. Step-based synchronization: Track current step per operator type
-4. Named variables: Support multiple named tensors/states per operator
-5. Tensor metadata: Store (data, meta) tuple for routing and backward tracking
+Zero-copy shard writing is supported via TransportReceiver delegation.
 """
 
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 import asyncio
 import logging
+from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from fluxway.common.types.data_types import OpType
+from fluxway.common.sync import ArrivalBarrier
+from fluxway.transport.communication import TransportReceiver
 
 logger = logging.getLogger(__name__)
 
@@ -27,87 +26,209 @@ if TYPE_CHECKING:
     from fluxway.common.types.data_types import TensorMeta
 
 
+# ---------------------------------------------------------------------------
+# StepBarrier — one per (op_type, step)
+# ---------------------------------------------------------------------------
+
+
+class StepBarrier:
+    """
+    Fires when all declared tensor names have received their expected shard
+    counts AND all declared state names have been received.
+
+    Internally composes one ArrivalBarrier per named stream.
+
+    Args:
+        expected_tensors: {tensor_name: required_shard_count}
+        expected_states:  list of required state names
+    """
+
+    __slots__ = ("_tensor_barriers", "_state_barriers", "_combined")
+
+    def __init__(
+        self, expected_tensors: Dict[str, int], expected_states: List[str]
+    ) -> None:
+        self._tensor_barriers: Dict[str, ArrivalBarrier] = {
+            name: ArrivalBarrier(count) for name, count in expected_tensors.items()
+        }
+        self._state_barriers: Dict[str, ArrivalBarrier] = {
+            name: ArrivalBarrier(1) for name in expected_states
+        }
+        # Combined completion event
+        self._combined = asyncio.Event()
+        self._check()  # fire immediately if both dicts are empty
+
+    # ------------------------------------------------------------------
+    # Arrival notification
+    # ------------------------------------------------------------------
+
+    def tensor_arrived(self, name: str) -> bool:
+        """Record one shard arriving for `name`. Returns True if barrier just fired."""
+        barrier = self._tensor_barriers.get(name)
+        if barrier is not None:
+            barrier.arrive()
+            return self._check()
+        return False
+
+    def state_arrived(self, name: str) -> bool:
+        """Record state data arriving for `name`. Returns True if barrier just fired."""
+        barrier = self._state_barriers.get(name)
+        if barrier is not None:
+            barrier.arrive()
+            return self._check()
+        return False
+
+    # ------------------------------------------------------------------
+    # Completion query
+    # ------------------------------------------------------------------
+
+    def _check(self) -> bool:
+        if self._combined.is_set():
+            return False
+        tensors_ok = all(b.is_done() for b in self._tensor_barriers.values())
+        states_ok = all(b.is_done() for b in self._state_barriers.values())
+        if tensors_ok and states_ok:
+            self._combined.set()
+            return True
+        return False
+
+    def is_ready(self) -> bool:
+        return self._combined.is_set()
+
+    async def wait(self) -> None:
+        await self._combined.wait()
+
+
+# ---------------------------------------------------------------------------
+# WorkerMailbox
+# ---------------------------------------------------------------------------
+
+
 class WorkerMailbox:
     """
-    Mailbox for caching incoming data in SPMD Worker.
+    Mailbox for caching incoming data in an SPMD Worker.
 
-    Supports dual-stream convergence with named variables:
-    - State data from Driver (control plane): {op_type: {name: {step: data}}}
-    - Tensor data from upstream workers (data plane): {op_type: {name: {step: {rank: (data, meta)}}}}
+    Control plane (state):
+        {op_type → {name → {step → data}}}
 
-    Async-safe for concurrent access using asyncio.Lock.
+    Data plane (tensors):
+        {op_type → {name → {step → {rank → (data, meta)}}}}
+
+    Completion tracking:
+        One StepBarrier per (op_type, step), registered via declare_step().
+        When a step becomes ready, the on_ready callback registered via
+        set_ready_callback() is called immediately — no external polling.
+
+    Zero-copy slots:
+        register_zero_copy_slot() activates a TransportReceiver for a slot
+        so put_tensor() writes directly into pre-allocated buffers.
     """
 
-    def __init__(self):
-        # {op_type: {name: {step: data}}} - State data from control plane
+    def __init__(self) -> None:
+        # Control plane
         self._state_data: Dict[OpType, Dict[str, Dict[int, Any]]] = {
-            OpType.FORWARD: {},
-            OpType.BACKWARD: {},
-            OpType.UPDATE: {},
+            op: {} for op in OpType
         }
-        # {op_type: {name: {step: {rank: (data, meta)}}}} - Tensor data with metadata
-        self._tensor_data: Dict[
+
+        # Data plane (buffered path)
+        self._tensor_slots: Dict[
             OpType, Dict[str, Dict[int, Dict[int, Tuple[Any, Optional["TensorMeta"]]]]]
-        ] = {OpType.FORWARD: {}, OpType.BACKWARD: {}, OpType.UPDATE: {}}
+        ] = {op: {} for op in OpType}
+
+        # Completion barriers: {op_type: {step: StepBarrier}}
+        self._barriers: Dict[OpType, Dict[int, StepBarrier]] = {op: {} for op in OpType}
+
+        # Zero-copy receivers (activated on demand)
+        self._zc_receivers: Dict[OpType, Dict[str, Dict[int, TransportReceiver]]] = {
+            op: {} for op in OpType
+        }
+
+        # Called with (op_type, step) when a step barrier fires
+        self._on_ready: Optional[Callable[[OpType, int], None]] = None
+
         self._lock = asyncio.Lock()
 
-    # =========================================================================
-    # State Data Operations (async versions)
-    # =========================================================================
+    # ------------------------------------------------------------------
+    # Step barrier lifecycle
+    # ------------------------------------------------------------------
 
-    async def put_state(self, op_type: OpType, name: str, step: int, data: Any) -> None:
+    def set_ready_callback(self, callback: Callable[[OpType, int], None]) -> None:
         """
-        Cache state data from control plane.
+        Register a callback fired when a step becomes ready.
+
+        The callback is invoked inside the asyncio.Lock, synchronously —
+        use asyncio.create_task() inside it for non-blocking work.
 
         Args:
-            op_type: Operator type this data is for
-            name: State variable name
-            step: Step number
-            data: State data
+            callback: callable(op_type, step)
         """
-        async with self._lock:
-            if name not in self._state_data[op_type]:
-                self._state_data[op_type][name] = {}
-            self._state_data[op_type][name][step] = data
+        self._on_ready = callback
 
-        # Debug log outside lock to avoid blocking
-        logger.debug(f"Mailbox put_state: op={op_type.name}, name={name}, step={step}")
+    def declare_step(
+        self,
+        op_type: OpType,
+        step: int,
+        expected_tensors: Dict[str, int],
+        expected_states: List[str],
+    ) -> None:
+        """
+        Declare the expected arrivals for a step.
+
+        Must be called before the first put_tensor() / put_state() for
+        that step.  If not called, put_* operations still work but no
+        barrier fires.
+
+        Args:
+            expected_tensors: {tensor_name: required_shard_count}
+            expected_states: list of required state names
+        """
+        barrier = StepBarrier(expected_tensors, expected_states)
+        self._barriers[op_type][step] = barrier
+        # In case expected counts are all zero the barrier is already ready
+        if barrier.is_ready() and self._on_ready:
+            self._on_ready(op_type, step)
+
+    # ------------------------------------------------------------------
+    # Control plane — state data
+    # ------------------------------------------------------------------
+
+    async def put_state(self, op_type: OpType, name: str, step: int, data: Any) -> None:
+        """Cache state data and notify the step barrier."""
+        async with self._lock:
+            self._state_data[op_type].setdefault(name, {})[step] = data
+            barrier = self._barriers[op_type].get(step)
+            if barrier is not None:
+                fired = barrier.state_arrived(name)
+                if fired and self._on_ready:
+                    self._on_ready(op_type, step)
+        logger.debug(
+            "Mailbox put_state: op=%s name=%s step=%d", op_type.name, name, step
+        )
 
     async def get_state(self, op_type: OpType, name: str, step: int) -> Optional[Any]:
-        """Get state data if available."""
         async with self._lock:
-            name_data = self._state_data[op_type].get(name, {})
-            return name_data.get(step)
+            return self._state_data[op_type].get(name, {}).get(step)
 
     async def get_all_states(self, op_type: OpType, step: int) -> Dict[str, Any]:
-        """Get all state data for a step, keyed by name."""
         async with self._lock:
-            result = {}
-            for name, step_data in self._state_data[op_type].items():
-                if step in step_data:
-                    result[name] = step_data[step]
-            return result
+            return {
+                name: steps[step]
+                for name, steps in self._state_data[op_type].items()
+                if step in steps
+            }
 
     async def has_state(self, op_type: OpType, name: str, step: int) -> bool:
-        """Check if state data exists for a specific name."""
         async with self._lock:
-            name_data = self._state_data[op_type].get(name, {})
-            return step in name_data
+            return step in self._state_data[op_type].get(name, {})
 
-    async def has_all_states(
-        self, op_type: OpType, step: int, expected_names: List[str]
-    ) -> bool:
-        """Check if all expected state variables have arrived."""
-        async with self._lock:
-            for name in expected_names:
-                name_data = self._state_data[op_type].get(name, {})
-                if step not in name_data:
-                    return False
-            return True
+    # ------------------------------------------------------------------
+    # Data plane — tensor shards
+    # ------------------------------------------------------------------
 
-    # =========================================================================
-    # Tensor Data Operations (with metadata support, async versions)
-    # =========================================================================
+    def _buffered_slot(
+        self, op_type: OpType, name: str, step: int
+    ) -> Dict[int, Tuple[Any, Optional["TensorMeta"]]]:
+        return self._tensor_slots[op_type].setdefault(name, {}).setdefault(step, {})
 
     async def put_tensor(
         self,
@@ -119,189 +240,163 @@ class WorkerMailbox:
         meta: Optional["TensorMeta"] = None,
     ) -> None:
         """
-        Cache tensor data from upstream worker with optional metadata.
+        Cache a tensor shard and notify the step barrier.
 
-        Args:
-            op_type: Operator type this data is for
-            name: Tensor variable name
-            step: Step number
-            rank: Sender's rank
-            data: Tensor shard
-            meta: Optional tensor metadata (for routing and backward tracking)
+        If a zero-copy slot is registered for (op_type, name, step), writes
+        directly into the pre-allocated buffer instead.
         """
         async with self._lock:
-            if name not in self._tensor_data[op_type]:
-                self._tensor_data[op_type][name] = {}
-            if step not in self._tensor_data[op_type][name]:
-                self._tensor_data[op_type][name][step] = {}
-            self._tensor_data[op_type][name][step][rank] = (data, meta)
+            zc = self._zc_receivers[op_type].get(name, {}).get(step)
+            if zc is not None:
+                count = (
+                    data.shape[0]
+                    if hasattr(data, "shape") and data.shape
+                    else (len(data) if isinstance(data, (list, tuple)) else 1)
+                )
+                zc.receive_slices(rank, [data], [count])
+            else:
+                self._buffered_slot(op_type, name, step)[rank] = (data, meta)
 
-        # Debug log outside lock to avoid blocking
+            barrier = self._barriers[op_type].get(step)
+            if barrier is not None:
+                fired = barrier.tensor_arrived(name)
+                if fired and self._on_ready:
+                    self._on_ready(op_type, step)
+
         logger.debug(
-            f"Mailbox put_tensor: op={op_type.name}, name={name}, step={step}, "
-            f"rank={rank}, has_meta={meta is not None}"
+            "Mailbox put_tensor: op=%s name=%s step=%d rank=%d has_meta=%s",
+            op_type.name,
+            name,
+            step,
+            rank,
+            meta is not None,
         )
 
     async def get_tensor_shard(
         self, op_type: OpType, name: str, step: int, rank: int
     ) -> Tuple[Optional[Any], Optional["TensorMeta"]]:
-        """
-        Get tensor shard and its metadata for a specific rank.
-
-        Returns:
-            Tuple of (data, meta), or (None, None) if not found
-        """
         async with self._lock:
-            name_data = self._tensor_data[op_type].get(name, {})
-            step_data = name_data.get(step, {})
-            return step_data.get(rank, (None, None))
+            return (
+                self._tensor_slots[op_type]
+                .get(name, {})
+                .get(step, {})
+                .get(rank, (None, None))
+            )
 
     async def get_tensor_shards(
         self, op_type: OpType, name: str, step: int
     ) -> Dict[int, Tuple[Any, Optional["TensorMeta"]]]:
-        """
-        Get all tensor shards (with metadata) for a step and name.
-
-        Returns:
-            Dict of {rank: (data, meta)}
-        """
         async with self._lock:
-            name_data = self._tensor_data[op_type].get(name, {})
-            return dict(name_data.get(step, {}))
-
-    async def get_tensor_shards_data_only(
-        self, op_type: OpType, name: str, step: int
-    ) -> Dict[int, Any]:
-        """
-        Get all tensor shards (data only, no metadata) for a step and name.
-
-        Returns:
-            Dict of {rank: data}
-        """
-        async with self._lock:
-            name_data = self._tensor_data[op_type].get(name, {})
-            step_data = name_data.get(step, {})
-            return {rank: item[0] for rank, item in step_data.items()}
+            return dict(self._tensor_slots[op_type].get(name, {}).get(step, {}))
 
     async def get_all_tensor_shards(
         self, op_type: OpType, step: int
     ) -> Dict[str, Dict[int, Tuple[Any, Optional["TensorMeta"]]]]:
-        """
-        Get all tensor shards (with metadata) for a step, keyed by name.
-
-        Returns:
-            Dict of {name: {rank: (data, meta)}}
-        """
         async with self._lock:
-            result = {}
-            for name, step_data in self._tensor_data[op_type].items():
-                if step in step_data:
-                    result[name] = dict(step_data[step])
-            return result
-
-    async def get_all_tensor_shards_data_only(
-        self, op_type: OpType, step: int
-    ) -> Dict[str, Dict[int, Any]]:
-        """
-        Get all tensor shards (data only) for a step, keyed by name.
-
-        Returns:
-            Dict of {name: {rank: data}}
-        """
-        async with self._lock:
-            result = {}
-            for name, step_data in self._tensor_data[op_type].items():
-                if step in step_data:
-                    result[name] = {
-                        rank: item[0] for rank, item in step_data[step].items()
-                    }
-            return result
+            return {
+                name: dict(step_dict[step])
+                for name, step_dict in self._tensor_slots[op_type].items()
+                if step in step_dict
+            }
 
     async def get_tensor_shard_count(
         self, op_type: OpType, name: str, step: int
     ) -> int:
-        """Get number of received tensor shards for a step and name."""
         async with self._lock:
-            name_data = self._tensor_data[op_type].get(name, {})
-            return len(name_data.get(step, {}))
+            return len(self._tensor_slots[op_type].get(name, {}).get(step, {}))
 
-    async def has_all_tensors(
-        self, op_type: OpType, step: int, expected_counts: Dict[str, int]
-    ) -> bool:
-        """
-        Check if all expected tensor shards have arrived.
+    # ------------------------------------------------------------------
+    # Step readiness
+    # ------------------------------------------------------------------
 
-        Args:
-            op_type: Operator type
-            step: Step number
-            expected_counts: {tensor_name: expected_shard_count}
+    def is_step_ready(self, op_type: OpType, step: int) -> bool:
+        """Non-blocking: True if the step barrier has fired."""
+        barrier = self._barriers[op_type].get(step)
+        return barrier is not None and barrier.is_ready()
+
+    async def wait_step_ready(self, op_type: OpType, step: int) -> None:
+        """Async wait until the step barrier fires.
+
+        Raises RuntimeError if declare_step() was never called for this step.
         """
+        barrier = self._barriers[op_type].get(step)
+        if barrier is None:
+            raise RuntimeError(
+                f"declare_step() was not called for op={op_type.name} step={step}"
+            )
+        await barrier.wait()
+
+    # ------------------------------------------------------------------
+    # Zero-copy registration
+    # ------------------------------------------------------------------
+
+    async def register_zero_copy_slot(
+        self,
+        op_type: OpType,
+        name: str,
+        step: int,
+        target_buffers: List[Any],
+        expect_offsets: dict,
+    ) -> None:
+        """Enable zero-copy write-through for a tensor slot."""
         async with self._lock:
-            for name, expected in expected_counts.items():
-                name_data = self._tensor_data[op_type].get(name, {})
-                if len(name_data.get(step, {})) < expected:
-                    return False
-            return True
+            receiver = TransportReceiver(wait_for_n_slices=0)
+            receiver.register_zero_copy_buffers(target_buffers, expect_offsets)
+            self._zc_receivers[op_type].setdefault(name, {})[step] = receiver
 
-    # =========================================================================
-    # Cleanup Operations (async versions)
-    # =========================================================================
+    async def get_zero_copy_buffers(
+        self, op_type: OpType, name: str, step: int
+    ) -> Optional[List[Any]]:
+        async with self._lock:
+            receiver = self._zc_receivers[op_type].get(name, {}).get(step)
+            return receiver.target_buffers if receiver is not None else None
+
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
 
     async def clear_step(self, op_type: OpType, step: int) -> None:
-        """Clear data for completed step."""
+        """Release all data for a completed step."""
         async with self._lock:
-            # Clear state data for this step across all names
-            for name in list(self._state_data[op_type].keys()):
-                self._state_data[op_type][name].pop(step, None)
-                # Clean up empty name entries
-                if not self._state_data[op_type][name]:
+            for name, step_dict in list(self._tensor_slots[op_type].items()):
+                step_dict.pop(step, None)
+                if not step_dict:
+                    del self._tensor_slots[op_type][name]
+
+            for name, step_dict in list(self._zc_receivers[op_type].items()):
+                step_dict.pop(step, None)
+                if not step_dict:
+                    del self._zc_receivers[op_type][name]
+
+            for name, step_dict in list(self._state_data[op_type].items()):
+                step_dict.pop(step, None)
+                if not step_dict:
                     del self._state_data[op_type][name]
 
-            # Clear tensor data for this step across all names
-            for name in list(self._tensor_data[op_type].keys()):
-                self._tensor_data[op_type][name].pop(step, None)
-                # Clean up empty name entries
-                if not self._tensor_data[op_type][name]:
-                    del self._tensor_data[op_type][name]
+            self._barriers[op_type].pop(step, None)
 
     async def clear_all(self) -> None:
-        """Clear all cached data."""
         async with self._lock:
-            for op_type in OpType:
-                self._state_data[op_type].clear()
-                self._tensor_data[op_type].clear()
+            for op in OpType:
+                self._state_data[op].clear()
+                self._tensor_slots[op].clear()
+                self._zc_receivers[op].clear()
+                self._barriers[op].clear()
 
-    # =========================================================================
-    # Size and Capacity (for backpressure monitoring, async versions)
-    # =========================================================================
+    # ------------------------------------------------------------------
+    # Backpressure monitoring
+    # ------------------------------------------------------------------
 
     async def get_size(self) -> int:
-        """
-        Get current total number of items in the mailbox.
-
-        Counts all state entries and tensor entries.
-        """
         async with self._lock:
             size = 0
-            # Count state entries
-            for op_type in OpType:
-                for name_data in self._state_data[op_type].values():
-                    size += len(name_data)
-
-            # Count tensor entries
-            for op_type in OpType:
-                for name_data in self._tensor_data[op_type].values():
-                    for step_data in name_data.values():
-                        size += len(step_data)
-
+            for op in OpType:
+                for step_dict in self._state_data[op].values():
+                    size += len(step_dict)
+                for step_dict in self._tensor_slots[op].values():
+                    for rank_dict in step_dict.values():
+                        size += len(rank_dict)
             return size
 
     async def get_capacity(self) -> int:
-        """
-        Get mailbox capacity for backpressure calculation.
-
-        This is a configurable limit on how many items can be stored.
-        Default is 100 items.
-        """
-        # TODO: Make this configurable
         return 100

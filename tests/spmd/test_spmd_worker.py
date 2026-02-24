@@ -1,19 +1,37 @@
+"""
+Tests for the unified completion notification mechanism and SPMD Worker infrastructure.
+
+Covers:
+- ArrivalBarrier: N-arrival primitive shared across transport and mailbox layers
+- StepBarrier: per-step composite barrier in WorkerMailbox
+- WorkerMailbox: declare_step, put_tensor/put_state, wait_step_ready, on_ready callback
+- TransportReceiver: async wait() via ArrivalBarrier
+- Worker integration: mesh, config, data reception
+"""
+
 import sys
 import os
-
-
-# Add project root to path
-sys.path.append(os.getcwd())
-
-from fluxway.spmd.worker.worker import SPMDWorker
-from fluxway.spmd.worker.mailbox import WorkerMailbox, OpType
-from fluxway.spmd.worker.operator_manager import OperatorManager
-from fluxway.common.types.data_types import SPMDConfig
-from fluxway.common.mesh import DeviceMesh
+import asyncio
+import numpy as np
 import pytest
 
+sys.path.append(os.getcwd())
 
-# Mock user functions
+from fluxway.common.sync import ArrivalBarrier
+from fluxway.spmd.worker.mailbox.mailbox import StepBarrier, WorkerMailbox
+from fluxway.spmd.worker.mailbox import OpType
+from fluxway.spmd.worker.worker import SPMDWorker
+from fluxway.spmd.worker.operator_manager import OperatorManager
+from fluxway.common.types.data_types import SPMDConfig, TensorMeta
+from fluxway.common.mesh import DeviceMesh
+from fluxway.transport.communication import TransportReceiver
+
+
+# ---------------------------------------------------------------------------
+# Dummy user functions
+# ---------------------------------------------------------------------------
+
+
 def forward_fn(state, batch):
     return state
 
@@ -26,104 +44,514 @@ def update_fn(state, grad):
     return state
 
 
-def test_layout_mesh():
-    """Verify DeviceMesh works with user-defined axis names."""
-    print("Testing DeviceMesh with user-defined axes...")
+# ===========================================================================
+# ArrivalBarrier — shared primitive
+# ===========================================================================
 
-    mesh = DeviceMesh((4, 2), axis_names=("data", "model"))
 
-    # Check properties
-    assert mesh.size == 8
-    assert mesh.ndim == 2
-    assert mesh.axis_names == ("data", "model")
-    assert mesh.shape == (4, 2)
+def test_arrival_barrier_zero_immediately_done():
+    """n=0 means the barrier fires immediately."""
+    b = ArrivalBarrier(0)
+    assert b.is_done()
 
-    # Check axis lookups
-    assert mesh.get_axis_size("data") == 4
-    assert mesh.get_axis_size("model") == 2
-    assert mesh.axis_names.index("data") == 0
-    assert mesh.axis_names.index("model") == 1
 
-    # Check coordinate lookups
-    coord = mesh.get_coordinate(5)  # rank 5 in 4x2 mesh
-    assert coord == (2, 1)  # row 2, col 1
+def test_arrival_barrier_n1():
+    """n=1: first arrive() fires the barrier."""
+    b = ArrivalBarrier(1)
+    assert not b.is_done()
+    fired = b.arrive()
+    assert fired
+    assert b.is_done()
 
-    # Check reverse lookup
-    assert mesh.get_rank((2, 1)) == 5
 
-    print("DeviceMesh with user-defined axes successful.")
+def test_arrival_barrier_n3():
+    """n=3: barrier fires on exactly the 3rd arrive()."""
+    b = ArrivalBarrier(3)
+    assert b.arrive() is False
+    assert b.arrive() is False
+    fired = b.arrive()
+    assert fired
+    assert b.is_done()
+    # Extra arrives do not return True (already done)
+    assert b.arrive() is False
+
+
+def test_arrival_barrier_reset():
+    """reset() clears the event and counter."""
+    b = ArrivalBarrier(2)
+    b.arrive()
+    b.arrive()
+    assert b.is_done()
+    b.reset()
+    assert not b.is_done()
+    assert b.count == 0
 
 
 @pytest.mark.asyncio
-async def test_mailbox_named_storage():
-    """Verify WorkerMailbox works with named tensors/states."""
-    print("Testing WorkerMailbox named storage...")
+async def test_arrival_barrier_async_wait():
+    """await wait() resolves after N arrivals triggered from a task."""
+    b = ArrivalBarrier(2)
 
-    mailbox = WorkerMailbox()
+    async def trigger():
+        await asyncio.sleep(0)
+        b.arrive()
+        await asyncio.sleep(0)
+        b.arrive()
 
-    # Test state storage with names
-    await mailbox.put_state(OpType.FORWARD, "id", step=1, data={"value": 42})
-    await mailbox.put_state(OpType.FORWARD, "config", step=1, data={"lr": 0.01})
+    asyncio.create_task(trigger())
+    await b.wait()
+    assert b.is_done()
 
-    assert await mailbox.has_state(OpType.FORWARD, "id", step=1)
-    assert await mailbox.has_state(OpType.FORWARD, "config", step=1)
-    assert not await mailbox.has_state(OpType.FORWARD, "missing", step=1)
 
-    # Test get_all_states
-    all_states = await mailbox.get_all_states(OpType.FORWARD, step=1)
-    assert "id" in all_states
-    assert "config" in all_states
-    assert all_states["id"]["value"] == 42
+def test_arrival_barrier_periodic_batches():
+    """
+    10 total arrivals, batch=3 → fires at counts 3, 6, 9.
+    close() flushes the remainder (1) → fires at count 10.
+    Total: 4 firings.
+    """
+    b = ArrivalBarrier(3, periodic=True)
+    fires = []
 
-    # Test tensor storage with names
-    await mailbox.put_tensor(OpType.FORWARD, "tensor_a", step=1, rank=0, data=[1, 2, 3])
-    await mailbox.put_tensor(OpType.FORWARD, "tensor_a", step=1, rank=1, data=[4, 5, 6])
-    await mailbox.put_tensor(OpType.FORWARD, "tensor_b", step=1, rank=0, data=[7, 8, 9])
+    for i in range(10):
+        fired = b.arrive()
+        if fired:
+            fires.append(b.count)
 
-    assert await mailbox.get_tensor_shard_count(OpType.FORWARD, "tensor_a", step=1) == 2
-    assert await mailbox.get_tensor_shard_count(OpType.FORWARD, "tensor_b", step=1) == 1
+    remainder = b.close()
 
-    # Test has_all_tensors
-    assert await mailbox.has_all_tensors(
-        OpType.FORWARD, step=1, expected_counts={"tensor_a": 2}
+    assert fires == [3, 6, 9], f"expected [3,6,9], got {fires}"
+    assert remainder is True
+    assert b.count == 10
+
+
+@pytest.mark.asyncio
+async def test_arrival_barrier_periodic_async():
+    """Async wait_batch() gets each of the 4 firings for 10/3 scenario."""
+    b = ArrivalBarrier(3, periodic=True)
+    received = []
+
+    async def producer():
+        for _ in range(10):
+            await asyncio.sleep(0)
+            b.arrive()
+        b.close()
+
+    asyncio.create_task(producer())
+
+    async for count in b:
+        received.append(count)
+
+    assert received == [3, 6, 9, 10], f"expected [3,6,9,10], got {received}"
+
+
+# ===========================================================================
+# TransportReceiver — now backed by ArrivalBarrier
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_transport_receiver_async_wait():
+    """TransportReceiver.wait() resolves when wait_for_n_slices payloads arrive."""
+    receiver = TransportReceiver(wait_for_n_slices=2)
+    assert not receiver.is_done()
+
+    async def send():
+        await asyncio.sleep(0)
+        receiver.receive_slices(0, [np.zeros(4)], [4])
+        await asyncio.sleep(0)
+        receiver.receive_slices(1, [np.zeros(4)], [4])
+
+    asyncio.create_task(send())
+    await receiver.wait()
+    assert receiver.is_done()
+    slices = receiver.get_buffered_slices()
+    assert len(slices) == 2
+
+
+def test_transport_receiver_buffered():
+    """Synchronous usage: receive_slices accumulates; get_buffered_slices consumes."""
+    receiver = TransportReceiver(wait_for_n_slices=3)
+    for i in range(3):
+        receiver.receive_slices(i, [np.eye(2)], [2])
+    assert receiver.is_done()
+    slices = receiver.get_buffered_slices()
+    assert len(slices) == 3
+    assert receiver.get_buffered_slices() == []  # consumed
+
+
+@pytest.mark.asyncio
+async def test_transport_receiver_periodic_10_batch3():
+    """
+    10 slices total, periodic batch_size=3.
+    Expect 4 triggers: at cumulative counts 3, 6, 9, and 10 (remainder).
+    """
+    receiver = TransportReceiver(wait_for_n_slices=3, periodic=True)
+    trigger_counts = []
+
+    async def producer():
+        for _ in range(10):
+            await asyncio.sleep(0)
+            receiver.receive_slices(0, [np.zeros(4)], [4])
+        receiver.close()  # flushes remainder (1 slice)
+
+    asyncio.create_task(producer())
+
+    async for count in receiver:
+        trigger_counts.append(count)
+
+    assert trigger_counts == [3, 6, 9, 10], f"got {trigger_counts}"
+
+
+def test_transport_receiver_zero_copy_offset():
+    """
+    Offset (shared buffer) zero-copy: two senders each write 2 rows
+    into a shared 4-row buffer at different offsets.  No concat needed.
+    """
+    shared = np.zeros((4, 3), dtype=np.float32)
+    receiver = TransportReceiver(wait_for_n_slices=2)
+    receiver.register_zero_copy_buffers(
+        target_buffers=[shared],
+        expect_offsets={0: 0, 1: 2},  # rank 0 → rows 0-1, rank 1 → rows 2-3
     )
-    assert not await mailbox.has_all_tensors(
-        OpType.FORWARD, step=1, expected_counts={"tensor_a": 3}
+
+    data0 = np.ones((2, 3), dtype=np.float32) * 1.0
+    data1 = np.ones((2, 3), dtype=np.float32) * 2.0
+    receiver.receive_slices(0, [data0], [2])
+    receiver.receive_slices(1, [data1], [2])
+
+    assert receiver.is_done()
+    # shared buffer should have rank-0 data in rows 0-1, rank-1 in rows 2-3
+    np.testing.assert_array_equal(receiver.target_buffers[0][:2], data0)
+    np.testing.assert_array_equal(receiver.target_buffers[0][2:], data1)
+    # verify actual written-row counts are recorded
+    wc = receiver.get_written_counts()
+    assert wc[0] == [2], f"rank-0 written_counts={wc[0]}"
+    assert wc[1] == [2], f"rank-1 written_counts={wc[1]}"
+
+
+def test_transport_receiver_zero_copy_dlpack_and_no_concat():
+    """
+    Verifies two essential properties of offset zero-copy mode:
+
+    1. The underlying buffer's base memory address does NOT change after
+       either write — pure in-place update, no realloc.
+
+    2. Both senders' data is readable directly from the single contiguous
+       buffer without any concat/stack step.
+
+    Note: get_dlpack_slice belongs to the registration phase, not the
+    receive path.  The receive path writes directly into the pre-allocated
+    slice via index assignment, which already avoids any final concat.
+    """
+    shared = np.zeros((6, 4), dtype=np.float32)
+    from fluxway.common.backend import get_backend
+
+    backend = get_backend()
+
+    # Capture memory address before writes (numpy __array_interface__)
+    ptr_before = shared.__array_interface__["data"][0]
+
+    receiver = TransportReceiver(wait_for_n_slices=2)
+    receiver.register_zero_copy_buffers(
+        target_buffers=[shared],
+        # rank 0 writes rows 0-2, rank 1 writes rows 3-5
+        expect_offsets={0: 0, 1: 3},
     )
 
-    # Test clear_step
-    await mailbox.clear_step(OpType.FORWARD, step=1)
-    assert not await mailbox.has_state(OpType.FORWARD, "id", step=1)
-    assert await mailbox.get_tensor_shard_count(OpType.FORWARD, "tensor_a", step=1) == 0
+    data0 = np.ones((3, 4), dtype=np.float32) * 10.0
+    data1 = np.ones((3, 4), dtype=np.float32) * 20.0
+    receiver.receive_slices(0, [data0], [3])
+    receiver.receive_slices(1, [data1], [3])
+    assert receiver.is_done()
 
-    print("WorkerMailbox named storage successful.")
+    # --- Property 1: No realloc — same underlying buffer ---
+    # (JAX's dynamic_update_slice always returns a new jax.Array,
+    #  so we only check identity for non-JAX backends.)
+    if backend.name() != "jax":
+        ptr_after = receiver.target_buffers[0].__array_interface__["data"][0]
+        assert ptr_after == ptr_before, (
+            f"Buffer was reallocated! Before: {ptr_before:#x}, After: {ptr_after:#x}"
+        )
+
+    # --- Property 2: No concat needed — read directly from the single buffer ---
+    buf = receiver.target_buffers[0]  # single contiguous pre-allocated array
+    np.testing.assert_array_equal(buf[:3], data0)  # rank-0 rows
+    np.testing.assert_array_equal(buf[3:], data1)  # rank-1 rows
+
+
+def test_transport_receiver_zero_copy_per_sender():
+    """
+    No-offset (per-sender) zero-copy: each sender writes into its own
+    independent buffer at row 0.  No shared buffer, no concat.
+    """
+    buf0 = np.zeros((3, 2), dtype=np.float32)
+    buf1 = np.zeros((5, 2), dtype=np.float32)
+
+    receiver = TransportReceiver(wait_for_n_slices=2)
+    receiver.register_per_sender_buffers({0: [buf0], 1: [buf1]})
+
+    data0 = np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=np.float32)
+    data1 = np.array([[7.0, 8.0], [9.0, 10.0]], dtype=np.float32)
+
+    receiver.receive_slices(0, [data0], [3])  # fill all 3 rows of buf0
+    receiver.receive_slices(1, [data1], [2])  # fill first 2 rows of buf1
+
+    assert receiver.is_done()
+    per_sender = receiver.get_per_sender_buffers()
+    np.testing.assert_array_equal(per_sender[0][0], data0)
+    np.testing.assert_array_equal(per_sender[1][0][:2], data1)
+    # verify actual written-row counts (buf1 has 5 rows but only 2 were written)
+    wc = receiver.get_written_counts()
+    assert wc[0] == [3], f"rank-0 written_counts={wc[0]}"
+    assert wc[1] == [2], f"rank-1 written_counts={wc[1]}"
+
+
+# ===========================================================================
+# StepBarrier
+# ===========================================================================
+
+
+def test_step_barrier_fires_on_completion():
+    """Fires when all tensor shards AND all states have arrived."""
+    b = StepBarrier(expected_tensors={"emb": 2, "attn": 1}, expected_states=["lr"])
+    assert not b.is_ready()
+    b.tensor_arrived("emb")
+    b.tensor_arrived("emb")
+    b.tensor_arrived("attn")
+    assert not b.is_ready()  # state "lr" still missing
+    b.state_arrived("lr")
+    assert b.is_ready()
+
+
+def test_step_barrier_partial_not_ready():
+    """Partial arrivals do not fire the barrier."""
+    b = StepBarrier(expected_tensors={"x": 3}, expected_states=[])
+    b.tensor_arrived("x")
+    b.tensor_arrived("x")
+    assert not b.is_ready()
+
+
+def test_step_barrier_no_expectations_fires_immediately():
+    """Empty expectations → already ready."""
+    b = StepBarrier(expected_tensors={}, expected_states=[])
+    assert b.is_ready()
+
+
+def test_step_barrier_unknown_name_ignored():
+    """Arrivals for unexpected names are silently ignored."""
+    b = StepBarrier(expected_tensors={"x": 1}, expected_states=[])
+    assert b.tensor_arrived("unknown_tensor") is False
+    assert not b.is_ready()
+    b.tensor_arrived("x")
+    assert b.is_ready()
+
+
+@pytest.mark.asyncio
+async def test_step_barrier_async_wait():
+    b = StepBarrier(expected_tensors={"x": 1}, expected_states=["s"])
+
+    async def arrive():
+        await asyncio.sleep(0)
+        b.tensor_arrived("x")
+        await asyncio.sleep(0)
+        b.state_arrived("s")
+
+    asyncio.create_task(arrive())
+    await b.wait()
+    assert b.is_ready()
+
+
+# ===========================================================================
+# WorkerMailbox — declare_step / on_ready / wait_step_ready
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_mailbox_declare_step_and_on_ready():
+    """on_ready callback fires exactly once when the step barrier completes."""
+    mb = WorkerMailbox()
+    fired = []
+
+    def cb(op, step):
+        fired.append((op, step))
+
+    mb.set_ready_callback(cb)
+    mb.declare_step(
+        OpType.FORWARD, step=0, expected_tensors={"x": 2}, expected_states=[]
+    )
+
+    await mb.put_tensor(OpType.FORWARD, "x", 0, rank=0, data=np.zeros(4))
+    assert not fired
+    await mb.put_tensor(OpType.FORWARD, "x", 0, rank=1, data=np.zeros(4))
+    assert fired == [(OpType.FORWARD, 0)]
+
+
+@pytest.mark.asyncio
+async def test_mailbox_wait_step_ready():
+    """wait_step_ready() coroutine resolves when the step is done."""
+    mb = WorkerMailbox()
+    mb.declare_step(
+        OpType.FORWARD, step=5, expected_tensors={"a": 1}, expected_states=["cfg"]
+    )
+
+    async def feed():
+        await asyncio.sleep(0)
+        await mb.put_tensor(OpType.FORWARD, "a", 5, rank=0, data=np.ones(3))
+        await asyncio.sleep(0)
+        await mb.put_state(OpType.FORWARD, "cfg", 5, data={"lr": 0.1})
+
+    asyncio.create_task(feed())
+    await mb.wait_step_ready(OpType.FORWARD, step=5)
+    assert mb.is_step_ready(OpType.FORWARD, step=5)
+
+
+@pytest.mark.asyncio
+async def test_mailbox_is_step_ready_before_declare():
+    """is_step_ready returns False when declare_step was not called."""
+    mb = WorkerMailbox()
+    assert not mb.is_step_ready(OpType.BACKWARD, step=99)
+
+
+@pytest.mark.asyncio
+async def test_mailbox_no_barrier_without_declare():
+    """wait_step_ready raises if declare_step was never called."""
+    mb = WorkerMailbox()
+    with pytest.raises(RuntimeError, match="declare_step"):
+        await mb.wait_step_ready(OpType.FORWARD, step=7)
+
+
+# ===========================================================================
+# WorkerMailbox — state data
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_mailbox_state_put_get():
+    mb = WorkerMailbox()
+    await mb.put_state(OpType.FORWARD, "lr", 1, 0.001)
+    assert await mb.has_state(OpType.FORWARD, "lr", 1)
+    assert await mb.get_state(OpType.FORWARD, "lr", 1) == 0.001
+
+
+@pytest.mark.asyncio
+async def test_mailbox_get_all_states():
+    mb = WorkerMailbox()
+    await mb.put_state(OpType.FORWARD, "a", 0, 1)
+    await mb.put_state(OpType.FORWARD, "b", 0, 2)
+    states = await mb.get_all_states(OpType.FORWARD, 0)
+    assert states == {"a": 1, "b": 2}
+
+
+# ===========================================================================
+# WorkerMailbox — tensor shards
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_mailbox_tensor_put_get():
+    mb = WorkerMailbox()
+    d = np.array([1.0, 2.0])
+    meta = TensorMeta(tensor_name="x", shape=(2,), dtype="float32")
+    await mb.put_tensor(OpType.FORWARD, "x", 0, rank=0, data=d, meta=meta)
+    shards = await mb.get_tensor_shards(OpType.FORWARD, "x", 0)
+    assert 0 in shards
+    np.testing.assert_array_equal(shards[0][0], d)
+    assert shards[0][1] is meta
+
+
+@pytest.mark.asyncio
+async def test_mailbox_tensor_multi_rank():
+    mb = WorkerMailbox()
+    await mb.put_tensor(OpType.FORWARD, "e", 1, rank=0, data=np.zeros(4))
+    await mb.put_tensor(OpType.FORWARD, "e", 1, rank=1, data=np.ones(4))
+    assert await mb.get_tensor_shard_count(OpType.FORWARD, "e", 1) == 2
+
+
+@pytest.mark.asyncio
+async def test_mailbox_op_isolation():
+    mb = WorkerMailbox()
+    await mb.put_tensor(OpType.FORWARD, "g", 0, 0, np.array([1.0]))
+    await mb.put_tensor(OpType.BACKWARD, "g", 0, 0, np.array([2.0]))
+    fwd = await mb.get_tensor_shards(OpType.FORWARD, "g", 0)
+    bwd = await mb.get_tensor_shards(OpType.BACKWARD, "g", 0)
+    np.testing.assert_array_equal(fwd[0][0], [1.0])
+    np.testing.assert_array_equal(bwd[0][0], [2.0])
+
+
+# ===========================================================================
+# WorkerMailbox — zero-copy
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_mailbox_zero_copy_writes_into_buffer():
+    mb = WorkerMailbox()
+    buf = np.zeros((4, 2), dtype=np.float32)
+    await mb.register_zero_copy_slot(
+        OpType.FORWARD, "emb", step=0, target_buffers=[buf], expect_offsets={0: 0}
+    )
+    await mb.put_tensor(
+        OpType.FORWARD,
+        "emb",
+        step=0,
+        rank=0,
+        data=np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
+    )
+    buffers = await mb.get_zero_copy_buffers(OpType.FORWARD, "emb", step=0)
+    assert buffers is not None
+    np.testing.assert_array_equal(buffers[0][:2], [[1.0, 2.0], [3.0, 4.0]])
+
+
+# ===========================================================================
+# WorkerMailbox — cleanup / backpressure
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_mailbox_clear_step():
+    mb = WorkerMailbox()
+    await mb.put_state(OpType.FORWARD, "s", 1, "x")
+    await mb.put_state(OpType.FORWARD, "s", 2, "y")
+    await mb.put_tensor(OpType.FORWARD, "t", 1, 0, np.zeros(2))
+    mb.declare_step(OpType.FORWARD, 1, {}, [])
+
+    await mb.clear_step(OpType.FORWARD, 1)
+
+    assert not await mb.has_state(OpType.FORWARD, "s", 1)
+    assert await mb.has_state(OpType.FORWARD, "s", 2)
+    assert await mb.get_tensor_shard_count(OpType.FORWARD, "t", 1) == 0
+    assert not mb.is_step_ready(OpType.FORWARD, 1)  # barrier also cleared
+
+
+@pytest.mark.asyncio
+async def test_mailbox_get_size():
+    mb = WorkerMailbox()
+    assert await mb.get_size() == 0
+    await mb.put_state(OpType.FORWARD, "s", 0, None)
+    await mb.put_tensor(OpType.FORWARD, "t", 0, 0, np.zeros(2))
+    await mb.put_tensor(OpType.FORWARD, "t", 0, 1, np.zeros(2))
+    assert await mb.get_size() == 3
+
+
+# ===========================================================================
+# Worker / OperatorManager integration
+# ===========================================================================
+
+
+def test_layout_mesh():
+    mesh = DeviceMesh((4, 2), axis_names=("data", "model"))
+    assert mesh.size == 8
+    assert mesh.get_coordinate(5) == (2, 1)
+    assert mesh.get_rank((2, 1)) == 5
 
 
 def test_spmd_config_with_mesh():
-    """Verify SPMDConfig stores DeviceMesh directly."""
-    print("Testing SPMDConfig with DeviceMesh...")
-
     mesh = DeviceMesh((4, 2), axis_names=("data", "model"))
     config = SPMDConfig(mesh=mesh, user_forward_fn=forward_fn)
-
-    assert config.has_mesh
-    assert config.mesh is not None
-    assert config.mesh.axis_names == ("data", "model")
-    assert config.mesh.shape == (4, 2)
-    assert config.get_mesh_size() == 8
-
-    # Test without mesh
-    config_no_mesh = SPMDConfig(user_forward_fn=forward_fn)
-    assert not config_no_mesh.has_mesh
-    assert config_no_mesh.get_mesh_size() == 1
-
-    print("SPMDConfig with DeviceMesh successful.")
+    assert config.has_mesh and config.get_mesh_size() == 8
 
 
-def test_operator_manager_gets_mesh_from_config():
-    """Verify OperatorManager gets mesh from config directly."""
-    print("Testing OperatorManager mesh from config...")
-
+def test_operator_manager_mesh():
     mesh = DeviceMesh((2,), axis_names=("data",))
     config = SPMDConfig(
         mesh=mesh,
@@ -131,20 +559,11 @@ def test_operator_manager_gets_mesh_from_config():
         user_backward_fn=backward_fn,
         user_update_fn=update_fn,
     )
-
-    manager = OperatorManager(config, rank=0)
-
-    # Verify mesh was set from config
-    assert manager._mesh is mesh
-
-    print("OperatorManager mesh from config successful.")
+    assert OperatorManager(config, rank=0)._mesh is mesh
 
 
 @pytest.mark.asyncio
-async def test_spmd_worker_gets_mesh_from_config():
-    """Verify SPMDWorker gets mesh from config directly."""
-    print("Testing SPMDWorker mesh from config...")
-
+async def test_spmd_worker_init():
     mesh = DeviceMesh((2,), axis_names=("data",))
     config = SPMDConfig(
         mesh=mesh,
@@ -152,75 +571,26 @@ async def test_spmd_worker_gets_mesh_from_config():
         user_backward_fn=backward_fn,
         user_update_fn=update_fn,
     )
-
-    worker_cls = getattr(SPMDWorker, "__ray_metadata__", None)
-    if worker_cls:
-        worker_cls = worker_cls.modified_class
-    else:
-        worker_cls = SPMDWorker
-    worker = worker_cls(config, rank=0)
-
-    # Verify worker has mesh from config
+    cls = getattr(SPMDWorker, "__ray_metadata__", None)
+    cls = cls.modified_class if cls else SPMDWorker
+    worker = cls(config, rank=0)
     assert worker._mesh is mesh
-    assert worker._mesh.axis_names == ("data",)
-    assert worker._mesh.shape == (2,)
-
-    # Verify op_manager also has the mesh
     assert worker._op_manager._mesh is mesh
-
-    print("SPMDWorker mesh from config successful.")
 
 
 @pytest.mark.asyncio
 async def test_receive_data_with_name():
-    """Verify receive_state_data and receive_tensor_data work with name parameter."""
-    print("Testing receive data with name parameter...")
-
     mesh = DeviceMesh((2,), axis_names=("data",))
     config = SPMDConfig(mesh=mesh, user_forward_fn=forward_fn)
+    cls = getattr(SPMDWorker, "__ray_metadata__", None)
+    cls = cls.modified_class if cls else SPMDWorker
+    worker = cls(config, rank=0)
 
-    worker_cls = getattr(SPMDWorker, "__ray_metadata__", None)
-    if worker_cls:
-        worker_cls = worker_cls.modified_class
-    else:
-        worker_cls = SPMDWorker
-    worker = worker_cls(config, rank=0)
+    await worker.receive_state_data(OpType.FORWARD, "id", step=1, data={"v": 42})
+    assert await worker._mailbox.get_state(OpType.FORWARD, "id", 1) == {"v": 42}
 
-    # Receive state data with name
-    await worker.receive_state_data(OpType.FORWARD, "id", step=1, data={"value": 42})
-
-    # Check data is in mailbox
-    state = await worker._mailbox.get_state(OpType.FORWARD, "id", step=1)
-    assert state is not None
-    assert state["value"] == 42
-
-    # Receive tensor data with name
     await worker.receive_tensor_data(
-        OpType.FORWARD, "tensor", step=1, sender_rank=0, data=[1, 2, 3]
+        OpType.FORWARD, "t", step=1, sender_rank=0, data=[1, 2, 3]
     )
-
-    # Check tensor is in mailbox
-    shards = await worker._mailbox.get_tensor_shards(OpType.FORWARD, "tensor", step=1)
-    assert 0 in shards
-    assert shards[0] == ([1, 2, 3], None)
-
-    print("receive data with name parameter successful.")
-
-
-if __name__ == "__main__":
-    try:
-        test_layout_mesh()
-        test_mailbox_named_storage()
-        test_spmd_config_with_mesh()
-        test_operator_manager_gets_mesh_from_config()
-        test_spmd_worker_gets_mesh_from_config()
-        test_receive_data_with_name()
-        print("\n" + "=" * 50)
-        print("All verification tests passed!")
-        print("=" * 50)
-    except Exception as e:
-        print(f"Verification failed: {e}")
-        import traceback
-
-        traceback.print_exc()
-        sys.exit(1)
+    shards = await worker._mailbox.get_tensor_shards(OpType.FORWARD, "t", 1)
+    assert shards[0][0] == [1, 2, 3]

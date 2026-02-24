@@ -273,114 +273,267 @@ class AsyncDataDistributor(BaseDataDistributor):
 DataDistributor = SyncDataDistributor
 
 
-class TransportReceiver:
-    """Unified configurable receiver for zero-copy or buffered scenarios.
+# ---------------------------------------------------------------------------
+# Module-level JIT-compiled zero-copy write kernels.
+#
+# These are defined at module level so the @compile decorator traces them
+# exactly once per unique (count, ndim) combination across all receivers,
+# eliminating JAX eager-mode overhead on every receive_slices() call.
+#
+# JAX constraint: dynamic_slice requires slice_sizes to be statically known
+# at trace time, so `count` is a static argnum.  The destination offset is
+# passed as a runtime (jnp.int32) so it can vary per sender without
+# triggering re-compilation.
+# ---------------------------------------------------------------------------
 
-    Waits for `wait_for_n_slices` slices to arrive, upon which `on_ready_callback` is fired.
-    If `wait_for_n_slices=1`, it behaves as an asynchronous stream.
-    If `target_buffers` are registered, received data is written directly into them
-    via zero-copy mechanisms. Otherwise, it behaves as a buffer collector storing
-    slices in an internal queue.
+
+@compile(static_argnums=(2,))
+def _jit_write_at_offset(src, dst, count, offset):
+    """Write `count` rows of `src` (which may be capacity-padded) into `dst`
+    starting at row `offset`.  JIT-compiled; `count` is static."""
+    backend = get_backend()
+    ndim = len(backend.shape(src))
+    start = (0,) * ndim
+    sizes = (count,) + backend.shape(src)[1:]
+    trimmed = backend.dynamic_slice(src, start, sizes)
+    dst_start = (offset,) + (0,) * (ndim - 1)
+    return backend.dynamic_slice_update(dst, trimmed, dst_start)
+
+
+@compile(static_argnums=(2,))
+def _jit_write_at_zero(src, dst, count):
+    """Write `count` rows of `src` (which may be capacity-padded) into `dst`
+    starting at row 0.  JIT-compiled; `count` is static."""
+    backend = get_backend()
+    ndim = len(backend.shape(src))
+    start = (0,) * ndim
+    sizes = (count,) + backend.shape(src)[1:]
+    trimmed = backend.dynamic_slice(src, start, sizes)
+    return backend.dynamic_slice_update(dst, trimmed, (0,) * ndim)
+
+
+class TransportReceiver:
+    """Configurable receiver for zero-copy or buffered transport scenarios.
+
+    Completion tracking is delegated to ArrivalBarrier (fluxway.common.sync).
+
+    **Modes**:
+
+    Buffered (default):
+        Received slices are queued in _rx_buffers; consume with
+        get_buffered_slices().
+
+    Zero-copy with offset (shared buffer):
+        All senders write into contiguous rows of a single pre-allocated
+        buffer, each at a pre-declared row offset.  Full-buffer shape is
+        known before any data arrives.
+
+        Example::
+            receiver.register_zero_copy_buffers(
+                target_buffers=[np.zeros((1024, 64))],
+                expect_offsets={0: 0, 1: 256, 2: 512, 3: 768},
+            )
+
+    Zero-copy without offset (per-sender independent buffers):
+        Each sender writes into its own pre-allocated buffer starting at
+        row 0.  Sender shapes can differ; no concat needed.
+
+        Example::
+            receiver.register_per_sender_buffers({
+                0: [np.zeros((256, 64))],
+                1: [np.zeros((128, 64))],
+            })
+
+    **Actual written lengths**:
+        After receive_slices(), call get_written_counts() to retrieve
+        {source_rank: [count_payload_0, count_payload_1, ...]}.
+        This is the number of valid rows written (the tensor may arrive
+        capacity-padded, so the buffer holds more rows than were written).
+
+    **Completion**:
+
+    One-shot (default):  await receiver.wait()
+    Periodic:            async for count in receiver: ...  +  receiver.close()
     """
 
-    def __init__(
-        self, wait_for_n_slices: int = 1, on_ready_callback: Optional[Callable] = None
-    ):
-        self.wait_for_n_slices = wait_for_n_slices
-        self.on_ready_callback = on_ready_callback
+    def __init__(self, wait_for_n_slices: int = 1, periodic: bool = False):
+        from fluxway.common.sync import ArrivalBarrier
+
+        self._barrier = ArrivalBarrier(wait_for_n_slices, periodic=periodic)
+        self._periodic = periodic
+
+        # Shared-buffer zero-copy (offset mode)
         self.target_buffers: Optional[List[Any]] = None
-        self.expect_offsets = {}  # src_rank -> List[offsets]
-        self._rx_buffers = []  # For buffering mode
-        self._received_count = 0
+        self.expect_offsets: dict = {}
+
+        # Per-sender zero-copy (no-offset mode)
+        self._per_sender_buffers: Optional[dict] = None  # {rank: [buf, ...]}
+
+        # Buffered mode
+        self._rx_buffers: list = []
+
+        # Actual written row counts: {source_rank: [count_per_payload_index]}
+        self._written_counts: dict = {}
+
+    # ------------------------------------------------------------------
+    # Zero-copy registration
+    # ------------------------------------------------------------------
 
     def register_zero_copy_buffers(
         self, target_buffers: List[Any], expect_offsets: dict
-    ):
-        """Registers destination buffers for Zero Copy writing."""
+    ) -> None:
+        """
+        Offset mode: all senders write into a single shared buffer set.
+
+        Args:
+            target_buffers: List of destination tensors (one per payload index).
+            expect_offsets: {source_rank: row_offset_or_list_of_offsets}
+        """
         self.target_buffers = target_buffers
         self.expect_offsets = expect_offsets
-        self._received_count = 0
+        self._per_sender_buffers = None
+        self._written_counts = {}
+        self._barrier.reset()
+
+    def register_per_sender_buffers(self, per_sender_buffers: dict) -> None:
+        """
+        No-offset mode: each sender has its own pre-allocated buffer list.
+
+        Data is written at row 0; actual written rows are tracked in
+        get_written_counts().
+
+        Args:
+            per_sender_buffers: {source_rank: [buf0, buf1, ...]}
+        """
+        self._per_sender_buffers = per_sender_buffers
+        self.target_buffers = None
+        self.expect_offsets = {}
+        self._written_counts = {}
+
+    # ------------------------------------------------------------------
+    # Slice reception
+    # ------------------------------------------------------------------
 
     def receive_slices(
         self, source_rank: int, tensors: List[Any], counts: List[int]
     ) -> bool:
-        """Called by network layer when a payload array arrives."""
+        """Called by the network layer when a payload arrives.
 
-        # Zero-Copy Mode
-        if self.target_buffers is not None:
+        All JAX write operations go through the module-level @compile kernels
+        (_jit_write_at_offset / _jit_write_at_zero) to avoid eager execution.
+        """
+        backend = get_backend()
+        written = []
+
+        if self._per_sender_buffers is not None:
+            # No-offset zero-copy
+            sender_bufs = self._per_sender_buffers.get(source_rank)
+            if sender_bufs is not None:
+                for i, tensor in enumerate(tensors):
+                    if tensor is None or i >= len(sender_bufs):
+                        written.append(0)
+                        continue
+                    count = int(counts[i] if i < len(counts) else counts[0])
+                    if backend.name() == "torch":
+                        sender_bufs[i][:count] = tensor[:count]
+                    elif backend.name() == "jax" and hasattr(tensor, "shape"):
+                        sender_bufs[i] = _jit_write_at_zero(
+                            tensor, sender_bufs[i], count
+                        )
+                    else:
+                        sender_bufs[i][:count] = tensor[:count]
+                    written.append(count)
+
+        elif self.target_buffers is not None:
+            # Offset zero-copy
             if source_rank in self.expect_offsets:
                 offsets = self.expect_offsets[source_rank]
                 if not isinstance(offsets, (list, tuple)):
                     offsets = [offsets]
-                backend = get_backend()
 
-                # Write to target_buffers directly using slice views/updates
-                for i in range(len(tensors)):
-                    if tensors[i] is None:
+                for i, tensor in enumerate(tensors):
+                    if tensor is None or i >= len(self.target_buffers):
+                        written.append(0)
                         continue
-                    if i >= len(self.target_buffers):
-                        continue
-                    count = counts[i] if i < len(counts) else counts[0]
-                    offset = offsets[i] if i < len(offsets) else offsets[0]
+                    count = int(counts[i] if i < len(counts) else counts[0])
+                    offset = int(offsets[i] if i < len(offsets) else offsets[0])
 
-                    # Zero-Copy bounds check mapped for Backend transparency
+                    # Bounds check (host-side, before JIT dispatch)
                     try:
-                        actual_buffer_len = backend.shape(self.target_buffers[i])[0]
-                        if offset + count > actual_buffer_len:
+                        buf_rows = backend.shape(self.target_buffers[i])[0]
+                        if offset + count > buf_rows:
                             raise RuntimeError(
-                                f"Zero-copy receiver buffer [{i}] overflow: offset {offset} + count {count} > {actual_buffer_len}"
+                                f"Zero-copy buffer [{i}] overflow: "
+                                f"offset={offset} + count={count} > buf_rows={buf_rows}"
                             )
-                    except Exception:
-                        pass  # Ignore shape-check failures for completely opaque tensors
+                    except TypeError:
+                        pass  # opaque buffer, skip check
 
-                    # Zero-Copy Slice Retrieval
-                    _ = backend.get_dlpack_slice(
-                        self.target_buffers[i], slice(offset, offset + count)
-                    )
-
-                    # Functional Fallback Update
                     if backend.name() == "torch":
-                        self.target_buffers[i][offset : offset + count] = tensors[i]
-                    elif backend.name() == "jax":
-                        # using dynamic scale update
-                        if hasattr(
-                            tensors[i], "shape"
-                        ):  # skip flat list like structures if any
-                            padded_update = tensors[i]
-                            # we only want to write `count` items, but tensors[i] might be padded
-                            # we trim it to `count` before dynamic update if needed in JAX
-                            trim_size = (count,) + backend.shape(padded_update)[1:]
-                            trimmed = backend.dynamic_slice(
-                                padded_update, (0,) * len(trim_size), trim_size
-                            )
-                            self.target_buffers[i] = backend.dynamic_slice_update(
-                                self.target_buffers[i],
-                                trimmed,
-                                (offset,) * len(trim_size),
-                            )
+                        self.target_buffers[i][offset : offset + count] = tensor[:count]
+                    elif backend.name() == "jax" and hasattr(tensor, "shape"):
+                        self.target_buffers[i] = _jit_write_at_offset(
+                            tensor, self.target_buffers[i], count, offset
+                        )
+                    else:
+                        self.target_buffers[i][offset : offset + count] = tensor[:count]
+                    written.append(count)
 
-            self._received_count += 1
-
-        # Buffered Mode
         else:
+            # Buffered mode: accumulate for later consumption.
             self._rx_buffers.append((tensors, counts))
-            self._received_count += 1
+            written = [int(c) for c in counts]
 
-        # Check wait criteria
-        if (
-            self.wait_for_n_slices > 0
-            and self._received_count >= self.wait_for_n_slices
-        ):
-            if self.on_ready_callback:
-                self.on_ready_callback(self)
-
+        if written:
+            self._written_counts[source_rank] = written
+        self._barrier.arrive()
         return True
 
-    def get_buffered_slices(self):
-        """Consume and return buffered slices."""
+    # ------------------------------------------------------------------
+    # Completion interface
+    # ------------------------------------------------------------------
+
+    async def wait(self) -> None:
+        """One-shot mode: block until all expected slices have arrived."""
+        await self._barrier.wait()
+
+    async def wait_batch(self) -> int:
+        """Periodic mode: block until the next batch fires."""
+        return await self._barrier.wait_batch()
+
+    def close(self) -> bool:
+        """Periodic mode: flush remainder batch."""
+        return self._barrier.close()
+
+    def __aiter__(self):
+        return self._barrier.__aiter__()
+
+    def is_done(self) -> bool:
+        """Non-blocking: True if the one-shot barrier has fired."""
+        return self._barrier.is_done()
+
+    # ------------------------------------------------------------------
+    # Data retrieval
+    # ------------------------------------------------------------------
+
+    def get_buffered_slices(self) -> list:
+        """Consume and return all pending (tensors, counts) tuples."""
         ret = self._rx_buffers
         self._rx_buffers = []
         return ret
+
+    def get_per_sender_buffers(self) -> Optional[dict]:
+        """Return the per-sender buffer dict (no-offset zero-copy) or None."""
+        return self._per_sender_buffers
+
+    def get_written_counts(self) -> dict:
+        """Return {source_rank: [actual_row_count_per_payload_index]}.
+
+        Available after receive_slices() for both zero-copy modes.
+        Useful when tensors arrive capacity-padded: only the first
+        `count` rows of each buffer are valid data.
+        """
+        return dict(self._written_counts)
 
 
 @compile(static_argnums=(3, 4, 5, 7, 8, 9, 11))

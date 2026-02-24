@@ -6,6 +6,7 @@ Provides @operator decorator to attach metadata (sharding, argument types) to us
 
 from typing import Any, Dict, List, Optional, Type, TypeVar, Tuple
 import functools
+import inspect
 
 
 def operator(
@@ -83,7 +84,6 @@ def operator(
                 )
 
         # 2. Validate that both input and output are of fluxway_data type
-        import inspect
 
         # Helper to check fluxway_data: class has is_fluxway_data method (set by @data_type decorator)
         def _is_fluxway_data_type(tp):

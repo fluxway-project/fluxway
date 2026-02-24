@@ -157,8 +157,9 @@ class SPMDWorker:
             asyncio.PriorityQueue()
         )
 
-        # Internal Mailbox (async-safe)
+        # Internal Mailbox (async-safe), wired to auto-enqueue when a step is ready
         self._mailbox = WorkerMailbox()
+        self._mailbox.set_ready_callback(self._on_step_ready)
 
         # Handler storage (worker-level, not in OperatorManager)
         # {spmd_id: {rank: handler}}
@@ -199,6 +200,9 @@ class SPMDWorker:
             OpType.BACKWARD: {},
             OpType.UPDATE: {},
         }
+
+        # Tracks which (op_type, step) barriers have been registered to avoid double-declaring.
+        self._barriers_declared: Dict[Tuple[OpType, int], bool] = {}
 
         # Reader-specific state
         self._is_reading_paused: bool = False  # Backpressure pause flag
@@ -444,14 +448,14 @@ class SPMDWorker:
             )
             return
 
-        # Cache in mailbox
+        # Lazily declare the step barrier on first data arrival
+        self._ensure_step_declared(op_type, step)
+
+        # Cache in mailbox — barrier fires on_ready automatically
         await self._mailbox.put_state(op_type, name, step, data)
         logger.debug(
             f"[spmd_id={self.spmd_id}] Worker {self.rank} received state: op={op_type.name}, name={name}, step={step}"
         )
-
-        # Check and enqueue if data is for current execution step
-        await self._check_and_enqueue(op_type, step)
 
     async def receive_tensor_data(
         self,
@@ -505,45 +509,52 @@ class SPMDWorker:
             )
             return
 
-        # Cache in mailbox with metadata
+        # Lazily declare the step barrier on first data arrival
+        self._ensure_step_declared(op_type, step)
+
+        # Cache in mailbox — barrier fires on_ready automatically
         await self._mailbox.put_tensor(op_type, name, step, sender_rank, data, meta)
         logger.debug(
             f"[spmd_id={self.spmd_id}] Worker {self.rank} received tensor: op={op_type.name}, name={name}, "
             f"step={step}, sender_rank={sender_rank}, has_meta={meta is not None}, data={data}"
         )
 
-        # Check and enqueue if data might be ready for execution
-        await self._check_and_enqueue(op_type, step)
+    def _ensure_step_declared(self, op_type: OpType, step: int) -> None:
+        """
+        Lazily register a StepBarrier for (op_type, step) on first data arrival.
 
-    async def _check_and_enqueue(self, op_type: OpType, step: int) -> None:
-        """Check data availability and enqueue if ready."""
-        # Get expected data from OperatorManager
-        expected_states = self._op_manager.get_expected_state_names(op_type)
-        expected_tensors = self._op_manager.get_expected_tensor_shards(op_type)
+        Expected counts are read from OperatorManager so the barrier knows
+        exactly how many shards/states to wait for before firing.
+        """
+        if self._mailbox.is_step_ready(op_type, step):
+            return  # Already done (or re-fired from a previous run)
+        if self._barriers_declared.get((op_type, step)):
+            return  # Already declared
 
-        # Check state data
-        if expected_states:
-            if not await self._mailbox.has_all_states(op_type, step, expected_states):
-                logger.debug(
-                    f"[spmd_id={self.spmd_id}] Waiting for state data: op={op_type.name}, step={step}, "
-                    f"expected={expected_states}"
-                )
-                return
-
-        # Check tensor shards
-        if expected_tensors:
-            if not await self._mailbox.has_all_tensors(op_type, step, expected_tensors):
-                logger.debug(
-                    f"[spmd_id={self.spmd_id}] Waiting for tensor shards: op={op_type.name}, step={step}, "
-                    f"expected={expected_tensors}"
-                )
-                return
-
-        # All conditions met, enqueue
-        logger.info(
-            f"[spmd_id={self.spmd_id} rank={self.rank}] Enqueuing task: op={op_type.name}, step={step}"
+        expected_tensors = (
+            self._op_manager.get_expected_tensor_shards(op_type)
+            if self._op_manager
+            else {}
         )
-        await self._enqueue(op_type, step)
+        expected_states = (
+            self._op_manager.get_expected_state_names(op_type)
+            if self._op_manager
+            else []
+        )
+        self._mailbox.declare_step(op_type, step, expected_tensors, expected_states)
+        self._barriers_declared[(op_type, step)] = True
+
+    def _on_step_ready(self, op_type: OpType, step: int) -> None:
+        """
+        Called by WorkerMailbox when a step's StepBarrier fires.
+
+        Schedules _enqueue as an asyncio task so the lock in put_tensor/
+        put_state can return immediately without blocking on queue insertion.
+        """
+        logger.info(
+            f"[spmd_id={self.spmd_id} rank={self.rank}] Step ready: op={op_type.name}, step={step}"
+        )
+        asyncio.create_task(self._enqueue(op_type, step))
 
     async def _enqueue(self, op_type: OpType, step: int) -> None:
         """Enqueue a task for execution."""
@@ -2021,32 +2032,76 @@ class SPMDWorker:
                 else:
                     from fluxway.transport.communication import AsyncDataDistributor
                     from fluxway.transport.tensor import TransportTensor
-                    import functools
 
-                    # Wrap single tensor into TransportTensor
                     transport_tensor = TransportTensor(
                         data=tensor_data, indices=routing_meta.global_indices
                     )
 
-                    distributor = AsyncDataDistributor(succ_info.total_rank)
+                    distributor = AsyncDataDistributor(self.rank)
 
-                    # Adapter function for sending packed parts to handlers
-                    send_fn = functools.partial(
-                        self._send_packaged_tensors,
-                        handlers=handlers,
-                        target_op=target_op,
-                        tensor_name=tensor_name,
-                        step=step,
-                        routing_meta=routing_meta,
-                        successor_spmd_id=spmd_id,
-                    )
+                    async def _send_fn(
+                        target_rank: int,
+                        tensors: list,
+                        counts: list,
+                        *,
+                        _handlers=handlers,
+                        _target_op=target_op,
+                        _tensor_name=tensor_name,
+                        _step=step,
+                        _routing_meta=routing_meta,
+                        _successor_spmd_id=spmd_id,
+                    ) -> bool:
+                        handler = _handlers.get(target_rank)
+                        if handler is None:
+                            return False
+                        count = int(counts[0]) if counts else 0
+                        if count == 0:
+                            return True
+                        # tensors[0] is the (padded) data buffer
+                        raw_data = tensors[0][:count]
+                        # If routing indices were transmitted (last buffer when
+                        # the target spec is content-addressable), recover them.
+                        global_indices = None
+                        if len(tensors) > 1:
+                            global_indices = np.asarray(tensors[-1][:count])
+                        shard_meta = self._build_shard_meta(_routing_meta, None)
+                        if global_indices is not None:
+                            shard_meta = TensorMeta(
+                                tensor_name=shard_meta.tensor_name,
+                                shape=getattr(raw_data, "shape", shard_meta.shape),
+                                dtype=shard_meta.dtype,
+                                global_indices=global_indices,
+                                global_shape=shard_meta.global_shape,
+                                source_spmd_id=self.spmd_id,
+                                source_rank=self.rank,
+                                forward_step=_step,
+                                is_sparse=shard_meta.is_sparse,
+                            )
+                        handler.receive_tensor_data.remote(
+                            _target_op,
+                            _tensor_name,
+                            _step,
+                            self.rank,
+                            raw_data,
+                            shard_meta,
+                        )
+                        logger.debug(
+                            "[spmd_id=%s rank=%d] _send_fn → %s rank=%d "
+                            "count=%d tensor=%s",
+                            self.spmd_id,
+                            self.rank,
+                            _successor_spmd_id,
+                            target_rank,
+                            count,
+                            _tensor_name,
+                        )
+                        return True
 
-                    distributor.distribute(
+                    await distributor.distribute(
                         local_data=transport_tensor,
-                        src_spec=output_spec,
-                        dst_spec=post_spec,
-                        src_rank=self.rank,
-                        send_fn=send_fn,
+                        source=output_spec,
+                        target=post_spec,
+                        send_fn=_send_fn,
                     )
 
         # --- Send state_argument via control plane ---
