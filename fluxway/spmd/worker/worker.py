@@ -33,6 +33,7 @@ from ...common.types import SPMDConfig, WorkerHeartbeat, WorkerStatus, WorkerTel
 from ...common.types.configs import NodeType, ReaderConfig, MailboxStatus
 from ...common.types.tensor import TransportTensor
 from ...common.utils import ensure_logging_configured
+from ...rpc.protocol import DataPlaneCallable
 from .mailbox import WorkerMailbox
 from .operator_manager import OperatorManager
 
@@ -73,7 +74,7 @@ class SPMDWorker:
             config: SPMD configuration with user functions
             rank: This worker's rank in the SPMD
             spmd_id: ID of this SPMD (for metadata tracking)
-            driver_handle: Reference to the SPMD driver for callbacks
+            driver_handle: Reference to the SPMD driver for callbacks (Native Ray)
             node_type: Type of node (SPMD or READER)
             reader_task: File read task (for READER nodes)
             reader_config: Reader configuration (for READER nodes)
@@ -86,7 +87,7 @@ class SPMDWorker:
         self.spmd_id = spmd_id
         self._running = False
 
-        # Driver handle for callbacks
+        # Driver handle for callbacks (Control Plane - Native Ray)
         self._driver_handle: Optional[Any] = driver_handle
 
         # Node type
@@ -103,11 +104,6 @@ class SPMDWorker:
             self._op_manager = OperatorManager(config, rank, spmd_id)
         else:
             self._op_manager = None
-
-        # Execution step counters {op_name: step} - tracks which step is being/was executed
-        self._current_steps: Dict[str, int] = dict.fromkeys(
-            self.config.operators if self.config else {}, 0
-        )
 
         # Execution step counters {op_name: step} - tracks which step is being/was executed
         self._current_steps: Dict[str, int] = dict.fromkeys(
@@ -151,10 +147,10 @@ class SPMDWorker:
         self._mailbox = WorkerMailbox()
         self._mailbox.set_ready_callback(self._on_step_ready)
 
-        # Handler storage (worker-level, not in OperatorManager)
-        # {spmd_id: {rank: handler}}
-        self._predecessor_handlers: Dict[str, Dict[int, Any]] = {}
-        self._successor_handlers: Dict[str, Dict[int, Any]] = {}
+        # Handler storage (Data Plane - wrapped in DataPlaneCallable)
+        # {spmd_id: {rank: DataPlaneCallable}}
+        self._predecessor_handlers: Dict[str, Dict[int, DataPlaneCallable]] = {}
+        self._successor_handlers: Dict[str, Dict[int, DataPlaneCallable]] = {}
 
         # Heartbeat configuration
         self._heartbeat_interval: float = 5.0
@@ -255,7 +251,9 @@ class SPMDWorker:
             spmd_id: Predecessor SPMD ID
             handlers: {rank: ray.ActorHandle}
         """
-        self._predecessor_handlers[spmd_id] = handlers
+        self._predecessor_handlers[spmd_id] = {
+            rank: DataPlaneCallable(h) for rank, h in handlers.items()
+        }
         logger.debug(
             f"[spmd_id={self.spmd_id} rank={self.rank}] Registered predecessor handlers: {spmd_id}, ranks={list(handlers.keys())}"
         )
@@ -276,7 +274,9 @@ class SPMDWorker:
             spmd_id: Successor SPMD ID
             handlers: {rank: ray.ActorHandle}
         """
-        self._successor_handlers[spmd_id] = handlers
+        self._successor_handlers[spmd_id] = {
+            rank: DataPlaneCallable(h) for rank, h in handlers.items()
+        }
         logger.debug(
             f"[spmd_id={self.spmd_id} rank={self.rank}] Registered successor handlers: {spmd_id}, ranks={list(handlers.keys())}"
         )
@@ -437,7 +437,7 @@ class SPMDWorker:
             step: Step number
             sender_rank: Sender's rank
             payloads: Raw data arrays for the shards
-            counts: Number of items for each payload
+            counts: Number of values for each payload
             is_ragged: Indicates if ragged lengths are included
             has_indices: Indicates if routing indices are included
         """
@@ -812,7 +812,7 @@ class SPMDWorker:
 
             try:
                 # Send as forward op data (reader always targets the downstream's "forward" op)
-                handler.receive_shards.remote(
+                await handler.receive_shards(
                     "forward",
                     tensor_name,
                     step,
@@ -900,7 +900,7 @@ class SPMDWorker:
                     for target_rank in range(succ_info.total_rank):
                         handler = handlers.get(target_rank)
                         if handler is not None:
-                            handler.receive_shards.remote(
+                            await handler.receive_shards(
                                 target_op,
                                 tensor_name,
                                 output_step,
@@ -1421,7 +1421,7 @@ class SPMDWorker:
                     if count == 0:
                         backend = get_backend()
                         empty_tensor = backend.zeros((0,), dtype=backend.float32())
-                        ref = handler.receive_shards.remote(
+                        ref_task = handler.receive_shards(
                             _target_op,
                             _tensor_name,
                             _step,
@@ -1432,7 +1432,7 @@ class SPMDWorker:
                             _has_indices,
                         )
                     else:
-                        ref = handler.receive_shards.remote(
+                        ref_task = handler.receive_shards(
                             _target_op,
                             _tensor_name,
                             _step,
@@ -1443,10 +1443,10 @@ class SPMDWorker:
                             _has_indices,
                         )
 
-                    async def _wait_and_release(r=ref):
+                    async def _wait_and_release(t=ref_task):
                         try:
-                            # Await the ObjectRef to get the downstream Mailbox watermark
-                            watermark = await r
+                            # Await the call to get the downstream Mailbox watermark
+                            watermark = await t
                             if (
                                 isinstance(watermark, int)
                                 and watermark > self._high_watermark
