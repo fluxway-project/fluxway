@@ -35,7 +35,6 @@ from ..common.types import (
     DriverHeartbeat,
     Graph,
     HeartbeatConfig,
-    OpType,
     NodeType,
 )
 from ..common.utils import ensure_logging_configured
@@ -268,48 +267,48 @@ if RAY_AVAILABLE:
         # =====================================================================
 
         async def report_op_completed(
-            self, spmd_id: str, op_type: OpType, step: int
+            self, spmd_id: str, op_name: str, step: int
         ) -> None:
             """
             Receive op completion report from a driver.
 
             Args:
                 spmd_id: SPMD identifier
-                op_type: Operation type
+                op_name: Operation name
                 step: Completed step number
             """
-            self._async_step_manager.report_op_completed(spmd_id, op_type, step)
+            self._async_step_manager.report_op_completed(spmd_id, op_name, step)
             await self._check_and_enforce_step_limits()
 
         async def _check_and_enforce_step_limits(self) -> None:
             """Check step differences and apply lock/unlock actions."""
             actions = self._async_step_manager.check_and_enforce_limits()
 
-            for spmd_id, op_type, is_lock in actions:
+            for spmd_id, op_name, is_lock in actions:
                 if is_lock:
-                    await self._lock_spmd_op(spmd_id, op_type)
+                    await self._lock_spmd_op(spmd_id, op_name)
                 else:
-                    await self._unlock_spmd_op(spmd_id, op_type)
+                    await self._unlock_spmd_op(spmd_id, op_name)
 
-        async def _lock_spmd_op(self, spmd_id: str, op_type: OpType) -> None:
+        async def _lock_spmd_op(self, spmd_id: str, op_name: str) -> None:
             """Lock an SPMD's operation."""
             driver = self._spmd_manager.get_driver_handle(spmd_id)
             if driver is not None:
                 try:
-                    await driver.block_op.remote(op_type)
-                    logger.info(f"Locked {spmd_id} {op_type.name}")
+                    await driver.block_op.remote(op_name)
+                    logger.info(f"Locked {spmd_id} {op_name}")
                 except Exception as e:
-                    logger.error(f"Failed to lock {spmd_id} {op_type.name}: {e}")
+                    logger.error(f"Failed to lock {spmd_id} {op_name}: {e}")
 
-        async def _unlock_spmd_op(self, spmd_id: str, op_type: OpType) -> None:
+        async def _unlock_spmd_op(self, spmd_id: str, op_name: str) -> None:
             """Unlock an SPMD's operation."""
             driver = self._spmd_manager.get_driver_handle(spmd_id)
             if driver is not None:
                 try:
-                    await driver.unblock_op.remote(op_type)
-                    logger.info(f"Unlocked {spmd_id} {op_type.name}")
+                    await driver.unblock_op.remote(op_name)
+                    logger.info(f"Unlocked {spmd_id} {op_name}")
                 except Exception as e:
-                    logger.error(f"Failed to unlock {spmd_id} {op_type.name}: {e}")
+                    logger.error(f"Failed to unlock {spmd_id} {op_name}: {e}")
 
         # =====================================================================
         # Backpressure Management for Reader Nodes
@@ -395,7 +394,7 @@ if RAY_AVAILABLE:
             self,
             source_spmd_id: str,
             target_spmd_id: str,
-            target_op: "OpType",
+            target_op: str,
             names: List[str],
             step: int,
             values: List[Any],

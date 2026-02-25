@@ -12,11 +12,11 @@ Completion tracking is event-driven, not polled:
 Zero-copy shard writing is supported via TransportReceiver delegation.
 """
 
+from fluxway.common.types.configs import BarrierConfig
 import asyncio
 import logging
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
-from fluxway.common.types.configs import OpType
 from fluxway.common.sync import ArrivalBarrier
 from fluxway.transport.communication import TransportReceiver
 
@@ -43,20 +43,26 @@ class StepBarrier:
         expected_states:  list of required state names
     """
 
-    __slots__ = ("_tensor_barriers", "_state_barriers", "_combined")
+    __slots__ = ("_tensor_barriers", "_state_barriers", "_combined", "_periodic")
 
     def __init__(
-        self, expected_tensors: Dict[str, int], expected_states: List[str]
+        self,
+        expected_tensors: Dict[str, int],
+        expected_states: List[str],
+        periodic: bool = False,
     ) -> None:
+        self._periodic = periodic
         self._tensor_barriers: Dict[str, ArrivalBarrier] = {
-            name: ArrivalBarrier(count) for name, count in expected_tensors.items()
+            name: ArrivalBarrier(count, periodic=periodic)
+            for name, count in expected_tensors.items()
         }
         self._state_barriers: Dict[str, ArrivalBarrier] = {
-            name: ArrivalBarrier(1) for name in expected_states
+            name: ArrivalBarrier(1, periodic=periodic) for name in expected_states
         }
-        # Combined completion event
+        # Combined completion event (one-shot mode only)
         self._combined = asyncio.Event()
-        self._check()  # fire immediately if both dicts are empty
+        if not periodic:
+            self._check()  # fire immediately if both dicts are empty
 
     # ------------------------------------------------------------------
     # Arrival notification
@@ -66,7 +72,9 @@ class StepBarrier:
         """Record one shard arriving for `name`. Returns True if barrier just fired."""
         barrier = self._tensor_barriers.get(name)
         if barrier is not None:
-            barrier.arrive()
+            fired = barrier.arrive()
+            if self._periodic:
+                return fired
             return self._check()
         return False
 
@@ -74,7 +82,9 @@ class StepBarrier:
         """Record state data arriving for `name`. Returns True if barrier just fired."""
         barrier = self._state_barriers.get(name)
         if barrier is not None:
-            barrier.arrive()
+            fired = barrier.arrive()
+            if self._periodic:
+                return fired
             return self._check()
         return False
 
@@ -126,25 +136,26 @@ class WorkerMailbox:
 
     def __init__(self) -> None:
         # Control plane
-        self._state_data: Dict[OpType, Dict[str, Dict[int, Any]]] = {
-            op: {} for op in OpType
-        }
+        self._state_data: Dict[str, Dict[str, Dict[int, Any]]] = {}
 
         # Data plane (buffered path)
         self._tensor_slots: Dict[
-            OpType, Dict[str, Dict[int, Dict[int, "TransportTensor"]]]
-        ] = {op: {} for op in OpType}
+            str, Dict[str, Dict[int, Dict[int, "TransportTensor"]]]
+        ] = {}
 
-        # Completion barriers: {op_type: {step: StepBarrier}}
-        self._barriers: Dict[OpType, Dict[int, StepBarrier]] = {op: {} for op in OpType}
+        # Completion barriers: {op_name: {step: StepBarrier}}
+        self._barriers: Dict[str, Dict[int, StepBarrier]] = {}
 
         # Zero-copy receivers (activated on demand)
-        self._zc_receivers: Dict[OpType, Dict[str, Dict[int, TransportReceiver]]] = {
-            op: {} for op in OpType
-        }
+        self._zc_receivers: Dict[str, Dict[str, Dict[int, TransportReceiver]]] = {}
 
-        # Called with (op_type, step) when a step barrier fires
-        self._on_ready: Optional[Callable[[OpType, int], None]] = None
+        # Called with (op_name, step) when a step barrier fires
+        self._on_ready: Optional[Callable[[str, int], None]] = None
+
+        # Periodic mode state: {op_name: current_virtual_step}
+        self._periodic_steps: Dict[str, int] = {}
+        # Mapping from periodic op to its perpetual barrier
+        self._periodic_barriers: Dict[str, StepBarrier] = {}
 
         self._lock = asyncio.Lock()
 
@@ -152,7 +163,7 @@ class WorkerMailbox:
     # Step barrier lifecycle
     # ------------------------------------------------------------------
 
-    def set_ready_callback(self, callback: Callable[[OpType, int], None]) -> None:
+    def set_ready_callback(self, callback: Callable[[str, int], None]) -> None:
         """
         Register a callback fired when a step becomes ready.
 
@@ -160,16 +171,17 @@ class WorkerMailbox:
         use asyncio.create_task() inside it for non-blocking work.
 
         Args:
-            callback: callable(op_type, step)
+            callback: callable(op_name, step)
         """
         self._on_ready = callback
 
     def declare_step(
         self,
-        op_type: OpType,
+        op_name: str,
         step: int,
         expected_tensors: Dict[str, int],
         expected_states: List[str],
+        barrier_config: Optional["BarrierConfig"] = None,
     ) -> None:
         """
         Declare the expected arrivals for a step.
@@ -179,66 +191,108 @@ class WorkerMailbox:
         barrier fires.
 
         Args:
+            op_name: Operation name
+            step: Execution step (ignored for periodic ops)
             expected_tensors: {tensor_name: required_shard_count}
             expected_states: list of required state names
+            barrier_config: Configuration for the step barrier
         """
+        from fluxway.common.types.configs import BarrierType
+
+        is_periodic = (
+            barrier_config.type == BarrierType.PERIODIC if barrier_config else False
+        )
+
+        if is_periodic:
+            if op_name not in self._periodic_barriers:
+                # Use n from barrier_config if available
+                # Note: StepBarrier currently assumes n is the same for all inputs in periodic mode.
+                # For now we use barrier_config.n if it is PeriodicBarrierConfig.
+                n = getattr(barrier_config, "n", 1)
+                self._periodic_barriers[op_name] = StepBarrier(
+                    expected_tensors, expected_states, periodic=True
+                )
+                # Ensure each ArrivalBarrier inside StepBarrier uses the correct n
+                for b in self._periodic_barriers[op_name]._tensor_barriers.values():
+                    b._n = n
+                for b in self._periodic_barriers[op_name]._state_barriers.values():
+                    b._n = n
+
+                self._periodic_steps[op_name] = 0
+            return
+
         barrier = StepBarrier(expected_tensors, expected_states)
-        self._barriers[op_type][step] = barrier
+        self._barriers.setdefault(op_name, {})[step] = barrier
         # In case expected counts are all zero the barrier is already ready
         if barrier.is_ready() and self._on_ready:
-            self._on_ready(op_type, step)
+            self._on_ready(op_name, step)
 
     # ------------------------------------------------------------------
     # Control plane — state data
     # ------------------------------------------------------------------
 
     async def deposit_states(
-        self, op_type: OpType, step: int, names: List[str], values: List[Any]
+        self, op_name: str, step: int, names: List[str], values: List[Any]
     ) -> None:
         """Cache state data and notify the step barrier."""
         if len(names) != len(values):
             raise ValueError("names and values must have the same length")
 
         async with self._lock:
+            # Handle periodic ops: use virtual step
+            actual_step = step
+            barrier = None
+            if op_name in self._periodic_barriers:
+                actual_step = self._periodic_steps[op_name]
+                self._periodic_steps[op_name] += 1
+                barrier = self._periodic_barriers[op_name]
+            else:
+                barrier = self._barriers.get(op_name, {}).get(step)
+
             for name, data in zip(names, values, strict=True):
-                self._state_data[op_type].setdefault(name, {})[step] = data
-                barrier = self._barriers[op_type].get(step)
+                self._state_data.setdefault(op_name, {}).setdefault(name, {})[
+                    actual_step
+                ] = data
                 if barrier is not None:
                     fired = barrier.state_arrived(name)
                     if fired and self._on_ready:
-                        self._on_ready(op_type, step)
+                        self._on_ready(op_name, actual_step)
         logger.debug(
-            "Mailbox deposit_states: op=%s names=%s step=%d", op_type.name, names, step
+            "Mailbox deposit_states: op=%s names=%s step=%d", op_name, names, step
         )
 
-    async def get_state(self, op_type: OpType, name: str, step: int) -> Optional[Any]:
+    async def get_state(self, op_name: str, name: str, step: int) -> Optional[Any]:
         async with self._lock:
-            return self._state_data[op_type].get(name, {}).get(step)
+            return self._state_data.get(op_name, {}).get(name, {}).get(step)
 
-    async def get_all_states(self, op_type: OpType, step: int) -> Dict[str, Any]:
+    async def get_all_states(self, op_name: str, step: int) -> Dict[str, Any]:
         async with self._lock:
             return {
                 name: steps[step]
-                for name, steps in self._state_data[op_type].items()
+                for name, steps in self._state_data.get(op_name, {}).items()
                 if step in steps
             }
 
-    async def has_state(self, op_type: OpType, name: str, step: int) -> bool:
+    async def has_state(self, op_name: str, name: str, step: int) -> bool:
         async with self._lock:
-            return step in self._state_data[op_type].get(name, {})
+            return step in self._state_data.get(op_name, {}).get(name, {})
 
     # ------------------------------------------------------------------
     # Data plane — tensor shards
     # ------------------------------------------------------------------
 
     def _buffered_slot(
-        self, op_type: OpType, name: str, step: int
+        self, op_name: str, name: str, step: int
     ) -> Dict[int, "TransportTensor"]:
-        return self._tensor_slots[op_type].setdefault(name, {}).setdefault(step, {})
+        return (
+            self._tensor_slots.setdefault(op_name, {})
+            .setdefault(name, {})
+            .setdefault(step, {})
+        )
 
     async def deposit_shards(
         self,
-        op_type: OpType,
+        op_name: str,
         name: str,
         step: int,
         rank: int,
@@ -254,7 +308,7 @@ class WorkerMailbox:
         directly into the pre-allocated buffer instead.
 
         Args:
-            op_type: Operation type
+            op_name: Operation type
             name: Tensor name
             step: Execution step
             rank: Sender rank
@@ -264,135 +318,172 @@ class WorkerMailbox:
             has_indices: Whether the payloads include routing indices
         """
         async with self._lock:
-            zc = self._zc_receivers[op_type].get(name, {}).get(step)
-            if zc is not None:
-                # Zero-copy delegates raw payloads directly to the receiver.
-                # Assuming one TransportTensor structure for simplicity in zero-copy routing.
-                # If there are multiple co-located tensors in `payloads`, zero-copy setup
-                # must match the exact payload sequence.
-                zc.receive_slices(rank, payloads, counts)
+            # Handle periodic ops: use virtual step
+            actual_step = step
+            barrier = None
+            if op_name in self._periodic_barriers:
+                actual_step = self._periodic_steps[op_name]
+                self._periodic_steps[op_name] += 1
+                barrier = self._periodic_barriers[op_name]
             else:
-                # Reconstruct TransportTensor(s) for the buffered slot
-                from fluxway.common.types.tensor import TransportTensor
-                from fluxway.common.backend import get_backend
+                zc = self._zc_receivers.get(op_name, {}).get(name, {}).get(step)
+                if zc is not None:
+                    # Zero-copy delegates raw payloads directly to the receiver.
+                    zc.receive_slices(rank, payloads, counts)
+                    # Note: zero-copy periodic is not yet implemented in this simplified path
+                barrier = self._barriers.get(op_name, {}).get(step)
 
-                cursor = 0
-                backend = get_backend()
-                tensors = []
-
-                # Handle multiple pairs if `payloads` contains more elements than a single tensor requires.
-                # Generally, 1 tensor = 1 data + (0 or 1 lengths) + (0 or 1 indices).
-                # To support lists (co-location), we iterate until payloads are consumed.
-                while cursor < len(payloads):
-                    count = counts[cursor] if cursor < len(counts) else 0
-                    data_payload = (
-                        payloads[cursor][:count] if count > 0 else payloads[cursor]
+            if op_name not in self._periodic_barriers:
+                # Standard buffered path (only if not handled by ZC)
+                zc = self._zc_receivers.get(op_name, {}).get(name, {}).get(step)
+                if zc is None:
+                    self._deposit_buffered_shards(
+                        op_name,
+                        name,
+                        actual_step,
+                        rank,
+                        payloads,
+                        counts,
+                        is_ragged,
+                        has_indices,
                     )
-                    cursor += 1
+            else:
+                # Periodic always uses buffered path for now
+                self._deposit_buffered_shards(
+                    op_name,
+                    name,
+                    actual_step,
+                    rank,
+                    payloads,
+                    counts,
+                    is_ragged,
+                    has_indices,
+                )
 
-                    lengths_payload = None
-                    if is_ragged and cursor < len(payloads):
-                        length_count = counts[cursor] if cursor < len(counts) else 0
-                        lengths_payload = (
-                            payloads[cursor][:length_count]
-                            if length_count > 0
-                            else payloads[cursor]
-                        )
-                        cursor += 1
-
-                    indices_payload = None
-                    if has_indices and cursor < len(payloads):
-                        index_count = counts[cursor] if cursor < len(counts) else 0
-                        indices_payload = (
-                            payloads[cursor][:index_count]
-                            if index_count > 0
-                            else payloads[cursor]
-                        )
-                        cursor += 1
-
-                    nested_splits = []
-                    if lengths_payload is not None:
-                        # Convert lengths back to splits via cumsum
-                        cs = backend.cumsum(lengths_payload, dim=0)
-                        zero = backend.zeros((1,), dtype=backend.int32())
-                        splits = backend.cat([zero, cs], dim=0)
-                        nested_splits = [splits]
-
-                    tensors.append(
-                        TransportTensor(
-                            data_payload,
-                            nested_splits=nested_splits,
-                            indices=indices_payload,
-                        )
-                    )
-
-                # Store single or list depending on original intention?
-                # For compatibility, if only 1, store it as single
-                if len(tensors) == 1:
-                    self._buffered_slot(op_type, name, step)[rank] = tensors[0]
-                else:
-                    self._buffered_slot(op_type, name, step)[rank] = tensors
-
-            barrier = self._barriers[op_type].get(step)
             if barrier is not None:
                 fired = barrier.tensor_arrived(name)
                 if fired and self._on_ready:
-                    self._on_ready(op_type, step)
+                    self._on_ready(op_name, actual_step)
 
         logger.debug(
             "Mailbox deposit_shards: op=%s name=%s step=%d rank=%d",
-            op_type.name,
+            op_name,
             name,
             step,
             rank,
         )
 
+    def _deposit_buffered_shards(
+        self,
+        op_name: str,
+        name: str,
+        step: int,
+        rank: int,
+        payloads: List[Any],
+        counts: List[int],
+        is_ragged: bool,
+        has_indices: bool,
+    ) -> None:
+        """Internal helper for buffered shard storage."""
+        from fluxway.common.types.tensor import TransportTensor
+        from fluxway.common.backend import get_backend
+
+        cursor = 0
+        backend = get_backend()
+        tensors = []
+
+        while cursor < len(payloads):
+            count = counts[cursor] if cursor < len(counts) else 0
+            data_payload = payloads[cursor][:count] if count > 0 else payloads[cursor]
+            cursor += 1
+
+            lengths_payload = None
+            if is_ragged and cursor < len(payloads):
+                length_count = counts[cursor] if cursor < len(counts) else 0
+                lengths_payload = (
+                    payloads[cursor][:length_count]
+                    if length_count > 0
+                    else payloads[cursor]
+                )
+                cursor += 1
+
+            indices_payload = None
+            if has_indices and cursor < len(payloads):
+                index_count = counts[cursor] if cursor < len(counts) else 0
+                indices_payload = (
+                    payloads[cursor][:index_count]
+                    if index_count > 0
+                    else payloads[cursor]
+                )
+                cursor += 1
+
+            nested_splits = []
+            if lengths_payload is not None:
+                cs = backend.cumsum(lengths_payload, dim=0)
+                zero = backend.zeros((1,), dtype=backend.int32())
+                splits = backend.cat([zero, cs], dim=0)
+                nested_splits = [splits]
+
+            tensors.append(
+                TransportTensor(
+                    data_payload, nested_splits=nested_splits, indices=indices_payload
+                )
+            )
+
+        if len(tensors) == 1:
+            self._buffered_slot(op_name, name, step)[rank] = tensors[0]
+        else:
+            self._buffered_slot(op_name, name, step)[rank] = tensors
+
     async def get_tensor_shard(
-        self, op_type: OpType, name: str, step: int, rank: int
+        self, op_name: str, name: str, step: int, rank: int
     ) -> Optional["TransportTensor"]:
         async with self._lock:
-            return self._tensor_slots[op_type].get(name, {}).get(step, {}).get(rank)
+            return (
+                self._tensor_slots.get(op_name, {})
+                .get(name, {})
+                .get(step, {})
+                .get(rank)
+            )
 
     async def get_tensor_shards(
-        self, op_type: OpType, name: str, step: int
+        self, op_name: str, name: str, step: int
     ) -> Dict[int, "TransportTensor"]:
         async with self._lock:
-            return dict(self._tensor_slots[op_type].get(name, {}).get(step, {}))
+            return dict(self._tensor_slots.get(op_name, {}).get(name, {}).get(step, {}))
 
     async def get_all_tensor_shards(
-        self, op_type: OpType, step: int
+        self, op_name: str, step: int
     ) -> Dict[str, Dict[int, "TransportTensor"]]:
         async with self._lock:
             return {
                 name: dict(step_dict[step])
-                for name, step_dict in self._tensor_slots[op_type].items()
+                for name, step_dict in self._tensor_slots.get(op_name, {}).items()
                 if step in step_dict
             }
 
-    async def get_tensor_shard_count(
-        self, op_type: OpType, name: str, step: int
-    ) -> int:
+    async def get_tensor_shard_count(self, op_name: str, name: str, step: int) -> int:
         async with self._lock:
-            return len(self._tensor_slots[op_type].get(name, {}).get(step, {}))
+            return len(self._tensor_slots.get(op_name, {}).get(name, {}).get(step, {}))
 
     # ------------------------------------------------------------------
     # Step readiness
     # ------------------------------------------------------------------
 
-    def is_step_ready(self, op_type: OpType, step: int) -> bool:
+    def is_step_ready(self, op_name: str, step: int) -> bool:
         """Non-blocking: True if the step barrier has fired."""
-        barrier = self._barriers[op_type].get(step)
+        barrier = self._barriers.get(op_name, {}).get(step)
         return barrier is not None and barrier.is_ready()
 
-    async def wait_step_ready(self, op_type: OpType, step: int) -> None:
+    async def wait_step_ready(self, op_name: str, step: int) -> None:
         """Async wait until the step barrier fires.
 
         Raises RuntimeError if declare_step() was never called for this step.
         """
-        barrier = self._barriers[op_type].get(step)
+        barrier = self._barriers.get(op_name, {}).get(step)
         if barrier is None:
             raise RuntimeError(
-                f"declare_step() was not called for op={op_type.name} step={step}"
+                f"declare_step() was not called for op={op_name} step={step}"
             )
         await barrier.wait()
 
@@ -402,7 +493,7 @@ class WorkerMailbox:
 
     async def register_zero_copy_slot(
         self,
-        op_type: OpType,
+        op_name: str,
         name: str,
         step: int,
         target_buffers: List[Any],
@@ -412,46 +503,51 @@ class WorkerMailbox:
         async with self._lock:
             receiver = TransportReceiver(wait_for_n_slices=0)
             receiver.register_zero_copy_buffers(target_buffers, expect_offsets)
-            self._zc_receivers[op_type].setdefault(name, {})[step] = receiver
+            self._zc_receivers.setdefault(op_name, {}).setdefault(name, {})[step] = (
+                receiver
+            )
 
     async def get_zero_copy_buffers(
-        self, op_type: OpType, name: str, step: int
+        self, op_name: str, name: str, step: int
     ) -> Optional[List[Any]]:
         async with self._lock:
-            receiver = self._zc_receivers[op_type].get(name, {}).get(step)
+            receiver = self._zc_receivers.get(op_name, {}).get(name, {}).get(step)
             return receiver.target_buffers if receiver is not None else None
 
     # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------
 
-    async def clear_step(self, op_type: OpType, step: int) -> None:
+    async def clear_step(self, op_name: str, step: int) -> None:
         """Release all data for a completed step."""
         async with self._lock:
-            for name, step_dict in list(self._tensor_slots[op_type].items()):
-                step_dict.pop(step, None)
-                if not step_dict:
-                    del self._tensor_slots[op_type][name]
+            if op_name in self._tensor_slots:
+                for name, step_dict in list(self._tensor_slots[op_name].items()):
+                    step_dict.pop(step, None)
+                    if not step_dict:
+                        del self._tensor_slots[op_name][name]
 
-            for name, step_dict in list(self._zc_receivers[op_type].items()):
-                step_dict.pop(step, None)
-                if not step_dict:
-                    del self._zc_receivers[op_type][name]
+            if op_name in self._zc_receivers:
+                for name, step_dict in list(self._zc_receivers[op_name].items()):
+                    step_dict.pop(step, None)
+                    if not step_dict:
+                        del self._zc_receivers[op_name][name]
 
-            for name, step_dict in list(self._state_data[op_type].items()):
-                step_dict.pop(step, None)
-                if not step_dict:
-                    del self._state_data[op_type][name]
+            if op_name in self._state_data:
+                for name, step_dict in list(self._state_data[op_name].items()):
+                    step_dict.pop(step, None)
+                    if not step_dict:
+                        del self._state_data[op_name][name]
 
-            self._barriers[op_type].pop(step, None)
+            if op_name in self._barriers:
+                self._barriers[op_name].pop(step, None)
 
     async def clear_all(self) -> None:
         async with self._lock:
-            for op in OpType:
-                self._state_data[op].clear()
-                self._tensor_slots[op].clear()
-                self._zc_receivers[op].clear()
-                self._barriers[op].clear()
+            self._state_data.clear()
+            self._tensor_slots.clear()
+            self._zc_receivers.clear()
+            self._barriers.clear()
 
     # ------------------------------------------------------------------
     # Backpressure monitoring
@@ -460,10 +556,11 @@ class WorkerMailbox:
     async def get_size(self) -> int:
         async with self._lock:
             size = 0
-            for op in OpType:
-                for step_dict in self._state_data[op].values():
+            for op_name_dict in self._state_data.values():
+                for step_dict in op_name_dict.values():
                     size += len(step_dict)
-                for step_dict in self._tensor_slots[op].values():
+            for op_name_dict in self._tensor_slots.values():
+                for step_dict in op_name_dict.values():
                     for rank_dict in step_dict.values():
                         size += len(rank_dict)
             return size

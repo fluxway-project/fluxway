@@ -19,7 +19,8 @@ This implementation uses Ray's async actor API for concurrency.
 See: https://docs.ray.io/en/latest/ray-core/actors/async_api.html
 """
 
-from fluxway.common.types.sharding import ShardingSpec
+from fluxway.common.mesh import DeviceMesh
+from fluxway.common.types.sharding import ShardingSpec, PartitionSpec
 from typing import Any, Dict, List, Optional, Tuple
 from fluxway.common.backend import get_backend
 import asyncio
@@ -29,7 +30,7 @@ import time
 import ray
 
 from ...common.types import SPMDConfig, WorkerHeartbeat, WorkerStatus, WorkerTelemetry
-from ...common.types.configs import OpType, NodeType, ReaderConfig, MailboxStatus
+from ...common.types.configs import NodeType, ReaderConfig, MailboxStatus
 from ...common.types.tensor import TransportTensor
 from ...common.utils import ensure_logging_configured
 from .mailbox import WorkerMailbox
@@ -103,50 +104,40 @@ class SPMDWorker:
         else:
             self._op_manager = None
 
-        # Execution step counters {op_type: step} - tracks which step is being/was executed
-        self._current_steps: Dict[OpType, int] = {
-            OpType.FORWARD: 0,
-            OpType.BACKWARD: 0,
-            OpType.UPDATE: 0,
-        }
+        # Execution step counters {op_name: step} - tracks which step is being/was executed
+        self._current_steps: Dict[str, int] = dict.fromkeys(
+            self.config.operators if self.config else {}, 0
+        )
 
-        # Input step counters for eager mode {op_type: step}
-        # Used to assign sequential step numbers to incoming data for eager_trigger operators
-        # Separate from _current_steps because eager mode doesn't require step matching
-        self._eager_input_steps: Dict[OpType, int] = {
-            OpType.FORWARD: 0,
-            OpType.BACKWARD: 0,
-            OpType.UPDATE: 0,
-        }
+        # Execution step counters {op_name: step} - tracks which step is being/was executed
+        self._current_steps: Dict[str, int] = dict.fromkeys(
+            self.config.operators if self.config else {}, 0
+        )
 
         # Op-level blocking: asyncio.Event (set=runnable, clear=blocked)
-        self._op_runnable: Dict[OpType, asyncio.Event] = {
-            OpType.FORWARD: asyncio.Event(),
-            OpType.BACKWARD: asyncio.Event(),
-            OpType.UPDATE: asyncio.Event(),
+        self._op_runnable: Dict[str, asyncio.Event] = {
+            op_name: asyncio.Event()
+            for op_name in (self.config.operators if self.config else {})
         }
         for event in self._op_runnable.values():
             event.set()  # Initially all ops are runnable
 
         # Pending tasks when blocked (to avoid priority queue reentry loop)
-        self._pending_blocked: Dict[OpType, List[int]] = {
-            OpType.FORWARD: [],
-            OpType.BACKWARD: [],
-            OpType.UPDATE: [],
+        self._pending_blocked: Dict[str, List[int]] = {
+            op_name: [] for op_name in (self.config.operators if self.config else {})
         }
 
         # Pending tasks for future steps (arrived early, waiting for current step to complete)
-        # Structure: {op_type: List[step]} - steps waiting to be executed
-        self._pending_future_steps: Dict[OpType, List[int]] = {
-            OpType.FORWARD: [],
-            OpType.BACKWARD: [],
-            OpType.UPDATE: [],
+        # Structure: {op_name: List[step]} - steps waiting to be executed
+        self._pending_future_steps: Dict[str, List[int]] = {
+            op_name: [] for op_name in (self.config.operators if self.config else {})
         }
 
         self._pending_lock = asyncio.Lock()
 
-        # Priority queue: asyncio.PriorityQueue with (priority, step, op_type)
-        self._execution_queue: asyncio.PriorityQueue[Tuple[int, int, OpType]] = (
+        # Priority queue: asyncio.PriorityQueue with (priority, step, op_name)
+        # We can extract priority from OperatorMeta
+        self._execution_queue: asyncio.PriorityQueue[Tuple[int, int, str]] = (
             asyncio.PriorityQueue()
         )
 
@@ -175,22 +166,14 @@ class SPMDWorker:
         self._expected_predecessor_count: int = 0
         self._expected_successor_count: int = 0
 
-        # Cached assembled input tensors: {op_type: {tensor_name: TransportTensor}}
+        # Cached assembled input tensors: {op_name: {tensor_name: TransportTensor}}
         # Updated by _assemble_input, used by _send_output for pass-through metadata
         self._last_assembled_tensors: Dict[
-            OpType, Dict[str, Optional[TransportTensor]]
-        ] = {OpType.FORWARD: {}, OpType.BACKWARD: {}, OpType.UPDATE: {}}
+            str, Dict[str, Optional[TransportTensor]]
+        ] = {op_name: {} for op_name in (self.config.operators if self.config else {})}
 
-        # Per-step tensor history for backward reverse routing
-        # Structure: {op_type: {step: {tensor_name: TransportTensor}}}
-        self._tensor_history: Dict[OpType, Dict[int, Dict[str, TransportTensor]]] = {
-            OpType.FORWARD: {},
-            OpType.BACKWARD: {},
-            OpType.UPDATE: {},
-        }
-
-        # Tracks which (op_type, step) barriers have been registered to avoid double-declaring.
-        self._barriers_declared: Dict[Tuple[OpType, int], bool] = {}
+        # Tracks which (op_name, step) barriers have been registered to avoid double-declaring.
+        self._barriers_declared: Dict[Tuple[str, int], bool] = {}
 
         # Reader-specific state
         self._is_reading_paused: bool = False  # Backpressure pause flag
@@ -229,7 +212,7 @@ class SPMDWorker:
         return self._driver_handle
 
     def compute_output_step(
-        self, *, is_eager: bool, current_step: int, input_step: int
+        self, *, is_periodic: bool, current_step: int, input_step: int
     ) -> int:
         """
         Compute output step number based on SPMDConfig and operator mode.
@@ -237,15 +220,15 @@ class SPMDWorker:
         Spec:
         - enable_output_step_remap=False (default): output_step == input_step
         - enable_output_step_remap=True:
-          - eager_trigger=True: output_step = total_rank * current_step + local_rank
-          - eager_trigger=False: output_step = current_step
+            - periodic_barrier=True: output_step = total_rank * current_step + local_rank
+            - standard (non-periodic): output_step = current_step
         """
         enable_output_step_remap = getattr(
             self.config, "enable_output_step_remap", False
         )
         if not enable_output_step_remap:
             return input_step
-        if is_eager:
+        if is_periodic:
             return self._total_rank * current_step + self.rank
         return current_step
 
@@ -358,100 +341,79 @@ class SPMDWorker:
     # Op-Level Blocking
     # =========================================================================
 
-    def block_op(self, op_type: OpType) -> None:
+    def block_op(self, op_name: str) -> None:
         """
         Block an operator's execution.
 
-        When blocked, tasks of this op_type will be held in pending queue
+        When blocked, tasks of this op_name will be held in pending queue
         instead of being executed. Other ops continue normally.
         """
-        self._op_runnable[op_type].clear()
-        logger.info(
-            f"[spmd_id={self.spmd_id}] Worker {self.rank}: {op_type.name} blocked"
-        )
+        self._op_runnable[op_name].clear()
+        logger.info(f"[spmd_id={self.spmd_id}] Worker {self.rank}: {op_name} blocked")
 
-    async def unblock_op(self, op_type: OpType) -> None:
+    async def unblock_op(self, op_name: str) -> None:
         """
         Unblock an operator and re-enqueue pending tasks.
         """
-        self._op_runnable[op_type].set()
+        self._op_runnable[op_name].set()
 
         # Re-enqueue pending tasks
         async with self._pending_lock:
-            for step in self._pending_blocked[op_type]:
-                await self._enqueue(op_type, step)
-            self._pending_blocked[op_type].clear()
+            for step in self._pending_blocked[op_name]:
+                await self._enqueue(op_name, step)
+            self._pending_blocked[op_name].clear()
 
-        logger.info(
-            f"[spmd_id={self.spmd_id}] Worker {self.rank}: {op_type.name} unblocked"
-        )
+        logger.info(f"[spmd_id={self.spmd_id}] Worker {self.rank}: {op_name} unblocked")
 
-    def is_op_blocked(self, op_type: OpType) -> bool:
+    def is_op_blocked(self, op_name: str) -> bool:
         """Check if an operator is blocked."""
-        return not self._op_runnable[op_type].is_set()
+        return not self._op_runnable[op_name].is_set()
 
     # =========================================================================
     # Data Reception
     # =========================================================================
 
     async def receive_states(
-        self, op_type: OpType, step: int, names: List[str], values: List[Any]
+        self, op_name: str, step: int, names: List[str], values: List[Any]
     ) -> None:
         """
         Receive state data from Driver (control plane).
 
         Args:
-            op_type: Operator type
-            step: Step number (ignored for eager_trigger operators)
+            op_name: Operator name
+            step: Step number
             names: State variable names
             values: State data values
         """
-        # Check if this op is in eager_trigger mode
-        is_eager = (
-            self._op_manager.is_eager_trigger(op_type) if self._op_manager else False
-        )
-
-        if is_eager:
-            # Eager mode: use _eager_input_steps for input labeling, ignore incoming step
-            # Each incoming data gets a unique input_step, then enqueue immediately
-            input_step = self._eager_input_steps[op_type]
-            self._eager_input_steps[op_type] += 1  # Increment for next input
-
-            await self._mailbox.deposit_states(
-                op_type, step=input_step, names=names, values=values
-            )
-            logger.debug(
-                f"[spmd_id={self.spmd_id}] Eager receive states: op={op_type.name}, names={names}, "
-                f"input_step={input_step}"
-            )
-            await self._enqueue(op_type, input_step)
-            return
-
         # Normal mode: step-ordered execution
-        exec_step = self._current_steps[op_type]
+        exec_step = self._current_steps.get(op_name, 0)
 
         # Drop stale data (data for steps already executed)
-        if step < exec_step:
+        # Note: periodic ops don't have stale steps as they use virtual sequence
+        is_periodic = (
+            self._op_manager.is_periodic_trigger(op_name) if self._op_manager else False
+        )
+        if not is_periodic and step < exec_step:
             logger.warning(
-                f"[spmd_id={self.spmd_id}] Dropping stale state data: op={op_type.name}, names={names}, "
+                f"[spmd_id={self.spmd_id}] Dropping stale state data: op={op_name}, names={names}, "
                 f"step={step} < exec_step={exec_step}"
             )
             return
 
         # Lazily declare the step barrier on first data arrival
-        self._ensure_step_declared(op_type, step)
+        self._ensure_step_declared(op_name, step)
 
         # Cache in mailbox — barrier fires on_ready automatically
         await self._mailbox.deposit_states(
-            op_type, step=step, names=names, values=values
+            op_name, step=step, names=names, values=values
         )
         logger.debug(
-            f"[spmd_id={self.spmd_id}] Worker {self.rank} received states: op={op_type.name}, names={names}, step={step}"
+            f"[spmd_id={self.spmd_id}] Worker {self.rank} received states: op={op_name}, names={names}, step={step}"
         )
 
     async def receive_shards(
         self,
-        op_type: OpType,
+        op_name: str,
         name: str,
         step: int,
         sender_rank: int,
@@ -464,92 +426,79 @@ class SPMDWorker:
         Receive tensor shard data from upstream worker (data plane).
 
         Args:
-            op_type: Operator type
+            op_name: Operator name
             name: Tensor variable name
-            step: Step number (ignored for eager_trigger operators)
+            step: Step number
             sender_rank: Sender's rank
             payloads: Raw data arrays for the shards
             counts: Number of items for each payload
             is_ragged: Indicates if ragged lengths are included
             has_indices: Indicates if routing indices are included
         """
-        # Check if this op is in eager_trigger mode
-        is_eager = (
-            self._op_manager.is_eager_trigger(op_type) if self._op_manager else False
-        )
-
-        if is_eager:
-            # Eager mode: use _eager_input_steps for input labeling, ignore incoming step
-            # Each incoming data gets a unique input_step, then enqueue immediately
-            input_step = self._eager_input_steps[op_type]
-            self._eager_input_steps[op_type] += 1  # Increment for next input
-
-            await self._mailbox.deposit_shards(
-                op_type,
-                name,
-                input_step,
-                sender_rank,
-                payloads,
-                counts,
-                is_ragged,
-                has_indices,
-            )
-            logger.debug(
-                f"[spmd_id={self.spmd_id}] Eager receive tensor: op={op_type.name}, name={name}, "
-                f"sender_rank={sender_rank}, input_step={input_step}"
-            )
-            await self._enqueue(op_type, input_step)
-            return
-
         # Normal mode: step-ordered execution
-        exec_step = self._current_steps[op_type]
+        exec_step = self._current_steps.get(op_name, 0)
 
         # Drop stale data (data for steps already executed)
-        if step < exec_step:
+        # Note: periodic ops don't have stale steps as they use virtual sequence
+        is_periodic = (
+            self._op_manager.is_periodic_trigger(op_name) if self._op_manager else False
+        )
+        if not is_periodic and step < exec_step:
             logger.warning(
-                f"[spmd_id={self.spmd_id}] Dropping stale tensor data: op={op_type.name}, name={name}, "
+                f"[spmd_id={self.spmd_id}] Dropping stale tensor data: op={op_name}, name={name}, "
                 f"step={step} < exec_step={exec_step}, rank={sender_rank}"
             )
             return
 
         # Lazily declare the step barrier on first data arrival
-        self._ensure_step_declared(op_type, step)
+        self._ensure_step_declared(op_name, step)
 
         # Cache in mailbox — barrier fires on_ready automatically
         await self._mailbox.deposit_shards(
-            op_type, name, step, sender_rank, payloads, counts, is_ragged, has_indices
+            op_name, name, step, sender_rank, payloads, counts, is_ragged, has_indices
         )
         logger.debug(
-            f"[spmd_id={self.spmd_id}] Worker {self.rank} received shards: op={op_type.name}, name={name}, "
+            f"[spmd_id={self.spmd_id}] Worker {self.rank} received shards: op={op_name}, name={name}, "
             f"step={step}, sender_rank={sender_rank}"
         )
 
-    def _ensure_step_declared(self, op_type: OpType, step: int) -> None:
+    def _ensure_step_declared(self, op_name: str, step: int) -> None:
         """
-        Lazily register a StepBarrier for (op_type, step) on first data arrival.
+        Lazily register a StepBarrier for (op_name, step) on first data arrival.
 
         Expected counts are read from OperatorManager so the barrier knows
         exactly how many shards/states to wait for before firing.
         """
-        if self._mailbox.is_step_ready(op_type, step):
+        if self._mailbox.is_step_ready(op_name, step):
             return  # Already done (or re-fired from a previous run)
-        if self._barriers_declared.get((op_type, step)):
+        if self._barriers_declared.get((op_name, step)):
             return  # Already declared
 
         expected_tensors = (
-            self._op_manager.get_expected_tensor_shards(op_type)
+            self._op_manager.get_expected_tensor_shards(op_name)
             if self._op_manager
             else {}
         )
         expected_states = (
-            self._op_manager.get_expected_state_names(op_type)
+            self._op_manager.get_expected_state_names(op_name)
             if self._op_manager
             else []
         )
-        self._mailbox.declare_step(op_type, step, expected_tensors, expected_states)
-        self._barriers_declared[(op_type, step)] = True
+        meta = (
+            self._op_manager.get_operator_metadata(op_name)
+            if self._op_manager
+            else None
+        )
+        self._mailbox.declare_step(
+            op_name,
+            step,
+            expected_tensors,
+            expected_states,
+            barrier_config=meta.barrier_config if meta else None,
+        )
+        self._barriers_declared[(op_name, step)] = True
 
-    def _on_step_ready(self, op_type: OpType, step: int) -> None:
+    def _on_step_ready(self, op_name: str, step: int) -> None:
         """
         Called by WorkerMailbox when a step's StepBarrier fires.
 
@@ -557,15 +506,19 @@ class SPMDWorker:
         deposit_states can return immediately without blocking on queue insertion.
         """
         logger.info(
-            f"[spmd_id={self.spmd_id} rank={self.rank}] Step ready: op={op_type.name}, step={step}"
+            f"[spmd_id={self.spmd_id} rank={self.rank}] Step ready: op={op_name}, step={step}"
         )
-        asyncio.create_task(self._enqueue(op_type, step))
+        asyncio.create_task(self._enqueue(op_name, step))
 
-    async def _enqueue(self, op_type: OpType, step: int) -> None:
+    async def _enqueue(self, op_name: str, step: int) -> None:
         """Enqueue a task for execution."""
-        await self._execution_queue.put((op_type.value, step, op_type))
+        from ...common.types.configs import OperatorMeta
+
+        meta = self._op_manager._get_operator_metadata(op_name)
+        priority = meta.priority if isinstance(meta, OperatorMeta) else 0
+        await self._execution_queue.put((-priority, step, op_name))
         logger.debug(
-            f"[spmd_id={self.spmd_id} rank={self.rank}] Task enqueued: op={op_type.name}, step={step}"
+            f"[spmd_id={self.spmd_id} rank={self.rank}] Task enqueued: op={op_name}, step={step}"
         )
 
     # =========================================================================
@@ -643,7 +596,7 @@ class SPMDWorker:
         while self._running:
             try:
                 # Blocking wait for next task (async)
-                priority, step, op_type = await self._execution_queue.get()
+                priority, step, op_name = await self._execution_queue.get()
 
                 # Check if we should stop
                 if not self._running:
@@ -651,47 +604,47 @@ class SPMDWorker:
                     break
 
                 # Check if this op is blocked
-                if not self._op_runnable[op_type].is_set():
+                if not self._op_runnable[op_name].is_set():
                     # Hold in pending queue instead of re-enqueueing
                     async with self._pending_lock:
-                        self._pending_blocked[op_type].append(step)
+                        self._pending_blocked[op_name].append(step)
                     logger.debug(
-                        f"[spmd_id={self.spmd_id}] Task held (op blocked): op={op_type.name}, step={step}"
+                        f"[spmd_id={self.spmd_id}] Task held (op blocked): op={op_name}, step={step}"
                     )
                     continue
 
-                # Check if this op is in eager_trigger mode
-                is_eager = (
-                    self._op_manager.is_eager_trigger(op_type)
+                # Check if this op is in periodic_trigger mode
+                is_periodic = (
+                    self._op_manager.is_periodic_trigger(op_name)
                     if self._op_manager
                     else False
                 )
 
-                if not is_eager:
+                if not is_periodic:
                     # Normal mode: verify step matches current expected execution step
-                    exec_step = self._current_steps[op_type]
+                    exec_step = self._current_steps[op_name]
                     if step < exec_step:
                         # Truly stale task (already executed), drop it
                         logger.warning(
-                            f"[spmd_id={self.spmd_id}] Stale task dropped: op={op_type.name}, "
+                            f"[spmd_id={self.spmd_id}] Stale task dropped: op={op_name}, "
                             f"task_step={step}, exec_step={exec_step}"
                         )
                         continue
                     elif step > exec_step:
                         # Future task (arrived early), hold for later execution
                         async with self._pending_lock:
-                            self._pending_future_steps[op_type].append(step)
+                            self._pending_future_steps[op_name].append(step)
                         logger.debug(
-                            f"[spmd_id={self.spmd_id}] Future task held: op={op_type.name}, "
+                            f"[spmd_id={self.spmd_id}] Future task held: op={op_name}, "
                             f"task_step={step}, exec_step={exec_step}"
                         )
                         continue
 
-                # Execute (for eager mode, execute any task that comes)
-                await self._execute_operator(op_type, step)
+                # Execute (for periodic mode, execute any task that comes)
+                await self._execute_operator(op_name, step)
 
                 # Advance execution step counter
-                await self._advance_step(op_type)
+                await self._advance_step(op_name)
 
             except asyncio.CancelledError:
                 logger.info(
@@ -814,7 +767,7 @@ class SPMDWorker:
         """
         Send a batch of data to downstream SPMD workers.
 
-        For eager mode (reader's downstream), there should be exactly one tensor arg.
+        For periodic mode (reader's downstream), there should be exactly one tensor arg.
         The batch is already converted to the target type by datasource.
 
         Args:
@@ -852,10 +805,9 @@ class SPMDWorker:
             handler = handlers[target_rank]
 
             try:
-                # Send as forward op data
-                # data_to_send is already converted to the target type by datasource
+                # Send as forward op data (reader always targets the downstream's "forward" op)
                 handler.receive_shards.remote(
-                    OpType.FORWARD,
+                    "forward",
                     tensor_name,
                     step,
                     self.rank,
@@ -873,7 +825,7 @@ class SPMDWorker:
         """Stop the execution loop gracefully."""
         self._running = False
         # Put a sentinel to unblock the queue
-        await self._execution_queue.put((999, 0, OpType.FORWARD))
+        await self._execution_queue.put((999, 0, "forward"))
 
         # Cancel tasks
         if self._run_task and not self._run_task.done():
@@ -883,13 +835,13 @@ class SPMDWorker:
 
         logger.info(f"[spmd_id={self.spmd_id}] Worker {self.rank} stopping")
 
-    async def _check_all_empty(self, op_type: OpType, step: int) -> bool:
+    async def _check_all_empty(self, op_name: str, step: int) -> bool:
         """Check if all received shards for a step are empty packets."""
-        expected_tensor_names = self._op_manager.get_expected_tensor_names(op_type)
+        expected_tensor_names = self._op_manager.get_expected_tensor_names(op_name)
         if not expected_tensor_names:
             return False
 
-        all_tensor_shards = await self._mailbox.get_all_tensor_shards(op_type, step)
+        all_tensor_shards = await self._mailbox.get_all_tensor_shards(op_name, step)
 
         for tensor_name in expected_tensor_names:
             if tensor_name not in all_tensor_shards:
@@ -904,24 +856,24 @@ class SPMDWorker:
                     return False
         return True
 
-    async def _propagate_empty_packets(self, op_type: OpType, step: int) -> None:
+    async def _propagate_empty_packets(self, op_name: str, step: int) -> None:
         """Forward empty packets to successor SPMDs."""
         if self._op_manager is None:
             return
 
-        output_sharding = self._op_manager.get_output_sharding(op_type)
-        successor_ids = self._op_manager.get_successor_ids(op_type)
+        output_sharding = self._op_manager.get_output_sharding(op_name)
+        successor_ids = self._op_manager.get_successor_ids(op_name)
         if not successor_ids:
             return
 
-        is_eager = self._op_manager.is_eager_trigger(op_type)
-        current_step = self._current_steps[op_type]
+        is_periodic = self._op_manager.is_periodic_trigger(op_name)
+        current_step = self._current_steps[op_name]
         output_step = self.compute_output_step(
-            is_eager=is_eager, current_step=current_step, input_step=step
+            is_periodic=is_periodic, current_step=current_step, input_step=step
         )
 
         for spmd_id in successor_ids:
-            succ_info = self._op_manager.get_successor_info(op_type, spmd_id)
+            succ_info = self._op_manager.get_successor_info(op_name, spmd_id)
             if succ_info is None:
                 continue
 
@@ -953,69 +905,69 @@ class SPMDWorker:
                                 empty_tensor.global_indices is not None,
                             )
 
-    async def _execute_operator(self, op_type: OpType, step: int) -> None:
+    async def _execute_operator(self, op_name: str, step: int) -> None:
         """Execute an operator: assemble data, execute, send outputs."""
         try:
             # --- Early check: all received shards are empty packets ---
-            all_empty = await self._check_all_empty(op_type, step)
+            all_empty = await self._check_all_empty(op_name, step)
             if all_empty:
                 logger.debug(
                     f"[spmd_id={self.spmd_id} rank={self.rank}] All received shards are empty for "
-                    f"op={op_type.name}, step={step}. Propagating per sparse routing rules."
+                    f"op={op_name}, step={step}. Propagating per sparse routing rules."
                 )
-                await self._propagate_empty_packets(op_type, step)
-                await self._mailbox.clear_step(op_type, step)
+                await self._propagate_empty_packets(op_name, step)
+                await self._mailbox.clear_step(op_name, step)
                 return
 
             # Assemble input data
-            input_data = await self._assemble_input(op_type, step)
+            input_data = await self._assemble_input(op_name, step)
 
             # Execute operator
             logger.debug(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] Executing: op={op_type.name}, step={step}"
+                f"[spmd_id={self.spmd_id} rank={self.rank}] Executing: op={op_name}, step={step}"
             )
-            result = self._op_manager.execute(op_type, input_data)
+            result = self._op_manager.execute(op_name, input_data)
 
             if result is None:
                 logger.warning(
-                    f"[spmd_id={self.spmd_id} rank={self.rank}] Operator {op_type.name} returned None, skipping output send"
+                    f"[spmd_id={self.spmd_id} rank={self.rank}] Operator {op_name} returned None, skipping output send"
                 )
                 return
 
             # Determine output step
-            is_eager = (
-                self._op_manager.is_eager_trigger(op_type)
+            is_periodic = (
+                self._op_manager.is_periodic_trigger(op_name)
                 if self._op_manager
                 else False
             )
-            current_step = self._current_steps[op_type]
+            current_step = self._current_steps[op_name]
             output_step = self.compute_output_step(
-                is_eager=is_eager, current_step=current_step, input_step=step
+                is_periodic=is_periodic, current_step=current_step, input_step=step
             )
-            if is_eager:
+            if is_periodic:
                 logger.debug(
-                    f"[spmd_id={self.spmd_id}] eager_trigger=True: input_step={step}, current_step={current_step}, "
+                    f"[spmd_id={self.spmd_id}] periodic_trigger=True: input_step={step}, current_step={current_step}, "
                     f"output_step={output_step}, rank={self.rank}, total_rank={self._total_rank}, "
                     f"enable_output_step_remap={getattr(self.config, 'enable_output_step_remap', False)}"
                 )
 
             # Send output
             logger.debug(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] About to send output: op={op_type.name}, "
+                f"[spmd_id={self.spmd_id} rank={self.rank}] About to send output: op={op_name}, "
                 f"output_step={output_step}, result_type={type(result).__name__}"
             )
-            await self._send_output(op_type, output_step, result, exec_step=step)
+            await self._send_output(op_name, output_step, result, exec_step=step)
 
             # Clear mailbox
-            await self._mailbox.clear_step(op_type, step)
+            await self._mailbox.clear_step(op_name, step)
 
         except Exception as e:
             logger.error(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] Operator {op_type.name} execution failed: {e}"
+                f"[spmd_id={self.spmd_id} rank={self.rank}] Operator {op_name} execution failed: {e}"
             )
             raise
 
-    async def _assemble_input(self, op_type: OpType, step: int) -> Any:
+    async def _assemble_input(self, op_name: str, step: int) -> Any:
         """
         Assemble input data from mailbox and construct data_type object.
 
@@ -1027,7 +979,7 @@ class SPMDWorker:
         5. Construct the final data_type object expected by the operator
 
         Args:
-            op_type: Operator type
+            op_name: Operator name
             step: Execution step
 
         Returns:
@@ -1037,8 +989,8 @@ class SPMDWorker:
         static_args = self._op_manager.get_static_args()
 
         # Task 2: Get state arguments
-        expected_state_names = self._op_manager.get_expected_state_names(op_type)
-        all_states = await self._mailbox.get_all_states(op_type, step)
+        expected_state_names = self._op_manager.get_expected_state_names(op_name)
+        all_states = await self._mailbox.get_all_states(op_name, step)
         state_args = {
             name: all_states[name]
             for name in expected_state_names
@@ -1046,51 +998,46 @@ class SPMDWorker:
         }
 
         # Task 3 & 4: Assemble tensor arguments and meta
-        expected_tensor_names = self._op_manager.get_expected_tensor_names(op_type)
-        all_tensor_shards = await self._mailbox.get_all_tensor_shards(op_type, step)
+        expected_tensor_names = self._op_manager.get_expected_tensor_names(op_name)
+        all_tensor_shards = await self._mailbox.get_all_tensor_shards(op_name, step)
 
-        # Check if eager_trigger mode
-        is_eager = self._op_manager.is_eager_trigger(op_type)
+        # Check if periodic_trigger mode
+        is_periodic = self._op_manager.is_periodic_trigger(op_name)
 
         tensor_args = {}
         for tensor_name in expected_tensor_names:
             if tensor_name not in all_tensor_shards:
                 raise ValueError(
-                    f"Missing tensor '{tensor_name}' for operator {op_type.name} at step {step}"
+                    f"Missing tensor '{tensor_name}' for operator {op_name} at step {step}"
                 )
 
             shards = all_tensor_shards[tensor_name]
 
-            if is_eager:
-                # Eager mode: use first shard directly, no assembly needed
+            if is_periodic:
+                # Periodic mode: use first shard directly, no assembly needed
                 first_rank = next(iter(shards.keys()))
                 tensor_args[tensor_name] = shards[first_rank]
             else:
                 # Normal mode: assemble tensor based on sharding
                 assembled_tensor = await self._assemble_tensor(
-                    op_type, tensor_name, shards
+                    op_name, tensor_name, shards
                 )
                 tensor_args[tensor_name] = assembled_tensor
 
         # Cache assembled tensors (they carry their own indices/meta)
-        self._last_assembled_tensors[op_type] = tensor_args
-        # Store per-step history for backward reverse routing
-        self._tensor_history[op_type][step] = tensor_args
-
-        # Free tensor history that is no longer needed (based on config)
-        # TODO: Implement granular history management
+        self._last_assembled_tensors[op_name] = tensor_args
 
         for tn, tensor in tensor_args.items():
             logger.debug(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] _assemble_input cached tensor: op={op_type.name}, step={step}, "
+                f"[spmd_id={self.spmd_id} rank={self.rank}] _assemble_input cached tensor: op={op_name}, step={step}, "
                 f"tensor={tn}, has_indices={tensor.global_indices is not None}"
             )
 
         # Task 5: Construct final data_type object
-        input_type = self._op_manager.get_operator_input_type(op_type)
+        input_type = self._op_manager.get_operator_input_type(op_name)
         if input_type is None:
             raise ValueError(
-                f"Cannot determine input type for operator {op_type.name}. "
+                f"Cannot determine input type for operator {op_name}. "
                 f"Make sure the operator function has type annotations."
             )
 
@@ -1124,10 +1071,10 @@ class SPMDWorker:
         return input_obj
 
     async def _assemble_tensor(
-        self, op_type: OpType, tensor_name: str, shards: Dict[int, TransportTensor]
+        self, op_name: str, tensor_name: str, shards: Dict[int, TransportTensor]
     ) -> TransportTensor:
         """Assemble tensor shards into a complete TransportTensor."""
-        input_sharding = self._op_manager.get_input_sharding(op_type)
+        input_sharding = self._op_manager.get_input_sharding(op_name)
         input_spec = input_sharding.get(tensor_name)
 
         if input_spec is None:
@@ -1136,7 +1083,7 @@ class SPMDWorker:
 
         if not input_spec.is_content_addressable:
             # Check for dynamic predecessors
-            predecessor_topology = self._op_manager.get_predecessor_topology(op_type)
+            predecessor_topology = self._op_manager.get_predecessor_topology(op_name)
             has_dynamic_predecessor = any(
                 p.tensor_sharding.get(tensor_name).is_content_addressable
                 if p.tensor_sharding.get(tensor_name)
@@ -1150,14 +1097,14 @@ class SPMDWorker:
                 )
             else:
                 return await self._assemble_static_to_static_tensor(
-                    op_type, tensor_name, shards, input_spec, predecessor_topology
+                    op_name, tensor_name, shards, input_spec, predecessor_topology
                 )
         else:
             return self._assemble_to_dynamic_tensor(tensor_name, shards)
 
     async def _assemble_static_to_static_tensor(
         self,
-        op_type: OpType,
+        op_name: str,
         tensor_name: str,
         shards: Dict[int, TransportTensor],
         input_spec: ShardingSpec,
@@ -1168,7 +1115,7 @@ class SPMDWorker:
         shard_list = []
         for pre_spmd_id, pre_info in predecessor_topology.items():
             strategy = self._op_manager.get_input_routing_strategy(
-                op_type, pre_spmd_id, tensor_name
+                op_name, pre_spmd_id, tensor_name
             )
             if strategy:
                 for rank in strategy.dependent_ranks:
@@ -1257,7 +1204,7 @@ class SPMDWorker:
                 assembled_data, local_indices, local_values
             )
         except AttributeError:
-            # Fallback to numpy if backend lacks index_update (eager/fallback)
+            # Fallback to numpy if backend lacks index_update (periodic/fallback)
             arr = backend.to_numpy(assembled_data)
             arr[backend.to_numpy(local_indices)] = backend.to_numpy(local_values)
             assembled_data = backend.tensor(arr)
@@ -1288,46 +1235,46 @@ class SPMDWorker:
 
         return TransportTensor(merged_values, indices=merged_indices)
 
-    async def _advance_step(self, op_type: OpType) -> None:
+    async def _advance_step(self, op_name: str) -> None:
         """Advance execution step counter for an operator."""
-        self._current_steps[op_type] += 1
-        new_step = self._current_steps[op_type]
+        self._current_steps[op_name] += 1
+        new_step = self._current_steps[op_name]
 
         # Report op completion to driver
-        self._report_op_completed(op_type, new_step)
+        self._report_op_completed(op_name, new_step)
 
-        # Check if this op is in eager_trigger mode
-        is_eager = (
-            self._op_manager.is_eager_trigger(op_type) if self._op_manager else False
+        # Check if this op is in periodic_trigger mode
+        is_periodic = (
+            self._op_manager.is_periodic_trigger(op_name) if self._op_manager else False
         )
 
-        if not is_eager:
+        if not is_periodic:
             # Normal mode: re-enqueue pending future tasks that match the new step
             async with self._pending_lock:
-                pending = self._pending_future_steps[op_type]
+                pending = self._pending_future_steps[op_name]
                 to_enqueue = [s for s in pending if s == new_step]
-                self._pending_future_steps[op_type] = [
+                self._pending_future_steps[op_name] = [
                     s for s in pending if s != new_step
                 ]
 
             for s in to_enqueue:
-                await self._enqueue(op_type, s)
+                await self._enqueue(op_name, s)
 
             # Also check if we have pending data for the new execution step
-            await self._check_and_enqueue(op_type, new_step)
+            await self._check_and_enqueue(op_name, new_step)
 
-    def _report_op_completed(self, op_type: OpType, step: int) -> None:
+    def _report_op_completed(self, op_name: str, step: int) -> None:
         """
         Report op completion to driver.
 
         Args:
-            op_type: Operation type
+            op_name: Operation name
             step: Completed step number
         """
         if self._driver_handle is not None:
             try:
                 self._driver_handle.report_worker_op_completed.remote(
-                    self.rank, op_type, step
+                    self.rank, op_name, step
                 )
             except Exception as e:
                 logger.error(
@@ -1338,38 +1285,74 @@ class SPMDWorker:
     # Data Sending
     # =========================================================================
 
+    def _should_propagate_indices(
+        self, op_name: str, spmd_id: str, tensor_name: str
+    ) -> bool:
+        """
+        Determines whether global indices need to be propagated to the target SPMD.
+
+        If the target relies on content-addressable routing (e.g., Hash, Dynamic)
+        or explicit sparse point-to-point routing, it needs the indices.
+        If it uses simple Dense Chunk routing, it does not.
+        """
+        succ_info = self._op_manager.get_successor_info(op_name, spmd_id)
+        if succ_info is None or succ_info.tensor_sharding is None:
+            return False
+
+        target_spec = succ_info.tensor_sharding.get(tensor_name)
+        if target_spec is None:
+            return False
+
+        # ShardingSpecs like HASH and DYNAMIC require explicit indices
+        partition_type_name = getattr(
+            getattr(target_spec, "partition_type", None), "name", ""
+        )
+        if partition_type_name in ("HASH", "DYNAMIC"):
+            return True
+
+        return False
+
     async def _send_output(
-        self,
-        op_type: OpType,
-        step: int,
-        result: Any,
-        *,
-        exec_step: Optional[int] = None,
+        self, op_name: str, step: int, result: Any, *, exec_step: Optional[int] = None
     ) -> None:
         """Send output to successor SPMDs using TransportTensor."""
         if exec_step is None:
             exec_step = step
 
-        output_sharding = self._op_manager.get_output_sharding(op_type)
+        output_sharding = self._op_manager.get_output_sharding(op_name)
         tensors_to_send = self._extract_tensors(result, output_sharding)
-        successor_ids = self._op_manager.get_successor_ids(op_type)
-        input_tensors = self._last_assembled_tensors.get(op_type, {})
+        successor_ids = self._op_manager.get_successor_ids(op_name)
+        input_tensors = self._last_assembled_tensors.get(op_name, {})
 
         for spmd_id in successor_ids:
-            succ_info = self._op_manager.get_successor_info(op_type, spmd_id)
+            succ_info = self._op_manager.get_successor_info(op_name, spmd_id)
             if succ_info is None:
                 continue
 
             target_op = succ_info.target_op
 
             for tensor_name, tensor_data in tensors_to_send.items():
-                # Wrap in TransportTensor
-                # Try to propagate indices from input if it's a pass-through
-                input_tensor = input_tensors.get(tensor_name)
-                indices = (
-                    input_tensor.global_indices if input_tensor is not None else None
+                # 1. Check if we need to propagate indices to this specific target
+                propagate_indices = self._should_propagate_indices(
+                    op_name, spmd_id, tensor_name
                 )
 
+                # 2. Extract indices if pass-through is possible
+                input_tensor = input_tensors.get(tensor_name)
+                indices = None
+
+                if input_tensor is not None:
+                    if propagate_indices:
+                        indices = input_tensor.global_indices
+                    else:
+                        # Optimization: zero-cost descriptor instead of full tensor
+                        indices = (
+                            input_tensor.index_descriptor
+                            if input_tensor.index_descriptor is not None
+                            else input_tensor.global_indices
+                        )
+
+                # Wrap in TransportTensor
                 transport_tensor = TransportTensor.from_tensor(
                     tensor_data, indices=indices
                 )
@@ -1389,7 +1372,26 @@ class SPMDWorker:
                 distributor = AsyncDataDistributor(self.rank)
 
                 source_spec = output_sharding.get(tensor_name)
+                if source_spec is None:
+                    # Default: replicated on self mesh
+                    source_mesh = self._mesh
+                    if source_mesh is None:
+                        source_mesh = DeviceMesh(
+                            device_shape=(1,), axis_names=("data",)
+                        )
+                    source_spec = ShardingSpec.chunk(source_mesh, PartitionSpec())
+
                 target_spec = succ_info.tensor_sharding.get(tensor_name)
+                if target_spec is None:
+                    # Default: replicated on target mesh (or self mesh if target mesh unknown)
+                    target_mesh = (
+                        succ_info.mesh if succ_info.mesh is not None else self._mesh
+                    )
+                    if target_mesh is None:
+                        target_mesh = DeviceMesh(
+                            device_shape=(1,), axis_names=("data",)
+                        )
+                    target_spec = ShardingSpec.chunk(target_mesh, PartitionSpec())
 
                 async def _send_fn(
                     target_rank: int,
@@ -1444,12 +1446,12 @@ class SPMDWorker:
 
         # --- Send state_argument via control plane ---
         # State arguments are sent through: rank0-worker -> driver -> controller -> target-driver -> all-workers
-        output_state_names = self._op_manager.get_output_state_names(op_type)
+        output_state_names = self._op_manager.get_output_state_names(op_name)
         if output_state_names:
             state_data = self._extract_states(result, output_state_names)
 
             for spmd_id in successor_ids:
-                succ_info = self._op_manager.get_successor_info(op_type, spmd_id)
+                succ_info = self._op_manager.get_successor_info(op_name, spmd_id)
                 if succ_info is None:
                     continue
 
@@ -1517,33 +1519,16 @@ class SPMDWorker:
         return tensors
 
     # =========================================================================
-    # Step Management
-    # =========================================================================
-
-    def clear_tensor_history(
-        self, op_type: OpType, up_to_step: Optional[int] = None
-    ) -> None:
-        """Free tensor history that is no longer needed."""
-        if up_to_step is None:
-            self._tensor_history[op_type].clear()
-        else:
-            steps_to_remove = [
-                s for s in self._tensor_history[op_type] if s <= up_to_step
-            ]
-            for s in steps_to_remove:
-                del self._tensor_history[op_type][s]
-
-    # =========================================================================
     # Backward Reverse Routing (using forward shard origins)
     # =========================================================================
 
     async def _self_receive_tensor(
-        self, target_op: OpType, name: str, step: int, tensor: TransportTensor
+        self, target_op: str, name: str, step: int, tensor: TransportTensor
     ) -> None:
         """Self-loop data passing - directly call data receive interface."""
         logger.debug(
             f"[spmd_id={self.spmd_id} rank={self.rank}] Self-loop data passing: {name} step={step} "
-            f"-> {target_op.name}"
+            f"-> {target_op}"
         )
         await self.receive_shards(
             target_op,
@@ -1557,7 +1542,7 @@ class SPMDWorker:
         )
 
     async def _self_receive_state(
-        self, target_op: OpType, name: str, step: int, data: Any
+        self, target_op: str, name: str, step: int, data: Any
     ) -> None:
         """
         Self-loop state passing - directly call data receive interface.
@@ -1568,7 +1553,7 @@ class SPMDWorker:
         """
         # Directly call receive_states to trigger target op's data readiness check
         await self.receive_states(
-            op_type=target_op, step=step, names=[name], values=[data]
+            op_name=target_op, step=step, names=[name], values=[data]
         )
 
     def _extract_states(self, data: Any, state_names: List[str]) -> Dict[str, Any]:
@@ -1629,7 +1614,7 @@ class SPMDWorker:
     def send_state_argument(
         self,
         target_spmd_id: str,
-        target_op: OpType,
+        target_op: str,
         state_name: str,
         step: int,
         state_value: Any,
@@ -1665,7 +1650,7 @@ class SPMDWorker:
             )
             logger.debug(
                 f"[spmd_id={self.spmd_id}] Worker {self.rank} sent state_argument '{state_name}' "
-                f"to SPMD {target_spmd_id}, target_op={target_op.name}, step={step}"
+                f"to SPMD {target_spmd_id}, target_op={target_op}, step={step}"
             )
         except Exception as e:
             logger.error(
@@ -1720,7 +1705,7 @@ class SPMDWorker:
         # Determine status
         if self._last_error:
             status = WorkerStatus.ERROR
-        elif not self._op_runnable[OpType.FORWARD].is_set():
+        elif any(not event.is_set() for event in self._op_runnable.values()):
             status = WorkerStatus.BLOCKED
         elif self._running:
             status = WorkerStatus.RUNNING
@@ -1733,7 +1718,7 @@ class SPMDWorker:
         heartbeat = WorkerHeartbeat(
             rank=self.rank,
             timestamp=time.time(),
-            op_steps={op.name: step for op, step in self._current_steps.items()},
+            op_steps=dict(self._current_steps),
             status=status,
             error_message=self._last_error,
             telemetry=self._collect_telemetry(),
@@ -1786,8 +1771,8 @@ class SPMDWorker:
     def set_state(self, state: Dict[str, Any]) -> None:
         """Restore worker state from checkpoint."""
         if "current_steps" in state:
-            for op_type, step in state["current_steps"].items():
-                self._current_steps[op_type] = step
+            for op_name, step in state["current_steps"].items():
+                self._current_steps[op_name] = step
         if "static_args" in state:
             for name, value in state["static_args"].items():
                 self._op_manager.set_static_arg(name, value)
@@ -1796,9 +1781,9 @@ class SPMDWorker:
     # Utility
     # =========================================================================
 
-    def get_current_step(self, op_type: OpType) -> int:
-        """Get current step for an operator type."""
-        return self._current_steps[op_type]
+    def get_current_step(self, op_name: str) -> int:
+        """Get current step for an operator name."""
+        return self._current_steps[op_name]
 
     def get_rank(self) -> int:
         """Get this worker's rank."""

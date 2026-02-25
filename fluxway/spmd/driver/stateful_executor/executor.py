@@ -101,32 +101,26 @@ class StatefulExecutor:
         """
         pass
 
-    def execute_forward(self, step: int) -> Any:
+    def execute_op(self, op_name: str, step: int) -> Any:
         """
-        Execute forward pass on all workers.
+        Trigger execution of an operator on all workers.
 
-        TODO: Coordinate forward execution
-        TODO: Handle data distribution
-        """
-        pass
+        This is the generic execution trigger. Instead of hardcoded
+        execute_forward / execute_backward, users call execute_op("rollout", step),
+        execute_op("compute_reward", step), etc.
 
-    def execute_backward(self, step: int) -> Any:
-        """
-        Execute backward pass on all workers.
+        The actual execution is driven by the Worker's mailbox:
+        workers begin processing when all expected shards for that (op_name, step)
+        have arrived via receive_shards / receive_states.
 
-        TODO: Coordinate backward execution
-        TODO: Handle gradient aggregation
-        """
-        pass
-
-    def execute_parameter_update(self) -> Dict[str, Any]:
-        """
-        Execute parameter update on all workers.
+        Args:
+            op_name: Name of the operator to execute (e.g., "forward", "rollout")
+            step: Execution step number
 
         Returns:
-            Update metrics
+            List of results from workers (currently placeholder)
 
-        TODO: Call apply_updates on all workers
-        TODO: Collect update metrics
+        TODO: Coordinate operator execution across workers
+        TODO: Support result aggregation
         """
-        pass
+        return self.execute_on_all_workers(op_name, step)

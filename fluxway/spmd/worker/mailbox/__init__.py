@@ -1,5 +1,5 @@
 """Mailbox module for dual-stream data caching."""
 
-from .mailbox import WorkerMailbox, OpType
+from .mailbox import WorkerMailbox
 
-__all__ = [OpType, WorkerMailbox]
+__all__ = [WorkerMailbox]

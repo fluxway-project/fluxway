@@ -4,30 +4,16 @@ Core data type definitions for Fluxway framework.
 Based on ARCHITECTURE.md sections 2.1.1, 3.2.1, 4.2, 4.3
 """
 
-from enum import IntEnum
 from typing import Callable, Dict, List, Optional, Any, Type
 
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 
 
-# =============================================================================
-# Graph Related Types (Section 2.1.1)
-# =============================================================================
-
 from enum import Enum
+from typing import Union
 
 
-class OpType(IntEnum):
-    """Operator type for execution phases.
-
-    name - op type
-    value - priority for execution order (lower value -> higher priority)
-    """
-
-    # TODO(Chiave): Support user-defined name and priority for each op_type
-    FORWARD = 0
-    BACKWARD = 1
-    UPDATE = 2
+# Removed OpType (replaced by strings for generic workflow support)
 
 
 class NodeType(str, Enum):
@@ -81,21 +67,20 @@ class SPMDConfig(BaseModel):
     worker_count: int = 1
     # Mesh is now stored as DeviceMesh directly
     mesh: Optional[Any] = None  # DeviceMesh (use Any to avoid circular import)
-    user_forward_fn: Optional[Callable] = None
-    user_backward_fn: Optional[Callable] = None
-    user_update_fn: Optional[Callable] = None  # User-defined parameter update function
+
+    # Generic operator registration
+    operators: Dict[str, Callable] = Field(default_factory=dict)
     # Explicit OperatorMeta storage - ensures metadata survives Ray serialization
     # (function attributes are lost when pickled by reference across processes)
-    forward_meta: Optional["OperatorMeta"] = None
-    backward_meta: Optional["OperatorMeta"] = None
-    update_meta: Optional["OperatorMeta"] = None
+    operator_metas: Dict[str, "OperatorMeta"] = Field(default_factory=dict)
+
     max_async_steps: int = 1  # Maximum async steps between workers in the same SPMD
     params_update_steps: int = 1  # Sync barrier every N steps for parameter updates
-    # Whether to remap output step numbers.
+    # remap to be unique.
     # - Default False: output step should be consistent with the input/execution step.
     # - If True:
-    #   - eager_trigger operators: output_step = total_rank * _current_step + local_rank
-    #   - non-eager operators: output_step = _current_step
+    #   - periodic operators: output_step = total_rank * _current_step + local_rank
+    #   - standard operators: output_step = _current_step
     enable_output_step_remap: bool = False
 
     @model_validator(mode="after")
@@ -190,8 +175,8 @@ class Edge(BaseModel):
 
     source_node: str
     target_node: str
-    source_op: OpType = OpType.FORWARD  # Source node's op type
-    target_op: OpType = OpType.FORWARD  # Target node's op type
+    source_op: str = "forward"  # Source node's op name
+    target_op: str = "forward"  # Target node's op name
     condition_fn: Optional[Callable[..., bool]] = None
 
 
@@ -231,10 +216,39 @@ class EdgeShardingInfo(BaseModel):
 
     # Tensor sharding for this edge: {tensor_name: raw dict or ShardingSpec}
     tensor_sharding: Dict[str, Any] = Field(default_factory=dict)
-    # Target node's op type (for cross-op-type edges like forward->backward)
-    target_op: OpType = OpType.FORWARD
+    # Target node's op name
+    target_op: str = "forward"
     # Condition function for conditional edges
     condition_fn: Optional[Callable[..., bool]] = None
+
+
+class BarrierType(str, Enum):
+    """Execution barrier types for operators."""
+
+    STANDARD = "standard"  # Wait for all expected shards/states (default)
+    PERIODIC = "periodic"  # Fire every 'n' arrivals; used for streaming
+
+
+class BarrierConfig(BaseModel):
+    """Base configuration for operator execution barriers."""
+
+    type: BarrierType = BarrierType.STANDARD
+
+
+class StandardBarrierConfig(BarrierConfig):
+    """Standard barrier: fires when all expected data for a step arrives."""
+
+    type: BarrierType = BarrierType.STANDARD
+
+
+class PeriodicBarrierConfig(BarrierConfig):
+    """
+    Periodic barrier: fires every 'n' arrivals regardless of global step boundaries.
+    Commonly used for streaming or 'eager-like' processing where n=1.
+    """
+
+    type: BarrierType = BarrierType.PERIODIC
+    n: int = 1
 
 
 class OperatorMeta(BaseModel):
@@ -243,6 +257,7 @@ class OperatorMeta(BaseModel):
     model_config = {"arbitrary_types_allowed": True}
 
     name: str
+    priority: int = 0  # Priority for execution order (lower value -> higher priority)
     # Keys use ArgumentType.value (i.e. "state" | "tensor" | "static") to avoid enum
     # serialization / circular import surprises across control-plane and worker.
     input_arguments: Optional[Dict[str, List[str]]]
@@ -262,9 +277,10 @@ class OperatorMeta(BaseModel):
         default_factory=dict
     )
 
-    # Eager trigger mode: when True, the operator triggers as soon as any data arrives
-    # (expected tensor shards = 1 for all tensors, ignoring sharding topology)
-    eager_trigger: bool = False
+    # Execution barrier configuration
+    barrier_config: Union[StandardBarrierConfig, PeriodicBarrierConfig] = Field(
+        default_factory=StandardBarrierConfig
+    )
 
     def get_arguments(self, is_output: bool, arg_type: "ArgumentType") -> List[str]:
         """
@@ -523,7 +539,7 @@ class RPCPayload(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    op_type: OpType
+    op_name: str
     name: str
     step: int
     sender_rank: int
@@ -670,8 +686,7 @@ class HeartbeatConfig(BaseModel):
 class AsyncStepConfig(BaseModel):
     """Configuration for async step difference control."""
 
-    max_forward_step_diff: int = 2  # Maximum forward step difference
-    max_backward_step_diff: int = 2  # Maximum backward step difference
+    max_step_diff: int = 2  # Maximum generic step difference
     min_lock_duration: float = (
         1.0  # Minimum lock duration (prevent frequent lock/unlock)
     )
@@ -711,15 +726,13 @@ class SPMDOpStep(BaseModel):
     """SPMD operation step tracking."""
 
     spmd_id: str
-    forward_step: int = 0
-    backward_step: int = 0
-    update_step: int = 0
+    op_steps: Dict[str, int] = Field(default_factory=dict)  # op_name -> step
 
 
 class OpLockState(BaseModel):
     """Operation lock state."""
 
     spmd_id: str
-    op_type: str  # OpType name
+    op_name: str  # Operator name
     locked_at: float
     reason: str

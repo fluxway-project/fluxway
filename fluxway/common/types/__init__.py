@@ -3,7 +3,6 @@
 from .configs import (
     # SPMD Configuration
     SPMDConfig,
-    OpType,
     # Graph Builder Types
     Edge,
     Node,
@@ -75,7 +74,6 @@ from .tensor import TransportTensor
 __all__ = [
     # SPMD Configuration
     "SPMDConfig",
-    "OpType",
     # Graph Builder Types
     "Edge",
     "Node",

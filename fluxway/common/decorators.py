@@ -16,7 +16,7 @@ def operator(
     state_argument: Optional[List[str]] = None,
     tensor_argument: Optional[List[str]] = None,
     static_argument: Optional[List[str]] = None,
-    eager_trigger: bool = False,
+    periodic_barrier: Optional[int] = None,
 ):
     """
     Decorator to mark a function as a Fluxway operator and attach metadata.
@@ -34,22 +34,23 @@ def operator(
         state_argument: List of argument names to treat as state (control flow)
         tensor_argument: List of argument names to treat as tensor (data flow)
         static_argument: List of argument names to treat as static args
-        eager_trigger: If True, the operator triggers as soon as any data arrives
-            (expected tensor shards = 1 for all tensors, ignoring sharding topology).
-            Useful for operators that should process data immediately without waiting
-            for all expected shards.
+        periodic_barrier: If set, use a periodic barrier that fires every N arrivals.
+            Useful for streaming or processing data as it arrives without
+            waiting for all expected shards of a global step.
 
     Note:
         Raw sharding specs are validated and stored as basic dicts.
         They are dynamically resolved by the AsyncDataDistributor when
         routing tensors between SPMD pipeline stages.
     """
-    from fluxway.common.types.configs import ArgumentType
+    from fluxway.common.types.configs import (
+        ArgumentType,
+        OperatorMeta,
+        StandardBarrierConfig,
+        PeriodicBarrierConfig,
+    )
 
     def decorator(func):
-        # Import here to avoid circular imports at module import time
-        from fluxway.common.types import OperatorMeta
-
         # 1. Validate arguments
         # 1.1. Validate state_argument, tensor_argument, and static_argument are mutually exclusive (no overlap)
         state_args = set(state_argument or [])
@@ -73,14 +74,14 @@ def operator(
                 f"In operator '{func.__qualname__}', tensor_argument ({tensor_args}) and input_sharding keys ({input_sharding_keys}) must match exactly"
             )
 
-        # 1.3. Validate eager_trigger constraint: state_arg + tensor_arg must have exactly one element
-        if eager_trigger:
+        # 1.3. Validate periodic_barrier constraint: state_arg + tensor_arg must have exactly one element if periodic
+        if periodic_barrier is not None:
             total_transferable_args = len(state_args) + len(tensor_args)
             if total_transferable_args != 1:
                 raise ValueError(
-                    f"Operator '{func.__qualname__}' has eager_trigger=True, but state_argument + tensor_argument "
+                    f"Operator '{func.__qualname__}' has periodic_barrier={periodic_barrier}, but state_argument + tensor_argument "
                     f"count is {total_transferable_args} (state={len(state_args)}, tensor={len(tensor_args)}). "
-                    f"eager_trigger operators must have exactly one transferable argument."
+                    f"Periodic operators must have exactly one transferable argument."
                 )
 
         # 2. Validate that both input and output are of fluxway_data type
@@ -258,6 +259,12 @@ def operator(
         if output_sharding:
             output_args = {ArgumentType.TENSOR.value: list(output_sharding.keys())}
 
+        # 2. Build metadata
+        if periodic_barrier is not None:
+            barrier_config = PeriodicBarrierConfig(n=periodic_barrier)
+        else:
+            barrier_config = StandardBarrierConfig()
+
         meta = OperatorMeta(
             name=name,
             input_sharding=input_sharding_processed,
@@ -268,7 +275,7 @@ def operator(
                 ArgumentType.STATIC.value: static_argument or [],
             },
             output_arguments=output_args,
-            eager_trigger=eager_trigger,
+            barrier_config=barrier_config,
         )
 
         # Attach metadata to the underlying function
@@ -444,11 +451,8 @@ def spmd(
     Returns:
         Decorated class with SPMD configuration
     """
-    from fluxway.common.types import (
-        ResourceSpec,
-        SPMDConfig,
-        DeviceMesh,
-    )  # Internal import
+    from fluxway.common.types import ResourceSpec, SPMDConfig  # Internal import
+    from fluxway.common.mesh import DeviceMesh
 
     T = TypeVar("T")
 
@@ -486,55 +490,51 @@ def spmd(
         )
         cls.is_fluxway_spmd = classmethod(lambda c: True)
 
-        def get_operator_meta(c, op_type):
-            """Get OperatorMeta for a given OpType (e.g. OpType.FORWARD)."""
+        def get_operator_meta(c, op_name: str):
+            """Get OperatorMeta for a given op_name (e.g. 'forward')."""
             from fluxway.common.types import (
                 OperatorMeta,
             )  # runtime import to avoid circular refs
-            from fluxway.common.types.configs import OpType
 
-            if not isinstance(op_type, OpType):
-                raise TypeError(f"op_type must be OpType, got {type(op_type)}")
-            method_name = op_type.name.lower()
-            method = getattr(c, method_name, None)
-            if method is None:
-                return None
-            meta = getattr(method, "_flux_operator_meta", None)
-            if isinstance(meta, OperatorMeta):
-                return meta
+            if not isinstance(op_name, str):
+                raise TypeError(f"op_name must be a string, got {type(op_name)}")
+
+            # Find the method that has an OperatorMeta with the matching name
+            for attr_name in dir(c):
+                # Skip private attributes
+                if attr_name.startswith("__"):
+                    continue
+                method = getattr(c, attr_name, None)
+                if method is not None:
+                    meta = getattr(method, "_flux_operator_meta", None)
+                    if isinstance(meta, OperatorMeta) and meta.name == op_name:
+                        return meta
             return None
 
         cls.get_operator_meta = classmethod(get_operator_meta)
 
-        def get_spmd_config(c) -> SPMDConfig:
-            from fluxway.common.types.configs import OpType
+        def get_spmd_config(c) -> "SPMDConfig":
+            from fluxway.common.types import SPMDConfig, OperatorMeta
 
-            forward_fn = getattr(c, OpType.FORWARD.name.lower(), None)
-            backward_fn = getattr(c, OpType.BACKWARD.name.lower(), None)
-            update_fn = getattr(c, OpType.UPDATE.name.lower(), None)
+            operators = {}
+            operator_metas = {}
 
-            # Extract OperatorMeta explicitly - ensures it survives Ray serialization
-            # (function attributes are lost when pickled by reference across processes)
-            forward_meta = (
-                getattr(forward_fn, "_flux_operator_meta", None) if forward_fn else None
-            )
-            backward_meta = (
-                getattr(backward_fn, "_flux_operator_meta", None)
-                if backward_fn
-                else None
-            )
-            update_meta = (
-                getattr(update_fn, "_flux_operator_meta", None) if update_fn else None
-            )
+            # Dynamically discover all operators
+            for attr_name in dir(c):
+                if attr_name.startswith("__"):
+                    continue
+                method = getattr(c, attr_name, None)
+                if method is not None:
+                    meta = getattr(method, "_flux_operator_meta", None)
+                    if isinstance(meta, OperatorMeta):
+                        op_name = meta.name
+                        operators[op_name] = method
+                        operator_metas[op_name] = meta
 
             return SPMDConfig(
                 mesh=c._mesh,
-                user_forward_fn=forward_fn,
-                user_backward_fn=backward_fn,
-                user_update_fn=update_fn,
-                forward_meta=forward_meta,
-                backward_meta=backward_meta,
-                update_meta=update_meta,
+                operators=operators,
+                operator_metas=operator_metas,
                 max_async_steps=c._max_async_steps,
                 params_update_steps=c._params_update_steps,
                 enable_output_step_remap=c._enable_output_step_remap,

@@ -31,7 +31,6 @@ from ...common.types import (
     DriverState,
     DriverStatus,
     HeartbeatConfig,
-    OpType,
     SPMDConfig,
     WorkerHeartbeat,
     NodeType,
@@ -512,21 +511,19 @@ if RAY_AVAILABLE:
         # =====================================================================
 
         def report_worker_op_completed(
-            self, rank: int, op_type: OpType, step: int
+            self, rank: int, op_name: str, step: int
         ) -> None:
             """
             Receive op completion report from a worker.
 
             Args:
                 rank: Worker rank
-                op_type: Operation type
+                op_name: Operation name
                 step: Completed step number
             """
-            self.worker_synchronizer.report_worker_op_completed(rank, op_type, step)
+            self.worker_synchronizer.report_worker_op_completed(rank, op_name, step)
 
-        def _on_spmd_op_completed(
-            self, spmd_id: str, op_type: OpType, step: int
-        ) -> None:
+        def _on_spmd_op_completed(self, spmd_id: str, op_name: str, step: int) -> None:
             """
             Callback when SPMD completes an op step.
 
@@ -535,7 +532,7 @@ if RAY_AVAILABLE:
             if self.controller_handle is not None:
                 try:
                     self.controller_handle.report_op_completed.remote(
-                        spmd_id, op_type, step
+                        spmd_id, op_name, step
                     )
                 except Exception as e:
                     logger.error(
@@ -546,13 +543,13 @@ if RAY_AVAILABLE:
         # Op Blocking
         # =====================================================================
 
-        def block_op(self, op_type: OpType) -> None:
+        def block_op(self, op_name: str) -> None:
             """Block an op for all workers (called by Controller)."""
-            self.worker_synchronizer.block_spmd_op(op_type)
+            self.worker_synchronizer.block_spmd_op(op_name)
 
-        def unblock_op(self, op_type: OpType) -> None:
+        def unblock_op(self, op_name: str) -> None:
             """Unblock an op for all workers (called by Controller)."""
-            self.worker_synchronizer.unblock_spmd_op(op_type)
+            self.worker_synchronizer.unblock_spmd_op(op_name)
 
         def block_all_ops(self) -> None:
             """Block all ops for all workers."""
@@ -564,23 +561,23 @@ if RAY_AVAILABLE:
             self.worker_synchronizer.unblock_all_ops()
             self.state_machine.trigger(DriverEvent.UNBLOCK_REQUESTED)
 
-        def _block_worker_op(self, rank: int, op_type: OpType) -> None:
+        def _block_worker_op(self, rank: int, op_name: str) -> None:
             """Block a specific worker's op."""
             worker = self._worker_handles.get(rank)
             if worker is not None:
                 try:
-                    worker.block_op.remote(op_type)
+                    worker.block_op.remote(op_name)
                 except Exception as e:
                     logger.error(
                         f"[spmd_id={self.spmd_id}] Failed to block worker {rank} op: {e}"
                     )
 
-        def _unblock_worker_op(self, rank: int, op_type: OpType) -> None:
+        def _unblock_worker_op(self, rank: int, op_name: str) -> None:
             """Unblock a specific worker's op."""
             worker = self._worker_handles.get(rank)
             if worker is not None:
                 try:
-                    worker.unblock_op.remote(op_type)
+                    worker.unblock_op.remote(op_name)
                 except Exception as e:
                     logger.error(
                         f"[spmd_id={self.spmd_id}] Failed to unblock worker {rank} op: {e}"
@@ -590,8 +587,9 @@ if RAY_AVAILABLE:
             """Block all workers (internal method)."""
             for rank, worker in self._worker_handles.items():
                 try:
-                    for op_type in OpType:
-                        worker.block_op.remote(op_type)
+                    ops = list(self.worker_synchronizer.get_spmd_steps().keys())
+                    for op_name in ops:
+                        worker.block_op.remote(op_name)
                 except Exception as e:
                     logger.error(
                         f"[spmd_id={self.spmd_id}] Failed to block worker {rank}: {e}"
@@ -602,7 +600,7 @@ if RAY_AVAILABLE:
         # =====================================================================
 
         def broadcast_state_argument(
-            self, target_op: "OpType", names: List[str], step: int, values: List[Any]
+            self, target_op: str, names: List[str], step: int, values: List[Any]
         ) -> None:
             """
             Broadcast state_arguments to all workers via receive_states.
@@ -631,7 +629,7 @@ if RAY_AVAILABLE:
         def forward_state_argument_to_controller(
             self,
             target_spmd_id: str,
-            target_op: "OpType",
+            target_op: str,
             names: List[str],
             step: int,
             values: List[Any],

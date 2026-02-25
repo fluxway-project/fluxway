@@ -6,7 +6,7 @@ All SPMDs:
 - Simulate data transmission only (no actual computation)
 - Have total_rank <= 6
 - Cover different stages of a machine learning pipeline:
-  - Preprocessing: sparse -> sparse (eager mode)
+  - Preprocessing: sparse -> sparse (periodic mode)
   - Embedding: sparse -> sparse
   - Model: sparse -> dense
 
@@ -207,10 +207,10 @@ class PreprocessingSPMD:
     Preprocessing SPMD (Eager mode).
 
     Performs data preprocessing: receives sparse data from reader, outputs sparse data.
-    Uses eager_trigger=True to process data immediately.
+    Uses periodic_barrier=1 to process data immediately.
     Uses modulo_routing_fn for input routing and hash_routing_fn for output routing.
 
-    Note: For eager_trigger, only tensor_argument is used (no state_argument).
+    Note: For periodic_barrier, only tensor_argument is used (no state_argument).
     The operator receives only the tensor from DataState1, not the full state.
     """
 
@@ -225,10 +225,10 @@ class PreprocessingSPMD:
             "tensor": {"type": "sparse", "axis": ["data"], "fn": hash_routing_fn}
         },
         tensor_argument=["input"],
-        eager_trigger=True,
+        periodic_barrier=1,
     )
     def forward(self, data: TensorOnly) -> DataState1:
-        """Preprocess sparse input from reader and output sparse data (eager mode)."""
+        """Preprocess sparse input from reader and output sparse data (periodic mode)."""
         start_time = time.time()
         input_shape_info = (
             f"len={len(data.input) if hasattr(data.input, '__len__') else 'N/A'}"
@@ -396,7 +396,7 @@ class EmbeddingSPMD:
             "tensor": {"type": "sparse", "axis": ["embed"], "fn": modulo_routing_fn}
         },
         tensor_argument=["tensor"],
-        eager_trigger=True,
+        periodic_barrier=1,
     )
     def forward(self, state: DataState1) -> DataState2:
         """Perform embedding: process sparse input and output sparse data."""
@@ -424,7 +424,7 @@ class EmbeddingSPMD:
         input_sharding={"tensor": {"type": "sparse", "axis": ["embed"]}},
         output_sharding={"tensor": {"type": "sparse", "axis": ["embed"]}},
         tensor_argument=["tensor"],
-        eager_trigger=True,
+        periodic_barrier=1,
     )
     def backward(self, grad: Gradient2) -> Gradient2:
         """Backward pass: compute embedding gradients."""

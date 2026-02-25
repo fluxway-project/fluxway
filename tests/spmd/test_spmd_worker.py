@@ -12,6 +12,9 @@ Covers:
 import sys
 import os
 import asyncio
+import ast
+import types
+from pathlib import Path
 import numpy as np
 import pytest
 
@@ -19,20 +22,35 @@ sys.path.append(os.getcwd())
 
 from fluxway.common.sync import ArrivalBarrier
 from fluxway.spmd.worker.mailbox.mailbox import StepBarrier, WorkerMailbox
-from fluxway.spmd.worker.mailbox import OpType
 from fluxway.spmd.worker.worker import SPMDWorker
 from fluxway.spmd.worker.operator_manager import OperatorManager
-from fluxway.common.types.configs import SPMDConfig
+from fluxway.common.types.configs import SPMDConfig, OperatorMeta, ArgumentType
 from fluxway.common.types.tensor import TransportTensor
 from fluxway.common.mesh import DeviceMesh
 from fluxway.transport.communication import TransportReceiver
 
 
 # ---------------------------------------------------------------------------
-# Dummy user functions
+# Helpers: build minimal SPMDConfig with registered operators
 # ---------------------------------------------------------------------------
 
 
+def _make_null_meta(name: str) -> OperatorMeta:
+    """Create a minimal OperatorMeta for unit tests (no sharding, no args)."""
+    return OperatorMeta(name=name, input_arguments=None, output_arguments=None)
+
+
+def _make_config(mesh: DeviceMesh, *op_names: str, **extra_ops) -> SPMDConfig:
+    """
+    Build SPMDConfig with the given operator names (each with a null lambda + meta).
+    extra_ops allows passing named op->callable overrides.
+    """
+    ops = {op: (extra_ops.get(op) or (lambda *a, **kw: None)) for op in op_names}
+    metas = {op: _make_null_meta(op) for op in op_names}
+    return SPMDConfig(mesh=mesh, operators=ops, operator_metas=metas)
+
+
+# Legacy dummy functions (kept for readability at call sites)
 def forward_fn(state, batch):
     return state
 
@@ -348,6 +366,21 @@ def test_step_barrier_unknown_name_ignored():
 
 
 @pytest.mark.asyncio
+async def test_step_barrier_periodic():
+    """Verify StepBarrier in periodic mode fires for every arrival."""
+    # Eager op expects 1 shard for 'x'
+    b = StepBarrier(expected_tensors={"x": 1}, expected_states=[], periodic=True)
+
+    # First arrival
+    fired = b.tensor_arrived("x")
+    assert fired is True
+
+    # Second arrival
+    fired = b.tensor_arrived("x")
+    assert fired is True
+
+
+@pytest.mark.asyncio
 async def test_step_barrier_async_wait():
     b = StepBarrier(expected_tensors={"x": 1}, expected_states=["s"])
 
@@ -377,19 +410,17 @@ async def test_mailbox_declare_step_and_on_ready():
         fired.append((op, step))
 
     mb.set_ready_callback(cb)
-    mb.declare_step(
-        OpType.FORWARD, step=0, expected_tensors={"x": 2}, expected_states=[]
-    )
+    mb.declare_step("forward", step=0, expected_tensors={"x": 2}, expected_states=[])
 
     tensor = TransportTensor.from_tensor(np.zeros(4))
     await mb.deposit_shards(
-        OpType.FORWARD, "x", 0, rank=0, payloads=[tensor.flat_values], counts=[4]
+        "forward", "x", 0, rank=0, payloads=[tensor.flat_values], counts=[4]
     )
     assert not fired
     await mb.deposit_shards(
-        OpType.FORWARD, "x", 0, rank=1, payloads=[tensor.flat_values], counts=[4]
+        "forward", "x", 0, rank=1, payloads=[tensor.flat_values], counts=[4]
     )
-    assert fired == [(OpType.FORWARD, 0)]
+    assert fired == [("forward", 0)]
 
 
 @pytest.mark.asyncio
@@ -397,28 +428,94 @@ async def test_mailbox_wait_step_ready():
     """wait_step_ready() coroutine resolves when the step is done."""
     mb = WorkerMailbox()
     mb.declare_step(
-        OpType.FORWARD, step=5, expected_tensors={"a": 1}, expected_states=["cfg"]
+        "forward", step=5, expected_tensors={"a": 1}, expected_states=["cfg"]
     )
 
     async def feed():
         await asyncio.sleep(0)
         tensor = TransportTensor.from_tensor(np.ones(3))
         await mb.deposit_shards(
-            OpType.FORWARD, "a", 5, rank=0, payloads=[tensor.flat_values], counts=[3]
+            "forward", "a", 5, rank=0, payloads=[tensor.flat_values], counts=[3]
         )
         await asyncio.sleep(0)
-        await mb.deposit_states(OpType.FORWARD, 5, names=["cfg"], values=[{"lr": 0.1}])
+        await mb.deposit_states("forward", 5, names=["cfg"], values=[{"lr": 0.1}])
 
     asyncio.create_task(feed())
-    await mb.wait_step_ready(OpType.FORWARD, step=5)
-    assert mb.is_step_ready(OpType.FORWARD, step=5)
+    await mb.wait_step_ready("forward", step=5)
+    assert mb.is_step_ready("forward", step=5)
+
+
+@pytest.mark.asyncio
+async def test_mailbox_periodic_trigger():
+    """
+    Verify WorkerMailbox handles periodic operators with virtual steps.
+
+    Virtual Step Mapping Flow:
+    ```mermaid
+    sequenceDiagram
+        participant Sender
+        participant SPMDWorker
+        participant WorkerMailbox
+        participant ExecutionLoop
+
+        Sender->>SPMDWorker: receive_shards(op, name, step=100)
+        SPMDWorker->>WorkerMailbox: deposit_shards(op, name, step=100)
+        Note over WorkerMailbox: Virtual step mapping: 100 -> 0
+        WorkerMailbox->>SPMDWorker: on_ready(op, step=0)
+        SPMDWorker->>ExecutionLoop: Enqueue(op, step=0)
+
+        Sender->>SPMDWorker: receive_shards(op, name, step=101)
+        SPMDWorker->>WorkerMailbox: deposit_shards(op, name, step=101)
+        Note over WorkerMailbox: Virtual step mapping: 101 -> 1
+        WorkerMailbox->>SPMDWorker: on_ready(op, step=1)
+        SPMDWorker->>ExecutionLoop: Enqueue(op, step=1)
+    ```
+    """
+    mb = WorkerMailbox()
+    ready_steps = []
+
+    def on_ready(op, step):
+        ready_steps.append((op, step))
+
+    mb.set_ready_callback(on_ready)
+
+    from fluxway.common.types.configs import PeriodicBarrierConfig
+
+    # Declare periodic op
+    mb.declare_step(
+        "periodic_op",
+        step=0,
+        expected_tensors={"x": 1},
+        expected_states=[],
+        barrier_config=PeriodicBarrierConfig(n=1),
+    )
+
+    # Deposit first shard (sender says step 100)
+    tensor = TransportTensor.from_tensor(np.array([1.0]))
+    await mb.deposit_shards(
+        "periodic_op", "x", step=100, rank=0, payloads=[tensor.flat_values], counts=[1]
+    )
+
+    # Deposit second shard (sender says step 101)
+    await mb.deposit_shards(
+        "periodic_op", "x", step=101, rank=1, payloads=[tensor.flat_values], counts=[1]
+    )
+
+    # Should have two ready events with sequential virtual steps 0 and 1
+    assert ready_steps == [("periodic_op", 0), ("periodic_op", 1)]
+
+    # Verify data storage
+    shards0 = await mb.get_tensor_shards("periodic_op", "x", 0)
+    assert 0 in shards0
+    shards1 = await mb.get_tensor_shards("periodic_op", "x", 1)
+    assert 1 in shards1
 
 
 @pytest.mark.asyncio
 async def test_mailbox_is_step_ready_before_declare():
     """is_step_ready returns False when declare_step was not called."""
     mb = WorkerMailbox()
-    assert not mb.is_step_ready(OpType.BACKWARD, step=99)
+    assert not mb.is_step_ready("backward", step=99)
 
 
 @pytest.mark.asyncio
@@ -426,7 +523,7 @@ async def test_mailbox_no_barrier_without_declare():
     """wait_step_ready raises if declare_step was never called."""
     mb = WorkerMailbox()
     with pytest.raises(RuntimeError, match="declare_step"):
-        await mb.wait_step_ready(OpType.FORWARD, step=7)
+        await mb.wait_step_ready("forward", step=7)
 
 
 # ===========================================================================
@@ -437,18 +534,43 @@ async def test_mailbox_no_barrier_without_declare():
 @pytest.mark.asyncio
 async def test_mailbox_state_put_get():
     mb = WorkerMailbox()
-    await mb.deposit_states(OpType.FORWARD, 1, names=["lr"], values=[0.001])
-    assert await mb.has_state(OpType.FORWARD, "lr", 1)
-    assert await mb.get_state(OpType.FORWARD, "lr", 1) == 0.001
+    await mb.deposit_states("forward", 1, names=["lr"], values=[0.001])
+    assert await mb.has_state("forward", "lr", 1)
+    assert await mb.get_state("forward", "lr", 1) == 0.001
 
 
 @pytest.mark.asyncio
 async def test_mailbox_get_all_states():
     mb = WorkerMailbox()
-    await mb.deposit_states(OpType.FORWARD, 0, names=["a"], values=[1])
-    await mb.deposit_states(OpType.FORWARD, 0, names=["b"], values=[2])
-    states = await mb.get_all_states(OpType.FORWARD, 0)
+    await mb.deposit_states("forward", 0, names=["a"], values=[1])
+    await mb.deposit_states("forward", 0, names=["b"], values=[2])
+    states = await mb.get_all_states("forward", 0)
     assert states == {"a": 1, "b": 2}
+
+
+@pytest.mark.asyncio
+async def test_mailbox_periodic_state():
+    """Verify WorkerMailbox handles periodic operators with states."""
+    mb = WorkerMailbox()
+    ready_steps = []
+    mb.set_ready_callback(lambda op, step: ready_steps.append((op, step)))
+
+    from fluxway.common.types.configs import PeriodicBarrierConfig
+
+    mb.declare_step(
+        "periodic_op",
+        step=0,
+        expected_tensors={},
+        expected_states=["s"],
+        barrier_config=PeriodicBarrierConfig(n=1),
+    )
+
+    await mb.deposit_states("periodic_op", step=50, names=["s"], values=["v1"])
+    await mb.deposit_states("periodic_op", step=51, names=["s"], values=["v2"])
+
+    assert ready_steps == [("periodic_op", 0), ("periodic_op", 1)]
+    assert await mb.get_state("periodic_op", "s", 0) == "v1"
+    assert await mb.get_state("periodic_op", "s", 1) == "v2"
 
 
 # ===========================================================================
@@ -462,9 +584,9 @@ async def test_mailbox_tensor_put_get():
     d = np.array([1.0, 2.0])
     tensor = TransportTensor.from_tensor(d)
     await mb.deposit_shards(
-        OpType.FORWARD, "x", 0, rank=0, payloads=[tensor.flat_values], counts=[2]
+        "forward", "x", 0, rank=0, payloads=[tensor.flat_values], counts=[2]
     )
-    shards = await mb.get_tensor_shards(OpType.FORWARD, "x", 0)
+    shards = await mb.get_tensor_shards("forward", "x", 0)
     assert 0 in shards
     np.testing.assert_array_equal(shards[0].flat_values, d)
 
@@ -474,26 +596,26 @@ async def test_mailbox_tensor_multi_rank():
     mb = WorkerMailbox()
     tensor_zeros = TransportTensor.from_tensor(np.zeros(4))
     await mb.deposit_shards(
-        OpType.FORWARD, "e", 1, rank=0, payloads=[tensor_zeros.flat_values], counts=[4]
+        "forward", "e", 1, rank=0, payloads=[tensor_zeros.flat_values], counts=[4]
     )
     tensor_ones = TransportTensor.from_tensor(np.ones(4))
     await mb.deposit_shards(
-        OpType.FORWARD, "e", 1, rank=1, payloads=[tensor_ones.flat_values], counts=[4]
+        "forward", "e", 1, rank=1, payloads=[tensor_ones.flat_values], counts=[4]
     )
-    assert await mb.get_tensor_shard_count(OpType.FORWARD, "e", 1) == 2
+    assert await mb.get_tensor_shard_count("forward", "e", 1) == 2
 
 
 @pytest.mark.asyncio
 async def test_mailbox_op_isolation():
     mb = WorkerMailbox()
     await mb.deposit_shards(
-        OpType.FORWARD, "g", 0, rank=0, payloads=[np.array([1.0])], counts=[1]
+        "forward", "g", 0, rank=0, payloads=[np.array([1.0])], counts=[1]
     )
     await mb.deposit_shards(
-        OpType.BACKWARD, "g", 0, rank=0, payloads=[np.array([2.0])], counts=[1]
+        "backward", "g", 0, rank=0, payloads=[np.array([2.0])], counts=[1]
     )
-    fwd = await mb.get_tensor_shards(OpType.FORWARD, "g", 0)
-    bwd = await mb.get_tensor_shards(OpType.BACKWARD, "g", 0)
+    fwd = await mb.get_tensor_shards("forward", "g", 0)
+    bwd = await mb.get_tensor_shards("backward", "g", 0)
     np.testing.assert_array_equal(fwd[0].flat_values, [1.0])
     np.testing.assert_array_equal(bwd[0].flat_values, [2.0])
 
@@ -508,17 +630,17 @@ async def test_mailbox_zero_copy_writes_into_buffer():
     mb = WorkerMailbox()
     buf = np.zeros((4, 2), dtype=np.float32)
     await mb.register_zero_copy_slot(
-        OpType.FORWARD, "emb", step=0, target_buffers=[buf], expect_offsets={0: 0}
+        "forward", "emb", step=0, target_buffers=[buf], expect_offsets={0: 0}
     )
     await mb.deposit_shards(
-        OpType.FORWARD,
+        "forward",
         "emb",
         step=0,
         rank=0,
         payloads=[np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)],
         counts=[2],
     )
-    buffers = await mb.get_zero_copy_buffers(OpType.FORWARD, "emb", step=0)
+    buffers = await mb.get_zero_copy_buffers("forward", "emb", step=0)
     assert buffers is not None
     np.testing.assert_array_equal(buffers[0][:2], [[1.0, 2.0], [3.0, 4.0]])
 
@@ -531,33 +653,33 @@ async def test_mailbox_zero_copy_writes_into_buffer():
 @pytest.mark.asyncio
 async def test_mailbox_clear_step():
     mb = WorkerMailbox()
-    await mb.deposit_states(OpType.FORWARD, 1, names=["s"], values=["x"])
-    await mb.deposit_states(OpType.FORWARD, 2, names=["s"], values=["y"])
+    await mb.deposit_states("forward", 1, names=["s"], values=["x"])
+    await mb.deposit_states("forward", 2, names=["s"], values=["y"])
     tensor = TransportTensor.from_tensor(np.zeros(2))
     await mb.deposit_shards(
-        OpType.FORWARD, "t", 1, rank=0, payloads=[tensor.flat_values], counts=[2]
+        "forward", "t", 1, rank=0, payloads=[tensor.flat_values], counts=[2]
     )
-    mb.declare_step(OpType.FORWARD, 1, {}, [])
+    mb.declare_step("forward", 1, {}, [])
 
-    await mb.clear_step(OpType.FORWARD, 1)
+    await mb.clear_step("forward", 1)
 
-    assert not await mb.has_state(OpType.FORWARD, "s", 1)
-    assert await mb.has_state(OpType.FORWARD, "s", 2)
-    assert await mb.get_tensor_shard_count(OpType.FORWARD, "t", 1) == 0
-    assert not mb.is_step_ready(OpType.FORWARD, 1)  # barrier also cleared
+    assert not await mb.has_state("forward", "s", 1)
+    assert await mb.has_state("forward", "s", 2)
+    assert await mb.get_tensor_shard_count("forward", "t", 1) == 0
+    assert not mb.is_step_ready("forward", 1)  # barrier also cleared
 
 
 @pytest.mark.asyncio
 async def test_mailbox_get_size():
     mb = WorkerMailbox()
     assert await mb.get_size() == 0
-    await mb.deposit_states(OpType.FORWARD, 0, names=["s"], values=[None])
+    await mb.deposit_states("forward", 0, names=["s"], values=[None])
     tensor = TransportTensor.from_tensor(np.zeros(2))
     await mb.deposit_shards(
-        OpType.FORWARD, "t", 0, rank=0, payloads=[tensor.flat_values], counts=[2]
+        "forward", "t", 0, rank=0, payloads=[tensor.flat_values], counts=[2]
     )
     await mb.deposit_shards(
-        OpType.FORWARD, "t", 0, rank=1, payloads=[tensor.flat_values], counts=[2]
+        "forward", "t", 0, rank=1, payloads=[tensor.flat_values], counts=[2]
     )
     assert await mb.get_size() == 3
 
@@ -574,32 +696,23 @@ def test_layout_mesh():
     assert mesh.get_rank((2, 1)) == 5
 
 
-def test_spmd_config_with_mesh():
+@pytest.mark.asyncio
+async def test_spmd_config_with_mesh():
     mesh = DeviceMesh((4, 2), axis_names=("data", "model"))
-    config = SPMDConfig(mesh=mesh, user_forward_fn=forward_fn)
+    config = _make_config(mesh, "forward")
     assert config.has_mesh and config.get_mesh_size() == 8
 
 
 def test_operator_manager_mesh():
     mesh = DeviceMesh((2,), axis_names=("data",))
-    config = SPMDConfig(
-        mesh=mesh,
-        user_forward_fn=forward_fn,
-        user_backward_fn=backward_fn,
-        user_update_fn=update_fn,
-    )
+    config = _make_config(mesh, "forward", "backward", "update")
     assert OperatorManager(config, rank=0)._mesh is mesh
 
 
 @pytest.mark.asyncio
 async def test_spmd_worker_init():
     mesh = DeviceMesh((2,), axis_names=("data",))
-    config = SPMDConfig(
-        mesh=mesh,
-        user_forward_fn=forward_fn,
-        user_backward_fn=backward_fn,
-        user_update_fn=update_fn,
-    )
+    config = _make_config(mesh, "forward", "backward", "update")
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
     cls = cls.modified_class if cls else SPMDWorker
     worker = cls(config, rank=0)
@@ -610,16 +723,21 @@ async def test_spmd_worker_init():
 @pytest.mark.asyncio
 async def test_receive_multi_tensor_data():
     mesh = DeviceMesh((2,), axis_names=("data",))
-    config = SPMDConfig(mesh=mesh, user_forward_fn=forward_fn)
+    config = _make_config(mesh, "forward")
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
     cls = cls.modified_class if cls else SPMDWorker
     worker = cls(config, rank=0)
+
+    # Declare the step first (workers normally do this via _start_step)
+    worker._mailbox.declare_step(
+        "forward", step=1, expected_tensors={"multi": 1}, expected_states=[]
+    )
 
     t1 = TransportTensor.from_tensor(np.array([1, 2]))
     t2 = TransportTensor.from_tensor(np.array([3, 4]))
 
     await worker.receive_shards(
-        OpType.FORWARD,
+        "forward",
         "multi",
         step=1,
         sender_rank=0,
@@ -628,7 +746,7 @@ async def test_receive_multi_tensor_data():
         is_ragged=False,
         has_indices=False,
     )
-    shards = await worker._mailbox.get_tensor_shards(OpType.FORWARD, "multi", 1)
+    shards = await worker._mailbox.get_tensor_shards("forward", "multi", 1)
     received = shards[0]
     assert isinstance(received, list)
     assert len(received) == 2
@@ -644,7 +762,7 @@ async def test_mailbox_zero_copy_ragged():
     len_buf = np.zeros((4,), dtype=np.int32)
 
     await mb.register_zero_copy_slot(
-        OpType.FORWARD,
+        "forward",
         "ragged",
         step=0,
         target_buffers=[data_buf, len_buf],
@@ -657,7 +775,7 @@ async def test_mailbox_zero_copy_ragged():
     tt = TransportTensor(flat_values, nested_splits=[splits])
 
     await mb.deposit_shards(
-        OpType.FORWARD,
+        "forward",
         "ragged",
         step=0,
         rank=0,
@@ -668,7 +786,7 @@ async def test_mailbox_zero_copy_ragged():
     )
 
     # Verify buffers from mailbox (handles JAX-style non-inplace updates)
-    buffers = await mb.get_zero_copy_buffers(OpType.FORWARD, "ragged", step=0)
+    buffers = await mb.get_zero_copy_buffers("forward", "ragged", step=0)
     assert buffers is not None
     # Verify data buffer
     np.testing.assert_array_equal(buffers[0][:5], flat_values)
@@ -677,7 +795,7 @@ async def test_mailbox_zero_copy_ragged():
 
 
 def test_replicate_operator_manager():
-    from fluxway.common.types.configs import OperatorMeta, ArgumentType
+    from fluxway.common.types.configs import OperatorMeta
 
     mesh = DeviceMesh((2, 2), axis_names=("x", "y"))
 
@@ -694,17 +812,153 @@ def test_replicate_operator_manager():
 
     my_forward._flux_operator_meta = meta
 
+    # Register with the operator name matching the meta name: "test_op"
     config = SPMDConfig(
         spmd_id="test",
         worker_count=4,
         mesh=mesh,
-        user_forward_fn=my_forward,
-        user_backward_fn=None,
-        user_update_fn=None,
+        operators={"test_op": my_forward},
+        operator_metas={"test_op": meta},
     )
 
     manager = OperatorManager(config, rank=0)
 
-    spec = manager.get_input_sharding(OpType.FORWARD)
+    # Query by the registered op name
+    spec = manager.get_input_sharding("test_op")
     assert "a" in spec
     assert spec["a"].replica_size == 4
+
+
+@pytest.mark.asyncio
+async def test_send_output_none_mesh():
+    # Test fallback to default mesh when config.mesh is None
+    # This specifically verifies the fix for ShardingSpec.chunk(None, ...)
+    config = _make_config(None, "forward")  # mesh=None
+    cls = getattr(SPMDWorker, "__ray_metadata__", None)
+    cls = cls.modified_class if cls else SPMDWorker
+    worker = cls(config, rank=0)
+
+    # Mock successor info to trigger _send_output logic
+    from unittest.mock import MagicMock
+
+    worker._op_manager = MagicMock()
+    # Mock sharding for a tensor named 't1'
+    # We leave it empty to trigger the default source_spec chunk call
+    worker._op_manager.get_output_sharding.return_value = {"t1": None}
+    worker._op_manager.get_successor_ids.return_value = ["succ"]
+
+    succ_info = MagicMock()
+    succ_info.is_self_loop = False
+    succ_info.target_op = "forward"
+    succ_info.tensor_sharding = {"t1": None}  # Trigger default target_spec
+    succ_info.mesh = None
+    worker._op_manager.get_successor_info.return_value = succ_info
+
+    # Mock successor handlers
+    handler = MagicMock()
+    worker._successor_handlers = {"succ": {0: handler}}
+
+    # Call _send_output
+    data = {"t1": np.array([1, 2, 3])}
+    # This should not raise "Argument Any | None is not assignable to parameter mesh"
+    # because we now provide a fallback DeviceMesh.
+    await worker._send_output("forward", 0, data)
+
+    # Verify distributor.distribute was called (indirectly by checking handler)
+    assert handler.receive_shards.remote.called
+
+
+# ===========================================================================
+# Step Regeneration / Remapping Logic
+# ===========================================================================
+
+
+def _load_compute_output_step():
+    """
+    Load compute_output_step without importing `fluxway` (importing it triggers runtime deps like Ray).
+    We parse `worker.py` and exec only the function definition.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    worker_path = repo_root / "fluxway" / "spmd" / "worker" / "worker.py"
+    source = worker_path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(worker_path))
+
+    method_node = None
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == "SPMDWorker":
+            for item in node.body:
+                if (
+                    isinstance(item, ast.FunctionDef)
+                    and item.name == "compute_output_step"
+                ):
+                    method_node = item
+                    break
+    assert method_node is not None, (
+        "SPMDWorker.compute_output_step not found in worker.py"
+    )
+
+    module = types.ModuleType("fluxway_worker_step_extract")
+    # Compile the method as a standalone function (first arg is `self`).
+    compiled = compile(
+        ast.Module(body=[method_node], type_ignores=[]), str(worker_path), "exec"
+    )
+    exec(compiled, module.__dict__)
+    return module.compute_output_step
+
+
+compute_output_step = _load_compute_output_step()
+
+
+class _DummyWorker:
+    def __init__(self, *, enable_output_step_remap: bool, total_rank: int, rank: int):
+        self.config = types.SimpleNamespace(
+            enable_output_step_remap=enable_output_step_remap
+        )
+        self._total_rank = total_rank
+        self.rank = rank
+
+
+def test_compute_output_step_keep_input_step() -> None:
+    assert (
+        compute_output_step(
+            _DummyWorker(enable_output_step_remap=False, total_rank=8, rank=3),
+            is_periodic=False,
+            current_step=100,
+            input_step=7,
+        )
+        == 7
+    )
+    assert (
+        compute_output_step(
+            _DummyWorker(enable_output_step_remap=False, total_rank=8, rank=3),
+            is_periodic=True,
+            current_step=100,
+            input_step=7,
+        )
+        == 7
+    )
+
+
+def test_compute_output_step_remap_non_periodic() -> None:
+    assert (
+        compute_output_step(
+            _DummyWorker(enable_output_step_remap=True, total_rank=8, rank=3),
+            is_periodic=False,
+            current_step=12,
+            input_step=7,
+        )
+        == 12
+    )
+
+
+def test_compute_output_step_remap_periodic() -> None:
+    # output_step = total_rank * current_step + local_rank
+    assert (
+        compute_output_step(
+            _DummyWorker(enable_output_step_remap=True, total_rank=8, rank=3),
+            is_periodic=True,
+            current_step=12,
+            input_step=7,
+        )
+        == 8 * 12 + 3
+    )

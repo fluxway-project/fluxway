@@ -20,7 +20,6 @@ from ...common.types import (
     Node,
     Edge,
     OperatorMeta,
-    OpType,
     EdgeShardingInfo,
     NodeType,
     ReaderConfig,
@@ -283,41 +282,41 @@ class Builder:
     def add_func_edge(
         self,
         source_node: str,
-        source_op: OpType,
+        source_op: str,
         target_node: str,
-        target_op: OpType,
+        target_op: str,
         condition_fn: Optional[Callable[..., bool]] = None,
     ) -> "Builder":
         """
-        Add a generic edge specifying source and target op types.
+        Add a generic edge specifying source and target op names.
 
         This is the core edge API. All other edge methods are syntactic sugar
         built on top of this method.
 
         Args:
             source_node: Source node name
-            source_op: Source node's op type (FORWARD/BACKWARD/UPDATE)
+            source_op: Source node's op name (e.g., "forward", "rollout")
             target_node: Target node name
-            target_op: Target node's op type
+            target_op: Target node's op name (e.g., "forward", "reward")
             condition_fn: Optional condition function
 
         Returns:
             Self for method chaining
 
         Examples:
-            # Forward -> Forward (equivalent to add_forward_edge)
-            builder.add_func_edge("A", OpType.FORWARD, "B", OpType.FORWARD)
+            # forward -> forward
+            builder.add_func_edge("A", "forward", "B", "forward")
 
-            # Forward -> Backward (sink node triggers its own backward)
-            builder.add_func_edge("Sink", OpType.FORWARD, "Sink", OpType.BACKWARD)
+            # forward -> backward self-loop (sink node triggers its own backward)
+            builder.add_func_edge("Sink", "forward", "Sink", "backward")
 
-            # Backward -> Backward
-            builder.add_func_edge("B", OpType.BACKWARD, "A", OpType.BACKWARD)
+            # rollout -> reward (arbitrary user-defined ops)
+            builder.add_func_edge("Actor", "rollout", "RewardModel", "compute_reward")
         """
         if source_node not in self._nodes:
-            raise ValueError(f"Source node {source_node} not found")
+            raise ValueError(f"Source node '{source_node}' not found")
         if target_node not in self._nodes:
-            raise ValueError(f"Target node {target_node} not found")
+            raise ValueError(f"Target node '{target_node}' not found")
 
         edge = Edge(
             source_node=source_node,
@@ -327,18 +326,11 @@ class Builder:
             condition_fn=condition_fn,
         )
 
-        # Store edge in appropriate list based on source_op
-        if source_op == OpType.FORWARD:
-            self._forward_edges.append(edge)
-        elif source_op == OpType.BACKWARD:
-            self._backward_edges.append(edge)
-        else:
-            # For UPDATE or other ops, store in forward_edges for now
-            self._forward_edges.append(edge)
+        # All edges go into _forward_edges (no semantic distinction anymore)
+        self._forward_edges.append(edge)
 
         # Skip sharding validation for Reader nodes (they don't have @spmd decorator)
         if self._is_reader_node(source_node) or self._is_reader_node(target_node):
-            # Reader nodes don't have operator metadata, skip validation
             return self
 
         # Validate and link sharding between source and target
@@ -347,30 +339,6 @@ class Builder:
         )
 
         return self
-
-    def add_sink_backward_trigger(
-        self, node_name: str, condition_fn: Optional[Callable[..., bool]] = None
-    ) -> "Builder":
-        """
-        Add forward -> backward self-trigger edge for a sink node.
-
-        This is syntactic sugar for:
-            add_func_edge(node, OpType.FORWARD, node, OpType.BACKWARD, condition_fn)
-
-        Args:
-            node_name: Sink node name
-            condition_fn: Optional condition function (e.g., only trigger in training mode)
-
-        Returns:
-            Self for method chaining
-        """
-        return self.add_func_edge(
-            node_name, OpType.FORWARD, node_name, OpType.BACKWARD, condition_fn
-        )
-
-    # -------------------------------------------------------------------------
-    # Forward edges
-    # -------------------------------------------------------------------------
 
     def add_forward_edge(
         self,
@@ -381,19 +349,18 @@ class Builder:
         """
         Add a forward edge: source.forward -> target.forward
 
-        This is syntactic sugar for:
-            add_func_edge(source, OpType.FORWARD, target, OpType.FORWARD, condition_fn)
+        Syntactic sugar for: add_func_edge(source, "forward", target, "forward", condition_fn)
 
         Args:
             source_node: Source node name
             target_node: Target node name
-            condition_fn: Condition function for the edge
+            condition_fn: Optional condition function for the edge
 
         Returns:
             Self for method chaining
         """
         return self.add_func_edge(
-            source_node, OpType.FORWARD, target_node, OpType.FORWARD, condition_fn
+            source_node, "forward", target_node, "forward", condition_fn
         )
 
     def add_forward_conditional_edge(
@@ -464,18 +431,18 @@ class Builder:
         """
         Add a backward edge: source.backward -> target.backward
 
-        This is syntactic sugar for:
-            add_func_edge(source, OpType.BACKWARD, target, OpType.BACKWARD, condition_fn)
+        Syntactic sugar for: add_func_edge(source, "backward", target, "backward", condition_fn)
 
         Args:
             source_node: Source node name (where gradient originates)
             target_node: Target node name (where gradient flows to)
+            condition_fn: Optional condition function
 
         Returns:
             Self for method chaining
         """
         return self.add_func_edge(
-            source_node, OpType.BACKWARD, target_node, OpType.BACKWARD, condition_fn
+            source_node, "backward", target_node, "backward", condition_fn
         )
 
     def add_backward_conditional_edge(
@@ -533,54 +500,6 @@ class Builder:
         return self
 
     # -------------------------------------------------------------------------
-    # Bidirectional edges
-    # -------------------------------------------------------------------------
-
-    def add_edge(self, source_node: str, target_node: str) -> "Builder":
-        """
-        Add a bidirectional edge between two nodes.
-
-        This will:
-        - Add a forward edge source_node -> target_node
-        - Add a backward edge target_node -> source_node
-        And validate both forward and backward operator compatibility.
-        """
-        # Forward direction
-        self.add_forward_edge(source_node, target_node)
-        # Backward direction
-        self.add_backward_edge(target_node, source_node)
-        return self
-
-    def add_conditional_edge(
-        self,
-        source_node: str,
-        condition_fn: Optional[Callable[..., bool]],
-        target_mapping: Union[Dict[bool, Optional[str]], str],
-    ) -> "Builder":
-        """
-        Add bidirectional conditional edges.
-
-        Semantics:
-        - Forward conditional edge: source_node -> targets (as in add_forward_conditional_edge)
-        - Backward conditional edge: targets -> source_node (mirror)
-        """
-        # Forward conditional edge(s)
-        self.add_forward_conditional_edge(source_node, condition_fn, target_mapping)
-
-        # Backward conditional edge(s) are mirrored:
-        if isinstance(target_mapping, str):
-            # Single target: backward from target -> source
-            # 反向的发送依赖于前向的实际来源，不再直接绑定 condition_fn
-            self.add_backward_conditional_edge(target_mapping, None, source_node)
-        else:
-            # Dict mapping: create backward edges for non-None targets
-            for _, tgt in target_mapping.items():
-                if tgt is not None:
-                    # 同样不使用 condition_fn，表示反向发送依赖于前向的来源
-                    self.add_backward_conditional_edge(tgt, None, source_node)
-        return self
-
-    # -------------------------------------------------------------------------
     # Internal helpers for operator metadata & sharding linking
     # -------------------------------------------------------------------------
 
@@ -597,20 +516,17 @@ class Builder:
     def _validate_and_link_edge(
         self,
         source_node: str,
-        source_op: OpType,
+        source_op: str,
         target_node: str,
-        target_op: OpType,
+        target_op: str,
         condition_fn: Optional[Callable[..., bool]],
     ) -> None:
         """
-        Validate and link operators between two nodes with arbitrary op types.
+        Validate and link operator metadata between two nodes.
 
-        核心注意点：这里必须基于 Node.spmd_config 里的 user_forward_fn / user_backward_fn
-        上挂载的 OperatorMeta 来写回 input_pre_sharding / output_post_sharding，
-        这样修改才能随 SPMDConfig 一起传递到 worker 进程。
+        Writes back pre/post sharding info into OperatorMeta so that
+        worker processes can read routing info from SPMDConfig.
         """
-        # 从 Node 的 spmd_config 中获取实际传给 worker 的函数对象
-        # 同时仍然保留 spmd_class 引用，用于 state 校验时的反射
         src_node = self._nodes[source_node]
         dst_node = self._nodes[target_node]
 
@@ -618,17 +534,10 @@ class Builder:
         dst_cfg = dst_node.spmd_config
 
         def _get_fn_and_meta(
-            cfg: SPMDConfig, op: OpType
+            cfg: SPMDConfig, op_name: str
         ) -> Tuple[Optional[Callable], Optional[OperatorMeta]]:
-            if op == OpType.FORWARD:
-                fn = cfg.user_forward_fn
-                meta = cfg.forward_meta
-            elif op == OpType.BACKWARD:
-                fn = cfg.user_backward_fn
-                meta = cfg.backward_meta
-            else:
-                fn = cfg.user_update_fn
-                meta = cfg.update_meta
+            fn = cfg.operators.get(op_name)
+            meta = cfg.operator_metas.get(op_name)
             if fn is None:
                 return None, None
             return fn, meta
@@ -636,40 +545,31 @@ class Builder:
         _, src_meta = _get_fn_and_meta(src_cfg, source_op)
         _, dst_meta = _get_fn_and_meta(dst_cfg, target_op)
 
-        # 用于错误信息和 state 校验的上下文
         src_cls = self._spmd_classes[source_node]
-        ctx = f"edge {source_node}.{source_op.name.lower()} -> {target_node}.{target_op.name.lower()}"
-        self._ensure_meta_exists(source_node, source_op.name.lower(), src_meta, ctx)
-        self._ensure_meta_exists(target_node, target_op.name.lower(), dst_meta, ctx)
+        ctx = f"edge {source_node}.{source_op} -> {target_node}.{target_op}"
+        self._ensure_meta_exists(source_node, source_op, src_meta, ctx)
+        self._ensure_meta_exists(target_node, target_op, dst_meta, ctx)
 
-        # For self-loops (same node, different ops), skip tensor validation
-        # because the data flows internally without external sharding requirements.
-        # However, state output inference must still run so that
-        # _send_output knows which state fields to transmit via _self_receive_state.
+        # For self-loops (same node, different ops), skip tensor I/O validation
+        # because the data flows internally. State inference must still run.
         is_self_loop = source_node == target_node
 
         if not is_self_loop:
             # 1) Validate tensor: src_op output vs dst_op input
             src_meta.validate_tensor_io_match(dst_meta, src_is_output=True, ctx=ctx)
 
-        # 2) Validate & update state: src_op output_state vs dst_op input_state
-        #    This must run for ALL edges (including self-loops) so that
-        #    output_arguments[STATE] is populated and _send_output can
-        #    extract and transmit state fields.
+        # 2) Validate & update state: src output_state vs dst input_state
         src_meta.validate_and_update_state_output_match_dest_input(
             dst_meta=dst_meta,
             src_spmd_class=src_cls,
-            src_method_name=source_op.name.lower(),
+            src_method_name=source_op,
             ctx=ctx,
         )
 
-        # 3) Write back pre/post sharding to OperatorMeta (with target_op info)
+        # 3) Write back pre/post sharding to OperatorMeta
         src_out = src_meta.output_sharding or {}
         dst_in = dst_meta.input_sharding or {}
 
-        # Update target.target_op.input_pre_sharding:
-        #   key: source_node
-        #   value: edge sharding info including target_op
         if src_out or is_self_loop:
             dst_meta.input_pre_sharding.setdefault(source_node, []).append(
                 EdgeShardingInfo(
@@ -681,15 +581,12 @@ class Builder:
             logger.debug(
                 "Builder linked input_pre_sharding: %s.%s <- %s.%s, tensor_keys=%s",
                 target_node,
-                target_op.name.lower(),
+                target_op,
                 source_node,
-                source_op.name.lower(),
+                source_op,
                 list(src_out.keys()),
             )
 
-        # Update source.source_op.output_post_sharding:
-        #   key: target_node
-        #   value: edge sharding info including target_op
         if dst_in or is_self_loop:
             src_meta.output_post_sharding.setdefault(target_node, []).append(
                 EdgeShardingInfo(
@@ -701,9 +598,9 @@ class Builder:
             logger.debug(
                 "Builder linked output_post_sharding: %s.%s -> %s.%s, tensor_keys=%s",
                 source_node,
-                source_op.name.lower(),
+                source_op,
                 target_node,
-                target_op.name.lower(),
+                target_op,
                 list(dst_in.keys()),
             )
 

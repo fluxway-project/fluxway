@@ -3,7 +3,7 @@ Main entry point for the Fluxway example.
 
 This example demonstrates a machine learning pipeline with:
 1. Reader: Reads data from JSON files (outputs sparse)
-2. Preprocessing: Preprocesses raw data (eager mode, sparse -> sparse)
+2. Preprocessing: Preprocesses raw data (periodic (streaming) mode, sparse -> sparse)
 3. Embedding: Performs embedding operations (sparse -> sparse)
 4. Model: Performs model computation (sparse -> dense)
 
@@ -45,7 +45,6 @@ except ImportError:
 from fluxway import Builder  # noqa: E402
 from fluxway.control_plane import ControllerActor  # noqa: E402
 from fluxway.common.types import Graph, HeartbeatConfig, AsyncStepConfig  # noqa: E402
-from fluxway.common.types.configs import OpType  # noqa: E402
 
 # Use absolute imports to support both module and direct execution
 from fluxway.example.spmd_modules import PreprocessingSPMD, EmbeddingSPMD, ModelSPMD  # noqa: E402
@@ -66,7 +65,7 @@ def build_example_graph(
     - Reader -> Preprocessing -> Embedding -> Model
     - Forward: reader (sparse) -> preprocessing (sparse->sparse) -> embedding (sparse->sparse) -> model (sparse->dense)
     - Backward: model forward -> model backward (self-loop), model -> embedding
-    - Preprocessing is eager mode
+    - Preprocessing is periodic (streaming) mode
     """
     builder = Builder()
 
@@ -96,7 +95,7 @@ def build_example_graph(
 
     # Forward edges
     logger.info("Building forward edges...")
-    # Reader -> Preprocessing (eager)
+    # Reader -> Preprocessing (periodic)
     builder.add_forward_edge("Reader", "Preprocessing")
 
     # Preprocessing -> Embedding
@@ -108,12 +107,12 @@ def build_example_graph(
     # Backward edges
     logger.info("Building backward edges...")
     # Model forward -> Model backward (self-loop)
-    builder.add_func_edge("Model", OpType.FORWARD, "Model", OpType.BACKWARD)
+    builder.add_func_edge("Model", "forward", "Model", "backward")
 
     # Model -> Embedding
     builder.add_backward_edge("Model", "Embedding")
 
-    # Note: No backward edge from Embedding to Preprocessing (eager node doesn't need backward)
+    # Note: No backward edge from Embedding to Preprocessing (periodic node doesn't need backward)
     # Note: No backward edge from Reader (Reader is a source)
 
     # Build graph
