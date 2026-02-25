@@ -103,7 +103,7 @@ if RAY_AVAILABLE:
             # Worker synchronizer
             self.worker_synchronizer = WorkerSynchronizer(
                 spmd_id=spmd_id,
-                worker_count=config.worker_count,
+                num_workers=config.num_workers,
                 max_worker_step_diff=config.max_async_steps,
             )
 
@@ -149,7 +149,7 @@ if RAY_AVAILABLE:
             node_type_str = "Reader" if node_type == NodeType.READER else "SPMD"
             logger.info(
                 f"[spmd_id={spmd_id}] {node_type_str}Driver initialized: spmd_id={spmd_id}, "
-                f"worker_count={config.worker_count}"
+                f"num_workers={config.num_workers}"
             )
 
         # =====================================================================
@@ -242,7 +242,7 @@ if RAY_AVAILABLE:
 
             # Get file read tasks (partitioned by worker count)
             self._file_tasks = datasource.get_read_tasks(
-                parallelism=self.reader_config.worker_count
+                parallelism=self.reader_config.num_workers
             )
 
             logger.info(
@@ -448,10 +448,10 @@ if RAY_AVAILABLE:
 
             # Check if all workers have reported heartbeat (workers_ready)
             if not self._workers_ready:
-                if len(self._worker_heartbeat_times) >= self.config.worker_count:
+                if len(self._worker_heartbeat_times) >= self.config.num_workers:
                     self._workers_ready = True
                     logger.info(
-                        f"[spmd_id={self.spmd_id}] All {self.config.worker_count} workers are ready for SPMD {self.spmd_id}"
+                        f"[spmd_id={self.spmd_id}] All {self.config.num_workers} workers are ready for SPMD {self.spmd_id}"
                     )
 
                     # Event-driven: trigger INIT_COMPLETE now that all workers are alive
@@ -472,7 +472,7 @@ if RAY_AVAILABLE:
                 )
                 if (
                     all_running
-                    and len(self._worker_heartbeats) >= self.config.worker_count
+                    and len(self._worker_heartbeats) >= self.config.num_workers
                 ):
                     self._workers_running = True
                     logger.info(
@@ -698,7 +698,7 @@ if RAY_AVAILABLE:
                                 f"[spmd_id={self.spmd_id}] SPMD {self.spmd_id} worker init "
                                 f"timeout after {elapsed:.1f}s "
                                 f"(received heartbeat from "
-                                f"{len(self._worker_heartbeat_times)}/{self.config.worker_count} workers)"
+                                f"{len(self._worker_heartbeat_times)}/{self.config.num_workers} workers)"
                             )
                             self.state_machine.trigger(
                                 DriverEvent.INIT_FAILED,
@@ -719,7 +719,7 @@ if RAY_AVAILABLE:
             # Count healthy workers
             healthy_count = 0
             current_time = time.time()
-            for rank in range(self.config.worker_count):
+            for rank in range(self.config.num_workers):
                 last_time = self._worker_heartbeat_times.get(rank, 0)
                 if current_time - last_time < self._heartbeat_config.heartbeat_timeout:
                     healthy_count += 1
@@ -727,7 +727,7 @@ if RAY_AVAILABLE:
             # Determine status
             if self.state_machine.is_error():
                 status = DriverStatus.ERROR
-            elif healthy_count < self.config.worker_count:
+            elif healthy_count < self.config.num_workers:
                 status = DriverStatus.WARNING
             else:
                 status = DriverStatus.HEALTHY
@@ -738,8 +738,8 @@ if RAY_AVAILABLE:
                 if hb.mailbox_status is not None and hb.mailbox_status.is_full:
                     busy_count += 1
             self._busy_worker_ratio = (
-                busy_count / self.config.worker_count
-                if self.config.worker_count > 0
+                busy_count / self.config.num_workers
+                if self.config.num_workers > 0
                 else 0.0
             )
 
@@ -750,8 +750,8 @@ if RAY_AVAILABLE:
                 state=self.state_machine.state,
                 error_message=self.state_machine.get_error_message(),
                 op_steps=self.worker_synchronizer.get_spmd_steps(),
-                worker_count=self.config.worker_count,
-                healthy_worker_count=healthy_count,
+                num_workers=self.config.num_workers,
+                healthy_num_workers=healthy_count,
                 blocked_ops=self.worker_synchronizer.get_locked_ops(),
                 workers_ready=self._workers_ready,
                 workers_running=self._workers_running,
@@ -766,7 +766,7 @@ if RAY_AVAILABLE:
                 self.controller_handle.receive_driver_heartbeat.remote(heartbeat)
                 logger.debug(
                     f"[spmd_id={self.spmd_id}] Driver {self.spmd_id} sent heartbeat: status={status.name}, "
-                    f"state={heartbeat.state.name}, healthy_workers={healthy_count}/{self.config.worker_count}, "
+                    f"state={heartbeat.state.name}, healthy_workers={healthy_count}/{self.config.num_workers}, "
                     f"op_steps={heartbeat.op_steps}, busy_ratio={self._busy_worker_ratio:.2f}"
                 )
             except Exception as e:
@@ -902,7 +902,7 @@ if RAY_AVAILABLE:
                 "spmd_id": self.spmd_id,
                 "state": self.state_machine.state.value,
                 "node_type": self.node_type.value,
-                "worker_count": self.config.worker_count,
+                "num_workers": self.config.num_workers,
                 "op_steps": self.worker_synchronizer.get_spmd_steps(),
                 "locked_ops": self.worker_synchronizer.get_locked_ops(),
                 "error_workers": self.state_machine.get_error_workers(),

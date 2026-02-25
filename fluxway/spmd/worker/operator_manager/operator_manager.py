@@ -45,7 +45,7 @@ class SPMDTopologyInfo:
     # Condition function for conditional edges (only for successors)
     condition_fn: Optional[Callable[..., bool]] = None
     # Target op name for cross-op edges (e.g., forward->backward)
-    target_op: str = "forward"
+    target_op: Optional[str] = None
     # Whether this is a self-loop edge (source_node == target_node)
     is_self_loop: bool = False
 
@@ -72,7 +72,7 @@ class OperatorManager:
         self._config = config  # Store config for explicit meta access
         self._mesh = config.mesh  # DeviceMesh from config
         self._rank = rank
-        self._total_rank = config.worker_count
+        self._total_rank = config.num_workers
         self._spmd_id = spmd_id
 
         # Register operators
@@ -171,7 +171,7 @@ class OperatorManager:
             for pre_spmd_id, edge_info_list in meta.input_pre_sharding.items():
                 merged_sharding: Dict[str, ShardingSpec] = {}
                 condition_fn = None
-                target_op = "forward"  # Default, will be updated from edge_info
+                target_op = None  # Must be provided by EdgeShardingInfo
                 for edge_info in edge_info_list:
                     merged_sharding.update(edge_info.tensor_sharding)
                     if edge_info.condition_fn is not None:
@@ -198,7 +198,7 @@ class OperatorManager:
             for post_spmd_id, edge_info_list in meta.output_post_sharding.items():
                 merged_sharding: Dict[str, Any] = {}
                 condition_fn = None
-                target_op = "forward"  # Default, will be updated from edge_info
+                target_op = None  # Must be provided by EdgeShardingInfo
                 for edge_info in edge_info_list:
                     merged_sharding.update(edge_info.tensor_sharding)
                     if edge_info.condition_fn is not None:

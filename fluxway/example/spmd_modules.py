@@ -199,8 +199,7 @@ def modulo_routing_fn(
     mesh_axis_names=("data",),
     mesh_axis_shapes=(4,),
     max_async_steps=2,
-    params_update_steps=1,
-    enable_output_step_remap=True,
+    use_global_step_indexing=True,
 )
 class PreprocessingSPMD:
     """
@@ -215,7 +214,7 @@ class PreprocessingSPMD:
     """
 
     @operator(
-        name="forward",
+        name="preprocess",
         input_sharding={
             # Sparse input: uses fn for dynamic routing
             "input": {"type": "sparse", "axis": ["data"]}
@@ -227,14 +226,14 @@ class PreprocessingSPMD:
         tensor_argument=["input"],
         periodic_barrier=1,
     )
-    def forward(self, data: TensorOnly) -> DataState1:
+    def preprocess(self, data: TensorOnly) -> DataState1:
         """Preprocess sparse input from reader and output sparse data (periodic mode)."""
         start_time = time.time()
         input_shape_info = (
             f"len={len(data.input) if hasattr(data.input, '__len__') else 'N/A'}"
         )
         logger.info(
-            f"[PreprocessingSPMD.forward] input: type={type(data.input).__name__}, "
+            f"[PreprocessingSPMD.preprocess] input: type={type(data.input).__name__}, "
             f"{input_shape_info}"
         )
 
@@ -259,7 +258,7 @@ class PreprocessingSPMD:
 
         end_time = time.time()
         logger.info(
-            f"[PreprocessingSPMD.forward] input_records={len(data.input)}, "
+            f"[PreprocessingSPMD.preprocess] input_records={len(data.input)}, "
             f"input_shape={input_shape_info}, output_shape={output_tensor.shape}, "
             f"duration={end_time - start_time:.6f}s"
         )
@@ -277,7 +276,7 @@ class PreprocessingSPMD:
     mesh_axis_names=("data",),
     mesh_axis_shapes=(2,),
     max_async_steps=2,
-    params_update_steps=1,
+    use_global_step_indexing=False,
 )
 class ModelSPMD:
     """
@@ -288,7 +287,7 @@ class ModelSPMD:
     """
 
     @operator(
-        name="forward",
+        name="compute",
         input_sharding={
             # Sparse input: uses fn for dynamic routing
             "tensor": {"type": "dense", "axis": ["data"]}
@@ -300,12 +299,12 @@ class ModelSPMD:
         state_argument=["processed"],
         tensor_argument=["tensor"],
     )
-    def forward(self, state: DataState2) -> DataState3:
+    def compute(self, state: DataState2) -> DataState3:
         """Model forward pass: process sparse input and output dense data."""
         start_time = time.time()
         input_shape = state.tensor.shape if hasattr(state.tensor, "shape") else "N/A"
         logger.info(
-            f"[ModelSPMD.forward] input: input_shape={input_shape}, "
+            f"[ModelSPMD.compute] input: input_shape={input_shape}, "
             f"processed={state.processed}"
         )
 
@@ -317,7 +316,7 @@ class ModelSPMD:
 
         end_time = time.time()
         logger.info(
-            f"[ModelSPMD.forward] completed, "
+            f"[ModelSPMD.compute] completed, "
             f"input_shape={input_shape}, output_shape={output_tensor.shape}, "
             f"duration={end_time - start_time:.6f}s"
         )
@@ -325,7 +324,7 @@ class ModelSPMD:
         return DataState3(tensor=output_tensor, stage=1)
 
     @operator(
-        name="backward",
+        name="optimize",
         input_sharding={
             # Dense input: regular block sharding
             # Note: This must match forward output sharding for self-loop edge
@@ -339,12 +338,12 @@ class ModelSPMD:
         state_argument=["stage"],
         tensor_argument=["tensor"],
     )
-    def backward(self, state: DataState3) -> Gradient2:
+    def optimize(self, state: DataState3) -> Gradient2:
         """Model backward pass: compute model gradients from forward output."""
         start_time = time.time()
         input_shape = state.tensor.shape if hasattr(state.tensor, "shape") else "N/A"
         logger.info(
-            f"[ModelSPMD.backward] input: input_shape={input_shape}, "
+            f"[ModelSPMD.optimize] input: input_shape={input_shape}, "
             f"stage={state.stage}"
         )
 
@@ -356,7 +355,7 @@ class ModelSPMD:
 
         end_time = time.time()
         logger.info(
-            f"[ModelSPMD.backward] completed, "
+            f"[ModelSPMD.optimize] completed, "
             f"input_shape={input_shape}, output_shape={output_grad.shape}, "
             f"duration={end_time - start_time:.6f}s"
         )

@@ -75,6 +75,6 @@ class WorkerRegistrar:
         """
         return self._registrations.copy()
 
-    def get_worker_count(self) -> int:
+    def get_num_workers(self) -> int:
         """Get number of registered workers."""
         return len(self._registrations)

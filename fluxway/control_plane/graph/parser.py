@@ -69,8 +69,6 @@ class GraphParser:
         config: SPMDConfig,
         upstream_nodes: Optional[List[str]] = None,
         downstream_nodes: Optional[List[str]] = None,
-        forward_fn: Optional[callable] = None,
-        backward_fn: Optional[callable] = None,
     ) -> Node:
         """
         Build a Node programmatically.
@@ -80,8 +78,6 @@ class GraphParser:
             config: SPMD configuration
             upstream_nodes: List of upstream dependency node IDs
             downstream_nodes: List of downstream dependent node IDs
-            forward_fn: User-defined forward function
-            backward_fn: User-defined backward function
 
         Returns:
             Constructed Node

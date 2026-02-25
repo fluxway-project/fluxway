@@ -1,8 +1,8 @@
 import fluxway
 import torch
 from typing import Optional
-from enum import Enum
-from fluxway import Builder
+
+from fluxway import FunctionalGraph
 
 ## 用户构建 graph 的相关 api 示例
 # 1. 定义数据类型：
@@ -77,8 +77,8 @@ def read_from_datasource(ds: DataSource) -> ActionState1:
 
 
 class SPMD1:
-    @fluxway.operator(name="forward")
-    def forward(self, datasource: DataSource) -> ActionState1:
+    @fluxway.operator(name="produce")
+    def produce(self, datasource: DataSource) -> ActionState1:
         return read_from_datasource(datasource)
 
 
@@ -86,56 +86,39 @@ class SPMD1:
     resource={"nums_cpu": 1, "nums_gpu": 0, "memory": 1, "cnt": 1},
     mesh_axis_names=("dp",),
     mesh_axis_shapes=(1,),
-    max_async_steps=10,
-    params_update_steps=1,
 )
 class SPMD2:
-    @fluxway.operator(name="forward")
-    def forward(self, state: ActionState1) -> ActionState2:
+    @fluxway.operator(name="compute")
+    def compute(self, state: ActionState1) -> ActionState2:
         return ActionState2(id=state.id, tensor=state.tensor)
 
-    @fluxway.operator(name="backward")
-    def backward(self, state: ActionState2) -> Optional[Gradient2]:
+    @fluxway.operator(name="optimize")
+    def optimize(self, state: ActionState2) -> Optional[Gradient2]:
         pass
-
-
-class PartitionType(str, Enum):
-    """The type of task to run on the vLLM engine."""
-
-    """Generate text."""
-    DP = "dp"
-
-    """Generate embeddings."""
-    TP = "tp"
 
 
 @fluxway.spmd(
     resource={"nums_cpu": 4, "nums_gpu": 2, "memory": 16, "cnt": 1},
     mesh_axis_names=("dp", "tp"),
     mesh_axis_shapes=(4, 2),
-    max_async_steps=10,
-    params_update_steps=1,
 )
 class SPMD3:
     @fluxway.operator(
-        name="forward",
+        name="compute",
         input_sharding={
-            "id": {"type": "dense", "axis": [None]},  # Replicate
-            "tensor": {"type": "dense", "axis": ["dp"]},  # Shard along dp axis
+            "id": {"type": "dense", "axis": [None]},
+            "tensor": {"type": "dense", "axis": ["dp"]},
         },
         output_sharding={
-            "id": {"type": "dense", "axis": [None]},  # Replicate
-            "tensor": {"type": "dense", "axis": ["dp"]},  # Shard along dp axis
-            # For sparse sharding, use fn:
-            # "tensor": {"type": "sparse", "axis": ["dp"], "fn": my_routing_fn}
-            # where fn(tensor, tensor_meta, post_spec) -> List[(slice, rank)]
+            "id": {"type": "dense", "axis": [None]},
+            "tensor": {"type": "dense", "axis": ["dp"]},
         },
     )
-    def forward(self, state: ActionState1) -> ActionState3:
+    def compute(self, state: ActionState1) -> ActionState3:
         return ActionState3(id=state.id, tensor=state.tensor)
 
-    @fluxway.operator(name="backward")
-    def backward(self, state: ActionState3) -> Optional[Gradient3]:
+    @fluxway.operator(name="optimize")
+    def optimize(self, state: ActionState3) -> Optional[Gradient3]:
         pass
 
 
@@ -143,37 +126,27 @@ def check(state: ActionState1) -> bool:
     return state.id == 1
 
 
-def check1(state: ActionState1) -> bool:
-    return state.id != 1
+# 使用 FunctionalGraph 构造 graph
+fg = FunctionalGraph()
 
+# 注册节点
+node1 = fg.node("Node1", SPMD1)
+node2 = fg.node("Node2", SPMD2)
+node3 = fg.node("Node3", SPMD3)
 
-# 构造器方法构造 graph
-builder = Builder()
+# 假设 datasource 是通过某种方式注入的或者在 SPMD1 内部处理
+# 这里简化为直接调用
+h1 = node1.produce(datasource=DataSource())
 
-builder.add_node("SPMD1", SPMD1, "description1")
-builder.add_node("SPMD2", SPMD2, "description2")
-builder.add_node("SPMD3", SPMD3, "description3")
+# 条件分支
+h2 = node2.compute(h1, condition_fn=check)
+h3 = node3.compute(h1, condition_fn=lambda state: not check(state))
 
-# 定义 SPMD1 和 SPMD2、SPMD3 之间的前向条件边
-builder.add_forward_conditional_edge("SPMD1", check, {True: "SPMD2", False: "SPMD3"})
-# 等价于
-builder.add_forward_conditional_edge("SPMD1", check, {True: "SPMD2"})
-builder.add_forward_conditional_edge("SPMD1", check, {False: "SPMD3"})
-# 等价于
-builder.add_forward_conditional_edge("SPMD1", check, "SPMD2")
-builder.add_forward_conditional_edge("SPMD1", check1, "SPMD3")
+# 反向链路（优化）
+node2.optimize(h2)
+node3.optimize(h3)
 
-# 定义 SPMD2 和 SPMD1 之间的反向条件边
-builder.add_backward_conditional_edge("SPMD2", None, "SPMD1")
-# 等价于
-builder.add_backward_edge("SPMD2", "SPMD1")
+# 自循环或其他复杂拓扑
+node2.optimize(h2)  # SPMD2 反向触发自身的下一次操作等（示意）
 
-# 定义 SPMD3 和 SPMD1 之间的反向条件边
-builder.add_backward_conditional_edge("SPMD3", None, "SPMD1")
-# 等价于
-builder.add_backward_edge("SPMD3", "SPMD1")
-
-builder.add_backward_edge("SPMD2", "SPMD2")
-builder.add_backward_edge("SPMD3", "SPMD3")
-
-builder.build(name="test")
+graph = fg.compile("functional_test")

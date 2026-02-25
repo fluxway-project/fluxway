@@ -6,7 +6,7 @@ Based on ARCHITECTURE.md sections 2.1.1, 3.2.1, 4.2, 4.3
 
 from typing import Callable, Dict, List, Optional, Any, Type
 
-from pydantic import BaseModel, Field, ConfigDict, model_validator
+from pydantic import BaseModel, Field, ConfigDict
 
 
 from enum import Enum
@@ -40,7 +40,7 @@ class ReaderConfig(BaseModel):
     data_type: str = "json"  # Data type: json, parquet, csv, etc.
     batch_size: int = 1000  # Batch size for reading
     file_pattern: str = "*"  # File pattern for matching
-    worker_count: int = 1  # Number of reader workers
+    num_workers: int = 1  # Number of reader workers
     encoding: str = "utf-8"  # File encoding
     tensor_name: Optional[str] = (
         None  # Tensor field name extracted from output_data_type (set during build)
@@ -60,11 +60,16 @@ class MailboxStatus(BaseModel):
 
 
 class SPMDConfig(BaseModel):
-    """SPMD configuration including worker count, resource requirements and execution params."""
+    """
+    Configuration for a single SPMD (Single Program, Multiple Data) execution unit.
+
+    This defines how the SPMD operates, including its mesh, operators, and execution
+    parameters.
+    """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    worker_count: int = 1
+    # Mesh axis configuration (e.g., ("data", 4), ("model", 2))
     # Mesh is now stored as DeviceMesh directly
     mesh: Optional[Any] = None  # DeviceMesh (use Any to avoid circular import)
 
@@ -75,26 +80,19 @@ class SPMDConfig(BaseModel):
     operator_metas: Dict[str, "OperatorMeta"] = Field(default_factory=dict)
 
     max_async_steps: int = 1  # Maximum async steps between workers in the same SPMD
-    params_update_steps: int = 1  # Sync barrier every N steps for parameter updates
-    # remap to be unique.
-    # - Default False: output step should be consistent with the input/execution step.
+    # use_global_step_indexing:
+    # - If False (default): output step should be consistent with the input/execution step.
     # - If True:
     #   - periodic operators: output_step = total_rank * _current_step + local_rank
     #   - standard operators: output_step = _current_step
-    enable_output_step_remap: bool = False
+    use_global_step_indexing: bool = False
 
-    @model_validator(mode="after")
-    def _sync_worker_count_from_mesh(self) -> "SPMDConfig":
-        """
-        Keep worker_count derived from mesh.
-
-        worker_count = product(mesh axis sizes) = mesh.num_devices
-        """
+    @property
+    def num_workers(self) -> int:
+        """Derive world size (total workers) from mesh size."""
         if self.mesh is None:
-            self.worker_count = 1
-            return self
-        self.worker_count = int(getattr(self.mesh, "size", 1))
-        return self
+            return 1
+        return int(getattr(self.mesh, "size", 1))
 
     @property
     def has_mesh(self) -> bool:
@@ -175,8 +173,8 @@ class Edge(BaseModel):
 
     source_node: str
     target_node: str
-    source_op: str = "forward"  # Source node's op name
-    target_op: str = "forward"  # Target node's op name
+    source_op: Optional[str] = None  # Source node's op name
+    target_op: Optional[str] = None  # Target node's op name
     condition_fn: Optional[Callable[..., bool]] = None
 
 
@@ -217,7 +215,7 @@ class EdgeShardingInfo(BaseModel):
     # Tensor sharding for this edge: {tensor_name: raw dict or ShardingSpec}
     tensor_sharding: Dict[str, Any] = Field(default_factory=dict)
     # Target node's op name
-    target_op: str = "forward"
+    target_op: Optional[str] = None
     # Condition function for conditional edges
     condition_fn: Optional[Callable[..., bool]] = None
 
@@ -663,8 +661,8 @@ class DriverHeartbeat(BaseModel):
     op_steps: Dict[str, int] = Field(
         default_factory=dict
     )  # op_type.name -> spmd-level step
-    worker_count: int = 0
-    healthy_worker_count: int = 0
+    num_workers: int = 0
+    healthy_num_workers: int = 0
     blocked_ops: List[str] = Field(default_factory=list)
     workers_ready: bool = False  # All workers have reported heartbeat
     workers_running: bool = False  # All workers are running main loop
@@ -705,14 +703,14 @@ class SPMDPlacementSpec(BaseModel):
     spmd_id: str
     driver_resource: DriverResourceSpec = Field(default_factory=DriverResourceSpec)
     worker_resource: Optional["ResourceSpec"] = None  # Single worker resource
-    worker_count: int = 1
+    num_workers: int = 1
 
     @property
     def total_worker_cpus(self) -> int:
         """Total worker CPUs."""
         if self.worker_resource is None:
-            return self.worker_count
-        return self.worker_resource.num_cpus * self.worker_count
+            return self.num_workers
+        return self.worker_resource.num_cpus * self.num_workers
 
     @property
     def total_worker_gpus(self) -> int:

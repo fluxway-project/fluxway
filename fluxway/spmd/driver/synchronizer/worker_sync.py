@@ -24,22 +24,22 @@ class WorkerSynchronizer:
     and reports SPMD-level progress to controller.
     """
 
-    def __init__(self, spmd_id: str, worker_count: int, max_worker_step_diff: int = 1):
+    def __init__(self, spmd_id: str, num_workers: int, max_worker_step_diff: int = 1):
         """
         Initialize WorkerSynchronizer.
 
         Args:
             spmd_id: SPMD identifier
-            worker_count: Number of workers in this SPMD
+            num_workers: Number of workers in this SPMD
             max_worker_step_diff: Maximum allowed step difference between workers
         """
         self.spmd_id = spmd_id
-        self.worker_count = worker_count
+        self.num_workers = num_workers
         self.max_worker_step_diff = max_worker_step_diff
 
         # Worker-level step tracking: rank -> {op_name -> step}
         self._worker_steps: Dict[int, Dict[str, int]] = {
-            rank: {} for rank in range(worker_count)
+            rank: {} for rank in range(num_workers)
         }
 
         # SPMD-level steps (minimum completed by all workers)
@@ -50,7 +50,7 @@ class WorkerSynchronizer:
 
         # Worker lock states (for step difference enforcement)
         self._worker_op_locked: Dict[int, Dict[str, bool]] = {
-            rank: {} for rank in range(worker_count)
+            rank: {} for rank in range(num_workers)
         }
 
         # Lock for thread safety
@@ -133,16 +133,14 @@ class WorkerSynchronizer:
 
         Must hold lock when calling.
         """
-        steps = [
-            self._worker_steps[r].get(op_name, 0) for r in range(self.worker_count)
-        ]
+        steps = [self._worker_steps[r].get(op_name, 0) for r in range(self.num_workers)]
         max_step = max(steps)
         min_step = min(steps)
         diff = max_step - min_step
 
         if diff > self.max_worker_step_diff:
             # Block workers that are too far ahead
-            for rank in range(self.worker_count):
+            for rank in range(self.num_workers):
                 worker_step = self._worker_steps[rank].get(op_name, 0)
                 if worker_step >= max_step and not self._worker_op_locked[rank].get(
                     op_name, False
@@ -160,7 +158,7 @@ class WorkerSynchronizer:
 
         elif diff <= self.max_worker_step_diff // 2:
             # Unblock workers when difference is small enough
-            for rank in range(self.worker_count):
+            for rank in range(self.num_workers):
                 if self._worker_op_locked[rank].get(op_name, False):
                     self._worker_op_locked[rank][op_name] = False
                     logger.info(
@@ -176,7 +174,7 @@ class WorkerSynchronizer:
         """Check if all workers completed the given step. Must hold lock."""
         return all(
             self._worker_steps[r].get(op_name, 0) >= step
-            for r in range(self.worker_count)
+            for r in range(self.num_workers)
         )
 
     # =========================================================================
@@ -198,7 +196,7 @@ class WorkerSynchronizer:
 
         # Block all workers
         if self._block_worker_op:
-            for rank in range(self.worker_count):
+            for rank in range(self.num_workers):
                 try:
                     self._block_worker_op(rank, op_name)
                 except Exception as e:
@@ -221,7 +219,7 @@ class WorkerSynchronizer:
             # Unblock workers (unless they're blocked by step diff)
             workers_to_unblock = [
                 rank
-                for rank in range(self.worker_count)
+                for rank in range(self.num_workers)
                 if not self._worker_op_locked[rank].get(op_name, False)
             ]
 
@@ -287,7 +285,7 @@ class WorkerSynchronizer:
     def reset(self) -> None:
         """Reset all step tracking and locks."""
         with self._lock:
-            for rank in range(self.worker_count):
+            for rank in range(self.num_workers):
                 self._worker_steps[rank].clear()
                 self._worker_op_locked[rank].clear()
 

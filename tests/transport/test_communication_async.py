@@ -12,7 +12,7 @@ from fluxway.common.types.tensor import TransportTensor
 class TestDataDistributor(unittest.TestCase):
     def setUp(self):
         self.local_rank = 0
-        self.world_size = 2
+        self.num_workers = 2
 
         # Setup simple data
         self.data = jnp.arange(10, dtype=jnp.float32)

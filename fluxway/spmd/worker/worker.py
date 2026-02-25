@@ -96,7 +96,7 @@ class SPMDWorker:
 
         # Mesh from config
         self._mesh = config.mesh
-        self._total_rank = config.worker_count  # Total number of workers in this SPMD
+        self._total_rank = config.num_workers  # Total number of workers in this SPMD
 
         # Operator Manager (topology parsed from config) - only for SPMD nodes
         if node_type == NodeType.SPMD:
@@ -211,22 +211,22 @@ class SPMDWorker:
         """Get the driver handle."""
         return self._driver_handle
 
-    def compute_output_step(
+    def _resolve_output_step(
         self, *, is_periodic: bool, current_step: int, input_step: int
     ) -> int:
         """
         Compute output step number based on SPMDConfig and operator mode.
 
         Spec:
-        - enable_output_step_remap=False (default): output_step == input_step
-        - enable_output_step_remap=True:
+        - use_global_step_indexing=False (default): output_step == input_step
+        - use_global_step_indexing=True:
             - periodic_barrier=True: output_step = total_rank * current_step + local_rank
             - standard (non-periodic): output_step = current_step
         """
-        enable_output_step_remap = getattr(
-            self.config, "enable_output_step_remap", False
+        use_global_step_indexing = getattr(
+            self.config, "use_global_step_indexing", False
         )
-        if not enable_output_step_remap:
+        if not use_global_step_indexing:
             return input_step
         if is_periodic:
             return self._total_rank * current_step + self.rank
@@ -941,14 +941,14 @@ class SPMDWorker:
                 else False
             )
             current_step = self._current_steps[op_name]
-            output_step = self.compute_output_step(
+            output_step = self._resolve_output_step(
                 is_periodic=is_periodic, current_step=current_step, input_step=step
             )
             if is_periodic:
                 logger.debug(
                     f"[spmd_id={self.spmd_id}] periodic_trigger=True: input_step={step}, current_step={current_step}, "
                     f"output_step={output_step}, rank={self.rank}, total_rank={self._total_rank}, "
-                    f"enable_output_step_remap={getattr(self.config, 'enable_output_step_remap', False)}"
+                    f"use_global_step_indexing={getattr(self.config, 'use_global_step_indexing', False)}"
                 )
 
             # Send output

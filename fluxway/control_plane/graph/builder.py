@@ -7,12 +7,12 @@ Usage:
     builder = Builder()
     builder.add_node("SPMD1", SPMD1, "description1")
     builder.add_node("SPMD2", SPMD2, "description2")
-    builder.add_forward_conditional_edge("SPMD1", check_fn, {True: "SPMD2"})
-    builder.add_backward_edge("SPMD2", "SPMD1")
+    builder.add_func_edge("SPMD1", "forward", "SPMD2", "forward")
+    builder.add_func_edge("SPMD2", "backward", "SPMD1", "backward")
     graph = builder.build(name="my_graph")
 """
 
-from typing import Any, Dict, List, Optional, Callable, Union, Type, Tuple
+from typing import Any, Dict, List, Optional, Callable, Type, Tuple
 import logging
 
 from ...common.types import (
@@ -337,165 +337,6 @@ class Builder:
         self._validate_and_link_edge(
             source_node, source_op, target_node, target_op, condition_fn
         )
-
-        return self
-
-    def add_forward_edge(
-        self,
-        source_node: str,
-        target_node: str,
-        condition_fn: Optional[Callable[..., bool]] = None,
-    ) -> "Builder":
-        """
-        Add a forward edge: source.forward -> target.forward
-
-        Syntactic sugar for: add_func_edge(source, "forward", target, "forward", condition_fn)
-
-        Args:
-            source_node: Source node name
-            target_node: Target node name
-            condition_fn: Optional condition function for the edge
-
-        Returns:
-            Self for method chaining
-        """
-        return self.add_func_edge(
-            source_node, "forward", target_node, "forward", condition_fn
-        )
-
-    def add_forward_conditional_edge(
-        self,
-        source_node: str,
-        condition_fn: Optional[Callable[..., bool]],
-        target_mapping: Union[Dict[bool, Optional[str]], str],
-    ) -> "Builder":
-        """
-        Add conditional forward edges based on a condition function.
-
-        Supports multiple forms:
-        1. add_forward_conditional_edge("SPMD1", check_fn, {True: "SPMD2", False: "SPMD3"})
-        2. add_forward_conditional_edge("SPMD1", check_fn, "SPMD2")  # Equivalent to {True: "SPMD2"}
-        3. add_forward_conditional_edge("SPMD1", None, "SPMD2")  # Unconditional edge
-
-        Args:
-            source_node: Source node name
-            condition_fn: Condition function that returns bool, or None for unconditional
-            target_mapping: Either a mapping from condition result to target node,
-                          or a simple target node string
-
-        Returns:
-            Self for method chaining
-        """
-        # Simple string form
-        if isinstance(target_mapping, str):
-            if condition_fn is None:
-                # Unconditional edge: add_forward_conditional_edge("SPMD1", None, "SPMD2")
-                return self.add_forward_edge(source_node, target_mapping)
-            else:
-                # Conditional edge with True: add_forward_conditional_edge("SPMD1", check, "SPMD2")
-                # Equivalent to {True: "SPMD2"}
-                self.add_forward_edge(source_node, target_mapping, condition_fn)
-                return self
-
-        # Dict form with condition mapping
-        for condition_result, target_node in target_mapping.items():
-            if target_node is not None:
-                # Create a wrapped condition function that checks for specific result
-                if condition_fn is not None:
-
-                    def make_condition(cond_fn: Callable, expected: bool) -> Callable:
-                        def wrapped_fn(*args, **kwargs) -> bool:
-                            return cond_fn(*args, **kwargs) == expected
-
-                        return wrapped_fn
-
-                    wrapped_condition = make_condition(condition_fn, condition_result)
-                    self.add_forward_edge(source_node, target_node, wrapped_condition)
-                else:
-                    # No condition function means unconditional edge
-                    if condition_result is True:
-                        self.add_forward_edge(source_node, target_node)
-
-        return self
-
-    # -------------------------------------------------------------------------
-    # Backward edges
-    # -------------------------------------------------------------------------
-
-    def add_backward_edge(
-        self,
-        source_node: str,
-        target_node: str,
-        condition_fn: Optional[Callable[..., bool]] = None,
-    ) -> "Builder":
-        """
-        Add a backward edge: source.backward -> target.backward
-
-        Syntactic sugar for: add_func_edge(source, "backward", target, "backward", condition_fn)
-
-        Args:
-            source_node: Source node name (where gradient originates)
-            target_node: Target node name (where gradient flows to)
-            condition_fn: Optional condition function
-
-        Returns:
-            Self for method chaining
-        """
-        return self.add_func_edge(
-            source_node, "backward", target_node, "backward", condition_fn
-        )
-
-    def add_backward_conditional_edge(
-        self,
-        source_node: str,
-        condition_fn: Optional[Callable[..., bool]],
-        target_mapping: Union[Dict[bool, Optional[str]], str],
-    ) -> "Builder":
-        """
-        Add conditional backward edges.
-
-        Supports multiple forms:
-        1. add_backward_conditional_edge("SPMD2", check_fn, {True: "SPMD1", False: None})
-        2. add_backward_conditional_edge("SPMD2", check_fn, "SPMD1")  # Equivalent to {True: "SPMD1"}
-        3. add_backward_conditional_edge("SPMD2", None, "SPMD1")  # Unconditional edge
-
-        Args:
-            source_node: Source node name
-            condition_fn: Condition function that returns bool, or None for unconditional
-            target_mapping: Either a mapping from condition result to target node,
-                          or a simple target node string
-
-        Returns:
-            Self for method chaining
-        """
-        # Simple string form
-        if isinstance(target_mapping, str):
-            if condition_fn is None:
-                # Unconditional edge: add_backward_conditional_edge("SPMD2", None, "SPMD1")
-                return self.add_backward_edge(source_node, target_mapping)
-            else:
-                # Conditional edge with True: add_backward_conditional_edge("SPMD2", check, "SPMD1")
-                # Equivalent to {True: "SPMD1"}
-                self.add_backward_edge(source_node, target_mapping, condition_fn)
-                return self
-
-        # Dict form with condition mapping
-        for condition_result, target_node in target_mapping.items():
-            if target_node is not None:
-                if condition_fn is not None:
-
-                    def make_condition(cond_fn: Callable, expected: bool) -> Callable:
-                        def wrapped_fn(*args, **kwargs) -> bool:
-                            return cond_fn(*args, **kwargs) == expected
-
-                        return wrapped_fn
-
-                    wrapped_condition = make_condition(condition_fn, condition_result)
-                    self.add_backward_edge(source_node, target_node, wrapped_condition)
-                else:
-                    # No condition function means unconditional edge
-                    if condition_result is True:
-                        self.add_backward_edge(source_node, target_node)
 
         return self
 

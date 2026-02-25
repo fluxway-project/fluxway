@@ -22,7 +22,7 @@ class TransportPlan:
     dest_devices: Any
     send_counts: Any
     dim: int
-    target_world_size: int
+    target_num_workers: int
     replication_factor: int = 1
     global_indices: Optional[Any] = None
 
@@ -45,7 +45,7 @@ class TransportPlan:
         """Iterate by device: (device_id, offset, count)."""
         backend = get_backend()
         offset = 0
-        for device_id in range(self.target_world_size):
+        for device_id in range(self.target_num_workers):
             count = int(backend.item(self.send_counts[device_id]))
             if count > 0:
                 yield device_id, offset, count
@@ -88,7 +88,7 @@ class TransportPlanner:
             dest_devices,
             send_counts,
             global_indices,
-            target_world_size,
+            target_num_workers,
             replica_size,
         ) = TransportPlanner._compute_plan_internal(
             src_indices=src_indices,
@@ -108,7 +108,7 @@ class TransportPlanner:
             dest_devices=dest_devices,
             send_counts=send_counts,
             dim=routing_dim,
-            target_world_size=target_world_size,
+            target_num_workers=target_num_workers,
             replication_factor=replica_size,
             global_indices=global_indices,
         )
@@ -129,7 +129,7 @@ class TransportPlanner:
         """Internal static logical core for JIT compilation."""
         backend = get_backend()
 
-        dst_world_size = dst_mesh.size if dst_mesh else 1
+        dst_num_workers = dst_mesh.size if dst_mesh else 1
         dst_is_content_addressable = (
             getattr(dst_strategy, "routing_paradigm", None) is not None
             and dst_strategy.routing_paradigm.name == "DYNAMIC"
@@ -220,14 +220,14 @@ class TransportPlanner:
             axes = dst_partitions[d]
             axis_indices = [dst_mesh.axis_names.index(ax) for ax in axes]
             sub_mesh_shape = tuple(dst_mesh.shape[idx] for idx in axis_indices)
-            sub_world_size = 1
+            sub_num_workers = 1
             for s in sub_mesh_shape:
-                sub_world_size *= s
+                sub_num_workers *= s
 
             logical_ranks_d = strategy(
                 indices_for_routing,
                 dim_size=dst_data_shape[d],
-                world_size=sub_world_size,
+                num_workers=sub_num_workers,
                 topology=dst_topology if is_dynamic_dim else None,
             )
 
@@ -315,14 +315,14 @@ class TransportPlanner:
         # Generate the count of elements destined for each device using bincount.
         # We use the physical target world size to ensure the counts array is correctly sized.
 
-        send_counts = _bincount(backend, primary_dest_flat, minlength=dst_world_size)
+        send_counts = _bincount(backend, primary_dest_flat, minlength=dst_num_workers)
 
         return (
             sort_indices,
             dest_devices,
             send_counts,
             primary_src_global_indices,
-            dst_world_size,
+            dst_num_workers,
             num_replicas,
         )
 

@@ -88,7 +88,7 @@ class PartitionStrategy:
         self,
         indices: Any,
         dim_size: int,
-        world_size: int,
+        num_workers: int,
         topology: Optional[Topology] = None,
     ) -> Any:
         raise NotImplementedError
@@ -104,23 +104,23 @@ class PartitionStrategy:
 class ChunkPartition(PartitionStrategy):
     """Chunk partitioning: idx → idx // chunk_size"""
 
-    def __call__(self, indices, dim_size, world_size, topology=None):
+    def __call__(self, indices, dim_size, num_workers, topology=None):
         backend = get_backend()
-        chunk_size = max((dim_size + world_size - 1) // world_size, 1)
+        chunk_size = max((dim_size + num_workers - 1) // num_workers, 1)
         ranks = indices // chunk_size
         return backend.where(
-            ranks >= world_size,
-            backend.full(backend.shape(ranks), world_size - 1, dtype=backend.int32()),
+            ranks >= num_workers,
+            backend.full(backend.shape(ranks), num_workers - 1, dtype=backend.int32()),
             ranks,
         )
 
 
 class CyclicPartition(PartitionStrategy):
-    """Cyclic partitioning: idx → idx % world_size"""
+    """Cyclic partitioning: idx → idx % num_workers"""
 
-    def __call__(self, indices, dim_size, world_size, topology=None):
+    def __call__(self, indices, dim_size, num_workers, topology=None):
         backend = get_backend()
-        return backend.mod(indices, world_size)
+        return backend.mod(indices, num_workers)
 
 
 class IndexedPartition(PartitionStrategy):
@@ -128,7 +128,7 @@ class IndexedPartition(PartitionStrategy):
 
     routing_paradigm = RoutingParadigm.DYNAMIC
 
-    def __call__(self, indices, dim_size, world_size, topology=None):
+    def __call__(self, indices, dim_size, num_workers, topology=None):
         backend = get_backend()
 
         if isinstance(topology, IndexedTopology):
@@ -141,7 +141,7 @@ class IndexedPartition(PartitionStrategy):
         else:
             values = indices
 
-        return backend.mod(values, world_size)
+        return backend.mod(values, num_workers)
 
 
 class GreedyPartition(PartitionStrategy):
@@ -149,7 +149,7 @@ class GreedyPartition(PartitionStrategy):
 
     routing_paradigm = RoutingParadigm.DYNAMIC
 
-    def __call__(self, indices, dim_size, world_size, topology=None):
+    def __call__(self, indices, dim_size, num_workers, topology=None):
         backend = get_backend()
 
         if isinstance(topology, RaggedTopology):
@@ -162,10 +162,10 @@ class GreedyPartition(PartitionStrategy):
         else:
             lengths_list = [1] * dim_size
 
-        rank_loads = [0] * world_size
+        rank_loads = [0] * num_workers
         assigned = []
         for length in lengths_list:
-            best = min(range(world_size), key=lambda i: rank_loads[i])
+            best = min(range(num_workers), key=lambda i: rank_loads[i])
             assigned.append(best)
             rank_loads[best] += int(length)
 
@@ -221,7 +221,7 @@ class Layout:
         return self.topology is None
 
     @property
-    def world_size(self) -> int:
+    def num_workers(self) -> int:
         return self.mesh.size
 
     def shard_size(self, dim: int) -> int:
@@ -466,9 +466,9 @@ class ShardingSpec:
 
             routing_paradigm = captured_strategy.routing_paradigm
 
-            def __call__(self, indices, dim_size, world_size, topology=None):
+            def __call__(self, indices, dim_size, num_workers, topology=None):
                 meta = captured_meta if captured_meta is not None else topology
-                return captured_strategy(indices, dim_size, world_size, topology=meta)
+                return captured_strategy(indices, dim_size, num_workers, topology=meta)
 
             @property
             def name(self):

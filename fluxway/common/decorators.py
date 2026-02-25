@@ -422,9 +422,7 @@ def spmd(
     resource: Optional[Dict[str, Any]] = None,
     mesh_axis_names: Optional[Tuple[str, ...]] = None,
     mesh_axis_shapes: Optional[Tuple[int, ...]] = None,
-    max_async_steps: int = 1,
-    params_update_steps: int = 1,
-    enable_output_step_remap: bool = False,
+    use_global_step_indexing: bool = False,
 ):
     """
     Decorator to mark a class with SPMD execution configuration.
@@ -444,9 +442,7 @@ def spmd(
         resource: Resource requirements dict
         mesh_axis_names: Ordered tuple of mesh axis names (e.g., ("data", "model"))
         mesh_axis_shapes: Ordered tuple of mesh axis sizes (e.g., (4, 2))
-        max_async_steps: Maximum async steps between workers
-        params_update_steps: Sync barrier every N steps
-        enable_output_step_remap: Whether to remap output step numbers (see SPMDConfig.enable_output_step_remap)
+        use_global_step_indexing: Whether to use global unique indexing for outputs (streaming mode)
 
     Returns:
         Decorated class with SPMD configuration
@@ -474,19 +470,17 @@ def spmd(
         # Add attributes directly to the class
         cls._resource = resource_spec
         cls._mesh = mesh
-        cls._max_async_steps = max_async_steps
-        cls._params_update_steps = params_update_steps
-        cls._enable_output_step_remap = enable_output_step_remap
-
-        cls._enable_output_step_remap = enable_output_step_remap
+        cls._num_workers = None  # Determined by mesh at runtime
+        cls._use_global_step_indexing = use_global_step_indexing
 
         # Add methods directly to the class
         cls.get_resource = classmethod(lambda c: c._resource)
         cls.get_mesh = classmethod(lambda c: c._mesh)
-        cls.get_max_async_steps = classmethod(lambda c: c._max_async_steps)
-        cls.get_params_update_steps = classmethod(lambda c: c._params_update_steps)
-        cls.get_enable_output_step_remap = classmethod(
-            lambda c: getattr(c, "_enable_output_step_remap", False)
+        cls.get_num_workers = classmethod(
+            lambda c: int(getattr(c._mesh, "size", 1)) if c._mesh else 1
+        )
+        cls.get_use_global_step_indexing = classmethod(
+            lambda c: getattr(c, "_use_global_step_indexing", False)
         )
         cls.is_fluxway_spmd = classmethod(lambda c: True)
 
@@ -533,11 +527,9 @@ def spmd(
 
             return SPMDConfig(
                 mesh=c._mesh,
+                use_global_step_indexing=c._use_global_step_indexing,
                 operators=operators,
                 operator_metas=operator_metas,
-                max_async_steps=c._max_async_steps,
-                params_update_steps=c._params_update_steps,
-                enable_output_step_remap=c._enable_output_step_remap,
             )
 
         cls.get_spmd_config = classmethod(get_spmd_config)

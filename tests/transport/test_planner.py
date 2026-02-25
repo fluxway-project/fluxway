@@ -17,7 +17,7 @@ def use_jax_backend():
     yield
 
 
-# ---- Scenario 1: static -> static (chunk -> chunk, different world_size) ----
+# ---- Scenario 1: static -> static (chunk -> chunk, different num_workers) ----
 
 
 def test_static_to_static():
@@ -32,7 +32,7 @@ def test_static_to_static():
     )
 
     assert plan.dim == 0
-    assert plan.target_world_size == 4
+    assert plan.target_num_workers == 4
 
     counts = plan.send_counts.tolist()
     assert counts[0] == 25
@@ -264,6 +264,6 @@ def test_multi_axis_dynamic_routing_dims():
     # Dim 0 processes [0, 1] -> distributes statically for Dim 1 because primary routing values map independently.
     # To truly verify Tuple routing_dim parsing without complex fallback payloads here, we rely on the compilation finishing successfully and generating valid layouts.
 
-    assert plan.target_world_size == 4
+    assert plan.target_num_workers == 4
     counts = plan.send_counts.tolist()
     assert len(counts) == 4

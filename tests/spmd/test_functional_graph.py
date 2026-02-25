@@ -13,11 +13,11 @@ class DummySPMD:
     """Mock SPMD for testing graph topology."""
 
     @operator
-    def forward(self, *args, **kwargs):
+    def compute(self, *args, **kwargs):
         pass
 
     @operator
-    def backward(self, *args, **kwargs):
+    def optimize(self, *args, **kwargs):
         pass
 
     @operator
@@ -46,8 +46,8 @@ def _mock_metas():
 
     metas = {}
     for op in [
-        "forward",
-        "backward",
+        "compute",
+        "optimize",
         "step",
         "rollout",
         "compute_reward",
@@ -92,9 +92,9 @@ def test_functional_graph_single_chain():
     node_a = graph.node("NodeA", DummySPMD)
     node_b = graph.node("NodeB", DummySPMD)
 
-    # A.forward -> B.forward
-    h_a = node_a.forward()
-    _ = node_b.forward(h_a)
+    # NodeA.compute -> NodeB.compute
+    h_a = node_a.compute()
+    _ = node_b.compute(h_a)
 
     task_graph = graph.compile()
 
@@ -106,9 +106,9 @@ def test_functional_graph_single_chain():
     assert len(task_graph.edges) == 1
     edge = task_graph.edges[0]
     assert edge.source_node == "NodeA"
-    assert edge.source_op == "forward"
+    assert edge.source_op == "compute"
     assert edge.target_node == "NodeB"
-    assert edge.target_op == "forward"
+    assert edge.target_op == "compute"
 
 
 def test_functional_graph_multi_input():
@@ -119,21 +119,21 @@ def test_functional_graph_multi_input():
     emb2 = graph.node("Emb2", DummySPMD)
     ffn = graph.node("FFN", DummySPMD)
 
-    h1 = emb1.forward()
-    h2 = emb2.forward()
+    h1 = emb1.compute()
+    h2 = emb2.compute()
 
     # FFN takes both
-    _ = ffn.forward(input1=h1, input2=h2)
+    _ = ffn.compute(input1=h1, input2=h2)
 
     task_graph = graph.compile()
 
     assert len(task_graph.edges) == 2
 
     sources = {(e.source_node, e.source_op) for e in task_graph.edges}
-    assert sources == {("Emb1", "forward"), ("Emb2", "forward")}
+    assert sources == {("Emb1", "compute"), ("Emb2", "compute")}
 
     targets = {(e.target_node, e.target_op) for e in task_graph.edges}
-    assert targets == {("FFN", "forward")}
+    assert targets == {("FFN", "compute")}
 
 
 def test_functional_graph_implicit_self_loop():
@@ -142,17 +142,17 @@ def test_functional_graph_implicit_self_loop():
 
     actor = graph.node("Actor", DummySPMD)
 
-    h_fwd = actor.forward()
-    _ = actor.backward(h_fwd)
+    h_fwd = actor.compute()
+    _ = actor.optimize(h_fwd)
 
     task_graph = graph.compile()
     assert len(task_graph.edges) == 1
 
     edge = task_graph.edges[0]
     assert edge.source_node == "Actor"
-    assert edge.source_op == "forward"
+    assert edge.source_op == "compute"
     assert edge.target_node == "Actor"
-    assert edge.target_op == "backward"
+    assert edge.target_op == "optimize"
 
 
 def test_functional_graph_agentic_rl():

@@ -41,11 +41,11 @@ def test_large_scale_sparse_moe():
     bk = get_backend()
 
     # 4 Experts
-    world_size = 4
-    mesh = DeviceMesh((world_size,), ("x",), list(range(world_size)))
+    num_workers = 4
+    mesh = DeviceMesh((num_workers,), ("x",), list(range(num_workers)))
     spec = ShardingSpec.chunk(mesh, P("x"))
 
-    cluster = {i: VirtualRank(i, mesh) for i in range(world_size)}
+    cluster = {i: VirtualRank(i, mesh) for i in range(num_workers)}
 
     # Large scale tokens (100k)
     import numpy as np
@@ -59,7 +59,7 @@ def test_large_scale_sparse_moe():
     tokens = bk.tensor(tokens_np)
 
     # Random routing to 4 experts (sparse distribution) -> each expert ~ 25k
-    routing_np = np.random.randint(0, world_size, size=total_tokens).astype(np.int32)
+    routing_np = np.random.randint(0, num_workers, size=total_tokens).astype(np.int32)
     routing = bk.tensor(routing_np)
 
     tt = TransportTensor(tokens, indices=routing)
@@ -91,7 +91,7 @@ def test_large_scale_sparse_moe():
 
     # Check experts received their shards
     total_received = 0
-    for r in range(world_size):
+    for r in range(num_workers):
         slices = cluster[r].receiver.get_buffered_slices()
         for tensors, counts in slices:
             count = counts[0]

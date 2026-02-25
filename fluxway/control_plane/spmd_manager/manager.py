@@ -190,7 +190,7 @@ class SPMDManager:
                     config=config,
                     placement_group=placement_group,
                     worker_bundle_indices=worker_bundle_indices
-                    or list(range(1, config.worker_count + 1)),
+                    or list(range(1, config.num_workers + 1)),
                     controller_handle=self._controller_handle,
                     graph_topology=graph_topology,
                     node_type=node_type,
@@ -203,7 +203,7 @@ class SPMDManager:
                     config=config,
                     placement_group=None,
                     worker_bundle_indices=worker_bundle_indices
-                    or list(range(1, config.worker_count + 1)),
+                    or list(range(1, config.num_workers + 1)),
                     controller_handle=self._controller_handle,
                     graph_topology=graph_topology,
                     node_type=node_type,

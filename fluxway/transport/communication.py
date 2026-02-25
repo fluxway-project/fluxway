@@ -565,7 +565,7 @@ def _jit_plan_and_pack(
         dest_devices,
         send_counts,
         global_indices,
-        target_world_size,
+        target_num_workers,
         replica_size,
     ) = TransportPlanner._compute_plan_internal(
         src_indices=src_indices,

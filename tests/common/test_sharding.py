@@ -30,7 +30,7 @@ def test_chunk_layout_dense():
     layout = spec._to_layout(data_shape=(100,))
 
     assert layout.partitions[0] == ("x",)
-    assert layout.world_size == 2
+    assert layout.num_workers == 2
     assert layout.is_static is True
     assert layout.topology_morphology == TopologyMorphology.CONTINUOUS
 

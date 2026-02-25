@@ -45,7 +45,7 @@ class PGManager:
 
     Each SPMD's PG contains:
     - 1 driver bundle (index 0)
-    - N worker bundles (indices 1 to worker_count)
+    - N worker bundles (indices 1 to num_workers)
     """
 
     def __init__(self):
@@ -56,7 +56,7 @@ class PGManager:
         # SPMD ID → ResourcePriority mapping
         self._spmd_to_priority: Dict[str, ResourcePriority] = {}
         # SPMD ID → worker count mapping
-        self._spmd_to_worker_count: Dict[str, int] = {}
+        self._spmd_to_num_workers: Dict[str, int] = {}
         # SPMD ID → driver resource mapping
         self._spmd_to_driver_resource: Dict[str, DriverResourceSpec] = {}
 
@@ -66,7 +66,7 @@ class PGManager:
         resource: ResourceSpec,
         priority: ResourcePriority = ResourcePriority.MID,
         strategy: PlacementStrategy = PlacementStrategy.PACK,
-        worker_count: int = 1,
+        num_workers: int = 1,
         driver_resource: Optional[DriverResourceSpec] = None,
     ) -> Optional[PlacementGroup]:
         """
@@ -74,14 +74,14 @@ class PGManager:
 
         The PG contains:
         - Bundle 0: Driver bundle
-        - Bundle 1 to worker_count: Worker bundles
+        - Bundle 1 to num_workers: Worker bundles
 
         Args:
             spmd_id: Unique SPMD identifier
             resource: Resource requirements for each worker
             priority: Resource priority for preemption decisions
             strategy: Placement strategy
-            worker_count: Number of workers
+            num_workers: Number of workers
             driver_resource: Optional driver resource spec (uses default if None)
 
         Returns:
@@ -93,7 +93,7 @@ class PGManager:
             logger.warning("Ray not available, returning mock placement group")
             self._spmd_to_resource[spmd_id] = resource
             self._spmd_to_priority[spmd_id] = priority
-            self._spmd_to_worker_count[spmd_id] = worker_count
+            self._spmd_to_num_workers[spmd_id] = num_workers
             self._spmd_to_driver_resource[spmd_id] = driver_res
             return None
 
@@ -105,9 +105,9 @@ class PGManager:
             driver_bundle = self._driver_resource_to_bundle(driver_res)
             bundles.append(driver_bundle)
 
-            # Bundles 1 to worker_count: Worker bundles
+            # Bundles 1 to num_workers: Worker bundles
             worker_bundle = self._resource_to_bundle(resource)
-            for _ in range(worker_count):
+            for _ in range(num_workers):
                 bundles.append(worker_bundle.copy())
 
             pg = placement_group(bundles=bundles, strategy=strategy.value)
@@ -119,12 +119,12 @@ class PGManager:
             self._spmd_to_pg[spmd_id] = pg
             self._spmd_to_resource[spmd_id] = resource
             self._spmd_to_priority[spmd_id] = priority
-            self._spmd_to_worker_count[spmd_id] = worker_count
+            self._spmd_to_num_workers[spmd_id] = num_workers
             self._spmd_to_driver_resource[spmd_id] = driver_res
 
             logger.info(
                 f"Created placement group for SPMD {spmd_id}: "
-                f"driver={driver_res}, worker={resource}, count={worker_count}"
+                f"driver={driver_res}, worker={resource}, count={num_workers}"
             )
             return pg
 
@@ -141,14 +141,14 @@ class PGManager:
         Get the bundle indices for workers.
 
         Returns:
-            List of bundle indices [1, 2, ..., worker_count]
+            List of bundle indices [1, 2, ..., num_workers]
         """
-        worker_count = self._spmd_to_worker_count.get(spmd_id, 1)
-        return list(range(1, worker_count + 1))
+        num_workers = self._spmd_to_num_workers.get(spmd_id, 1)
+        return list(range(1, num_workers + 1))
 
-    def get_worker_count(self, spmd_id: str) -> int:
+    def get_num_workers(self, spmd_id: str) -> int:
         """Get the worker count for an SPMD."""
-        return self._spmd_to_worker_count.get(spmd_id, 1)
+        return self._spmd_to_num_workers.get(spmd_id, 1)
 
     def get_pg(self, spmd_id: str) -> Optional[PlacementGroup]:
         """Get the PlacementGroup for an SPMD."""
@@ -297,7 +297,7 @@ class PGManager:
         Get detailed placement group info for an SPMD.
 
         Returns:
-            Dict with pg, driver_bundle_index, worker_bundle_indices, worker_count
+            Dict with pg, driver_bundle_index, worker_bundle_indices, num_workers
         """
         if spmd_id not in self._spmd_to_resource:
             return None
@@ -306,7 +306,7 @@ class PGManager:
             "pg": self._spmd_to_pg.get(spmd_id),
             "driver_bundle_index": self.get_driver_bundle_index(spmd_id),
             "worker_bundle_indices": self.get_worker_bundle_indices(spmd_id),
-            "worker_count": self.get_worker_count(spmd_id),
+            "num_workers": self.get_num_workers(spmd_id),
             "worker_resource": self._spmd_to_resource.get(spmd_id),
             "driver_resource": self._spmd_to_driver_resource.get(spmd_id),
         }

@@ -50,16 +50,16 @@ def _make_config(mesh: DeviceMesh, *op_names: str, **extra_ops) -> SPMDConfig:
     return SPMDConfig(mesh=mesh, operators=ops, operator_metas=metas)
 
 
-# Legacy dummy functions (kept for readability at call sites)
-def forward_fn(state, batch):
+# Generic dummy functions for testing
+def compute_fn(state, batch):
     return state
 
 
-def backward_fn(state, grad):
+def optimize_fn(state, grad):
     return state
 
 
-def update_fn(state, grad):
+def apply_fn(state, grad):
     return state
 
 
@@ -410,17 +410,17 @@ async def test_mailbox_declare_step_and_on_ready():
         fired.append((op, step))
 
     mb.set_ready_callback(cb)
-    mb.declare_step("forward", step=0, expected_tensors={"x": 2}, expected_states=[])
+    mb.declare_step("compute", step=0, expected_tensors={"x": 2}, expected_states=[])
 
     tensor = TransportTensor.from_tensor(np.zeros(4))
     await mb.deposit_shards(
-        "forward", "x", 0, rank=0, payloads=[tensor.flat_values], counts=[4]
+        "compute", "x", 0, rank=0, payloads=[tensor.flat_values], counts=[4]
     )
     assert not fired
     await mb.deposit_shards(
-        "forward", "x", 0, rank=1, payloads=[tensor.flat_values], counts=[4]
+        "compute", "x", 0, rank=1, payloads=[tensor.flat_values], counts=[4]
     )
-    assert fired == [("forward", 0)]
+    assert fired == [("compute", 0)]
 
 
 @pytest.mark.asyncio
@@ -428,21 +428,21 @@ async def test_mailbox_wait_step_ready():
     """wait_step_ready() coroutine resolves when the step is done."""
     mb = WorkerMailbox()
     mb.declare_step(
-        "forward", step=5, expected_tensors={"a": 1}, expected_states=["cfg"]
+        "compute", step=5, expected_tensors={"a": 1}, expected_states=["cfg"]
     )
 
     async def feed():
         await asyncio.sleep(0)
         tensor = TransportTensor.from_tensor(np.ones(3))
         await mb.deposit_shards(
-            "forward", "a", 5, rank=0, payloads=[tensor.flat_values], counts=[3]
+            "compute", "a", 5, rank=0, payloads=[tensor.flat_values], counts=[3]
         )
         await asyncio.sleep(0)
-        await mb.deposit_states("forward", 5, names=["cfg"], values=[{"lr": 0.1}])
+        await mb.deposit_states("compute", 5, names=["cfg"], values=[{"lr": 0.1}])
 
     asyncio.create_task(feed())
-    await mb.wait_step_ready("forward", step=5)
-    assert mb.is_step_ready("forward", step=5)
+    await mb.wait_step_ready("compute", step=5)
+    assert mb.is_step_ready("compute", step=5)
 
 
 @pytest.mark.asyncio
@@ -515,7 +515,7 @@ async def test_mailbox_periodic_trigger():
 async def test_mailbox_is_step_ready_before_declare():
     """is_step_ready returns False when declare_step was not called."""
     mb = WorkerMailbox()
-    assert not mb.is_step_ready("backward", step=99)
+    assert not mb.is_step_ready("optimize", step=99)
 
 
 @pytest.mark.asyncio
@@ -523,7 +523,7 @@ async def test_mailbox_no_barrier_without_declare():
     """wait_step_ready raises if declare_step was never called."""
     mb = WorkerMailbox()
     with pytest.raises(RuntimeError, match="declare_step"):
-        await mb.wait_step_ready("forward", step=7)
+        await mb.wait_step_ready("compute", step=7)
 
 
 # ===========================================================================
@@ -534,17 +534,17 @@ async def test_mailbox_no_barrier_without_declare():
 @pytest.mark.asyncio
 async def test_mailbox_state_put_get():
     mb = WorkerMailbox()
-    await mb.deposit_states("forward", 1, names=["lr"], values=[0.001])
-    assert await mb.has_state("forward", "lr", 1)
-    assert await mb.get_state("forward", "lr", 1) == 0.001
+    await mb.deposit_states("compute", 1, names=["lr"], values=[0.001])
+    assert await mb.has_state("compute", "lr", 1)
+    assert await mb.get_state("compute", "lr", 1) == 0.001
 
 
 @pytest.mark.asyncio
 async def test_mailbox_get_all_states():
     mb = WorkerMailbox()
-    await mb.deposit_states("forward", 0, names=["a"], values=[1])
-    await mb.deposit_states("forward", 0, names=["b"], values=[2])
-    states = await mb.get_all_states("forward", 0)
+    await mb.deposit_states("compute", 0, names=["a"], values=[1])
+    await mb.deposit_states("compute", 0, names=["b"], values=[2])
+    states = await mb.get_all_states("compute", 0)
     assert states == {"a": 1, "b": 2}
 
 
@@ -584,9 +584,9 @@ async def test_mailbox_tensor_put_get():
     d = np.array([1.0, 2.0])
     tensor = TransportTensor.from_tensor(d)
     await mb.deposit_shards(
-        "forward", "x", 0, rank=0, payloads=[tensor.flat_values], counts=[2]
+        "compute", "x", 0, rank=0, payloads=[tensor.flat_values], counts=[2]
     )
-    shards = await mb.get_tensor_shards("forward", "x", 0)
+    shards = await mb.get_tensor_shards("compute", "x", 0)
     assert 0 in shards
     np.testing.assert_array_equal(shards[0].flat_values, d)
 
@@ -596,26 +596,26 @@ async def test_mailbox_tensor_multi_rank():
     mb = WorkerMailbox()
     tensor_zeros = TransportTensor.from_tensor(np.zeros(4))
     await mb.deposit_shards(
-        "forward", "e", 1, rank=0, payloads=[tensor_zeros.flat_values], counts=[4]
+        "compute", "e", 1, rank=0, payloads=[tensor_zeros.flat_values], counts=[4]
     )
     tensor_ones = TransportTensor.from_tensor(np.ones(4))
     await mb.deposit_shards(
-        "forward", "e", 1, rank=1, payloads=[tensor_ones.flat_values], counts=[4]
+        "compute", "e", 1, rank=1, payloads=[tensor_ones.flat_values], counts=[4]
     )
-    assert await mb.get_tensor_shard_count("forward", "e", 1) == 2
+    assert await mb.get_tensor_shard_count("compute", "e", 1) == 2
 
 
 @pytest.mark.asyncio
 async def test_mailbox_op_isolation():
     mb = WorkerMailbox()
     await mb.deposit_shards(
-        "forward", "g", 0, rank=0, payloads=[np.array([1.0])], counts=[1]
+        "compute", "g", 0, rank=0, payloads=[np.array([1.0])], counts=[1]
     )
     await mb.deposit_shards(
-        "backward", "g", 0, rank=0, payloads=[np.array([2.0])], counts=[1]
+        "optimize", "g", 0, rank=0, payloads=[np.array([2.0])], counts=[1]
     )
-    fwd = await mb.get_tensor_shards("forward", "g", 0)
-    bwd = await mb.get_tensor_shards("backward", "g", 0)
+    fwd = await mb.get_tensor_shards("compute", "g", 0)
+    bwd = await mb.get_tensor_shards("optimize", "g", 0)
     np.testing.assert_array_equal(fwd[0].flat_values, [1.0])
     np.testing.assert_array_equal(bwd[0].flat_values, [2.0])
 
@@ -630,17 +630,17 @@ async def test_mailbox_zero_copy_writes_into_buffer():
     mb = WorkerMailbox()
     buf = np.zeros((4, 2), dtype=np.float32)
     await mb.register_zero_copy_slot(
-        "forward", "emb", step=0, target_buffers=[buf], expect_offsets={0: 0}
+        "compute", "emb", step=0, target_buffers=[buf], expect_offsets={0: 0}
     )
     await mb.deposit_shards(
-        "forward",
+        "compute",
         "emb",
         step=0,
         rank=0,
         payloads=[np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)],
         counts=[2],
     )
-    buffers = await mb.get_zero_copy_buffers("forward", "emb", step=0)
+    buffers = await mb.get_zero_copy_buffers("compute", "emb", step=0)
     assert buffers is not None
     np.testing.assert_array_equal(buffers[0][:2], [[1.0, 2.0], [3.0, 4.0]])
 
@@ -653,33 +653,33 @@ async def test_mailbox_zero_copy_writes_into_buffer():
 @pytest.mark.asyncio
 async def test_mailbox_clear_step():
     mb = WorkerMailbox()
-    await mb.deposit_states("forward", 1, names=["s"], values=["x"])
-    await mb.deposit_states("forward", 2, names=["s"], values=["y"])
+    await mb.deposit_states("compute", 1, names=["s"], values=["x"])
+    await mb.deposit_states("compute", 2, names=["s"], values=["y"])
     tensor = TransportTensor.from_tensor(np.zeros(2))
     await mb.deposit_shards(
-        "forward", "t", 1, rank=0, payloads=[tensor.flat_values], counts=[2]
+        "compute", "t", 1, rank=0, payloads=[tensor.flat_values], counts=[2]
     )
-    mb.declare_step("forward", 1, {}, [])
+    mb.declare_step("compute", 1, {}, [])
 
-    await mb.clear_step("forward", 1)
+    await mb.clear_step("compute", 1)
 
-    assert not await mb.has_state("forward", "s", 1)
-    assert await mb.has_state("forward", "s", 2)
-    assert await mb.get_tensor_shard_count("forward", "t", 1) == 0
-    assert not mb.is_step_ready("forward", 1)  # barrier also cleared
+    assert not await mb.has_state("compute", "s", 1)
+    assert await mb.has_state("compute", "s", 2)
+    assert await mb.get_tensor_shard_count("compute", "t", 1) == 0
+    assert not mb.is_step_ready("compute", 1)  # barrier also cleared
 
 
 @pytest.mark.asyncio
 async def test_mailbox_get_size():
     mb = WorkerMailbox()
     assert await mb.get_size() == 0
-    await mb.deposit_states("forward", 0, names=["s"], values=[None])
+    await mb.deposit_states("compute", 0, names=["s"], values=[None])
     tensor = TransportTensor.from_tensor(np.zeros(2))
     await mb.deposit_shards(
-        "forward", "t", 0, rank=0, payloads=[tensor.flat_values], counts=[2]
+        "compute", "t", 0, rank=0, payloads=[tensor.flat_values], counts=[2]
     )
     await mb.deposit_shards(
-        "forward", "t", 0, rank=1, payloads=[tensor.flat_values], counts=[2]
+        "compute", "t", 0, rank=1, payloads=[tensor.flat_values], counts=[2]
     )
     assert await mb.get_size() == 3
 
@@ -699,20 +699,20 @@ def test_layout_mesh():
 @pytest.mark.asyncio
 async def test_spmd_config_with_mesh():
     mesh = DeviceMesh((4, 2), axis_names=("data", "model"))
-    config = _make_config(mesh, "forward")
+    config = _make_config(mesh, "compute")
     assert config.has_mesh and config.get_mesh_size() == 8
 
 
 def test_operator_manager_mesh():
     mesh = DeviceMesh((2,), axis_names=("data",))
-    config = _make_config(mesh, "forward", "backward", "update")
+    config = _make_config(mesh, "compute", "optimize", "apply")
     assert OperatorManager(config, rank=0)._mesh is mesh
 
 
 @pytest.mark.asyncio
 async def test_spmd_worker_init():
     mesh = DeviceMesh((2,), axis_names=("data",))
-    config = _make_config(mesh, "forward", "backward", "update")
+    config = _make_config(mesh, "compute", "optimize", "apply")
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
     cls = cls.modified_class if cls else SPMDWorker
     worker = cls(config, rank=0)
@@ -723,21 +723,21 @@ async def test_spmd_worker_init():
 @pytest.mark.asyncio
 async def test_receive_multi_tensor_data():
     mesh = DeviceMesh((2,), axis_names=("data",))
-    config = _make_config(mesh, "forward")
+    config = _make_config(mesh, "compute")
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
     cls = cls.modified_class if cls else SPMDWorker
     worker = cls(config, rank=0)
 
     # Declare the step first (workers normally do this via _start_step)
     worker._mailbox.declare_step(
-        "forward", step=1, expected_tensors={"multi": 1}, expected_states=[]
+        "compute", step=1, expected_tensors={"multi": 1}, expected_states=[]
     )
 
     t1 = TransportTensor.from_tensor(np.array([1, 2]))
     t2 = TransportTensor.from_tensor(np.array([3, 4]))
 
     await worker.receive_shards(
-        "forward",
+        "compute",
         "multi",
         step=1,
         sender_rank=0,
@@ -746,7 +746,7 @@ async def test_receive_multi_tensor_data():
         is_ragged=False,
         has_indices=False,
     )
-    shards = await worker._mailbox.get_tensor_shards("forward", "multi", 1)
+    shards = await worker._mailbox.get_tensor_shards("compute", "multi", 1)
     received = shards[0]
     assert isinstance(received, list)
     assert len(received) == 2
@@ -762,7 +762,7 @@ async def test_mailbox_zero_copy_ragged():
     len_buf = np.zeros((4,), dtype=np.int32)
 
     await mb.register_zero_copy_slot(
-        "forward",
+        "compute",
         "ragged",
         step=0,
         target_buffers=[data_buf, len_buf],
@@ -775,7 +775,7 @@ async def test_mailbox_zero_copy_ragged():
     tt = TransportTensor(flat_values, nested_splits=[splits])
 
     await mb.deposit_shards(
-        "forward",
+        "compute",
         "ragged",
         step=0,
         rank=0,
@@ -786,7 +786,7 @@ async def test_mailbox_zero_copy_ragged():
     )
 
     # Verify buffers from mailbox (handles JAX-style non-inplace updates)
-    buffers = await mb.get_zero_copy_buffers("forward", "ragged", step=0)
+    buffers = await mb.get_zero_copy_buffers("compute", "ragged", step=0)
     assert buffers is not None
     # Verify data buffer
     np.testing.assert_array_equal(buffers[0][:5], flat_values)
@@ -815,7 +815,7 @@ def test_replicate_operator_manager():
     # Register with the operator name matching the meta name: "test_op"
     config = SPMDConfig(
         spmd_id="test",
-        worker_count=4,
+        num_workers=4,
         mesh=mesh,
         operators={"test_op": my_forward},
         operator_metas={"test_op": meta},
@@ -833,7 +833,7 @@ def test_replicate_operator_manager():
 async def test_send_output_none_mesh():
     # Test fallback to default mesh when config.mesh is None
     # This specifically verifies the fix for ShardingSpec.chunk(None, ...)
-    config = _make_config(None, "forward")  # mesh=None
+    config = _make_config(None, "compute")  # mesh=None
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
     cls = cls.modified_class if cls else SPMDWorker
     worker = cls(config, rank=0)
@@ -849,7 +849,7 @@ async def test_send_output_none_mesh():
 
     succ_info = MagicMock()
     succ_info.is_self_loop = False
-    succ_info.target_op = "forward"
+    succ_info.target_op = "compute"
     succ_info.tensor_sharding = {"t1": None}  # Trigger default target_spec
     succ_info.mesh = None
     worker._op_manager.get_successor_info.return_value = succ_info
@@ -862,7 +862,7 @@ async def test_send_output_none_mesh():
     data = {"t1": np.array([1, 2, 3])}
     # This should not raise "Argument Any | None is not assignable to parameter mesh"
     # because we now provide a fallback DeviceMesh.
-    await worker._send_output("forward", 0, data)
+    await worker._send_output("compute", 0, data)
 
     # Verify distributor.distribute was called (indirectly by checking handler)
     assert handler.receive_shards.remote.called
@@ -889,12 +889,12 @@ def _load_compute_output_step():
             for item in node.body:
                 if (
                     isinstance(item, ast.FunctionDef)
-                    and item.name == "compute_output_step"
+                    and item.name == "_resolve_output_step"
                 ):
                     method_node = item
                     break
     assert method_node is not None, (
-        "SPMDWorker.compute_output_step not found in worker.py"
+        "SPMDWorker._resolve_output_step not found in worker.py"
     )
 
     module = types.ModuleType("fluxway_worker_step_extract")
@@ -903,16 +903,16 @@ def _load_compute_output_step():
         ast.Module(body=[method_node], type_ignores=[]), str(worker_path), "exec"
     )
     exec(compiled, module.__dict__)
-    return module.compute_output_step
+    return module._resolve_output_step
 
 
-compute_output_step = _load_compute_output_step()
+_resolve_output_step = _load_compute_output_step()
 
 
 class _DummyWorker:
-    def __init__(self, *, enable_output_step_remap: bool, total_rank: int, rank: int):
+    def __init__(self, *, use_global_step_indexing: bool, total_rank: int, rank: int):
         self.config = types.SimpleNamespace(
-            enable_output_step_remap=enable_output_step_remap
+            use_global_step_indexing=use_global_step_indexing
         )
         self._total_rank = total_rank
         self.rank = rank
@@ -920,8 +920,8 @@ class _DummyWorker:
 
 def test_compute_output_step_keep_input_step() -> None:
     assert (
-        compute_output_step(
-            _DummyWorker(enable_output_step_remap=False, total_rank=8, rank=3),
+        _resolve_output_step(
+            _DummyWorker(use_global_step_indexing=False, total_rank=8, rank=3),
             is_periodic=False,
             current_step=100,
             input_step=7,
@@ -929,8 +929,8 @@ def test_compute_output_step_keep_input_step() -> None:
         == 7
     )
     assert (
-        compute_output_step(
-            _DummyWorker(enable_output_step_remap=False, total_rank=8, rank=3),
+        _resolve_output_step(
+            _DummyWorker(use_global_step_indexing=False, total_rank=8, rank=3),
             is_periodic=True,
             current_step=100,
             input_step=7,
@@ -941,8 +941,8 @@ def test_compute_output_step_keep_input_step() -> None:
 
 def test_compute_output_step_remap_non_periodic() -> None:
     assert (
-        compute_output_step(
-            _DummyWorker(enable_output_step_remap=True, total_rank=8, rank=3),
+        _resolve_output_step(
+            _DummyWorker(use_global_step_indexing=True, total_rank=8, rank=3),
             is_periodic=False,
             current_step=12,
             input_step=7,
@@ -954,8 +954,8 @@ def test_compute_output_step_remap_non_periodic() -> None:
 def test_compute_output_step_remap_periodic() -> None:
     # output_step = total_rank * current_step + local_rank
     assert (
-        compute_output_step(
-            _DummyWorker(enable_output_step_remap=True, total_rank=8, rank=3),
+        _resolve_output_step(
+            _DummyWorker(use_global_step_indexing=True, total_rank=8, rank=3),
             is_periodic=True,
             current_step=12,
             input_step=7,

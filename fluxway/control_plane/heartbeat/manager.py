@@ -181,7 +181,7 @@ class HeartbeatManager:
         logger.debug(
             f"Received heartbeat from {spmd_id}: status={heartbeat.status.name}, "
             f"state={heartbeat.state.name}, timestamp={heartbeat.timestamp:.3f}, "
-            f"healthy_workers={heartbeat.healthy_worker_count}/{heartbeat.worker_count}, "
+            f"healthy_workers={heartbeat.healthy_num_workers}/{heartbeat.num_workers}, "
             f"op_steps={heartbeat.op_steps}, workers_ready={heartbeat.workers_ready}"
         )
 
