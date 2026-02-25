@@ -186,9 +186,13 @@ class OperatorManager:
 
             # 1. Per-operator input/output sharding
             if meta.input_sharding:
-                self._input_sharding[op_type] = dict(meta.input_sharding)
+                self._input_sharding[op_type] = self._parse_sharding_specs(
+                    meta.input_sharding
+                )
             if meta.output_sharding:
-                self._output_sharding[op_type] = dict(meta.output_sharding)
+                self._output_sharding[op_type] = self._parse_sharding_specs(
+                    meta.output_sharding
+                )
 
             logger.debug(
                 "OperatorManager[%s]: op=%s, input_sharding_keys=%s, output_sharding_keys=%s, "
@@ -283,6 +287,33 @@ class OperatorManager:
                 f"successors={list(self._successor_topology[op_type].keys())}, "
                 f"output_to_input_tensor_mapping={mapping}"
             )
+
+    def _parse_sharding_specs(
+        self, raw_specs: Dict[str, Any]
+    ) -> Dict[str, "ShardingSpec"]:
+        """Convert raw sharding dictionaries into ShardingSpec objects."""
+        from fluxway.common.types.sharding import (
+            ShardingSpec,
+            ChunkPartition,
+            PartitionSpec,
+        )
+
+        parsed = {}
+        for tensor_name, raw_spec in raw_specs.items():
+            if isinstance(raw_spec, dict):
+                sharding_type = raw_spec.get("type", "dense")
+                if sharding_type == "replicated":
+                    parsed[tensor_name] = ShardingSpec(
+                        strategy=ChunkPartition(),
+                        mesh=self._mesh,
+                        partition=PartitionSpec(),
+                        routing_dim=0,
+                    )
+                elif sharding_type == "sparse":
+                    pass  # will handle shortly
+            elif isinstance(raw_spec, ShardingSpec):
+                parsed[tensor_name] = raw_spec
+        return parsed
 
     def _get_operator_metadata(self, op_type: OpType) -> Optional["OperatorMeta"]:
         """

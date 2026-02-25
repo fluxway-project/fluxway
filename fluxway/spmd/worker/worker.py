@@ -394,17 +394,17 @@ class SPMDWorker:
     # Data Reception
     # =========================================================================
 
-    async def receive_state_data(
-        self, op_type: OpType, name: str, step: int, data: Any
+    async def receive_states(
+        self, op_type: OpType, step: int, names: List[str], values: List[Any]
     ) -> None:
         """
         Receive state data from Driver (control plane).
 
         Args:
             op_type: Operator type
-            name: State variable name
             step: Step number (ignored for eager_trigger operators)
-            data: State data
+            names: State variable names
+            values: State data values
         """
         # Check if this op is in eager_trigger mode
         is_eager = (
@@ -417,9 +417,11 @@ class SPMDWorker:
             input_step = self._eager_input_steps[op_type]
             self._eager_input_steps[op_type] += 1  # Increment for next input
 
-            await self._mailbox.put_state(op_type, name, input_step, data)
+            await self._mailbox.deposit_states(
+                op_type, step=input_step, names=names, values=values
+            )
             logger.debug(
-                f"[spmd_id={self.spmd_id}] Eager receive state: op={op_type.name}, name={name}, "
+                f"[spmd_id={self.spmd_id}] Eager receive states: op={op_type.name}, names={names}, "
                 f"input_step={input_step}"
             )
             await self._enqueue(op_type, input_step)
@@ -431,7 +433,7 @@ class SPMDWorker:
         # Drop stale data (data for steps already executed)
         if step < exec_step:
             logger.warning(
-                f"[spmd_id={self.spmd_id}] Dropping stale state data: op={op_type.name}, name={name}, "
+                f"[spmd_id={self.spmd_id}] Dropping stale state data: op={op_type.name}, names={names}, "
                 f"step={step} < exec_step={exec_step}"
             )
             return
@@ -440,28 +442,36 @@ class SPMDWorker:
         self._ensure_step_declared(op_type, step)
 
         # Cache in mailbox — barrier fires on_ready automatically
-        await self._mailbox.put_state(op_type, name, step, data)
+        await self._mailbox.deposit_states(
+            op_type, step=step, names=names, values=values
+        )
         logger.debug(
-            f"[spmd_id={self.spmd_id}] Worker {self.rank} received state: op={op_type.name}, name={name}, step={step}"
+            f"[spmd_id={self.spmd_id}] Worker {self.rank} received states: op={op_type.name}, names={names}, step={step}"
         )
 
-    async def receive_tensor_data(
+    async def receive_shards(
         self,
         op_type: OpType,
         name: str,
         step: int,
         sender_rank: int,
-        tensor: TransportTensor,
+        payloads: List[Any],
+        counts: List[int],
+        is_ragged: bool = False,
+        has_indices: bool = False,
     ) -> None:
         """
-        Receive tensor data from upstream worker (data plane).
+        Receive tensor shard data from upstream worker (data plane).
 
         Args:
             op_type: Operator type
             name: Tensor variable name
             step: Step number (ignored for eager_trigger operators)
             sender_rank: Sender's rank
-            tensor: TransportTensor object containing data and metadata
+            payloads: Raw data arrays for the shards
+            counts: Number of items for each payload
+            is_ragged: Indicates if ragged lengths are included
+            has_indices: Indicates if routing indices are included
         """
         # Check if this op is in eager_trigger mode
         is_eager = (
@@ -474,8 +484,15 @@ class SPMDWorker:
             input_step = self._eager_input_steps[op_type]
             self._eager_input_steps[op_type] += 1  # Increment for next input
 
-            await self._mailbox.put_tensor(
-                op_type, name, input_step, sender_rank, tensor
+            await self._mailbox.deposit_shards(
+                op_type,
+                name,
+                input_step,
+                sender_rank,
+                payloads,
+                counts,
+                is_ragged,
+                has_indices,
             )
             logger.debug(
                 f"[spmd_id={self.spmd_id}] Eager receive tensor: op={op_type.name}, name={name}, "
@@ -499,9 +516,11 @@ class SPMDWorker:
         self._ensure_step_declared(op_type, step)
 
         # Cache in mailbox — barrier fires on_ready automatically
-        await self._mailbox.put_tensor(op_type, name, step, sender_rank, tensor)
+        await self._mailbox.deposit_shards(
+            op_type, name, step, sender_rank, payloads, counts, is_ragged, has_indices
+        )
         logger.debug(
-            f"[spmd_id={self.spmd_id}] Worker {self.rank} received tensor: op={op_type.name}, name={name}, "
+            f"[spmd_id={self.spmd_id}] Worker {self.rank} received shards: op={op_type.name}, name={name}, "
             f"step={step}, sender_rank={sender_rank}"
         )
 
@@ -534,8 +553,8 @@ class SPMDWorker:
         """
         Called by WorkerMailbox when a step's StepBarrier fires.
 
-        Schedules _enqueue as an asyncio task so the lock in put_tensor/
-        put_state can return immediately without blocking on queue insertion.
+        Schedules _enqueue as an asyncio task so the lock in deposit_shards/
+        deposit_states can return immediately without blocking on queue insertion.
         """
         logger.info(
             f"[spmd_id={self.spmd_id} rank={self.rank}] Step ready: op={op_type.name}, step={step}"
@@ -835,8 +854,15 @@ class SPMDWorker:
             try:
                 # Send as forward op data
                 # data_to_send is already converted to the target type by datasource
-                handler.receive_tensor_data.remote(
-                    OpType.FORWARD, tensor_name, step, self.rank, transport_tensor
+                handler.receive_shards.remote(
+                    OpType.FORWARD,
+                    tensor_name,
+                    step,
+                    self.rank,
+                    [transport_tensor.flat_values],
+                    [int(transport_tensor.shape[0])],
+                    transport_tensor.is_ragged,
+                    transport_tensor.global_indices is not None,
                 )
             except Exception as e:
                 logger.error(
@@ -916,12 +942,15 @@ class SPMDWorker:
                     for target_rank in range(succ_info.total_rank):
                         handler = handlers.get(target_rank)
                         if handler is not None:
-                            handler.receive_tensor_data.remote(
+                            handler.receive_shards.remote(
                                 target_op,
                                 tensor_name,
                                 output_step,
                                 self.rank,
-                                empty_tensor,
+                                [empty_tensor.flat_values],
+                                [0],
+                                empty_tensor.is_ragged,
+                                empty_tensor.global_indices is not None,
                             )
 
     async def _execute_operator(self, op_type: OpType, step: int) -> None:
@@ -1359,6 +1388,9 @@ class SPMDWorker:
 
                 distributor = AsyncDataDistributor(self.rank)
 
+                source_spec = output_sharding.get(tensor_name)
+                target_spec = succ_info.tensor_sharding.get(tensor_name)
+
                 async def _send_fn(
                     target_rank: int,
                     tensors: list,
@@ -1368,38 +1400,45 @@ class SPMDWorker:
                     _target_op=target_op,
                     _tensor_name=tensor_name,
                     _step=step,
+                    _is_ragged=transport_tensor.is_ragged,
+                    _has_indices=transport_tensor.global_indices is not None,
                 ) -> bool:
                     handler = _handlers.get(target_rank)
                     if handler is None:
                         return False
 
-                    # Package received slices back into a TransportTensor for the receiver
                     count = int(counts[0]) if counts else 0
                     if count == 0:
                         backend = get_backend()
-                        empty_tensor = TransportTensor.from_tensor(
-                            backend.zeros((0,), dtype=backend.float32())
-                        )
-                        handler.receive_tensor_data.remote(
-                            _target_op, _tensor_name, _step, self.rank, empty_tensor
+                        empty_tensor = backend.zeros((0,), dtype=backend.float32())
+                        handler.receive_shards.remote(
+                            _target_op,
+                            _tensor_name,
+                            _step,
+                            self.rank,
+                            [empty_tensor],
+                            [0],
+                            _is_ragged,
+                            _has_indices,
                         )
                         return True
 
-                    data_payload = tensors[0][:count]
-                    indices_payload = tensors[1][:count] if len(tensors) > 1 else None
-
-                    received_tensor = TransportTensor(
-                        data_payload, indices=indices_payload
-                    )
-                    handler.receive_tensor_data.remote(
-                        _target_op, _tensor_name, _step, self.rank, received_tensor
+                    handler.receive_shards.remote(
+                        _target_op,
+                        _tensor_name,
+                        _step,
+                        self.rank,
+                        tensors,
+                        counts,
+                        _is_ragged,
+                        _has_indices,
                     )
                     return True
 
                 await distributor.distribute(
                     transport_tensor,
-                    dest_topology={spmd_id: succ_info},
-                    tensor_name=tensor_name,
+                    source=source_spec,
+                    target=target_spec,
                     send_fn=_send_fn,
                 )
 
@@ -1421,6 +1460,9 @@ class SPMDWorker:
 
                 target_op = succ_info.target_op
 
+                # Collect all state names and values for this target
+                names_to_send = []
+                values_to_send = []
                 for state_name, state_value in state_data.items():
                     if succ_info.is_self_loop:
                         # Self-loop: directly set as static arg
@@ -1428,14 +1470,24 @@ class SPMDWorker:
                             target_op, state_name, step, state_value
                         )
                     elif self.rank == 0:
-                        # Cross-node: send via control plane (only rank 0)
-                        logger.debug(
-                            f"[spmd_id={self.spmd_id}] Worker {self.rank} sending state_argument: name={state_name}, "
-                            f"target_spmd={spmd_id}, step={step}"
-                        )
-                        self.send_state_argument(
-                            spmd_id, target_op, state_name, step, state_value
-                        )
+                        names_to_send.append(state_name)
+                        values_to_send.append(state_value)
+
+                if names_to_send:
+                    logger.debug(
+                        f"[spmd_id={self.spmd_id}] Worker {self.rank} sending state_arguments: names={names_to_send}, "
+                        f"step={step} to {spmd_id}"
+                    )
+                    if self._driver_handle is not None:
+                        try:
+                            self._driver_handle.forward_state_argument_to_controller.remote(
+                                spmd_id, target_op, names_to_send, step, values_to_send
+                            )
+                        except Exception as e:
+                            logger.error(
+                                f"[spmd_id={self.spmd_id}] Worker {self.rank} failed to send state_arguments "
+                                f"via driver: {e}"
+                            )
 
     def _extract_tensors(
         self, data: Any, output_sharding: Dict[str, ShardingSpec]
@@ -1493,7 +1545,16 @@ class SPMDWorker:
             f"[spmd_id={self.spmd_id} rank={self.rank}] Self-loop data passing: {name} step={step} "
             f"-> {target_op.name}"
         )
-        await self.receive_tensor_data(target_op, name, step, self.rank, tensor)
+        await self.receive_shards(
+            target_op,
+            name,
+            step,
+            self.rank,
+            [tensor.flat_values],
+            [int(tensor.shape[0])],
+            tensor.is_ragged,
+            tensor.global_indices is not None,
+        )
 
     async def _self_receive_state(
         self, target_op: OpType, name: str, step: int, data: Any
@@ -1502,23 +1563,12 @@ class SPMDWorker:
         Self-loop state passing - directly call data receive interface.
 
         For same-node edges (e.g., forward -> backward), this method
-        maintains the data-driven execution model by calling receive_state_data
+        maintains the data-driven execution model by calling receive_states
         on self rather than sending via control plane.
-
-        Args:
-            target_op: Target operator type
-            name: State variable name
-            step: Current step number
-            data: State data to pass
         """
-        logger.debug(
-            f"[spmd_id={self.spmd_id} rank={self.rank}] Self-loop state passing: {name} step={step} "
-            f"-> {target_op.name}"
-        )
-
-        # Directly call receive_state_data to trigger target op's data readiness check
-        await self.receive_state_data(
-            op_type=target_op, name=name, step=step, data=data
+        # Directly call receive_states to trigger target op's data readiness check
+        await self.receive_states(
+            op_type=target_op, step=step, names=[name], values=[data]
         )
 
     def _extract_states(self, data: Any, state_names: List[str]) -> Dict[str, Any]:

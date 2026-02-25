@@ -16,8 +16,6 @@ from pydantic import BaseModel, Field, ConfigDict, model_validator
 
 from enum import Enum
 
-from fluxway.common.types.sharding import ShardingSpec
-
 
 class OpType(IntEnum):
     """Operator type for execution phases.
@@ -231,8 +229,8 @@ class EdgeShardingInfo(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    # Tensor sharding for this edge: {tensor_name: ShardingSpec}
-    tensor_sharding: Dict[str, ShardingSpec] = Field(default_factory=dict)
+    # Tensor sharding for this edge: {tensor_name: raw dict or ShardingSpec}
+    tensor_sharding: Dict[str, Any] = Field(default_factory=dict)
     # Target node's op type (for cross-op-type edges like forward->backward)
     target_op: OpType = OpType.FORWARD
     # Condition function for conditional edges
@@ -249,6 +247,8 @@ class OperatorMeta(BaseModel):
     # serialization / circular import surprises across control-plane and worker.
     input_arguments: Optional[Dict[str, List[str]]]
     output_arguments: Optional[Dict[str, List[str]]]
+    input_sharding: Dict[str, Any] = Field(default_factory=dict)
+    output_sharding: Dict[str, Any] = Field(default_factory=dict)
     # Linking sharding specs (populated by Builder when constructing the graph)
     # 对于当前 operator：
     # - input_pre_sharding：记录所有「前驱 SPMD -> 当前 SPMD」的边及其 sharding，

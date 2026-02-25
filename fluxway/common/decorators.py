@@ -229,29 +229,29 @@ def operator(
                     f"for operator '{func.__qualname__}'"
                 )
         # Store raw sharding specs as plain dicts (serializable, mesh-independent)
-        input_sharding_raw: Dict[str, Any] = {}
+        input_sharding_processed: Dict[str, Any] = {}
         if input_sharding:
             for tensor_name, raw_spec in input_sharding.items():
                 spec_dict = (
                     raw_spec if isinstance(raw_spec, dict) else raw_spec.__dict__
                 )
-                if spec_dict.get("type") not in ("dense", "sparse"):
+                if spec_dict.get("type") not in ("dense", "sparse", "replicated"):
                     raise ValueError(
-                        f"input_sharding['{tensor_name}'] type must be 'dense' or 'sparse'"
+                        f"input_sharding['{tensor_name}'] type must be 'dense', 'sparse', or 'replicated'"
                     )
-                input_sharding_raw[tensor_name] = spec_dict
+                input_sharding_processed[tensor_name] = spec_dict
 
-        output_sharding_raw: Dict[str, Any] = {}
+        output_sharding_processed: Dict[str, Any] = {}
         if output_sharding:
             for tensor_name, raw_spec in output_sharding.items():
                 spec_dict = (
                     raw_spec if isinstance(raw_spec, dict) else raw_spec.__dict__
                 )
-                if spec_dict.get("type") not in ("dense", "sparse"):
+                if spec_dict.get("type") not in ("dense", "sparse", "replicated"):
                     raise ValueError(
-                        f"output_sharding['{tensor_name}'] type must be 'dense' or 'sparse'"
+                        f"output_sharding['{tensor_name}'] type must be 'dense', 'sparse', or 'replicated'"
                     )
-                output_sharding_raw[tensor_name] = spec_dict
+                output_sharding_processed[tensor_name] = spec_dict
 
         # Prepare output_arguments
         output_args = None
@@ -260,8 +260,8 @@ def operator(
 
         meta = OperatorMeta(
             name=name,
-            input_sharding_raw=input_sharding_raw,
-            output_sharding_raw=output_sharding_raw,
+            input_sharding=input_sharding_processed,
+            output_sharding=output_sharding_processed,
             input_arguments={
                 ArgumentType.STATE.value: state_argument or [],
                 ArgumentType.TENSOR.value: tensor_argument or [],

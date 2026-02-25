@@ -602,68 +602,61 @@ if RAY_AVAILABLE:
         # =====================================================================
 
         def broadcast_state_argument(
-            self, target_op: "OpType", state_name: str, step: int, state_value: Any
+            self, target_op: "OpType", names: List[str], step: int, values: List[Any]
         ) -> None:
             """
-            Broadcast state_argument to all workers via receive_state_data.
+            Broadcast state_arguments to all workers via receive_states.
 
             Args:
                 target_op: Target operator type on the receiving workers
-                state_name: State variable name
+                names: List of state variable names
                 step: Current step number
-                state_value: State value
+                values: List of state values
             """
             for rank, worker in self._worker_handles.items():
                 try:
-                    worker.receive_state_data.remote(
-                        target_op, state_name, step, state_value
-                    )
+                    worker.receive_states.remote(target_op, step, names, values)
                     logger.debug(
-                        f"[spmd_id={self.spmd_id}] Broadcasted step {step} state_argument '{state_name}' to worker {rank}"
+                        f"[spmd_id={self.spmd_id}] Broadcasted step {step} state_arguments {names} to worker {rank}"
                     )
                 except Exception as e:
                     logger.error(
-                        f"[spmd_id={self.spmd_id}] Failed to send state_data to worker: {e}"
+                        f"[spmd_id={self.spmd_id}] Failed to send state_arguments to worker: {e}"
                     )
 
             logger.debug(
-                f"[spmd_id={self.spmd_id}] Broadcasted step {step} state_argument '{state_name}' to all workers"
+                f"[spmd_id={self.spmd_id}] Broadcasted step {step} state_arguments {names} to all workers"
             )
 
         def forward_state_argument_to_controller(
             self,
             target_spmd_id: str,
             target_op: "OpType",
-            state_name: str,
+            names: List[str],
             step: int,
-            state_value: Any,
+            values: List[Any],
         ) -> None:
             """
-            Forward state_argument to controller (called by rank0 worker).
+            Forward state_arguments to controller (called by rank0 worker).
 
             Args:
                 target_spmd_id: Target SPMD ID
                 target_op: Target operator type on the receiving side
-                state_name: State variable name
+                names: State variable names
                 step: Current step number
-                state_value: State value
+                values: State values
             """
             if self.controller_handle is not None:
                 try:
                     self.controller_handle.receive_state_argument.remote(
-                        self.spmd_id,
-                        target_spmd_id,
-                        target_op,
-                        state_name,
-                        step,
-                        state_value,
+                        self.spmd_id, target_spmd_id, target_op, names, step, values
                     )
                     logger.debug(
-                        f"[spmd_id={self.spmd_id}] Forwarded step {step} state_argument '{state_name}' to controller"
+                        f"[spmd_id={self.spmd_id}] Forwarded step {step} state_arguments {names} to controller"
                     )
                 except Exception as e:
                     logger.error(
-                        f"[spmd_id={self.spmd_id}] Failed to forward state_argument to controller: {e}"
+                        f"[spmd_id={self.spmd_id}] Failed to forward state_arguments to controller: {e}"
                     )
 
         # =====================================================================

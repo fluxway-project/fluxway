@@ -4,7 +4,7 @@ Tests for the unified completion notification mechanism and SPMD Worker infrastr
 Covers:
 - ArrivalBarrier: N-arrival primitive shared across transport and mailbox layers
 - StepBarrier: per-step composite barrier in WorkerMailbox
-- WorkerMailbox: declare_step, put_tensor/put_state, wait_step_ready, on_ready callback
+- WorkerMailbox: declare_step, deposit_shards/put_state, wait_step_ready, on_ready callback
 - TransportReceiver: async wait() via ArrivalBarrier
 - Worker integration: mesh, config, data reception
 """
@@ -381,12 +381,13 @@ async def test_mailbox_declare_step_and_on_ready():
         OpType.FORWARD, step=0, expected_tensors={"x": 2}, expected_states=[]
     )
 
-    await mb.put_tensor(
-        OpType.FORWARD, "x", 0, rank=0, tensor=TransportTensor.from_tensor(np.zeros(4))
+    tensor = TransportTensor.from_tensor(np.zeros(4))
+    await mb.deposit_shards(
+        OpType.FORWARD, "x", 0, rank=0, payloads=[tensor.flat_values], counts=[4]
     )
     assert not fired
-    await mb.put_tensor(
-        OpType.FORWARD, "x", 0, rank=1, tensor=TransportTensor.from_tensor(np.zeros(4))
+    await mb.deposit_shards(
+        OpType.FORWARD, "x", 0, rank=1, payloads=[tensor.flat_values], counts=[4]
     )
     assert fired == [(OpType.FORWARD, 0)]
 
@@ -401,15 +402,12 @@ async def test_mailbox_wait_step_ready():
 
     async def feed():
         await asyncio.sleep(0)
-        await mb.put_tensor(
-            OpType.FORWARD,
-            "a",
-            5,
-            rank=0,
-            tensor=TransportTensor.from_tensor(np.ones(3)),
+        tensor = TransportTensor.from_tensor(np.ones(3))
+        await mb.deposit_shards(
+            OpType.FORWARD, "a", 5, rank=0, payloads=[tensor.flat_values], counts=[3]
         )
         await asyncio.sleep(0)
-        await mb.put_state(OpType.FORWARD, "cfg", 5, data={"lr": 0.1})
+        await mb.deposit_states(OpType.FORWARD, 5, names=["cfg"], values=[{"lr": 0.1}])
 
     asyncio.create_task(feed())
     await mb.wait_step_ready(OpType.FORWARD, step=5)
@@ -439,7 +437,7 @@ async def test_mailbox_no_barrier_without_declare():
 @pytest.mark.asyncio
 async def test_mailbox_state_put_get():
     mb = WorkerMailbox()
-    await mb.put_state(OpType.FORWARD, "lr", 1, 0.001)
+    await mb.deposit_states(OpType.FORWARD, 1, names=["lr"], values=[0.001])
     assert await mb.has_state(OpType.FORWARD, "lr", 1)
     assert await mb.get_state(OpType.FORWARD, "lr", 1) == 0.001
 
@@ -447,8 +445,8 @@ async def test_mailbox_state_put_get():
 @pytest.mark.asyncio
 async def test_mailbox_get_all_states():
     mb = WorkerMailbox()
-    await mb.put_state(OpType.FORWARD, "a", 0, 1)
-    await mb.put_state(OpType.FORWARD, "b", 0, 2)
+    await mb.deposit_states(OpType.FORWARD, 0, names=["a"], values=[1])
+    await mb.deposit_states(OpType.FORWARD, 0, names=["b"], values=[2])
     states = await mb.get_all_states(OpType.FORWARD, 0)
     assert states == {"a": 1, "b": 2}
 
@@ -463,7 +461,9 @@ async def test_mailbox_tensor_put_get():
     mb = WorkerMailbox()
     d = np.array([1.0, 2.0])
     tensor = TransportTensor.from_tensor(d)
-    await mb.put_tensor(OpType.FORWARD, "x", 0, rank=0, tensor=tensor)
+    await mb.deposit_shards(
+        OpType.FORWARD, "x", 0, rank=0, payloads=[tensor.flat_values], counts=[2]
+    )
     shards = await mb.get_tensor_shards(OpType.FORWARD, "x", 0)
     assert 0 in shards
     np.testing.assert_array_equal(shards[0].flat_values, d)
@@ -472,11 +472,13 @@ async def test_mailbox_tensor_put_get():
 @pytest.mark.asyncio
 async def test_mailbox_tensor_multi_rank():
     mb = WorkerMailbox()
-    await mb.put_tensor(
-        OpType.FORWARD, "e", 1, rank=0, tensor=TransportTensor.from_tensor(np.zeros(4))
+    tensor_zeros = TransportTensor.from_tensor(np.zeros(4))
+    await mb.deposit_shards(
+        OpType.FORWARD, "e", 1, rank=0, payloads=[tensor_zeros.flat_values], counts=[4]
     )
-    await mb.put_tensor(
-        OpType.FORWARD, "e", 1, rank=1, tensor=TransportTensor.from_tensor(np.ones(4))
+    tensor_ones = TransportTensor.from_tensor(np.ones(4))
+    await mb.deposit_shards(
+        OpType.FORWARD, "e", 1, rank=1, payloads=[tensor_ones.flat_values], counts=[4]
     )
     assert await mb.get_tensor_shard_count(OpType.FORWARD, "e", 1) == 2
 
@@ -484,11 +486,11 @@ async def test_mailbox_tensor_multi_rank():
 @pytest.mark.asyncio
 async def test_mailbox_op_isolation():
     mb = WorkerMailbox()
-    await mb.put_tensor(
-        OpType.FORWARD, "g", 0, 0, TransportTensor.from_tensor(np.array([1.0]))
+    await mb.deposit_shards(
+        OpType.FORWARD, "g", 0, rank=0, payloads=[np.array([1.0])], counts=[1]
     )
-    await mb.put_tensor(
-        OpType.BACKWARD, "g", 0, 0, TransportTensor.from_tensor(np.array([2.0]))
+    await mb.deposit_shards(
+        OpType.BACKWARD, "g", 0, rank=0, payloads=[np.array([2.0])], counts=[1]
     )
     fwd = await mb.get_tensor_shards(OpType.FORWARD, "g", 0)
     bwd = await mb.get_tensor_shards(OpType.BACKWARD, "g", 0)
@@ -508,14 +510,13 @@ async def test_mailbox_zero_copy_writes_into_buffer():
     await mb.register_zero_copy_slot(
         OpType.FORWARD, "emb", step=0, target_buffers=[buf], expect_offsets={0: 0}
     )
-    await mb.put_tensor(
+    await mb.deposit_shards(
         OpType.FORWARD,
         "emb",
         step=0,
         rank=0,
-        tensor=TransportTensor.from_tensor(
-            np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
-        ),
+        payloads=[np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)],
+        counts=[2],
     )
     buffers = await mb.get_zero_copy_buffers(OpType.FORWARD, "emb", step=0)
     assert buffers is not None
@@ -530,10 +531,11 @@ async def test_mailbox_zero_copy_writes_into_buffer():
 @pytest.mark.asyncio
 async def test_mailbox_clear_step():
     mb = WorkerMailbox()
-    await mb.put_state(OpType.FORWARD, "s", 1, "x")
-    await mb.put_state(OpType.FORWARD, "s", 2, "y")
-    await mb.put_tensor(
-        OpType.FORWARD, "t", 1, 0, TransportTensor.from_tensor(np.zeros(2))
+    await mb.deposit_states(OpType.FORWARD, 1, names=["s"], values=["x"])
+    await mb.deposit_states(OpType.FORWARD, 2, names=["s"], values=["y"])
+    tensor = TransportTensor.from_tensor(np.zeros(2))
+    await mb.deposit_shards(
+        OpType.FORWARD, "t", 1, rank=0, payloads=[tensor.flat_values], counts=[2]
     )
     mb.declare_step(OpType.FORWARD, 1, {}, [])
 
@@ -549,12 +551,13 @@ async def test_mailbox_clear_step():
 async def test_mailbox_get_size():
     mb = WorkerMailbox()
     assert await mb.get_size() == 0
-    await mb.put_state(OpType.FORWARD, "s", 0, None)
-    await mb.put_tensor(
-        OpType.FORWARD, "t", 0, 0, TransportTensor.from_tensor(np.zeros(2))
+    await mb.deposit_states(OpType.FORWARD, 0, names=["s"], values=[None])
+    tensor = TransportTensor.from_tensor(np.zeros(2))
+    await mb.deposit_shards(
+        OpType.FORWARD, "t", 0, rank=0, payloads=[tensor.flat_values], counts=[2]
     )
-    await mb.put_tensor(
-        OpType.FORWARD, "t", 0, 1, TransportTensor.from_tensor(np.zeros(2))
+    await mb.deposit_shards(
+        OpType.FORWARD, "t", 0, rank=1, payloads=[tensor.flat_values], counts=[2]
     )
     assert await mb.get_size() == 3
 
@@ -605,19 +608,103 @@ async def test_spmd_worker_init():
 
 
 @pytest.mark.asyncio
-async def test_receive_data_with_name():
+async def test_receive_multi_tensor_data():
     mesh = DeviceMesh((2,), axis_names=("data",))
     config = SPMDConfig(mesh=mesh, user_forward_fn=forward_fn)
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
     cls = cls.modified_class if cls else SPMDWorker
     worker = cls(config, rank=0)
 
-    await worker.receive_state_data(OpType.FORWARD, "id", step=1, data={"v": 42})
-    assert await worker._mailbox.get_state(OpType.FORWARD, "id", 1) == {"v": 42}
+    t1 = TransportTensor.from_tensor(np.array([1, 2]))
+    t2 = TransportTensor.from_tensor(np.array([3, 4]))
 
-    tensor = TransportTensor.from_tensor(np.array([1, 2, 3]))
-    await worker.receive_tensor_data(
-        OpType.FORWARD, "t", step=1, sender_rank=0, tensor=tensor
+    await worker.receive_shards(
+        OpType.FORWARD,
+        "multi",
+        step=1,
+        sender_rank=0,
+        payloads=[t1.flat_values, t2.flat_values],
+        counts=[2, 2],
+        is_ragged=False,
+        has_indices=False,
     )
-    shards = await worker._mailbox.get_tensor_shards(OpType.FORWARD, "t", 1)
-    np.testing.assert_array_equal(shards[0].flat_values, [1, 2, 3])
+    shards = await worker._mailbox.get_tensor_shards(OpType.FORWARD, "multi", 1)
+    received = shards[0]
+    assert isinstance(received, list)
+    assert len(received) == 2
+    np.testing.assert_array_equal(received[0].flat_values, [1, 2])
+    np.testing.assert_array_equal(received[1].flat_values, [3, 4])
+
+
+@pytest.mark.asyncio
+async def test_mailbox_zero_copy_ragged():
+    mb = WorkerMailbox()
+    # For ragged, we expect 2 buffers: data and lengths
+    data_buf = np.zeros((10,), dtype=np.float32)
+    len_buf = np.zeros((4,), dtype=np.int32)
+
+    await mb.register_zero_copy_slot(
+        OpType.FORWARD,
+        "ragged",
+        step=0,
+        target_buffers=[data_buf, len_buf],
+        expect_offsets={0: [0, 0]},
+    )
+
+    # Create a ragged tensor: 2 elements, counts [3, 2], values [1,1,1, 2,2]
+    flat_values = np.array([1, 1, 1, 2, 2], dtype=np.float32)
+    splits = np.array([0, 3, 5], dtype=np.int32)
+    tt = TransportTensor(flat_values, nested_splits=[splits])
+
+    await mb.deposit_shards(
+        OpType.FORWARD,
+        "ragged",
+        step=0,
+        rank=0,
+        payloads=[tt.flat_values, np.array([3, 2], dtype=np.int32)],
+        counts=[5, 2],
+        is_ragged=True,
+        has_indices=False,
+    )
+
+    # Verify buffers from mailbox (handles JAX-style non-inplace updates)
+    buffers = await mb.get_zero_copy_buffers(OpType.FORWARD, "ragged", step=0)
+    assert buffers is not None
+    # Verify data buffer
+    np.testing.assert_array_equal(buffers[0][:5], flat_values)
+    # Verify lengths buffer
+    np.testing.assert_array_equal(buffers[1][:2], [3, 2])
+
+
+def test_replicate_operator_manager():
+    from fluxway.common.types.configs import OperatorMeta, ArgumentType
+
+    mesh = DeviceMesh((2, 2), axis_names=("x", "y"))
+
+    meta = OperatorMeta(
+        name="test_op",
+        input_arguments={ArgumentType.TENSOR.value: ["a"]},
+        output_arguments={},
+        input_sharding={"a": {"type": "replicated"}},
+        output_sharding={},
+    )
+
+    def my_forward(a):
+        pass
+
+    my_forward._flux_operator_meta = meta
+
+    config = SPMDConfig(
+        spmd_id="test",
+        worker_count=4,
+        mesh=mesh,
+        user_forward_fn=my_forward,
+        user_backward_fn=None,
+        user_update_fn=None,
+    )
+
+    manager = OperatorManager(config, rank=0)
+
+    spec = manager.get_input_sharding(OpType.FORWARD)
+    assert "a" in spec
+    assert spec["a"].replica_size == 4

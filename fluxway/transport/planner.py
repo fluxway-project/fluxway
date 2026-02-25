@@ -137,7 +137,7 @@ class TransportPlanner:
 
         dst_replica_axes = None
         dst_replica_size = 1
-        if dst_mesh and dst_partitions:
+        if dst_mesh and dst_partitions is not None:
             used = set()
             for axes in dst_partitions.values():
                 used.update(axes)

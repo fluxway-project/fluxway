@@ -396,12 +396,12 @@ if RAY_AVAILABLE:
             source_spmd_id: str,
             target_spmd_id: str,
             target_op: "OpType",
-            state_name: str,
+            names: List[str],
             step: int,
-            state_value: Any,
+            values: List[Any],
         ) -> None:
             """
-            Receive state_argument and forward to target SPMD.
+            Receive state_arguments and forward to target SPMD.
 
             Transport path: rank0-worker -> source-driver -> controller
                            -> target-driver -> all-workers
@@ -410,27 +410,27 @@ if RAY_AVAILABLE:
                 source_spmd_id: Source SPMD ID
                 target_spmd_id: Target SPMD ID
                 target_op: Target operator type on the receiving side
-                state_name: State variable name
+                names: State variable names
                 step: Current step number
-                state_value: State value
+                values: State values
             """
             target_driver = self._spmd_manager.get_driver_handle(target_spmd_id)
             if target_driver is None:
                 logger.error(
-                    f"Target SPMD {target_spmd_id} not found for state_argument"
+                    f"Target SPMD {target_spmd_id} not found for state_arguments"
                 )
                 return
 
             try:
                 await target_driver.broadcast_state_argument.remote(
-                    target_op, state_name, step, state_value
+                    target_op, names, step, values
                 )
                 logger.debug(
-                    f"Forwarded state_argument '{state_name}' from {source_spmd_id} "
+                    f"Forwarded state_arguments {names} from {source_spmd_id} "
                     f"to {target_spmd_id}, target_op={target_op}, step={step}"
                 )
             except Exception as e:
-                logger.error(f"Failed to forward state_argument: {e}")
+                logger.error(f"Failed to forward state_arguments: {e}")
 
         # =====================================================================
         # SPMD Error Handling

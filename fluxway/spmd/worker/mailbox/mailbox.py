@@ -121,7 +121,7 @@ class WorkerMailbox:
 
     Zero-copy slots:
         register_zero_copy_slot() activates a TransportReceiver for a slot
-        so put_tensor() writes directly into pre-allocated buffers.
+        so deposit_shards() writes directly into pre-allocated buffers.
     """
 
     def __init__(self) -> None:
@@ -174,8 +174,8 @@ class WorkerMailbox:
         """
         Declare the expected arrivals for a step.
 
-        Must be called before the first put_tensor() / put_state() for
-        that step.  If not called, put_* operations still work but no
+        Must be called before the first deposit_shards() / deposit_states() for
+        that step.  If not called, deposit_* operations still work but no
         barrier fires.
 
         Args:
@@ -192,17 +192,23 @@ class WorkerMailbox:
     # Control plane — state data
     # ------------------------------------------------------------------
 
-    async def put_state(self, op_type: OpType, name: str, step: int, data: Any) -> None:
+    async def deposit_states(
+        self, op_type: OpType, step: int, names: List[str], values: List[Any]
+    ) -> None:
         """Cache state data and notify the step barrier."""
+        if len(names) != len(values):
+            raise ValueError("names and values must have the same length")
+
         async with self._lock:
-            self._state_data[op_type].setdefault(name, {})[step] = data
-            barrier = self._barriers[op_type].get(step)
-            if barrier is not None:
-                fired = barrier.state_arrived(name)
-                if fired and self._on_ready:
-                    self._on_ready(op_type, step)
+            for name, data in zip(names, values, strict=True):
+                self._state_data[op_type].setdefault(name, {})[step] = data
+                barrier = self._barriers[op_type].get(step)
+                if barrier is not None:
+                    fired = barrier.state_arrived(name)
+                    if fired and self._on_ready:
+                        self._on_ready(op_type, step)
         logger.debug(
-            "Mailbox put_state: op=%s name=%s step=%d", op_type.name, name, step
+            "Mailbox deposit_states: op=%s names=%s step=%d", op_type.name, names, step
         )
 
     async def get_state(self, op_type: OpType, name: str, step: int) -> Optional[Any]:
@@ -230,42 +236,102 @@ class WorkerMailbox:
     ) -> Dict[int, "TransportTensor"]:
         return self._tensor_slots[op_type].setdefault(name, {}).setdefault(step, {})
 
-    async def put_tensor(
+    async def deposit_shards(
         self,
         op_type: OpType,
         name: str,
         step: int,
         rank: int,
-        tensor: "TransportTensor",
+        payloads: List[Any],
+        counts: List[int],
+        is_ragged: bool = False,
+        has_indices: bool = False,
     ) -> None:
         """
         Cache a tensor shard and notify the step barrier.
 
         If a zero-copy slot is registered for (op_type, name, step), writes
         directly into the pre-allocated buffer instead.
+
+        Args:
+            op_type: Operation type
+            name: Tensor name
+            step: Execution step
+            rank: Sender rank
+            payloads: Raw data arrays (data, optional lengths, optional indices)
+            counts: Number of rows for each payload
+            is_ragged: Whether the payloads represent a ragged tensor (data + lengths)
+            has_indices: Whether the payloads include routing indices
         """
         async with self._lock:
             zc = self._zc_receivers[op_type].get(name, {}).get(step)
             if zc is not None:
-                # For zero-copy, we extract data and lengths from TransportTensor
-                if tensor.nested_splits:
-                    # If ragged, we might need lengths. For now, assume dense or handle ragged lengths
-                    pass
-
-                # Simplified for refactoring: delegate to receiver
-                # Use tensor.flat_values and length if dense
-                count = (
-                    tensor.flat_values.shape[0]
-                    if hasattr(tensor.flat_values, "shape") and tensor.flat_values.shape
-                    else (
-                        len(tensor.flat_values)
-                        if isinstance(tensor.flat_values, (list, tuple))
-                        else 1
-                    )
-                )
-                zc.receive_slices(rank, [tensor.flat_values], [count])
+                # Zero-copy delegates raw payloads directly to the receiver.
+                # Assuming one TransportTensor structure for simplicity in zero-copy routing.
+                # If there are multiple co-located tensors in `payloads`, zero-copy setup
+                # must match the exact payload sequence.
+                zc.receive_slices(rank, payloads, counts)
             else:
-                self._buffered_slot(op_type, name, step)[rank] = tensor
+                # Reconstruct TransportTensor(s) for the buffered slot
+                from fluxway.common.types.tensor import TransportTensor
+                from fluxway.common.backend import get_backend
+
+                cursor = 0
+                backend = get_backend()
+                tensors = []
+
+                # Handle multiple pairs if `payloads` contains more elements than a single tensor requires.
+                # Generally, 1 tensor = 1 data + (0 or 1 lengths) + (0 or 1 indices).
+                # To support lists (co-location), we iterate until payloads are consumed.
+                while cursor < len(payloads):
+                    count = counts[cursor] if cursor < len(counts) else 0
+                    data_payload = (
+                        payloads[cursor][:count] if count > 0 else payloads[cursor]
+                    )
+                    cursor += 1
+
+                    lengths_payload = None
+                    if is_ragged and cursor < len(payloads):
+                        length_count = counts[cursor] if cursor < len(counts) else 0
+                        lengths_payload = (
+                            payloads[cursor][:length_count]
+                            if length_count > 0
+                            else payloads[cursor]
+                        )
+                        cursor += 1
+
+                    indices_payload = None
+                    if has_indices and cursor < len(payloads):
+                        index_count = counts[cursor] if cursor < len(counts) else 0
+                        indices_payload = (
+                            payloads[cursor][:index_count]
+                            if index_count > 0
+                            else payloads[cursor]
+                        )
+                        cursor += 1
+
+                    nested_splits = []
+                    if lengths_payload is not None:
+                        # Convert lengths back to splits via cumsum
+                        cs = backend.cumsum(lengths_payload, dim=0)
+                        zero = backend.zeros((1,), dtype=backend.int32())
+                        splits = backend.cat([zero, cs], dim=0)
+                        nested_splits = [splits]
+
+                    tensors.append(
+                        TransportTensor(
+                            data_payload,
+                            nested_splits=nested_splits,
+                            indices=indices_payload,
+                        )
+                    )
+
+                # Store single or list depending on original intention?
+                # For compatibility, if only 1, store it as single
+                if len(tensors) == 1:
+                    self._buffered_slot(op_type, name, step)[rank] = tensors[0]
+                else:
+                    self._buffered_slot(op_type, name, step)[rank] = tensors
 
             barrier = self._barriers[op_type].get(step)
             if barrier is not None:
@@ -274,7 +340,7 @@ class WorkerMailbox:
                     self._on_ready(op_type, step)
 
         logger.debug(
-            "Mailbox put_tensor: op=%s name=%s step=%d rank=%d",
+            "Mailbox deposit_shards: op=%s name=%s step=%d rank=%d",
             op_type.name,
             name,
             step,
