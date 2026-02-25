@@ -141,6 +141,12 @@ class SPMDWorker:
             asyncio.PriorityQueue()
         )
 
+        # --- Backpressure components ---
+        self._max_in_flight = 50
+        self._send_semaphore = asyncio.Semaphore(self._max_in_flight)
+        self._mailbox_capacity = 100  # Default value
+        self._high_watermark = int(self._mailbox_capacity * 0.8)
+
         # Internal Mailbox (async-safe), wired to auto-enqueue when a step is ready
         self._mailbox = WorkerMailbox()
         self._mailbox.set_ready_callback(self._on_step_ready)
@@ -1409,11 +1415,13 @@ class SPMDWorker:
                     if handler is None:
                         return False
 
+                    await self._send_semaphore.acquire()
+
                     count = int(counts[0]) if counts else 0
                     if count == 0:
                         backend = get_backend()
                         empty_tensor = backend.zeros((0,), dtype=backend.float32())
-                        handler.receive_shards.remote(
+                        ref = handler.receive_shards.remote(
                             _target_op,
                             _tensor_name,
                             _step,
@@ -1423,18 +1431,36 @@ class SPMDWorker:
                             _is_ragged,
                             _has_indices,
                         )
-                        return True
+                    else:
+                        ref = handler.receive_shards.remote(
+                            _target_op,
+                            _tensor_name,
+                            _step,
+                            self.rank,
+                            tensors,
+                            counts,
+                            _is_ragged,
+                            _has_indices,
+                        )
 
-                    handler.receive_shards.remote(
-                        _target_op,
-                        _tensor_name,
-                        _step,
-                        self.rank,
-                        tensors,
-                        counts,
-                        _is_ragged,
-                        _has_indices,
-                    )
+                    async def _wait_and_release(r=ref):
+                        try:
+                            # Await the ObjectRef to get the downstream Mailbox watermark
+                            watermark = await r
+                            if (
+                                isinstance(watermark, int)
+                                and watermark > self._high_watermark
+                            ):
+                                # Apply adaptive throttling backoff
+                                await asyncio.sleep(0.05)
+                        except Exception as e:
+                            logger.debug(
+                                f"[spmd_id={self.spmd_id}] Error tracing ACK for backpressure: {e}"
+                            )
+                        finally:
+                            self._send_semaphore.release()
+
+                    asyncio.create_task(_wait_and_release())
                     return True
 
                 await distributor.distribute(

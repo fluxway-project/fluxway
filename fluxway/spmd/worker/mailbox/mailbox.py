@@ -88,6 +88,28 @@ class StepBarrier:
             return self._check()
         return False
 
+    def satisfy_tensor(self, name: str) -> bool:
+        """Force a tensor barrier to be satisfied (e.g., via staleness fallback)."""
+        barrier = self._tensor_barriers.get(name)
+        if barrier is not None and not barrier.is_done():
+            # Force the ArrivalBarrier to be done by simulating arrivals
+            remaining = barrier._n - barrier._count
+            for _ in range(remaining):
+                barrier.arrive()
+            return self._check()
+        return False
+
+    def satisfy_state(self, name: str) -> bool:
+        """Force a state barrier to be satisfied."""
+        barrier = self._state_barriers.get(name)
+        if barrier is not None and not barrier.is_done():
+            # Force the ArrivalBarrier to be done by simulating arrivals
+            remaining = barrier._n - barrier._count
+            for _ in range(remaining):
+                barrier.arrive()
+            return self._check()
+        return False
+
     # ------------------------------------------------------------------
     # Completion query
     # ------------------------------------------------------------------
@@ -157,6 +179,14 @@ class WorkerMailbox:
         # Mapping from periodic op to its perpetual barrier
         self._periodic_barriers: Dict[str, StepBarrier] = {}
 
+        # Tolerant mode (staleness) config: {op_name: {name: staleness_value}}
+        self._staleness_config: Dict[str, Dict[str, int]] = {}
+        # Expected counts for satisfying staleness: {op_name: {name: expected_count}}
+        self._expected_tensor_counts: Dict[str, Dict[str, int]] = {}
+        self._expected_state_names: Dict[str, List[str]] = {}
+        # Retrieval policy for tolerant params: {op_name: {name: policy_string}}
+        self._retrieval_policy: Dict[str, Dict[str, str]] = {}
+
         self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
@@ -203,6 +233,18 @@ class WorkerMailbox:
             barrier_config.type == BarrierType.PERIODIC if barrier_config else False
         )
 
+        staleness_dict = {}
+        if barrier_config and barrier_config.type == BarrierType.TOLERANT:
+            staleness_dict = getattr(barrier_config, "staleness", {})
+            self._staleness_config[op_name] = staleness_dict
+            self._expected_tensor_counts[op_name] = expected_tensors
+            self._expected_state_names[op_name] = expected_states
+            policy = getattr(barrier_config, "retrieval_policy", "latest")
+            # Currently apply one policy per operator for all its staleness configs
+            self._retrieval_policy.setdefault(op_name, {})
+            for name in staleness_dict:
+                self._retrieval_policy[op_name][name] = policy
+
         if is_periodic:
             if op_name not in self._periodic_barriers:
                 # Use n from barrier_config if available
@@ -223,6 +265,37 @@ class WorkerMailbox:
 
         barrier = StepBarrier(expected_tensors, expected_states)
         self._barriers.setdefault(op_name, {})[step] = barrier
+
+        # Check if we can satisfy any tolerant dependencies using cached older data
+        for name, max_staleness in staleness_dict.items():
+            if max_staleness <= 0:
+                continue
+
+            # For tensors
+            if name in expected_tensors:
+                expected = expected_tensors[name]
+                if expected > 0:
+                    found_valid = False
+                    for k in range(step, max(-1, step - max_staleness - 1), -1):
+                        cached_shards = (
+                            self._tensor_slots.get(op_name, {}).get(name, {}).get(k, {})
+                        )
+                        if len(cached_shards) >= expected:
+                            found_valid = True
+                            break
+                    if found_valid:
+                        barrier.satisfy_tensor(name)
+
+            # For states
+            elif name in expected_states:
+                found_valid = False
+                for k in range(step, max(-1, step - max_staleness - 1), -1):
+                    if k in self._state_data.get(op_name, {}).get(name, {}):
+                        found_valid = True
+                        break
+                if found_valid:
+                    barrier.satisfy_state(name)
+
         # In case expected counts are all zero the barrier is already ready
         if barrier.is_ready() and self._on_ready:
             self._on_ready(op_name, step)
@@ -257,21 +330,59 @@ class WorkerMailbox:
                     fired = barrier.state_arrived(name)
                     if fired and self._on_ready:
                         self._on_ready(op_name, actual_step)
+
+                # Check if this state satisfies any FUTURE barriers that tolerate staleness
+                staleness = self._staleness_config.get(op_name, {}).get(name, 0)
+                if staleness > 0:
+                    for s in range(actual_step + 1, actual_step + staleness + 1):
+                        future_barrier = self._barriers.get(op_name, {}).get(s)
+                        if future_barrier is not None:
+                            fired_future = future_barrier.satisfy_state(name)
+                            if fired_future and self._on_ready:
+                                self._on_ready(op_name, s)
         logger.debug(
             "Mailbox deposit_states: op=%s names=%s step=%d", op_name, names, step
         )
 
     async def get_state(self, op_name: str, name: str, step: int) -> Optional[Any]:
         async with self._lock:
+            staleness = self._staleness_config.get(op_name, {}).get(name, 0)
+            if staleness > 0:
+                policy = self._retrieval_policy.get(op_name, {}).get(name, "latest")
+                step_dict = self._state_data.get(op_name, {}).get(name, {})
+                valid_steps = [
+                    k
+                    for k in range(max(0, step - staleness), step + 1)
+                    if k in step_dict
+                ]
+                if valid_steps:
+                    best_k = valid_steps[0] if policy == "oldest" else valid_steps[-1]
+                    return step_dict[best_k]
+
             return self._state_data.get(op_name, {}).get(name, {}).get(step)
 
     async def get_all_states(self, op_name: str, step: int) -> Dict[str, Any]:
         async with self._lock:
-            return {
-                name: steps[step]
-                for name, steps in self._state_data.get(op_name, {}).items()
-                if step in steps
-            }
+            result = {}
+            for name, step_dict in self._state_data.get(op_name, {}).items():
+                staleness = self._staleness_config.get(op_name, {}).get(name, 0)
+                if staleness > 0:
+                    policy = self._retrieval_policy.get(op_name, {}).get(name, "latest")
+                    valid_steps = [
+                        k
+                        for k in range(max(0, step - staleness), step + 1)
+                        if k in step_dict
+                    ]
+                    if valid_steps:
+                        best_k = (
+                            valid_steps[0] if policy == "oldest" else valid_steps[-1]
+                        )
+                        result[name] = step_dict[best_k]
+                        continue
+
+                if step in step_dict:
+                    result[name] = step_dict[step]
+            return result
 
     async def has_state(self, op_name: str, name: str, step: int) -> bool:
         async with self._lock:
@@ -300,7 +411,7 @@ class WorkerMailbox:
         counts: List[int],
         is_ragged: bool = False,
         has_indices: bool = False,
-    ) -> None:
+    ) -> int:
         """
         Cache a tensor shard and notify the step barrier.
 
@@ -365,6 +476,23 @@ class WorkerMailbox:
                 if fired and self._on_ready:
                     self._on_ready(op_name, actual_step)
 
+            # Check if this completion satisfies any FUTURE barriers that tolerate staleness
+            staleness = self._staleness_config.get(op_name, {}).get(name, 0)
+            if staleness > 0:
+                expected = self._expected_tensor_counts.get(op_name, {}).get(name, 0)
+                cached_shards = (
+                    self._tensor_slots.get(op_name, {})
+                    .get(name, {})
+                    .get(actual_step, {})
+                )
+                if expected > 0 and len(cached_shards) >= expected:
+                    for s in range(actual_step + 1, actual_step + staleness + 1):
+                        future_barrier = self._barriers.get(op_name, {}).get(s)
+                        if future_barrier is not None:
+                            fired_future = future_barrier.satisfy_tensor(name)
+                            if fired_future and self._on_ready:
+                                self._on_ready(op_name, s)
+
         logger.debug(
             "Mailbox deposit_shards: op=%s name=%s step=%d rank=%d",
             op_name,
@@ -372,6 +500,7 @@ class WorkerMailbox:
             step,
             rank,
         )
+        return await self.get_size()
 
     def _deposit_buffered_shards(
         self,
@@ -450,17 +579,57 @@ class WorkerMailbox:
         self, op_name: str, name: str, step: int
     ) -> Dict[int, "TransportTensor"]:
         async with self._lock:
+            staleness = self._staleness_config.get(op_name, {}).get(name, 0)
+            if staleness > 0:
+                expected = self._expected_tensor_counts.get(op_name, {}).get(name, 0)
+                if expected > 0:
+                    policy = self._retrieval_policy.get(op_name, {}).get(name, "latest")
+                    step_dict = self._tensor_slots.get(op_name, {}).get(name, {})
+                    valid_steps = [
+                        k
+                        for k in range(max(0, step - staleness), step + 1)
+                        if len(step_dict.get(k, {})) >= expected
+                    ]
+                    if valid_steps:
+                        best_k = (
+                            valid_steps[0] if policy == "oldest" else valid_steps[-1]
+                        )
+                        return dict(step_dict[best_k])
+
             return dict(self._tensor_slots.get(op_name, {}).get(name, {}).get(step, {}))
 
     async def get_all_tensor_shards(
         self, op_name: str, step: int
     ) -> Dict[str, Dict[int, "TransportTensor"]]:
         async with self._lock:
-            return {
-                name: dict(step_dict[step])
-                for name, step_dict in self._tensor_slots.get(op_name, {}).items()
-                if step in step_dict
-            }
+            result = {}
+            for name, step_dict in self._tensor_slots.get(op_name, {}).items():
+                staleness = self._staleness_config.get(op_name, {}).get(name, 0)
+                if staleness > 0:
+                    expected = self._expected_tensor_counts.get(op_name, {}).get(
+                        name, 0
+                    )
+                    if expected > 0:
+                        policy = self._retrieval_policy.get(op_name, {}).get(
+                            name, "latest"
+                        )
+                        valid_steps = [
+                            k
+                            for k in range(max(0, step - staleness), step + 1)
+                            if len(step_dict.get(k, {})) >= expected
+                        ]
+                        if valid_steps:
+                            best_k = (
+                                valid_steps[0]
+                                if policy == "oldest"
+                                else valid_steps[-1]
+                            )
+                            result[name] = dict(step_dict[best_k])
+                            continue
+
+                if step in step_dict:
+                    result[name] = dict(step_dict[step])
+            return result
 
     async def get_tensor_shard_count(self, op_name: str, name: str, step: int) -> int:
         async with self._lock:
@@ -519,23 +688,29 @@ class WorkerMailbox:
     # ------------------------------------------------------------------
 
     async def clear_step(self, op_name: str, step: int) -> None:
-        """Release all data for a completed step."""
+        """Release all data for a completed step, respecting staleness retention."""
         async with self._lock:
             if op_name in self._tensor_slots:
                 for name, step_dict in list(self._tensor_slots[op_name].items()):
-                    step_dict.pop(step, None)
+                    staleness = self._staleness_config.get(op_name, {}).get(name, 0)
+                    clear_target = step - staleness
+                    step_dict.pop(clear_target, None)
                     if not step_dict:
                         del self._tensor_slots[op_name][name]
 
             if op_name in self._zc_receivers:
                 for name, step_dict in list(self._zc_receivers[op_name].items()):
-                    step_dict.pop(step, None)
+                    staleness = self._staleness_config.get(op_name, {}).get(name, 0)
+                    clear_target = step - staleness
+                    step_dict.pop(clear_target, None)
                     if not step_dict:
                         del self._zc_receivers[op_name][name]
 
             if op_name in self._state_data:
                 for name, step_dict in list(self._state_data[op_name].items()):
-                    step_dict.pop(step, None)
+                    staleness = self._staleness_config.get(op_name, {}).get(name, 0)
+                    clear_target = step - staleness
+                    step_dict.pop(clear_target, None)
                     if not step_dict:
                         del self._state_data[op_name][name]
 

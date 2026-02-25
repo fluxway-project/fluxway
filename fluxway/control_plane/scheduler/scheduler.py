@@ -213,7 +213,7 @@ class Scheduler:
         Creates multi-bundle PG for each SPMD:
         - 1 driver bundle
         - N worker bundles (based on reader_config.worker_count for Reader nodes,
-          or spmd_config.worker_count for SPMD nodes)
+          or spmd_config.num_workers for SPMD nodes)
 
         Args:
             graph: The task graph (for worker_count info)
@@ -229,7 +229,7 @@ class Scheduler:
 
             # Get worker count from graph node
             # For Reader nodes, use reader_config.worker_count
-            # For SPMD nodes, use spmd_config.worker_count
+            # For SPMD nodes, use spmd_config.num_workers
             node = graph.nodes.get(spmd_id)
             worker_count = 1
             if node:
@@ -237,16 +237,15 @@ class Scheduler:
                     # Reader nodes: use worker_count from ReaderConfig
                     worker_count = node.reader_config.worker_count
                 elif node.spmd_config:
-                    # SPMD nodes: use worker_count from SPMDConfig
-                    worker_count = node.spmd_config.worker_count
+                    # SPMD nodes: use num_workers from SPMDConfig
+                    worker_count = node.spmd_config.num_workers
 
-            # Create PG via pg_pool_manager with multi-bundle support
             pg = await self._pg_manager.create_pg(
                 spmd_id=spmd_id,
                 resource=resource,
                 priority=priority,
                 strategy=plan.strategy,
-                worker_count=worker_count,
+                num_workers=worker_count,
             )
 
             if pg is None and RAY_AVAILABLE:

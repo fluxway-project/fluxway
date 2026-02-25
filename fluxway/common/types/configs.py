@@ -225,6 +225,7 @@ class BarrierType(str, Enum):
 
     STANDARD = "standard"  # Wait for all expected shards/states (default)
     PERIODIC = "periodic"  # Fire every 'n' arrivals; used for streaming
+    TOLERANT = "tolerant"  # Wait for bounded stale data, used for off-policy
 
 
 class BarrierConfig(BaseModel):
@@ -247,6 +248,18 @@ class PeriodicBarrierConfig(BarrierConfig):
 
     type: BarrierType = BarrierType.PERIODIC
     n: int = 1
+
+
+class TolerantBarrierConfig(BarrierConfig):
+    """
+    Tolerant barrier: fires when data within allowable staleness window is available.
+    Commonly used for Off-Policy / SSP training.
+    """
+
+    type: BarrierType = BarrierType.TOLERANT
+    anchor_tensor: Optional[str] = None
+    staleness: Dict[str, int] = Field(default_factory=dict)
+    retrieval_policy: str = "latest"  # "latest", "oldest", "closest"
 
 
 class OperatorMeta(BaseModel):
@@ -276,9 +289,9 @@ class OperatorMeta(BaseModel):
     )
 
     # Execution barrier configuration
-    barrier_config: Union[StandardBarrierConfig, PeriodicBarrierConfig] = Field(
-        default_factory=StandardBarrierConfig
-    )
+    barrier_config: Union[
+        StandardBarrierConfig, PeriodicBarrierConfig, TolerantBarrierConfig
+    ] = Field(default_factory=StandardBarrierConfig)
 
     def get_arguments(self, is_output: bool, arg_type: "ArgumentType") -> List[str]:
         """
@@ -717,7 +730,7 @@ class SPMDPlacementSpec(BaseModel):
         """Total worker GPUs."""
         if self.worker_resource is None:
             return 0
-        return self.worker_resource.num_gpus * self.worker_count
+        return self.worker_resource.num_gpus * self.num_workers
 
 
 class SPMDOpStep(BaseModel):
