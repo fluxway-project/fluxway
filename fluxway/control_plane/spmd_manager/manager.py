@@ -383,7 +383,7 @@ class SPMDManager:
         # Notify existing drivers of topology update
         if RAY_AVAILABLE:
             for spmd_id, handle in self._spmd_handles.items():
-                ## TODO(Chiave): 必须保证所有的 driver 都为 is_initialized 后，才执行前后置节点的注册
+                ## TODO(Chiave): Must ensure all drivers are is_initialized before registering predecessor/successor nodes
                 if handle.driver_handle is not None and handle.is_initialized:
                     try:
                         predecessors = self._reverse_topology.get(spmd_id, [])

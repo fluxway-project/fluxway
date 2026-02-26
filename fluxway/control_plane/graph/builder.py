@@ -41,8 +41,7 @@ class Builder:
 
     def __init__(self):
         self._nodes: Dict[str, Node] = {}
-        self._forward_edges: List[Edge] = []
-        self._backward_edges: List[Edge] = []
+        self._edges: List[Edge] = []
         self._spmd_classes: Dict[str, Type] = {}
         self._reader_configs: Dict[str, ReaderConfig] = {}  # Reader configurations
 
@@ -188,7 +187,7 @@ class Builder:
         # Reader uses num_workers from ReaderConfig, not from mesh
         spmd_config = SPMDConfig(
             # num_workers=num_workers, # Property is derived from mesh
-            max_async_steps=1,  # Reader doesn't need async steps
+            max_async_steps=1  # Reader doesn't need async steps
         )
 
         # Create Node with READER type
@@ -326,8 +325,8 @@ class Builder:
             condition_fn=condition_fn,
         )
 
-        # All edges go into _forward_edges (no semantic distinction anymore)
-        self._forward_edges.append(edge)
+        # All edges go into _edges (no semantic distinction anymore)
+        self._edges.append(edge)
 
         # Skip sharding validation for Reader nodes (they don't have @spmd decorator)
         if self._is_reader_node(source_node):
@@ -465,11 +464,8 @@ class Builder:
         Raises:
             ValueError: If graph validation fails
         """
-        # Combine all edges
-        all_edges = self._forward_edges + self._backward_edges
-
         # Validate that all edge references exist
-        for edge in all_edges:
+        for edge in self._edges:
             if edge.source_node not in self._nodes:
                 raise ValueError(
                     f"Edge references non-existent source node: {edge.source_node}"
@@ -479,7 +475,7 @@ class Builder:
                     f"Edge references non-existent target node: {edge.target_node}"
                 )
 
-        graph = Graph(name=name, nodes=self._nodes.copy(), edges=all_edges)
+        graph = Graph(name=name, nodes=self._nodes.copy(), edges=self._edges.copy())
 
         return graph
 
@@ -491,10 +487,9 @@ class Builder:
             Self for method chaining
         """
         self._nodes.clear()
-        self._forward_edges.clear()
-        self._backward_edges.clear()
         self._spmd_classes.clear()
         self._reader_configs.clear()
+        self._edges.clear()
         return self
 
     def get_spmd_class(self, node_name: str) -> Optional[Type]:

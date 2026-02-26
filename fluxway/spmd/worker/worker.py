@@ -13,7 +13,7 @@ Key responsibilities:
 4. Send outputs to successors using computed routing
 5. Provide op-level blocking (block one op without affecting others)
 6. Report op completion to driver
-7. Handle state_argument reception and forwarding
+7. Handle state_argument reception and propagate to successors
 
 This implementation uses Ray's async actor API for concurrency.
 See: https://docs.ray.io/en/latest/ray-core/actors/async_api.html
@@ -48,7 +48,7 @@ class SPMDWorker:
 
     Implements dual-stream convergence with priority queue execution:
     - Data is received by WorkerMailbox (async-safe)
-    - Executes operators in priority order: update > backward > forward
+    - Executes operators based on priority metadata
     - Supports op-level blocking without affecting other ops
     - Reports op completion to driver
     - Handles state_argument for cross-SPMD state transfer
@@ -831,7 +831,7 @@ class SPMDWorker:
         """Stop the execution loop gracefully."""
         self._running = False
         # Put a sentinel to unblock the queue
-        await self._execution_queue.put((999, 0, "forward"))
+        await self._execution_queue.put((999, 0, "__stop__"))
 
         # Cancel tasks
         if self._run_task and not self._run_task.done():
@@ -863,7 +863,7 @@ class SPMDWorker:
         return True
 
     async def _propagate_empty_packets(self, op_name: str, step: int) -> None:
-        """Forward empty packets to successor SPMDs."""
+        """Propagate empty packets to successor SPMDs to make sure the transmission steps are complete in all workers."""
         if self._op_manager is None:
             return
 
@@ -1505,7 +1505,7 @@ class SPMDWorker:
                     )
                     if self._driver_handle is not None:
                         try:
-                            self._driver_handle.forward_state_argument_to_controller.remote(
+                            self._driver_handle.routing_state_argument_to_controller.remote(
                                 spmd_id, target_op, names_to_send, step, values_to_send
                             )
                         except Exception as e:
@@ -1668,7 +1668,7 @@ class SPMDWorker:
             return
 
         try:
-            self._driver_handle.forward_state_argument_to_controller.remote(
+            self._driver_handle.routing_state_argument_to_controller.remote(
                 target_spmd_id, target_op, state_name, step, state_value
             )
             logger.debug(

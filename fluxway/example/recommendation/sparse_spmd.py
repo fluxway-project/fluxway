@@ -3,6 +3,7 @@ import jax.numpy as jnp
 from fluxway.common.decorators import spmd, operator
 from .data_types import EmbeddingInput, EmbeddingOutput, GradientOutput
 
+
 @spmd(
     resource={"nums_cpu": 1},
     mesh_axis_names=("shard",),
@@ -14,7 +15,7 @@ class SparseEmbeddingSPMD:
         self.embed_dim = embed_dim
         # Local shard of embedding table
         # In a real scenario, this would be initialized based on rank/mesh
-        self.weights = jnp.zeros((vocab_size // 2, embed_dim)) 
+        self.weights = jnp.zeros((vocab_size // 2, embed_dim))
 
     @operator(
         name="lookup",
@@ -24,7 +25,7 @@ class SparseEmbeddingSPMD:
         },
         output_sharding={
             "embeddings": {"type": "static", "axis": ["shard", None, None]}
-        }
+        },
     )
     def lookup(self, data: EmbeddingInput) -> EmbeddingOutput:
         """
@@ -32,12 +33,12 @@ class SparseEmbeddingSPMD:
         """
         # Feature IDs are already routed to this worker by Fluxway
         print(f"[SparseSPMD] lookup: received feature_ids {data.feature_ids.shape}")
-        
+
         # Simulate lookup
         batch_size = data.feature_ids.shape[0]
         num_features = data.feature_ids.shape[1]
         emb_values = jnp.zeros((batch_size, num_features, 64))
-        
+
         return EmbeddingOutput(embeddings=emb_values, feature_ids=data.feature_ids)
 
     @operator(
@@ -45,16 +46,19 @@ class SparseEmbeddingSPMD:
         tensor_argument=["grads", "feature_ids"],
         input_sharding={
             "grads": {"type": "static", "axis": ["shard", None, None]},
-            "feature_ids": {"type": "static", "axis": ["shard", None]}
-        }
+            "feature_ids": {"type": "static", "axis": ["shard", None]},
+        },
     )
     def update(self, data: GradientOutput) -> None:
         """Update local embedding weights with gradients."""
-        print(f"[SparseSPMD] update: received grads {data.grads.shape} for ids {data.feature_ids.shape}")
+        print(
+            f"[SparseSPMD] update: received grads {data.grads.shape} for ids {data.feature_ids.shape}"
+        )
         # Simple SGD update for demo
         # ids = data.feature_ids % (self.vocab_size // 2)
         # self.weights = self.weights.at[ids].add(-0.01 * data.grads)
         pass
+
 
 def hash_routing(tensor, mesh):
     """

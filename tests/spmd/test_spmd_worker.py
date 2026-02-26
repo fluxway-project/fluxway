@@ -807,17 +807,17 @@ def test_replicate_operator_manager():
         output_sharding={},
     )
 
-    def my_forward(a):
+    def dummy_op(a):
         pass
 
-    my_forward._flux_operator_meta = meta
+    dummy_op._flux_operator_meta = meta
 
     # Register with the operator name matching the meta name: "test_op"
     config = SPMDConfig(
         spmd_id="test",
         num_workers=4,
         mesh=mesh,
-        operators={"test_op": my_forward},
+        operators={"test_op": dummy_op},
         operator_metas={"test_op": meta},
     )
 
@@ -856,7 +856,9 @@ async def test_send_output_none_mesh():
 
     # Mock successor handlers
     handler = MagicMock()
-    worker._successor_handlers = {"succ": {0: handler}}
+    from fluxway.rpc.protocol import DataPlaneCallable
+
+    worker._successor_handlers = {"succ": {0: DataPlaneCallable(handler)}}
 
     # Call _send_output
     data = {"t1": np.array([1, 2, 3])}

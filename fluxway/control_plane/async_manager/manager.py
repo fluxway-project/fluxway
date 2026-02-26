@@ -8,8 +8,7 @@ Responsibilities:
 4. Unlock when step difference shrinks within threshold
 
 Key logic:
-- Forward edges check forward op step difference
-- Backward edges check backward op step difference
+- Check step difference for all functional edges defined in the graph
 - Has minimum lock duration to prevent frequent lock/unlock
 """
 
@@ -54,31 +53,13 @@ class AsyncStepManager:
         # Lock for thread safety
         self._lock = threading.Lock()
 
-        # Build edge map for quick lookup
-        self._forward_edges = self._build_edge_map()
-        self._backward_edges = self._build_reverse_edge_map()
-
-    def _build_edge_map(self) -> Dict[str, List[str]]:
-        """Build forward edge map: source -> [targets]"""
-        edge_map: Dict[str, List[str]] = {name: [] for name in self._graph.nodes}
-        for edge in self._graph.edges:
-            edge_map[edge.source_node].append(edge.target_node)
-        return edge_map
-
-    def _build_reverse_edge_map(self) -> Dict[str, List[str]]:
-        """Build backward edge map: target -> [sources]"""
-        edge_map: Dict[str, List[str]] = {name: [] for name in self._graph.nodes}
-        for edge in self._graph.edges:
-            edge_map[edge.target_node].append(edge.source_node)
-        return edge_map
-
     def report_op_completed(self, spmd_id: str, op_name: str, step: int) -> None:
         """
         Report that an SPMD completed an op step.
 
         Args:
             spmd_id: SPMD identifier
-            op_type: Operation type
+            op_name: Operation name
             step: Completed step number
         """
         with self._lock:
@@ -87,23 +68,11 @@ class AsyncStepManager:
                 return
 
             spmd_step = self._spmd_steps[spmd_id]
-
-            if op_name == "forward":
-                spmd_step.forward_step = max(spmd_step.forward_step, step)
-            elif op_name == "backward":
-                spmd_step.backward_step = max(spmd_step.backward_step, step)
-            elif op_name == "update":
-                spmd_step.update_step = max(spmd_step.update_step, step)
-            else:
-                spmd_step.dynamic_steps[op_name] = max(
-                    spmd_step.dynamic_steps.get(op_name, 0), step
-                )
+            spmd_step.op_steps[op_name] = max(spmd_step.op_steps.get(op_name, 0), step)
 
             logger.debug(
                 f"SPMD {spmd_id} completed {op_name} step {step}, "
-                f"current steps: fwd={spmd_step.forward_step}, "
-                f"bwd={spmd_step.backward_step}, upd={spmd_step.update_step}, "
-                f"dynamic={spmd_step.dynamic_steps}"
+                f"current steps: {spmd_step.op_steps}"
             )
 
     def report_op_steps(self, spmd_id: str, op_steps: Dict[str, int]) -> None:
@@ -112,7 +81,7 @@ class AsyncStepManager:
 
         Args:
             spmd_id: SPMD identifier
-            op_steps: Dict mapping op_type name to step number
+            op_steps: Dict mapping op_name to step number
         """
         with self._lock:
             if spmd_id not in self._spmd_steps:
@@ -122,16 +91,9 @@ class AsyncStepManager:
             spmd_step = self._spmd_steps[spmd_id]
 
             for op_name, step in op_steps.items():
-                if op_name == "forward":
-                    spmd_step.forward_step = max(spmd_step.forward_step, step)
-                elif op_name == "backward":
-                    spmd_step.backward_step = max(spmd_step.backward_step, step)
-                elif op_name == "update":
-                    spmd_step.update_step = max(spmd_step.update_step, step)
-                else:
-                    spmd_step.dynamic_steps[op_name] = max(
-                        spmd_step.dynamic_steps.get(op_name, 0), step
-                    )
+                spmd_step.op_steps[op_name] = max(
+                    spmd_step.op_steps.get(op_name, 0), step
+                )
 
     def check_and_enforce_limits(self) -> List[Tuple[str, str, bool]]:
         """
@@ -145,59 +107,41 @@ class AsyncStepManager:
         current_time = time.time()
 
         with self._lock:
-            # Check forward edges for forward step difference
-            for source, targets in self._forward_edges.items():
-                source_step = self._spmd_steps[source].forward_step
+            for edge in self._graph.edges:
+                if not edge.source_op or not edge.target_op:
+                    continue
 
-                for target in targets:
-                    target_step = self._spmd_steps[target].forward_step
-                    diff = source_step - target_step
+                source = edge.source_node
+                target = edge.target_node
+                source_op = edge.source_op
+                target_op = edge.target_op
 
-                    # Check if need to lock source's forward
-                    if diff > self._config.max_forward_step_diff:
-                        if not self._is_locked(source, "forward"):
-                            actions.append((source, "forward", True))
-                            self._set_locked(
-                                source,
-                                "forward",
-                                current_time,
-                                f"Step diff {diff} > {self._config.max_forward_step_diff} "
-                                f"(target: {target})",
-                            )
+                if source not in self._spmd_steps or target not in self._spmd_steps:
+                    continue
 
-                    # Check if can unlock (diff within half of max)
-                    elif diff <= self._config.max_forward_step_diff // 2:
-                        if self._is_locked(source, "forward"):
-                            if self._can_unlock(source, "forward", current_time):
-                                actions.append((source, "forward", False))
-                                self._clear_locked(source, "forward")
+                source_step = self._spmd_steps[source].op_steps.get(source_op, 0)
+                target_step = self._spmd_steps[target].op_steps.get(target_op, 0)
 
-            # Check backward edges for backward step difference
-            # For backward, the gradient flows from target back to source
-            for target, sources in self._backward_edges.items():
-                target_step = self._spmd_steps[target].backward_step
+                diff = source_step - target_step
 
-                for source in sources:
-                    source_step = self._spmd_steps[source].backward_step
-                    # For backward, target should be ahead (gradient comes from target)
-                    diff = target_step - source_step
+                # Check if need to lock source's op
+                if diff > self._config.max_step_diff:
+                    if not self._is_locked(source, source_op):
+                        actions.append((source, source_op, True))
+                        self._set_locked(
+                            source,
+                            source_op,
+                            current_time,
+                            f"Step diff {diff} > {self._config.max_step_diff} "
+                            f"(edge: {source}.{source_op} -> {target}.{target_op})",
+                        )
 
-                    if diff > self._config.max_backward_step_diff:
-                        if not self._is_locked(target, "backward"):
-                            actions.append((target, "backward", True))
-                            self._set_locked(
-                                target,
-                                "backward",
-                                current_time,
-                                f"Backward step diff {diff} > "
-                                f"{self._config.max_backward_step_diff} (source: {source})",
-                            )
-
-                    elif diff <= self._config.max_backward_step_diff // 2:
-                        if self._is_locked(target, "backward"):
-                            if self._can_unlock(target, "backward", current_time):
-                                actions.append((target, "backward", False))
-                                self._clear_locked(target, "backward")
+                # Check if can unlock (diff within half of max)
+                elif diff <= self._config.max_step_diff // 2:
+                    if self._is_locked(source, source_op):
+                        if self._can_unlock(source, source_op, current_time):
+                            actions.append((source, source_op, False))
+                            self._clear_locked(source, source_op)
 
         return actions
 
@@ -212,7 +156,7 @@ class AsyncStepManager:
         """Set op as locked (must hold lock)."""
         key = (spmd_id, op_name)
         self._lock_states[key] = OpLockState(
-            spmd_id=spmd_id, op_type=op_name, locked_at=timestamp, reason=reason
+            spmd_id=spmd_id, op_name=op_name, locked_at=timestamp, reason=reason
         )
         logger.info(f"Locked {spmd_id} {op_name}: {reason}")
 
@@ -274,7 +218,5 @@ class AsyncStepManager:
         """Reset all step tracking and locks."""
         with self._lock:
             for spmd_step in self._spmd_steps.values():
-                spmd_step.forward_step = 0
-                spmd_step.backward_step = 0
-                spmd_step.update_step = 0
+                spmd_step.op_steps.clear()
             self._lock_states.clear()

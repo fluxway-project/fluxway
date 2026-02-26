@@ -124,7 +124,9 @@ class FunctionalGraph:
         self._builder.add_node(name, spmd_class, description=description)
         return NodeProxy(name, self)
 
-    def reader(self, name: str, config: Optional[Dict[str, Any]] = None, **kwargs) -> NodeProxy:
+    def reader(
+        self, name: str, config: Optional[Dict[str, Any]] = None, **kwargs
+    ) -> NodeProxy:
         """
         Registers a Reader node and returns a proxy.
         """

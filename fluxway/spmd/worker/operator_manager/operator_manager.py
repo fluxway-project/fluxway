@@ -2,7 +2,7 @@
 Operator Manager for SPMD Worker.
 
 Responsibilities:
-1. Store and manage operators (forward/backward/update)
+1. Store and manage operators (e.g., train_step, rollout, reward)
 2. Parse topology from OperatorMeta at initialization (no runtime registration)
 3. Compute expected tensor shards based on input_sharding + input_pre_sharding
 4. Compute output routing based on output_sharding + output_post_sharding (4 cases)
@@ -44,7 +44,7 @@ class SPMDTopologyInfo:
     tensor_sharding: Dict[str, ShardingSpec] = field(default_factory=dict)
     # Condition function for conditional edges (only for successors)
     condition_fn: Optional[Callable[..., bool]] = None
-    # Target op name for cross-op edges (e.g., forward->backward)
+    # Target op name for cross-op edges (e.g., train_step->update)
     target_op: Optional[str] = None
     # Whether this is a self-loop edge (source_node == target_node)
     is_self_loop: bool = False

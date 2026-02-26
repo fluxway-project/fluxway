@@ -244,7 +244,7 @@ if RAY_AVAILABLE:
             Args:
                 heartbeat: Driver heartbeat data
             """
-            # Forward to heartbeat manager
+            # Route to heartbeat manager
             await self._heartbeat_manager.receive_heartbeat(heartbeat)
 
             # Update async step manager with op steps

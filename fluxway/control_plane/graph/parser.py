@@ -130,9 +130,6 @@ class GraphParser:
 
         # Build adjacency info from edges
         in_degree: Dict[str, int] = dict.fromkeys(self._graph.nodes, 0)
-        for node_name, node in self._graph.nodes.items():
-            # Count incoming edges based on forward_edges of other nodes
-            pass
 
         # Count in-degrees from edges
         for edge in self._graph.edges:

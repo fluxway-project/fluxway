@@ -106,7 +106,7 @@ class StatefulExecutor:
         Trigger execution of an operator on all workers.
 
         This is the generic execution trigger. Instead of hardcoded
-        execute_forward / execute_backward, users call execute_op("rollout", step),
+        named methods, users call execute_op("rollout", step),
         execute_op("compute_reward", step), etc.
 
         The actual execution is driven by the Worker's mailbox:
@@ -114,7 +114,7 @@ class StatefulExecutor:
         have arrived via receive_shards / receive_states.
 
         Args:
-            op_name: Name of the operator to execute (e.g., "forward", "rollout")
+            op_name: Name of the operator to execute (e.g., "train_step", "rollout")
             step: Execution step number
 
         Returns:

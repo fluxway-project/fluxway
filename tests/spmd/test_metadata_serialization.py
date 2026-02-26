@@ -24,8 +24,14 @@ import tempfile
 
 import pytest
 
-from pydantic import BaseModel, Field, ConfigDict
-from typing import Dict, List, Any, Optional, Callable
+sys.path.append(os.getcwd())
+
+from fluxway.common.types.configs import (
+    SPMDConfig,
+    OperatorMeta,
+    EdgeShardingInfo,
+    ArgumentType,
+)
 
 
 def dummy_my_function():
@@ -146,39 +152,20 @@ print(repr(restored_fn.meta))
                 os.unlink(pickle_path)
 
 
-class DummyEdgeShardingInfo(BaseModel):
-    tensor_sharding: Dict[str, Any] = Field(default_factory=dict)
-
-
-class DummyOperatorMeta(BaseModel):
-    name: str
-    input_pre_sharding: Dict[str, List[DummyEdgeShardingInfo]] = Field(
-        default_factory=dict
-    )
-
-
-class DummySPMDConfig(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-    user_forward_fn: Optional[Callable] = None
-    forward_meta: Optional[DummyOperatorMeta] = None
-
-
-def dummy_forward(x):
+def dummy_op(x):
     return x
 
 
 class TestOperatorMetaSerialization:
-    """Tests for OperatorMeta serialization in SPMDConfig."""
+    """Tests for OperatorMeta serialization in SPMDConfig using actual types."""
 
-    def test_pydantic_model_preserves_modifications_in_pickle(self):
+    def test_real_pydantic_model_preserves_modifications_in_pickle(self):
         """
-        Pydantic models (like OperatorMeta) preserve modifications when pickled.
-
-        This is why storing OperatorMeta explicitly in SPMDConfig works.
+        OperatorMeta (Pydantic model) preserves modifications when pickled.
         """
         # Create and modify meta
-        meta = DummyOperatorMeta(name="forward")
-        edge_info = DummyEdgeShardingInfo(tensor_sharding={"tensor": "some_spec"})
+        meta = OperatorMeta(name="test_op", input_arguments=None, output_arguments=None)
+        edge_info = EdgeShardingInfo(tensor_sharding={"tensor": "some_spec"})
         meta.input_pre_sharding["Preprocessing"] = [edge_info]
 
         # Pickle and unpickle
@@ -191,36 +178,40 @@ class TestOperatorMetaSerialization:
             "tensor": "some_spec"
         }
 
-    def test_spmd_config_with_explicit_meta_preserves_modifications(self):
+    def test_real_spmd_config_preserves_modifications(self):
         """
         SPMDConfig with explicit meta fields preserves OperatorMeta modifications.
-
-        This is the solution implemented to fix the sharding issue.
         """
-        my_forward = dummy_forward
+        my_op = dummy_op
 
-        meta = DummyOperatorMeta(name="forward")
-        my_forward._flux_operator_meta = meta
+        meta = OperatorMeta(
+            name="test_op",
+            input_arguments={ArgumentType.TENSOR.value: ["input"]},
+            output_arguments={ArgumentType.TENSOR.value: ["output"]},
+        )
+        my_op._flux_operator_meta = meta
 
-        # Create config with explicit meta (simulating get_spmd_config)
-        config = DummySPMDConfig(
-            user_forward_fn=my_forward,
-            forward_meta=meta,  # Store explicitly
+        # Create config with explicit meta
+        config = SPMDConfig(
+            operators={"test_op": my_op}, operator_metas={"test_op": meta}
         )
 
-        # Modify meta after config creation (simulating Builder)
-        edge_info = DummyEdgeShardingInfo(tensor_sharding={"tensor": "some_spec"})
-        meta.input_pre_sharding["Preprocessing"] = [edge_info]
+        # Modify meta after config creation (simulating Builder linking)
+        edge_info = EdgeShardingInfo(tensor_sharding={"input": "sharded_spec"})
+        meta.input_pre_sharding["SourceSPMD"] = [edge_info]
 
         # Pickle and unpickle (simulating Ray serialization)
         pickled = pickle.dumps(config)
         restored = pickle.loads(pickled)
 
-        # forward_meta preserves modifications (Pydantic model)
-        assert restored.forward_meta is not None
-        assert list(restored.forward_meta.input_pre_sharding.keys()) == [
-            "Preprocessing"
+        # op_metas preserves modifications
+        assert "test_op" in restored.operator_metas
+        assert list(restored.operator_metas["test_op"].input_pre_sharding.keys()) == [
+            "SourceSPMD"
         ]
+        assert restored.operator_metas["test_op"].input_pre_sharding["SourceSPMD"][
+            0
+        ].tensor_sharding == {"input": "sharded_spec"}
 
 
 if __name__ == "__main__":

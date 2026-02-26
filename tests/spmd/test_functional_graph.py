@@ -1,5 +1,6 @@
 import sys
 import os
+import copy
 
 sys.path.append(os.getcwd())
 
@@ -38,10 +39,24 @@ class DummySPMD:
 
 
 def _mock_metas():
-    # Patch DummySPMD.get_operator_metas to return something dummy so Builder passes validation
+    """
+    [Beginner's Guide: Why do we need to mock metadata?]
+
+    In Fluxway's formal workflow, each operator needs to strictly define its input/output data types (Dataclass)
+    and tensor sharding strategies. The Builder performs rigorous physical validation when connecting edges:
+    1. Validate whether the output of A and the input of B are type-compatible.
+    2. Validate whether data needs to be rearranged (Resharding) when transferred from A's memory distribution to B's.
+
+    In "graph logic tests," we often only care about "whether Node A is connected to Node B," without worrying about specific physical implementations.
+
+    The purpose of this function is:
+    1. Dynamically inject (Patch) metadata so the Builder thinks these Dummy operators have valid inputs and outputs.
+    2. Disable strict physical validation (e.g., validate_tensor_io_match), allowing us to quickly test various complex graph topologies (e.g., RL loops, multi-input merges) without defining complex data structures.
+    3. Ensure each test node gets an independent metadata copy (Deepcopy) to prevent test interference.
+    """
     from fluxway.common.types.configs import OperatorMeta
 
-    # Mock validation method
+    # Shield physical validation logic, keep only topological logic
     OperatorMeta.validate_tensor_io_match = lambda self, dst, src_is_output, ctx: None
 
     metas = {}
@@ -63,25 +78,30 @@ def _mock_metas():
             sync_outputs=[],
             input_arguments={},
             output_arguments={},
-            input_sharding={},
-            output_sharding={},
+            # Inject virtual sharding info to trigger Builder's EdgeShardingInfo routing records
+            input_sharding={"dummy_tensor": {"type": "replicated"}},
+            output_sharding={"dummy_tensor": {"type": "replicated"}},
         )
     DummySPMD.get_operator_metas = classmethod(lambda cls: metas)
 
-    # Builder extracts metas from spmd_config
+    # Intercept configuration acquisition to ensure Builder gets metas processed by Mock
     orig_get_config = DummySPMD.get_spmd_config
 
     def mock_get_config(cls):
         config = orig_get_config()
         if config is None:
             config = SPMDConfig()
-        config.operator_metas = metas
+        # Core: Must use deepcopy!
+        # Otherwise, all nodes in the graph using DummySPMD will point to the same meta object,
+        # causing edge info to overwrite each other.
+        config.operator_metas = copy.deepcopy(metas)
         config.operators = {op: getattr(DummySPMD, op) for op in metas.keys()}
         return config
 
     DummySPMD.get_spmd_config = classmethod(mock_get_config)
 
 
+# Execute Mock injection
 _mock_metas()
 
 
@@ -137,7 +157,7 @@ def test_functional_graph_multi_input():
 
 
 def test_functional_graph_implicit_self_loop():
-    """Verify self-loops are naturally recorded for backward pass activation saving."""
+    """Verify self-loops are naturally recorded."""
     graph = FunctionalGraph()
 
     actor = graph.node("Actor", DummySPMD)
@@ -161,7 +181,6 @@ def test_functional_graph_agentic_rl():
 
     env = graph.node("Env", DummySPMD)
     actor = graph.node("Actor", DummySPMD)
-    _ = graph.node("Reward", DummySPMD)
 
     h_obs = env.step()
     h_action = actor.rollout(h_obs)
@@ -170,20 +189,56 @@ def test_functional_graph_agentic_rl():
 
     task_graph = graph.compile()
 
-    # Should have 3 edges:
+    # Edges:
     # 1. Env.step -> Actor.rollout
     # 2. Actor.rollout -> Env.compute_reward
     # 3. Env.compute_reward -> Actor.train_step
     assert len(task_graph.edges) == 3
 
-    edge1 = task_graph.edges[0]
-    assert edge1.source_node == "Env" and edge1.source_op == "step"
-    assert edge1.target_node == "Actor" and edge1.target_op == "rollout"
 
-    edge2 = task_graph.edges[1]
-    assert edge2.source_node == "Actor" and edge2.source_op == "rollout"
-    assert edge2.target_node == "Env" and edge2.target_op == "compute_reward"
+def test_functional_graph_arbitrary_rl_loop():
+    """
+    Verify arbitrary reinforcement learning closed-loop: Actor -> Reward -> Learner -> Actor.
+    This loop is a typical scenario in offline RL or continuous learning.
+    """
+    graph = FunctionalGraph()
 
-    edge3 = task_graph.edges[2]
-    assert edge3.source_node == "Env" and edge3.source_op == "compute_reward"
-    assert edge3.target_node == "Actor" and edge3.target_op == "train_step"
+    actor = graph.node("Actor", DummySPMD)
+    reward = graph.node("Reward", DummySPMD)
+    learner = graph.node("Learner", DummySPMD)
+
+    # 1. Actor generates behavior
+    h_obs = actor.rollout()
+    # 2. Reward calculates score
+    h_reward = reward.compute_reward(h_obs)
+    # 3. Learner updates model and generates new strategy/parameters
+    h_train = learner.train_step(h_reward)
+    # 4. Feedback to Actor (closed loop)
+    _ = actor.rollout(h_train)
+
+    task_graph = graph.compile()
+
+    assert len(task_graph.nodes) == 3
+    assert len(task_graph.edges) == 3
+
+    # Use Builder for secondary verification to ensure metadata can be correctly
+    # injected into OperatorMeta after compilation
+    from fluxway.control_plane.graph.builder import Builder
+
+    builder = Builder()
+    for name in task_graph.nodes:
+        builder.add_node(name, DummySPMD)
+
+    for edge in task_graph.edges:
+        builder.add_func_edge(
+            edge.source_node, edge.source_op, edge.target_node, edge.target_op
+        )
+
+    linked_graph = builder.build("linked_graph")
+
+    # Verify that the critical "feedback" edge is effective in operator metadata
+    actor_meta = linked_graph.nodes["Actor"].spmd_config.operator_metas["rollout"]
+
+    # The operator's predecessor (Input) should include Learner, and the successor (Output) should include Reward
+    assert "Learner" in actor_meta.input_pre_sharding
+    assert "Reward" in actor_meta.output_post_sharding

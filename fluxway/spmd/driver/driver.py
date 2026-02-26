@@ -626,7 +626,7 @@ if RAY_AVAILABLE:
                 f"[spmd_id={self.spmd_id}] Broadcasted step {step} state_arguments {names} to all workers"
             )
 
-        def forward_state_argument_to_controller(
+        def routing_state_argument_to_controller(
             self,
             target_spmd_id: str,
             target_op: str,
@@ -635,7 +635,7 @@ if RAY_AVAILABLE:
             values: List[Any],
         ) -> None:
             """
-            Forward state_arguments to controller (called by rank0 worker).
+            Route state_arguments to controller (called by rank0 worker).
 
             Args:
                 target_spmd_id: Target SPMD ID
@@ -650,11 +650,11 @@ if RAY_AVAILABLE:
                         self.spmd_id, target_spmd_id, target_op, names, step, values
                     )
                     logger.debug(
-                        f"[spmd_id={self.spmd_id}] Forwarded step {step} state_arguments {names} to controller"
+                        f"[spmd_id={self.spmd_id}] Routed step {step} state_arguments {names} to controller"
                     )
                 except Exception as e:
                     logger.error(
-                        f"[spmd_id={self.spmd_id}] Failed to forward state_arguments to controller: {e}"
+                        f"[spmd_id={self.spmd_id}] Failed to route state_arguments to controller: {e}"
                     )
 
         # =====================================================================

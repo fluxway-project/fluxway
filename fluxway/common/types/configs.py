@@ -48,6 +48,7 @@ class ReaderConfig(BaseModel):
     tensor_type: Optional[Type] = (
         None  # Tensor field type extracted from output_data_type (set during build)
     )
+    target_op: Optional[str] = None  # Target operator name on successor nodes
 
 
 class MailboxStatus(BaseModel):
@@ -276,13 +277,13 @@ class OperatorMeta(BaseModel):
     input_sharding: Dict[str, Any] = Field(default_factory=dict)
     output_sharding: Dict[str, Any] = Field(default_factory=dict)
     # Linking sharding specs (populated by Builder when constructing the graph)
-    # 对于当前 operator：
-    # - input_pre_sharding：记录所有「前驱 SPMD -> 当前 SPMD」的边及其 sharding，
-    #   包含条件边；key 为前驱 spmd_id，value 为该前驱到当前的若干条边。
-    #   结构：{pred_spmd_id: List[EdgeShardingInfo]}
-    # - output_post_sharding：记录所有「当前 SPMD -> 后继 SPMD」的边及其 sharding，
-    #   同样包含条件边；key 为后继 spmd_id。
-    #   结构：{succ_spmd_id: List[EdgeShardingInfo]}
+    # For the current operator:
+    # - input_pre_sharding: Records all "predecessor SPMD -> current SPMD" edges and their sharding,
+    #   including conditional edges; key is predecessor spmd_id, value is a list of edges from that predecessor.
+    #   Structure: {pred_spmd_id: List[EdgeShardingInfo]}
+    # - output_post_sharding: Records all "current SPMD -> successor SPMD" edges and their sharding,
+    #   also including conditional edges; key is successor spmd_id.
+    #   Structure: {succ_spmd_id: List[EdgeShardingInfo]}
     input_pre_sharding: Dict[str, List[EdgeShardingInfo]] = Field(default_factory=dict)
     output_post_sharding: Dict[str, List[EdgeShardingInfo]] = Field(
         default_factory=dict
@@ -506,10 +507,6 @@ class NodeView(BaseModel):
         pass
 
 
-
-
-
-
 # =============================================================================
 # Driver and Worker Status Types (for heartbeat and state management)
 # =============================================================================
@@ -651,8 +648,6 @@ class DriverResourceSpec(BaseModel):
 
     num_cpus: int = 1
     memory_gb: float = 1.0
-
-
 
 
 class SPMDOpStep(BaseModel):
