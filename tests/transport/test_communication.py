@@ -41,7 +41,7 @@ def test_distributor_receiver_integration():
     receiver1 = TransportReceiver(wait_for_n_slices=0)
     receivers = [receiver0, receiver1]
 
-    def mock_send(target_rank, tensors, counts):
+    def mock_send(target_rank, tensors, counts, includes_indices=False):
         rec = receivers[target_rank]
         rec.receive_slices(local_rank, tensors, counts)
         return True

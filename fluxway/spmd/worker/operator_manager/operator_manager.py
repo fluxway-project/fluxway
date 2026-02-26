@@ -275,25 +275,14 @@ class OperatorManager:
         self, raw_specs: Dict[str, Any]
     ) -> Dict[str, "ShardingSpec"]:
         """Convert raw sharding dictionaries into ShardingSpec objects."""
-        from fluxway.common.types.sharding import (
-            ShardingSpec,
-            ChunkPartition,
-            PartitionSpec,
-        )
+        from fluxway.common.types.sharding import ShardingSpec, ShardingConfig
 
         parsed = {}
         for tensor_name, raw_spec in raw_specs.items():
             if isinstance(raw_spec, dict):
-                sharding_type = raw_spec.get("type", "static")
-                if sharding_type == "replicated":
-                    parsed[tensor_name] = ShardingSpec(
-                        strategy=ChunkPartition(),
-                        mesh=self._mesh,
-                        partition=PartitionSpec(),
-                        routing_dim=0,
-                    )
-                elif sharding_type == "dynamic":
-                    pass  # will handle shortly
+                parsed[tensor_name] = ShardingConfig.model_validate(raw_spec).to_spec(
+                    self._mesh
+                )
             elif isinstance(raw_spec, ShardingSpec):
                 parsed[tensor_name] = raw_spec
         return parsed
@@ -587,10 +576,17 @@ class OperatorManager:
         for all fields identified in output_arguments.
         """
         meta = self._get_operator_metadata(op_name)
+        from fluxway.common.types.sharding import ShardingConfig, ShardingSpec
+
         explicit_sharding = {}
         if meta.output_sharding:
             for name, spec_dict in meta.output_sharding.items():
-                explicit_sharding[name] = ShardingSpec.from_dict(spec_dict)
+                if isinstance(spec_dict, dict):
+                    explicit_sharding[name] = ShardingConfig.model_validate(
+                        spec_dict
+                    ).to_spec(self._mesh)
+                else:
+                    explicit_sharding[name] = spec_dict
 
         # If we have inferred output arguments but no explicit sharding,
         # default them to Replicated on current mesh.
@@ -617,7 +613,7 @@ class OperatorManager:
         Get output state argument names for an operator.
 
         These are the state variables that need to be sent to successors
-        via the control plane (state_argument transmission path).
+        via the control plane (control_argument transmission path).
 
         Returns:
             List of state argument names from output_arguments

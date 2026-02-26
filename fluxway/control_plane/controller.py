@@ -290,6 +290,13 @@ if RAY_AVAILABLE:
 
         async def _check_and_enforce_step_limits(self) -> None:
             """Check step differences and apply lock/unlock actions."""
+            # 1. Check for completion if max_steps is set
+            if self._async_step_manager.is_all_completed():
+                logger.info("All operators reached max_steps, triggering completion")
+                self._state_machine.transit(ControllerEvent.ALL_DRIVERS_COMPLETED)
+                return
+
+            # 2. Enforce step difference limits
             actions = self._async_step_manager.check_and_enforce_limits()
 
             for spmd_id, op_name, is_lock in actions:
@@ -394,7 +401,7 @@ if RAY_AVAILABLE:
         # State Argument Transport
         # =====================================================================
 
-        async def receive_state_argument(
+        async def receive_control_argument(
             self,
             source_spmd_id: str,
             target_spmd_id: str,
@@ -404,7 +411,7 @@ if RAY_AVAILABLE:
             values: List[Any],
         ) -> None:
             """
-            Receive state_arguments and forward to target SPMD.
+            Receive control_arguments and forward to target SPMD.
 
             Transport path: rank0-worker -> source-driver -> controller
                            -> target-driver -> all-workers
@@ -420,20 +427,20 @@ if RAY_AVAILABLE:
             target_driver = self._spmd_manager.get_driver_handle(target_spmd_id)
             if target_driver is None:
                 logger.error(
-                    f"Target SPMD {target_spmd_id} not found for state_arguments"
+                    f"Target SPMD {target_spmd_id} not found for control_arguments"
                 )
                 return
 
             try:
-                await target_driver.broadcast_state_argument.remote(
+                await target_driver.broadcast_control_argument.remote(
                     target_op, names, step, values
                 )
                 logger.debug(
-                    f"Forwarded state_arguments {names} from {source_spmd_id} "
+                    f"Forwarded control_arguments {names} from {source_spmd_id} "
                     f"to {target_spmd_id}, target_op={target_op}, step={step}"
                 )
             except Exception as e:
-                logger.error(f"Failed to forward state_arguments: {e}")
+                logger.error(f"Failed to forward control_arguments: {e}")
 
         # =====================================================================
         # SPMD Error Handling

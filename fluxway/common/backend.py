@@ -176,7 +176,13 @@ class TensorBackend(ABC):
         pass
 
     @abstractmethod
-    def repeat_interleave(self, x: Any, repeats: Any, dim: int = 0) -> Any:
+    def repeat_interleave(
+        self,
+        x: Any,
+        repeats: Any,
+        dim: Optional[int] = None,
+        total_repeat_length: Optional[int] = None,
+    ) -> Any:
         pass
 
     @abstractmethod
@@ -363,8 +369,16 @@ class TorchBackend(TensorBackend):
     def where(self, condition: Any, x: Any, y: Any) -> Any:
         return self._torch.where(condition, x, y)
 
-    def repeat_interleave(self, x: Any, repeats: Any, dim: int = None) -> Any:
-        return self._torch.repeat_interleave(x, repeats, dim=dim)
+    def repeat_interleave(
+        self,
+        x: Any,
+        repeats: Any,
+        dim: Optional[int] = None,
+        total_repeat_length: Optional[int] = None,
+    ) -> Any:
+        return self._torch.repeat_interleave(
+            x, repeats, dim=dim, output_size=total_repeat_length
+        )
 
     def cumsum(self, x: Any, dim: int = 0) -> Any:
         return self._torch.cumsum(x, dim=dim)
@@ -411,6 +425,13 @@ class TorchBackend(TensorBackend):
 
     def bincount(self, x: Any, minlength: int = 0) -> Any:
         return self._torch.bincount(x, minlength=minlength)
+
+    def unique(
+        self, x: Any, return_inverse: bool = False, return_counts: bool = False
+    ) -> Any:
+        return self._torch.unique(
+            x, return_inverse=return_inverse, return_counts=return_counts
+        )
 
     def vmap(self, fun: Any, in_axes: Any = 0, out_axes: Any = 0) -> Any:
         if hasattr(self._torch, "vmap"):
@@ -628,10 +649,17 @@ class JaxBackend(TensorBackend):
     def where(self, condition: Any, x: Any, y: Any) -> Any:
         return self._jnp.where(condition, x, y)
 
-    def repeat_interleave(self, x: Any, repeats: Any, dim: int = 0) -> Any:
-        # JAX doesn't have repeat_interleave exactly matching torch's signature for tensors
-        # jnp.repeat repeats elements.
-        return self._jnp.repeat(x, repeats, axis=dim, total_repeat_length=None)
+    def repeat_interleave(
+        self,
+        x: Any,
+        repeats: Any,
+        dim: Optional[int] = None,
+        total_repeat_length: Optional[int] = None,
+    ) -> Any:
+        # JAX jnp.repeat repeats elements.
+        return self._jnp.repeat(
+            x, repeats, axis=dim, total_repeat_length=total_repeat_length
+        )
 
     def cumsum(self, x: Any, dim: int = 0) -> Any:
         return self._jnp.cumsum(x, axis=dim)

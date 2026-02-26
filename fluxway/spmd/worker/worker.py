@@ -13,7 +13,7 @@ Key responsibilities:
 4. Send outputs to successors using computed routing
 5. Provide op-level blocking (block one op without affecting others)
 6. Report op completion to driver
-7. Handle state_argument reception and propagate to successors
+7. Handle control_argument reception and propagate to successors
 
 This implementation uses Ray's async actor API for concurrency.
 See: https://docs.ray.io/en/latest/ray-core/actors/async_api.html
@@ -56,7 +56,7 @@ class SPMDWorker:
     - Executes operators based on priority metadata
     - Supports op-level blocking without affecting other ops
     - Reports op completion to driver
-    - Handles state_argument for cross-SPMD state transfer
+    - Handles control_argument for cross-SPMD state transfer
 
     Uses asyncio for concurrency instead of threading.
     Ray will automatically detect this as an async actor due to async method definitions.
@@ -1342,7 +1342,7 @@ class SPMDWorker:
                     send_fn=_send_fn,
                 )
 
-        # --- Send state_argument via control plane ---
+        # --- Send control_argument via control plane ---
         # State arguments are sent through: rank0-worker -> driver -> controller -> target-driver -> all-workers
         output_state_names = self._op_manager.get_output_state_names(op_name)
         if output_state_names:
@@ -1375,17 +1375,17 @@ class SPMDWorker:
 
                 if names_to_send:
                     logger.debug(
-                        f"[spmd_id={self.spmd_id}] Worker {self.rank} sending state_arguments: names={names_to_send}, "
+                        f"[spmd_id={self.spmd_id}] Worker {self.rank} sending control_arguments: names={names_to_send}, "
                         f"step={step} to {spmd_id}"
                     )
                     if self._driver_handle is not None:
                         try:
-                            self._driver_handle.routing_state_argument_to_controller.remote(
+                            self._driver_handle.routing_control_argument_to_controller.remote(
                                 spmd_id, target_op, names_to_send, step, values_to_send
                             )
                         except Exception as e:
                             logger.error(
-                                f"[spmd_id={self.spmd_id}] Worker {self.rank} failed to send state_arguments "
+                                f"[spmd_id={self.spmd_id}] Worker {self.rank} failed to send control_arguments "
                                 f"via driver: {e}"
                             )
 
@@ -1503,9 +1503,9 @@ class SPMDWorker:
     # State Argument Handling
     # =========================================================================
 
-    def receive_state_argument(self, state_name: str, state_value: Any) -> None:
+    def receive_control_argument(self, state_name: str, state_value: Any) -> None:
         """
-        Receive state_argument from driver (broadcast from Controller).
+        Receive control_argument from driver (broadcast from Controller).
 
         State arguments are set as static args for operator execution.
 
@@ -1515,10 +1515,10 @@ class SPMDWorker:
         """
         self.set_static_arg(state_name, state_value)
         logger.debug(
-            f"[spmd_id={self.spmd_id}] Worker {self.rank} received state_argument: {state_name}"
+            f"[spmd_id={self.spmd_id}] Worker {self.rank} received control_argument: {state_name}"
         )
 
-    def send_state_argument(
+    def send_control_argument(
         self,
         target_spmd_id: str,
         target_op: str,
@@ -1527,7 +1527,7 @@ class SPMDWorker:
         state_value: Any,
     ) -> None:
         """
-        Send state_argument to target SPMD.
+        Send control_argument to target SPMD.
 
         Only rank 0 worker should call this method.
         Path: rank0-worker -> driver -> controller -> target-driver -> all-workers
@@ -1543,25 +1543,25 @@ class SPMDWorker:
             RuntimeError: If called from non-rank-0 worker
         """
         if self.rank != 0:
-            raise RuntimeError("Only rank 0 worker can send state_argument")
+            raise RuntimeError("Only rank 0 worker can send control_argument")
 
         if self._driver_handle is None:
             logger.error(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] No driver handle set, cannot send state_argument"
+                f"[spmd_id={self.spmd_id} rank={self.rank}] No driver handle set, cannot send control_argument"
             )
             return
 
         try:
-            self._driver_handle.routing_state_argument_to_controller.remote(
+            self._driver_handle.routing_control_argument_to_controller.remote(
                 target_spmd_id, target_op, state_name, step, state_value
             )
             logger.debug(
-                f"[spmd_id={self.spmd_id}] Worker {self.rank} sent state_argument '{state_name}' "
+                f"[spmd_id={self.spmd_id}] Worker {self.rank} sent control_argument '{state_name}' "
                 f"to SPMD {target_spmd_id}, target_op={target_op}, step={step}"
             )
         except Exception as e:
             logger.error(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] Failed to send state_argument: {e}"
+                f"[spmd_id={self.spmd_id} rank={self.rank}] Failed to send control_argument: {e}"
             )
 
     # =========================================================================

@@ -674,6 +674,7 @@ class HeartbeatConfig(FluxwayBaseModel):
 class AsyncStepConfig(FluxwayBaseModel):
     """Configuration for async step difference control."""
 
+    max_steps: Optional[int] = None  # Maximum steps to run (global limit)
     max_step_diff: int = 2  # Maximum generic step difference
     min_lock_duration: float = (
         1.0  # Minimum lock duration (prevent frequent lock/unlock)

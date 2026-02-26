@@ -10,7 +10,7 @@ Features:
 Usage:
     import fluxway
 
-    @fluxway.data_type(state_argument=["id"], tensor_argument=["tensor"])
+    @fluxway.data_type(control_argument=["id"], data_argument=["tensor"])
     class MyData:
         id: int
         tensor: torch.Tensor

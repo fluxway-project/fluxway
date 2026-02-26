@@ -1,77 +1,66 @@
+import jax
 import jax.numpy as jnp
 from fluxway.common.decorators import spmd, operator
-from .data_types import DenseInput, EmbeddingOutput, GradientOutput
+from fluxway.common.types.tensor import TransportTensor
+from .data_types import LookupOutput, DenseOutput
 
 
-def hash_routing(indices, num_workers, **kwargs):
-    """Hash-based routing for All-to-All communication."""
-    return jnp.mod(indices, num_workers)
-
-
-@spmd(
-    resource={"nums_cpu": 1},
-    mesh_axis_names=("dp", "mp"),
-    mesh_axis_shapes=(2, 2),  # 2 data parallel, 2 model parallel
-)
+@spmd(mesh_axis_names=("dp",), mesh_axis_shapes=(2,))
 class DenseSPMD:
-    def __init__(self, hidden_dim: int = 256):
-        self.hidden_dim = hidden_dim
-        # Model weights would be initialized here and sharded via jax.jit/sharding
-        # For demo, we just simulate the computation logic
-        pass
+    """
+    Final computation node.
+    """
 
     @operator(
         name="forward",
-        tensor_argument=["emb1", "emb2"],
+        data_argument=["emb1", "inv1", "emb2", "inv2"],
         input_sharding={
-            "emb1": {"type": "static", "axis": ["dp", None, None]},
-            "emb2": {"type": "static", "axis": ["dp", None, None]},
+            "emb1": {"type": "static", "axis": ["dp"]},
+            "inv1": {"type": "static", "axis": ["dp"]},
+            "emb2": {"type": "static", "axis": ["dp"]},
+            "inv2": {"type": "static", "axis": ["dp"]},
         },
-        output_sharding={"prediction": {"type": "static", "axis": ["dp", None]}},
     )
-    def forward(self, emb1: EmbeddingOutput, emb2: EmbeddingOutput) -> DenseInput:
-        """
-        Concatenate embeddings and perform dense layers.
-        Incoming embeddings are already partitioned by DP axis.
-        """
-        print(
-            f"[DenseSPMD] forward: received emb1 {emb1.embeddings.shape}, emb2 {emb2.embeddings.shape}"
-        )
+    def forward(
+        self,
+        emb1: LookupOutput,
+        inv1: TransportTensor,
+        emb2: LookupOutput,
+        inv2: TransportTensor,
+    ) -> DenseOutput:
+        rank = jax.process_index() if hasattr(jax, "process_index") else 0
 
-        # Concatenate embeddings: (batch, num_features, dim) -> (batch, flattened)
-        merged = jnp.concatenate([emb1.embeddings, emb2.embeddings], axis=1)
-        flattened = merged.reshape(merged.shape[0], -1)
+        # O(1) Reconstructions
+        f1_rec = emb1.sparse_features.gather(inv1.flat_values)
+        f2_rec = emb2.sparse_features.gather(inv2.flat_values)
 
-        # We store feature_ids so we can return them in backward
-        return DenseInput(
-            vector=flattened,
-            feature_ids1=emb1.feature_ids,
-            feature_ids2=emb2.feature_ids,
-        )
+        # Simple summation for demo prediction
+        prediction = jnp.sum(f1_rec.flat_values) + jnp.sum(f2_rec.flat_values)
+        print(f"[DenseSPMD] Worker {rank} Forward complete. Prediction: {prediction}")
+        return DenseOutput(prediction=prediction, inv1=inv1, inv2=inv2)
 
     @operator(
         name="backward",
-        tensor_argument=["prediction_grad"],
-        input_sharding={"prediction_grad": {"type": "static", "axis": ["dp", None]}},
+        data_argument=["context"],
         output_sharding={
             "grad1": {"type": "dynamic", "axis": [0], "fn": "hash_routing"},
             "grad2": {"type": "dynamic", "axis": [0], "fn": "hash_routing"},
         },
     )
-    def backward(self, data: DenseInput) -> GradientOutput:
-        """Compute gradients and route back to sparse SPMDs."""
-        # Simulated backprop
-        batch_size = data.vector.shape[0]
-        print(f"[DenseSPMD] backward: computing grads for batch {batch_size}")
+    def backward(self, context: DenseOutput) -> dict:
+        rank = jax.process_index() if hasattr(jax, "process_index") else 0
+        print(f"[DenseSPMD] Worker {rank} Backward starting.")
 
-        # grad1 corresponds to emb1/ids1, grad2 corresponds to emb2/ids2
-        # In a real model, we'd slice 'data.vector' gradients
-        dummy_grad1 = jnp.zeros((batch_size, 2, 64))  # Assuming 2 features for Sparse1
-        dummy_grad2 = jnp.zeros((batch_size, 2, 64))  # Assuming 2 features for Sparse2
+        # Simulate backprop to unique ID space
+        g1 = TransportTensor.from_tensor(jnp.ones_like(context.inv1.flat_values) * 0.1)
+        g2 = TransportTensor.from_tensor(jnp.ones_like(context.inv2.flat_values) * 0.2)
 
-        return GradientOutput(
-            grads=dummy_grad1,  # Primary grad field
-            feature_ids=data.feature_ids1,
-            grad1=dummy_grad1,
-            grad2=dummy_grad2,
+        print(
+            f"[DenseSPMD] Worker {rank} Produced gradients sum: {jnp.sum(g1.flat_values) + jnp.sum(g2.flat_values)}"
         )
+        return {"grad1": g1, "grad2": g2}
+
+
+def hash_routing(tensor, mesh):
+    val = tensor.flat_values if isinstance(tensor, TransportTensor) else tensor
+    return jnp.mod(val, mesh.size)

@@ -107,6 +107,21 @@ class AsyncStepManager:
         current_time = time.time()
 
         with self._lock:
+            # 1. Check global step limit (max_steps)
+            if self._config.max_steps is not None:
+                for spmd_id, spmd_step in self._spmd_steps.items():
+                    for op_name, step in spmd_step.op_steps.items():
+                        if step >= self._config.max_steps:
+                            if not self._is_locked(spmd_id, op_name):
+                                actions.append((spmd_id, op_name, True))
+                                self._set_locked(
+                                    spmd_id,
+                                    op_name,
+                                    current_time,
+                                    f"Step {step} >= max_steps {self._config.max_steps}",
+                                )
+
+            # 2. Check step differences for edges
             for edge in self._graph.edges:
                 if not edge.source_op or not edge.target_op:
                     continue
@@ -121,6 +136,13 @@ class AsyncStepManager:
 
                 source_step = self._spmd_steps[source].op_steps.get(source_op, 0)
                 target_step = self._spmd_steps[target].op_steps.get(target_op, 0)
+
+                # Skip if already reached max_steps (handled above)
+                if (
+                    self._config.max_steps is not None
+                    and source_step >= self._config.max_steps
+                ):
+                    continue
 
                 diff = source_step - target_step
 
@@ -139,11 +161,37 @@ class AsyncStepManager:
                 # Check if can unlock (diff within half of max)
                 elif diff <= self._config.max_step_diff // 2:
                     if self._is_locked(source, source_op):
-                        if self._can_unlock(source, source_op, current_time):
-                            actions.append((source, source_op, False))
-                            self._clear_locked(source, source_op)
+                        # ONLY unlock if NOT reached max_steps
+                        if (
+                            self._config.max_steps is None
+                            or source_step < self._config.max_steps
+                        ):
+                            if self._can_unlock(source, source_op, current_time):
+                                actions.append((source, source_op, False))
+                                self._clear_locked(source, source_op)
 
         return actions
+
+    def is_all_completed(self) -> bool:
+        """Check if all operators in all SPMDs have reached max_steps."""
+        if self._config.max_steps is None:
+            return False
+
+        with self._lock:
+            for spmd_id, node in self._graph.nodes.items():
+                spmd_step = self._spmd_steps.get(spmd_id)
+                if not spmd_step:
+                    return False
+
+                # All operators of this SPMD must reach max_steps
+                # (Note: only checking operators that have reported at least once)
+                if not spmd_step.op_steps:
+                    return False
+
+                for op_name, step in spmd_step.op_steps.items():
+                    if step < self._config.max_steps:
+                        return False
+        return True
 
     def _is_locked(self, spmd_id: str, op_name: str) -> bool:
         """Check if an op is locked (must hold lock)."""

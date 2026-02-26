@@ -95,7 +95,7 @@ def test_embedding_lookup_flow():
     # Rank 0 sends
     dist0 = cluster[0].distributor
 
-    def send_wrapper_0(target, tensors, counts):
+    def send_wrapper_0(target, tensors, counts, includes_indices=False):
         cluster[0].send([target], tensors, counts, cluster)
         return True
 
@@ -111,7 +111,7 @@ def test_embedding_lookup_flow():
     # Rank 1 sends
     dist1 = cluster[1].distributor
 
-    def send_wrapper_1(target, tensors, counts):
+    def send_wrapper_1(target, tensors, counts, includes_indices=False):
         cluster[1].send([target], tensors, counts, cluster)
         return True
 
@@ -231,7 +231,9 @@ def test_embedding_lookup_flow():
         dist = cluster[r].distributor
 
         # Send wrapper calling receive_slices
-        def send_wrapper_combine(target, tensors, counts, source_rank=r):
+        def send_wrapper_combine(
+            target, tensors, counts, includes_indices=False, source_rank=r
+        ):
             if target in cluster:
                 # This calls receive_slices -> writes into target_buffers Zero-Copy
                 cluster[target].receiver.receive_slices(source_rank, tensors, counts)
@@ -312,7 +314,7 @@ def test_embedding_lookup_flow():
         0
     ].distributor  # Re-using dist 0 (Rank 0 of Sim) for Rank 0 of SPMD2
 
-    def send_wrapper_bk_0(target, tensors, counts):
+    def send_wrapper_bk_0(target, tensors, counts, includes_indices=False):
         if target in grad_acc:
             grad_acc[target].append((tensors, counts))
         return True
@@ -333,7 +335,7 @@ def test_embedding_lookup_flow():
     # Send from Rank 1
     dist_bk_1 = cluster[1].distributor
 
-    def send_wrapper_bk_1(target, tensors, counts):
+    def send_wrapper_bk_1(target, tensors, counts, includes_indices=False):
         if target in grad_acc:
             grad_acc[target].append((tensors, counts))
         return True
@@ -391,7 +393,7 @@ def test_jit_shielding_flow():
     # A global list to capture side-effects from the shielded function
     side_effects = []
 
-    def side_effect_send(target, tensors, counts):
+    def side_effect_send(target, tensors, counts, includes_indices=False):
         count = counts[0]
         if count > 0:
             side_effects.append(tensors[0][:count])
@@ -525,7 +527,7 @@ def test_colocation_dispatch():
 
     received_payloads = []
 
-    def mock_send(target, tensors, counts):
+    def mock_send(target, tensors, counts, includes_indices=False):
         received_payloads.append((target, tensors, counts))
         return True
 

@@ -1,76 +1,81 @@
 import ray
 import asyncio
+import argparse
 from fluxway.control_plane.graph.functional import FunctionalGraph
 from fluxway.control_plane.controller import create_controller
+from fluxway.common.types.configs import AsyncStepConfig
 
-from .data_types import EmbeddingInput
+from .input_spmd import InputSPMD
 from .sparse_spmd import SparseEmbeddingSPMD
 from .dense_spmd import DenseSPMD
+from .reader import RecommendationReader
 
 
-async def run_training():
-    # 1. Initialize Ray
+async def run_training(args):
+    # Set JAX_PLATFORMS=cpu in runtime_env to ensure all Ray actors use CPU
+    runtime_env = {"env_vars": {"JAX_PLATFORMS": "cpu"}}
+
     if not ray.is_initialized():
-        ray.init(ignore_reinit_error=True)
+        ray.init(ignore_reinit_error=True, runtime_env=runtime_env)
 
-    # 2. Initialize Functional Graph
     graph = FunctionalGraph()
 
-    # 3. Define SPMD Nodes
-    sparse1 = graph.node("Sparse1", SparseEmbeddingSPMD)
-    sparse2 = graph.node("Sparse2", SparseEmbeddingSPMD)
-    dense = graph.node("Dense", DenseSPMD)
+    # 1. Define Nodes
+    input_node = graph.node("InputProcessor", InputSPMD)
+    table1 = graph.node("EmbeddingTable1", SparseEmbeddingSPMD)
+    table2 = graph.node("EmbeddingTable2", SparseEmbeddingSPMD)
+    dense = graph.node("DenseLayers", DenseSPMD)
 
-    # 4. Define Data Flow (Forward)
-    reader1 = graph.reader(
-        "Input1", config={"src_dir": "/tmp/data1"}, output_data_type=EmbeddingInput
-    )
-    reader2 = graph.reader(
-        "Input2", config={"src_dir": "/tmp/data2"}, output_data_type=EmbeddingInput
-    )
+    # 2. Source Data (Custom Reader)
+    reader = graph.node("TrainingReader", RecommendationReader)
+    h_raw = reader.read()
 
-    h_input1 = reader1.read()
-    h_input2 = reader2.read()
+    # 3. Forward Pass
+    h_proc = input_node.process(h_raw)
 
-    h_emb1 = sparse1.lookup(h_input1)
-    h_emb2 = sparse2.lookup(h_input2)
+    h_emb1 = table1.lookup(unique_ids=h_proc)
+    h_emb2 = table2.lookup(unique_ids=h_proc)
 
-    h_forward = dense.forward(emb1=h_emb1, emb2=h_emb2)
+    h_forward = dense.forward(emb1=h_emb1, inv1=h_proc, emb2=h_emb2, inv2=h_proc)
 
-    # 5. Define Data Flow (Backward)
-    # The backward operator returns grad1, grad2
-    h_grads = dense.backward(h_forward)
+    # 4. Backward Pass
+    h_grads = dense.backward(context=h_forward)
 
-    # Route gradients back to Sparse SPMDs
-    # In FunctionalGraph, we can select specific outputs if an op returns multiple
-    # but for simplicity in this demo, we use the returned handle
-    _ = sparse1.update(h_grads)
-    _ = sparse2.update(h_grads)
+    _ = table1.update(grads=h_grads)
+    _ = table2.update(grads=h_grads)
 
-    # 6. Compile the Graph
-    task_graph = graph.compile("Recommendation_Training")
+    # 6. Compile and Start
+    task_graph = graph.compile("End-to-End_Training_Flow")
 
-    print("Success: Recommendation training graph compiled!")
+    print("\n[Fluxway] Recommendation Graph Compiled.")
     print(f"Nodes: {list(task_graph.nodes.keys())}")
 
-    # 7. Start Distributed Execution via Controller
-    print("\nStarting Fluxway Controller (Ray Actors)...")
-    try:
-        _ = await create_controller(task_graph)
-        print("Controller started. Waiting for execution... (10s)")
-        await asyncio.sleep(10)
+    # Set max steps
+    async_step_config = AsyncStepConfig(max_steps=args.steps)
 
-        print("Trial execution completed.")
-        print(
-            "Check the logs above for [SparseSPMD] and [DenseSPMD] prints to verify communication."
+    try:
+        controller = await create_controller(
+            task_graph, async_step_config=async_step_config, runtime_env=runtime_env
         )
+        print(f"[Fluxway] System running for {args.steps} steps...")
+
+        # Wait for completion
+        completed = await controller.wait_for_completion.remote()
+        if completed:
+            print(f"\n[Fluxway] Training completed successfully after {args.steps} steps.")
+        else:
+            print("\n[Fluxway] Training failed or timed out.")
 
     except Exception as e:
-        print(f"Controller Startup Failed (likely due to resource constraints): {e}")
+        print(f"Controller Failed: {e}")
 
 
 def main():
-    asyncio.run(run_training())
+    parser = argparse.ArgumentParser(description="Fluxway Recommendation Example")
+    parser.add_argument("--steps", type=int, default=5, help="Number of steps to run")
+    args = parser.parse_args()
+
+    asyncio.run(run_training(args))
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ The SPMD Driver coordinates all workers within the SPMD:
 - Handles worker heartbeats and monitors health
 - Synchronizes worker steps within the SPMD
 - Reports SPMD-level progress to Controller
-- Handles state_argument broadcasting
+- Handles control_argument broadcasting
 - Manages op-level blocking
 """
 
@@ -521,11 +521,11 @@ if RAY_AVAILABLE:
         # State Argument Broadcasting
         # =====================================================================
 
-        def broadcast_state_argument(
+        def broadcast_control_argument(
             self, target_op: str, names: List[str], step: int, values: List[Any]
         ) -> None:
             """
-            Broadcast state_arguments to all workers via receive_states.
+            Broadcast control_arguments to all workers via receive_states.
 
             Args:
                 target_op: Target operator type on the receiving workers
@@ -537,18 +537,18 @@ if RAY_AVAILABLE:
                 try:
                     worker.receive_states.remote(target_op, step, names, values)
                     logger.debug(
-                        f"[spmd_id={self.spmd_id}] Broadcasted step {step} state_arguments {names} to worker {rank}"
+                        f"[spmd_id={self.spmd_id}] Broadcasted step {step} control_arguments {names} to worker {rank}"
                     )
                 except Exception as e:
                     logger.error(
-                        f"[spmd_id={self.spmd_id}] Failed to send state_arguments to worker: {e}"
+                        f"[spmd_id={self.spmd_id}] Failed to send control_arguments to worker: {e}"
                     )
 
             logger.debug(
-                f"[spmd_id={self.spmd_id}] Broadcasted step {step} state_arguments {names} to all workers"
+                f"[spmd_id={self.spmd_id}] Broadcasted step {step} control_arguments {names} to all workers"
             )
 
-        def routing_state_argument_to_controller(
+        def routing_control_argument_to_controller(
             self,
             target_spmd_id: str,
             target_op: str,
@@ -557,7 +557,7 @@ if RAY_AVAILABLE:
             values: List[Any],
         ) -> None:
             """
-            Route state_arguments to controller (called by rank0 worker).
+            Route control_arguments to controller (called by rank0 worker).
 
             Args:
                 target_spmd_id: Target SPMD ID
@@ -568,15 +568,15 @@ if RAY_AVAILABLE:
             """
             if self.controller_handle is not None:
                 try:
-                    self.controller_handle.receive_state_argument.remote(
+                    self.controller_handle.receive_control_argument.remote(
                         self.spmd_id, target_spmd_id, target_op, names, step, values
                     )
                     logger.debug(
-                        f"[spmd_id={self.spmd_id}] Routed step {step} state_arguments {names} to controller"
+                        f"[spmd_id={self.spmd_id}] Routed step {step} control_arguments {names} to controller"
                     )
                 except Exception as e:
                     logger.error(
-                        f"[spmd_id={self.spmd_id}] Failed to route state_arguments to controller: {e}"
+                        f"[spmd_id={self.spmd_id}] Failed to route control_arguments to controller: {e}"
                     )
 
         # =====================================================================

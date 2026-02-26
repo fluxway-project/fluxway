@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import enum
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union, Dict
 
 from fluxway.common.backend import get_backend
 from fluxway.common.mesh import DeviceMesh
@@ -22,9 +21,15 @@ from fluxway.common.topology import (
 # ============================================================
 
 
-class RoutingParadigm(enum.Enum):
-    STATIC = enum.auto()
-    DYNAMIC = enum.auto()
+from fluxway.common.types.configs import FluxwayBaseModel, ConfigDict
+from pydantic import Field, model_validator
+
+
+class RoutingParadigm(str, enum.Enum):
+    """Semantics of routing: static (rank-based) or dynamic (content-based)."""
+
+    STATIC = "static"
+    DYNAMIC = "dynamic"
 
 
 # ============================================================
@@ -32,42 +37,94 @@ class RoutingParadigm(enum.Enum):
 # ============================================================
 
 
-class PartitionSpec:
-    """Maps tensor dimensions to device mesh axes by position.
+class PartitionSpec(FluxwayBaseModel):
+    """Maps tensor dimensions to device mesh axes by position."""
 
-    This specification aligns target tensor dimensions with distributed topology axes.
+    model_config = ConfigDict(frozen=True)
 
-    Examples:
-        P('x')           -> dimension 0 is sharded along device axis 'x'
-        P(None, 'x')     -> dimension 1 is sharded along device axis 'x'
-        P(('x', 'y'))    -> dimension 0 is jointly sharded along axes ('x', 'y')
-    """
+    specs: Tuple[Optional[Union[str, int, Tuple[str, ...]]], ...] = Field(
+        default_factory=tuple
+    )
 
-    def __init__(self, *specs: Optional[Union[str, Tuple[str, ...]]]):
-        self.specs = specs
+    def __init__(self, *specs: Optional[Union[str, int, Tuple[str, ...]]]):
+        if len(specs) == 1 and isinstance(specs[0], (list, tuple)) and not specs[0]:
+            super().__init__(specs=())
+        else:
+            super().__init__(specs=specs)
 
     @property
-    def partitions(self):
-        """Returns a mapping from tensor dimension index to mesh axis names."""
+    def partitions(self) -> Dict[int, Tuple[str, ...]]:
         result = {}
         for i, s in enumerate(self.specs):
             if s is not None:
-                result[i] = (s,) if isinstance(s, str) else tuple(s)
-        if not result:
-            pass  # P() implies complete replication, valid.
+                if isinstance(s, (str, int)):
+                    result[i] = (str(s),)
+                else:
+                    result[i] = tuple(str(x) for x in s)
         return result
+
+    def to_named_spec(self, mesh: DeviceMesh) -> PartitionSpec:
+        """Converts integer axis indices to mesh axis names."""
+        new_specs = []
+        for s in self.specs:
+            if isinstance(s, int):
+                if s < len(mesh.axis_names):
+                    new_specs.append(mesh.axis_names[s])
+                else:
+                    new_specs.append(None)
+            elif isinstance(s, tuple):
+                new_specs.append(
+                    tuple(mesh.axis_names[x] if isinstance(x, int) else x for x in s)
+                )
+            else:
+                new_specs.append(s)
+        return PartitionSpec(*new_specs)
 
     def __repr__(self) -> str:
         return f"P({', '.join(repr(s) for s in self.specs)})"
 
-    def __eq__(self, other):
-        return isinstance(other, PartitionSpec) and self.specs == other.specs
-
-    def __hash__(self):
-        return hash(self.specs)
+    def __str__(self) -> str:
+        return self.__repr__()
 
 
 P = PartitionSpec
+
+
+# ============================================================
+# ShardingConfig — Declarative Config (Bridge from Dict)
+# ============================================================
+
+
+class ShardingConfig(FluxwayBaseModel):
+    """Bridge model to parse user-provided sharding dictionaries."""
+
+    sharding_type: str = Field(default="static", alias="type")
+    axis: List[Union[str, int]] = Field(default_factory=list)
+    fn: Optional[str] = None
+    routing_dim: Union[int, Tuple[int, ...]] = 0
+
+    def to_spec(self, mesh: DeviceMesh) -> ShardingSpec:
+        """Converts declarative config to an executable ShardingSpec."""
+        ps = PartitionSpec(*self.axis).to_named_spec(mesh)
+
+        if self.sharding_type == "replicated" or (
+            self.sharding_type == "static" and not self.axis
+        ):
+            return ShardingSpec(strategy=_CHUNK, mesh=mesh, partition=PartitionSpec())
+
+        # Select strategy based on type/fn
+        if self.fn in ("hash_routing", "hash") or self.sharding_type == "dynamic":
+            strategy = _INDEXED
+        elif self.fn == "cyclic":
+            strategy = _CYCLIC
+        elif self.fn == "greedy":
+            strategy = _GREEDY
+        else:
+            strategy = _CHUNK
+
+        return ShardingSpec(
+            strategy=strategy, mesh=mesh, partition=ps, routing_dim=self.routing_dim
+        )
 
 
 # ============================================================
@@ -75,12 +132,14 @@ P = PartitionSpec
 # ============================================================
 
 
-class PartitionStrategy:
+class PartitionStrategy(FluxwayBaseModel):
     """Base class for partitioning strategies.
 
     Encapsulates core algorithm for determining rank assignments (partitioning logic)
     along with derived metadata indicating how the topology should be interpreted.
     """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
     routing_paradigm: RoutingParadigm = RoutingParadigm.STATIC
 
@@ -104,6 +163,8 @@ class PartitionStrategy:
 class ChunkPartition(PartitionStrategy):
     """Chunk partitioning: idx → idx // chunk_size"""
 
+    routing_paradigm: RoutingParadigm = RoutingParadigm.STATIC
+
     def __call__(self, indices, dim_size, num_workers, topology=None):
         backend = get_backend()
         chunk_size = max((dim_size + num_workers - 1) // num_workers, 1)
@@ -118,6 +179,8 @@ class ChunkPartition(PartitionStrategy):
 class CyclicPartition(PartitionStrategy):
     """Cyclic partitioning: idx → idx % num_workers"""
 
+    routing_paradigm: RoutingParadigm = RoutingParadigm.STATIC
+
     def __call__(self, indices, dim_size, num_workers, topology=None):
         backend = get_backend()
         return backend.mod(indices, num_workers)
@@ -126,7 +189,7 @@ class CyclicPartition(PartitionStrategy):
 class IndexedPartition(PartitionStrategy):
     """Dynamic partitioning based on values or lookup tables."""
 
-    routing_paradigm = RoutingParadigm.DYNAMIC
+    routing_paradigm: RoutingParadigm = RoutingParadigm.DYNAMIC
 
     def __call__(self, indices, dim_size, num_workers, topology=None):
         backend = get_backend()
@@ -147,7 +210,7 @@ class IndexedPartition(PartitionStrategy):
 class GreedyPartition(PartitionStrategy):
     """Greedy load balancing partitioning."""
 
-    routing_paradigm = RoutingParadigm.DYNAMIC
+    routing_paradigm: RoutingParadigm = RoutingParadigm.DYNAMIC
 
     def __call__(self, indices, dim_size, num_workers, topology=None):
         backend = get_backend()
@@ -195,18 +258,36 @@ def _ravel_multi_index(coords, sizes):
     return result
 
 
-@dataclass
-class Layout:
+class Layout(FluxwayBaseModel):
     """Data distribution description describing physical placement on a DeviceMesh."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
     data_shape: Tuple[int, ...]
     mesh: DeviceMesh
     topology: Optional[Topology] = None
-    partitions: Optional[dict] = None  # Dict[int, Tuple[str, ...]]
+    partitions: Optional[Dict[int, Tuple[str, ...]]] = None
     strategy: Optional[PartitionStrategy] = None
-    routing_dim: Optional[int] = None
-    replica_axes: Optional[Tuple[str, ...]] = None
+    routing_dim: Optional[Union[int, Tuple[int, ...]]] = None
+    replica_axes: Optional[List[str]] = None
     replica_size: int = 1
+
+    @model_validator(mode="after")
+    def _compute_replica_info(self) -> "Layout":
+        if self.replica_axes is None and self.mesh is not None and self.partitions:
+            used = set()
+            for axes in self.partitions.values():
+                used.update(axes)
+            all_axes = set(self.mesh.axis_names)
+            repl = sorted(all_axes - used, key=lambda x: self.mesh.axis_names.index(x))
+            if repl:
+                # We use object.__setattr__ because the model is frozen
+                object.__setattr__(self, "replica_axes", repl)
+                size = 1
+                for ax in repl:
+                    size *= self.mesh.shape[self.mesh.axis_names.index(ax)]
+                object.__setattr__(self, "replica_size", size)
+        return self
 
     @property
     def topology_morphology(self) -> TopologyMorphology:
@@ -318,34 +399,51 @@ class Layout:
 # ============================================================
 
 
-class ShardingSpec:
+class ShardingSpec(FluxwayBaseModel):
     """Algebraic partitioning description linking a stragety, mesh, and specific layout."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    strategy: PartitionStrategy
+    mesh: Optional[DeviceMesh] = None
+    partition: PartitionSpec
+    routing_dim: Union[int, Tuple[int, ...]] = 0
+
+    replica_axes: Optional[List[str]] = Field(default=None)
+    replica_size: int = Field(default=1)
 
     def __init__(
         self,
         strategy: PartitionStrategy,
-        mesh: DeviceMesh,
         partition: PartitionSpec,
-        routing_dim: Optional[int] = None,
+        mesh: Optional[DeviceMesh] = None,
+        routing_dim: Union[int, Tuple[int, ...]] = 0,
+        **kwargs,
     ):
-        self.strategy = strategy
-        self.mesh = mesh
-        self.partition = partition
-        self.routing_dim = routing_dim
+        super().__init__(
+            strategy=strategy,
+            partition=partition,
+            mesh=mesh,
+            routing_dim=routing_dim,
+            **kwargs,
+        )
 
-        # Pre-compute immutable derived properties.
-        used = set()
-        for axes in self.partition.partitions.values():
-            used.update(axes)
+    @model_validator(mode="after")
+    def _compute_replica_info(self) -> "ShardingSpec":
+        if self.mesh is not None:
+            used = set()
+            for axes in self.partition.partitions.values():
+                used.update(axes)
 
-        all_axes = set(mesh.axis_names)
-        repl = sorted(all_axes - used, key=lambda x: mesh.axis_names.index(x))
-        self._replica_axes: Optional[List[str]] = repl if repl else None
-
-        self._replica_size = 1
-        if self._replica_axes:
-            for ax in self._replica_axes:
-                self._replica_size *= mesh.shape[mesh.axis_names.index(ax)]
+            all_axes = set(self.mesh.axis_names)
+            repl = sorted(all_axes - used, key=lambda x: self.mesh.axis_names.index(x))
+            if repl:
+                object.__setattr__(self, "replica_axes", repl)
+                size = 1
+                for ax in repl:
+                    size *= self.mesh.shape[self.mesh.axis_names.index(ax)]
+                object.__setattr__(self, "replica_size", size)
+        return self
 
     @property
     def partitions(self):
@@ -354,14 +452,6 @@ class ShardingSpec:
     @property
     def is_content_addressable(self) -> bool:
         return self.strategy.routing_paradigm == RoutingParadigm.DYNAMIC
-
-    @property
-    def replica_axes(self) -> Optional[List[str]]:
-        return self._replica_axes
-
-    @property
-    def replica_size(self) -> int:
-        return self._replica_size
 
     def _to_layout(
         self,
@@ -374,12 +464,8 @@ class ShardingSpec:
                 raise ValueError("data_shape is required for static sharding")
             data_shape = (-1,)
 
-        # Infer routing_dim if not provided but topology requires it
-        target_routing_dim = self.routing_dim
-        if target_routing_dim is None and self.is_content_addressable:
-            target_routing_dim = (
-                0  # Graceful fallback for legacy codes that didn't provide arg
-            )
+        if self.mesh is None:
+            raise ValueError("mesh is required to evaluate Layout")
 
         return Layout(
             data_shape=data_shape,
@@ -387,9 +473,9 @@ class ShardingSpec:
             topology=topology,
             partitions=self.partitions,
             strategy=self.strategy,
-            routing_dim=target_routing_dim,
-            replica_axes=self._replica_axes,
-            replica_size=self._replica_size,
+            routing_dim=self.routing_dim,
+            replica_axes=self.replica_axes,
+            replica_size=self.replica_size,
         )
 
     def get_expected_local_indices(
@@ -398,6 +484,9 @@ class ShardingSpec:
         """Returns expected global indices for implicit mesh inference (chunk only)."""
         backend = get_backend()
         if not isinstance(self.strategy, ChunkPartition):
+            return None
+
+        if self.mesh is None:
             return None
 
         if not self.partitions or dim not in self.partitions:
@@ -450,7 +539,7 @@ class ShardingSpec:
             _GREEDY, mesh=mesh, partition=partition, routing_dim=routing_dim
         )
 
-    # ---- Dependency ----
+    # ---- Dependency & Derived Sharding ----
 
     @staticmethod
     def follow(source_layout: Layout, dim: int = 0) -> ShardingSpec:
@@ -464,17 +553,18 @@ class ShardingSpec:
         class _FollowPartition(PartitionStrategy):
             """Wraps a captured strategy with bound topology."""
 
-            routing_paradigm = captured_strategy.routing_paradigm
+            model_config = ConfigDict(frozen=True)
+            routing_paradigm: RoutingParadigm = captured_strategy.routing_paradigm
 
             def __call__(self, indices, dim_size, num_workers, topology=None):
                 meta = captured_meta if captured_meta is not None else topology
                 return captured_strategy(indices, dim_size, num_workers, topology=meta)
 
             @property
-            def name(self):
+            def name(self) -> str:
                 return f"Follow({captured_strategy.name})"
 
-        # Reconstruct PartitionSpec at the target dim (Note: Follow only tracks single dimension)
+        # Reconstruct PartitionSpec at the target dim
         specs = [None] * (dim + 1)
         if source_layout.partitions and dim in source_layout.partitions:
             axes = source_layout.partitions[dim]
@@ -503,9 +593,9 @@ class ShardingSpec:
     def __repr__(self) -> str:
         parts = [
             f"fn={self.strategy.name}",
-            f"partition={self.partition}",
+            f"partition={self.partition!r}",
             f"mesh={self.mesh.shape if self.mesh else None}",
         ]
-        if self._replica_axes:
-            parts.append(f"repl={self._replica_axes}")
+        if self.replica_axes:
+            parts.append(f"repl={self.replica_axes}")
         return f"ShardingSpec({', '.join(parts)})"

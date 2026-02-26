@@ -144,7 +144,20 @@ class BaseDataDistributor:
 
         routing_dim = dst_layout.routing_dim
 
+        # Prepare static shapes for JIT padding
+        # static_shapes: (item_cap, payload0_flat_cap, payload1_flat_cap, ...)
+        static_shapes = [capacity]
+        for tt in tensors_to_pack:
+            if tt.is_ragged:
+                static_shapes.append(int(backend.shape(tt.flat_values)[0]))
+            else:
+                static_shapes.append(capacity)
+        static_shapes_tuple = tuple(static_shapes)
+
         # Compute plan and sequence packing (JIT compiled)
+        dst_routing_values = (
+            primary.flat_values if dst_layout.is_content_addressable else None
+        )
         (
             padded_buffers_lists,  # List of (padded_data, padded_lengths)
             valid_counts,
@@ -164,8 +177,8 @@ class BaseDataDistributor:
             dst_partitions_tuple,
             src_layout.get_local_indices,
             self.local_rank,
-            primary.flat_values if dst_layout.is_content_addressable else None,
-            capacity,
+            dst_routing_values,
+            static_shapes_tuple,
         )
 
         counts_host = backend.to_numpy(valid_counts).flatten()
@@ -250,9 +263,7 @@ class SyncDataDistributor(BaseDataDistributor):
             if meta_sort_indices is None:
                 meta_sort_indices = sort_idx
             for target_id in targets:
-                res = send_fn(
-                    target_id, tensors, counts, includes_indices=includes_indices
-                )
+                res = send_fn(target_id, tensors, counts, includes_indices)
                 results.append(res)
         return results, meta_sort_indices
 
@@ -282,11 +293,7 @@ class AsyncDataDistributor(BaseDataDistributor):
             if meta_sort_indices is None:
                 meta_sort_indices = sort_idx
             for target_id in targets:
-                tasks.append(
-                    send_fn(
-                        target_id, tensors, counts, includes_indices=includes_indices
-                    )
-                )
+                tasks.append(send_fn(target_id, tensors, counts, includes_indices))
 
         if not tasks:
             return [], meta_sort_indices
@@ -575,15 +582,14 @@ def _jit_plan_and_pack(
     src_layout_local_indices_fn: Callable,
     local_rank: int,
     dst_routing_values: Any,
-    capacity: int,
+    static_shapes: Tuple[int, ...],
 ):
     """JIT-compiled kernel for planning and sequence packing.
 
-    Returns padded and packed data structures ready for transmission.
-    This function leverages backend primitives to trace distribution logic
-    statically, reducing runtime overhead for tensor routing and padding.
+    static_shapes: (item_capacity, payload0_flat_cap, payload1_flat_cap, ...)
     """
     backend = get_backend()
+    item_cap = static_shapes[0]
 
     # 1. Compute Plan
     (
@@ -614,66 +620,122 @@ def _jit_plan_and_pack(
     # 2. Flatten and Gather Masked Sequences for each payload
     padded_buffers_lists = []
 
-    for data, lengths in payloads_tuple:
-        # Sort data
-        reordered_data = backend.take(data, sort_indices)
+    for i in range(len(payloads_tuple)):
+        data, lengths = payloads_tuple[i]
+        flat_cap = static_shapes[i + 1]
 
-        # Pad reordered_data to avoid dynamic_slice out of bounds when size < capacity
-        dtype_data = getattr(reordered_data, "dtype", None)
-        pad_shape_data = (capacity,) + backend.shape(reordered_data)[1:]
-        padded_reordered = backend.cat(
-            [reordered_data, backend.zeros(pad_shape_data, dtype=dtype_data)], dim=0
-        )
+        is_ragged = lengths is not None
 
-        # Vectorized / vmap-friendly packing for data
-        def pack_data_for_rank(offset, count, padded_reordered=padded_reordered):
-            ndim = len(backend.shape(padded_reordered))
-            start_indices = (offset,) + (0,) * (ndim - 1)
-            slice_sizes = (capacity,) + backend.shape(padded_reordered)[1:]
-            seq = backend.dynamic_slice(padded_reordered, start_indices, slice_sizes)
-            return seq
+        if not is_ragged:
+            # --- Dense Path ---
+            reordered_data = backend.take(data, sort_indices)
 
-        padded_data = backend.vmap(pack_data_for_rank)(send_offsets, send_counts)
+            # Pad buffer to ensure safety for vmap slice-out
+            dtype_data = getattr(reordered_data, "dtype", None)
+            pad_amount = item_cap  # Safe margin
+            pad_shape = (pad_amount,) + backend.shape(reordered_data)[1:]
+            padded_reordered = backend.cat(
+                [reordered_data, backend.zeros(pad_shape, dtype=dtype_data)], dim=0
+            )
 
-        padded_lengths = None
-        if lengths is not None:
-            # Sort lengths
-            reordered_lengths = backend.take(lengths, sort_indices)
+            def pack_data_for_rank(offset, count, padded_reordered=padded_reordered):
+                ndim = len(backend.shape(padded_reordered))
+                start_indices = (offset,) + (0,) * (ndim - 1)
+                slice_sizes = (item_cap,) + backend.shape(padded_reordered)[1:]
+                return backend.dynamic_slice(
+                    padded_reordered, start_indices, slice_sizes
+                )
+
+            padded_data = backend.vmap(pack_data_for_rank)(send_offsets, send_counts)
+            padded_lengths = None
+
+        else:
+            # --- Ragged Path ---
+            # Gather flat_values using item-to-element mapping
+            item_offsets_orig = backend.cat([zero, backend.cumsum(lengths)[:-1]], dim=0)
+            reordered_item_starts = backend.take(item_offsets_orig, sort_indices)
+            reordered_item_lengths = backend.take(lengths, sort_indices)
+
+            reordered_flat_offsets = backend.cat(
+                [zero, backend.cumsum(reordered_item_lengths)], dim=0
+            )
+
+            num_items = backend.shape(reordered_item_lengths)[0]
+            # Create a segmentation map: which item does each flat element belong to?
+            # We use flat_cap (the static buffer size) to ensure JIT friendliness.
+            item_ids = backend.repeat_interleave(
+                backend.arange(0, num_items, dtype=backend.int32()),
+                reordered_item_lengths,
+                total_repeat_length=flat_cap,
+            )
+
+            # Calculate inner offsets: iota - start_of_that_item_in_reordered_flat
+            iota = backend.arange(0, flat_cap, dtype=backend.int32())
+            reordered_flat_starts = backend.take(reordered_flat_offsets, item_ids)
+            inner_offsets = iota - reordered_flat_starts
+
+            # Map back to original flat positions
+            orig_item_starts = backend.take(reordered_item_starts, item_ids)
+            flat_indices = orig_item_starts + inner_offsets
+
+            reordered_data = backend.take(data, flat_indices)
+
+            # Map item-level send info to element-level send info
+            send_flat_offsets = backend.take(reordered_flat_offsets, send_offsets)
+
+            # Pad buffer to ensure safety for vmap slice-out
+            dtype_data = getattr(reordered_data, "dtype", None)
+            pad_shape = (flat_cap,) + backend.shape(reordered_data)[1:]
+            padded_reordered = backend.cat(
+                [reordered_data, backend.zeros(pad_shape, dtype=dtype_data)], dim=0
+            )
+
+            def pack_flat_data_for_rank(
+                offset, flat_cap=flat_cap, padded_reordered=padded_reordered
+            ):
+                ndim = len(backend.shape(padded_reordered))
+                start_indices = (offset,) + (0,) * (ndim - 1)
+                slice_sizes = (flat_cap,) + backend.shape(padded_reordered)[1:]
+                return backend.dynamic_slice(
+                    padded_reordered, start_indices, slice_sizes
+                )
+
+            padded_data = backend.vmap(pack_flat_data_for_rank)(send_flat_offsets)
+
+            # Correctly handle item-level lengths
+            reordered_lengths = reordered_item_lengths
             dtype_len = getattr(reordered_lengths, "dtype", None)
-            pad_shape_len = (capacity,) + backend.shape(reordered_lengths)[1:]
+            pad_shape_len = (item_cap,) + backend.shape(reordered_lengths)[1:]
             padded_reordered_len = backend.cat(
                 [reordered_lengths, backend.zeros(pad_shape_len, dtype=dtype_len)],
                 dim=0,
             )
 
-            def pack_len_for_rank(
-                offset, count, padded_reordered_len=padded_reordered_len
-            ):
-                ndim = len(backend.shape(padded_reordered_len))
-                start_indices = (offset,) + (0,) * (ndim - 1)
-                slice_sizes = (capacity,) + backend.shape(padded_reordered_len)[1:]
+            def pack_len_for_rank(offset, padded_reordered_len=padded_reordered_len):
+                start_indices = (offset,)
+                slice_sizes = (item_cap,)
                 return backend.dynamic_slice(
                     padded_reordered_len, start_indices, slice_sizes
                 )
 
-            padded_lengths = backend.vmap(pack_len_for_rank)(send_offsets, send_counts)
+            padded_lengths = backend.vmap(pack_len_for_rank)(send_offsets)
 
         padded_buffers_lists.append((padded_data, padded_lengths))
 
-    # Pack routing indices similarly
+    # Pack routing indices
     padded_indices_payload = None
     if global_indices is not None:
         sorted_globals = backend.take(global_indices, sort_indices)
         dtype_route = getattr(sorted_globals, "dtype", None)
-        pad_shape_route = (capacity,) + backend.shape(sorted_globals)[1:]
+        pad_shape_route = (item_cap,) + backend.shape(sorted_globals)[1:]
         padded_sorted_globals = backend.cat(
             [sorted_globals, backend.zeros(pad_shape_route, dtype=dtype_route)], dim=0
         )
 
-        def pack_routing(offset, count):
-            return backend.dynamic_slice(padded_sorted_globals, (offset,), (capacity,))
+        def pack_routing(offset):
+            return backend.dynamic_slice(padded_sorted_globals, (offset,), (item_cap,))
 
-        padded_indices_payload = backend.vmap(pack_routing)(send_offsets, send_counts)
+        padded_indices_payload = backend.vmap(pack_routing)(send_offsets)
 
     return (
         padded_buffers_lists,

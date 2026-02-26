@@ -1,69 +1,70 @@
 import jax
 import jax.numpy as jnp
 from fluxway.common.decorators import spmd, operator
-from .data_types import EmbeddingInput, EmbeddingOutput, GradientOutput
+from fluxway.common.types.tensor import TransportTensor
+from .data_types import LookupOutput
 
 
-@spmd(
-    resource={"nums_cpu": 1},
-    mesh_axis_names=("shard",),
-    mesh_axis_shapes=(2,),  # Example: 2 workers for embedding shard
-)
+def route_back(tensor, mesh):
+    """Routing unique embeddings back to origin Dense workers."""
+    return tensor.origin_ranks
+
+
+@spmd(mesh_axis_names=("shard",), mesh_axis_shapes=(4,))
 class SparseEmbeddingSPMD:
+    """
+    Generic lookup table.
+    """
+
     def __init__(self, vocab_size: int = 1000, embed_dim: int = 64):
-        self.vocab_size = vocab_size
         self.embed_dim = embed_dim
-        # Local shard of embedding table
-        # In a real scenario, this would be initialized based on rank/mesh
-        self.weights = jnp.zeros((vocab_size // 2, embed_dim))
 
     @operator(
         name="lookup",
-        tensor_argument=["feature_ids"],
+        # We can dynamically name the tensor argument via metadata
+        data_argument=["unique_ids"],
         input_sharding={
-            "feature_ids": {"type": "dynamic", "axis": [0], "fn": "hash_routing"}
+            "unique_ids": {"type": "dynamic", "axis": [0], "fn": "hash_routing"}
         },
         output_sharding={
-            "embeddings": {"type": "static", "axis": ["shard", None, None]}
+            "sparse_features": {"type": "dynamic", "axis": [0], "fn": "route_back"}
         },
     )
-    def lookup(self, data: EmbeddingInput) -> EmbeddingOutput:
+    def lookup(self, data: dict) -> LookupOutput:
         """
-        Perform embedding lookup using hash-based routing.
+        Receives a dict containing 'unique_ids'.
         """
-        # Feature IDs are already routed to this worker by Fluxway
-        print(f"[SparseSPMD] lookup: received feature_ids {data.feature_ids.shape}")
+        rank = jax.process_index() if hasattr(jax, "process_index") else 0
+        uids = data["unique_ids"]
 
-        # Simulate lookup
-        batch_size = data.feature_ids.shape[0]
-        num_features = data.feature_ids.shape[1]
-        emb_values = jnp.zeros((batch_size, num_features, 64))
+        ids = uids.flat_values
+        embeddings = jnp.ones((ids.shape[0], self.embed_dim)) * (rank + 1)
 
-        return EmbeddingOutput(embeddings=emb_values, feature_ids=data.feature_ids)
+        print(f"[SparseSPMD] Worker {rank}: Looked up IDs {ids}")
+        print(
+            f"[SparseSPMD] Worker {rank}: Returning embeddings sum {jnp.sum(embeddings)}"
+        )
+
+        output = TransportTensor(
+            embeddings,
+            origin_ranks=uids.origin_ranks,
+            origin_indices=uids.origin_indices,
+        )
+        return LookupOutput(sparse_features=output)
 
     @operator(
         name="update",
-        tensor_argument=["grads", "feature_ids"],
+        data_argument=["grads"],
         input_sharding={
-            "grads": {"type": "static", "axis": ["shard", None, None]},
-            "feature_ids": {"type": "static", "axis": ["shard", None]},
+            "grads": {"type": "dynamic", "axis": [0], "fn": "hash_routing"}
         },
     )
-    def update(self, data: GradientOutput) -> None:
-        """Update local embedding weights with gradients."""
+    def update(self, grads: TransportTensor) -> None:
         print(
-            f"[SparseSPMD] update: received grads {data.grads.shape} for ids {data.feature_ids.shape}"
+            f"[SparseSPMD] Update Task: Received Gradients for IDs. Grad Sum: {jnp.sum(grads.flat_values)}"
         )
-        # Simple SGD update for demo
-        # ids = data.feature_ids % (self.vocab_size // 2)
-        # self.weights = self.weights.at[ids].add(-0.01 * data.grads)
-        pass
 
 
 def hash_routing(tensor, mesh):
-    """
-    Routing function for sparse embedding IDs.
-    Determines which worker rank handles which ID.
-    """
-    # hash(id) % mesh_size
-    return jax.hash(tensor) % mesh.size
+    val = tensor.flat_values if isinstance(tensor, TransportTensor) else tensor
+    return jnp.mod(val, mesh.size)

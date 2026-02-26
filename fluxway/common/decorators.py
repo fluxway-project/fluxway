@@ -118,8 +118,8 @@ def operator(
     name: str,
     input_sharding: Optional[Dict[str, Any]] = None,
     output_sharding: Optional[Dict[str, Any]] = None,
-    state_argument: Optional[List[str]] = None,
-    tensor_argument: Optional[List[str]] = None,
+    control_argument: Optional[List[str]] = None,
+    data_argument: Optional[List[str]] = None,
     static_argument: Optional[List[str]] = None,
     periodic_barrier: Optional[int] = None,
 ):
@@ -162,10 +162,12 @@ def operator(
 
         # Merge explicit overrides
         final_tensors = list(
-            set(tensor_argument) if tensor_argument is not None else all_data_fields
+            set(data_argument) if data_argument is not None else all_data_fields
         )
         final_states = list(
-            set(state_argument) if state_argument is not None else all_control_fields
+            set(control_argument)
+            if control_argument is not None
+            else all_control_fields
         )
         final_statics = list(
             set(static_argument) if static_argument is not None else set()

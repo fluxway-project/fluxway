@@ -65,7 +65,7 @@ def test_large_scale_sparse_moe():
     tt = TransportTensor(tokens, indices=routing)
 
     # Mock send wrapper
-    def send_wrapper_moe_0(target, tensors, counts):
+    def send_wrapper_moe_0(target, tensors, counts, includes_indices=False):
         count = counts[0]
         if count > 0:
             cluster[target].receiver.receive_slices(0, tensors, counts)

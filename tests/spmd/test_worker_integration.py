@@ -2,7 +2,7 @@ import sys
 import os
 import numpy as np
 import pytest
-from unittest.mock import MagicMock, AsyncMock
+from unittest.mock import AsyncMock
 
 sys.path.append(os.getcwd())
 
@@ -85,48 +85,3 @@ async def test_worker_self_receive_state(worker_config):
     assert kwargs["step"] == 10
     assert kwargs["names"] == ["lr"]
     assert kwargs["values"] == [0.01]
-
-
-@pytest.mark.asyncio
-async def test_worker_reader_send_batch(mock_mesh):
-    """Verify that _send_reader_batch correctly calls receive_shards on a mocked handler."""
-    from fluxway.common.types.configs import ReaderConfig, NodeType
-    from fluxway.rpc.protocol import DataPlaneCallable
-
-    reader_config = ReaderConfig(
-        src_dir="/tmp",
-        file_pattern="*",
-        data_type="dummy",
-        tensor_name="input_data",
-        target_op="op1",
-    )
-
-    config = SPMDConfig(
-        mesh=mock_mesh, node_type=NodeType.READER, reader_config=reader_config
-    )
-
-    cls = getattr(SPMDWorker, "__ray_metadata__", None)
-    cls = cls.modified_class if cls else SPMDWorker
-    # Reader worker requires node_type and reader_config in __init__
-    worker = cls(config, rank=0, node_type=NodeType.READER, reader_config=reader_config)
-
-    # Mock successor handlers
-    mock_actor = MagicMock()
-    worker._successor_handlers = {"downstream_spmd": {0: DataPlaneCallable(mock_actor)}}
-
-    batch_data = np.array([1, 2, 3])
-
-    await worker._send_reader_batch(batch_data, step=0)
-
-    # Verify RPC call to receive_shards (DataPlaneCallable calls .remote())
-    mock_actor.receive_shards.remote.assert_called_once()
-    args, _ = mock_actor.receive_shards.remote.call_args
-
-    assert args[0] == "op1"
-    assert args[1] == "input_data"
-    assert args[2] == 0  # step
-    assert args[3] == 0  # worker.rank
-    assert isinstance(args[4], list)  # payloads
-    assert isinstance(args[5], list)  # counts
-    np.testing.assert_array_equal(args[4][0], batch_data)
-    assert args[5][0] == 3

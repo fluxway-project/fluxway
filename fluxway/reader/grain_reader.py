@@ -1,157 +1,150 @@
 """
-Reader implementation using Google Grain.
+Standardized Reader implementation leveraging Google Grain.
 """
 
 import logging
-from typing import Any, Dict, List
-import numpy as np
-import json
-import os
+from typing import Any, Dict
 
-from ..common.decorators import spmd, operator
-from .base_reader import BaseReader, ReaderBatch
+from fluxway.common.decorators import spmd, operator
+from .base_reader import BaseReader
 
 logger = logging.getLogger(__name__)
 
-# Attempt to import grain (will be used inside classes)
 try:
     import grain.python as grain
 except ImportError:
     grain = None
 
 
-class JsonDataSource:
-    """Simple JSON data source for Google Grain."""
-
-    def __init__(self, files: List[str]):
-        self._data = []
-        for f in files:
-            if not os.path.isfile(f):
-                continue
-            try:
-                with open(f, "r") as json_f:
-                    for line in json_f:
-                        if not line.strip():
-                            continue
-                        self._data.append(json.loads(line))
-            except Exception as e:
-                logger.warning(f"Failed to read JSON file {f}: {e}")
-
-    def __len__(self):
-        return len(self._data)
-
-    def __getitem__(self, index):
-        return self._data[index]
-
-
 @spmd()
 class GrainReader(BaseReader):
     """
-    Reader implementation leveraging Google Grain for efficient data loading and sharding.
+    Standard Reader implementation using Google Grain.
+
+    This class acts as an orchestration engine for Grain's data pipelines.
+    It automatically handles distributed sharding based on the SPMD worker's
+    rank and world size.
     """
 
     def __init__(self):
         super().__init__()
         self._dataloader = None
         self._iterator = None
+        self._output_type = None
 
-    def _initialize_grain(
+    def _create_data_loader(
         self, static_args: Dict[str, Any], rank: int, world_size: int
     ):
-        """Initialize Google Grain dataloader."""
+        """
+        Constructs the Google Grain DataLoader pipeline.
+        """
+        print(
+            f"[GrainReader DEBUG] Starting _create_data_loader for rank {rank}/{world_size}"
+        )
         if grain is None:
-            raise ImportError("google-grain not installed")
+            raise ImportError("google-grain not found. Install it to use GrainReader.")
 
-        src_dir = static_args.get("src_dir")
-        file_pattern = static_args.get("file_pattern", "*")
-        batch_size = static_args.get("batch_size", 1)
+        # 1. Get DataSource
+        data_source = static_args.get("data_source")
+        if data_source is None:
+            raise ValueError("GrainReader requires 'data_source' in static_args.")
+        print(f"[GrainReader DEBUG] Data source length: {len(data_source)}")
 
-        logger.info(
-            f"[spmd_id={getattr(self, 'spmd_id', 'unknown')}] Initializing GrainReader rank={rank}/{world_size} "
-            f"at {src_dir} with pattern {file_pattern}, batch_size={batch_size}"
+        # 2. Create MapDataset
+        print("[GrainReader DEBUG] Creating MapDataset source")
+        dataset = grain.MapDataset.source(data_source)
+
+        # 3. Apply Transformations
+        transformations = static_args.get("transformations", [])
+        print(f"[GrainReader DEBUG] Applying {len(transformations)} transformations")
+        for tx in transformations:
+            dataset = dataset.map(tx)
+
+        # 4. Get Sampler (Default to IndexSampler with SPMD sharding)
+        print("[GrainReader DEBUG] Creating IndexSampler")
+        sampler = static_args.get("sampler")
+        if sampler is None:
+            num_records = len(data_source)
+            sampler = grain.IndexSampler(
+                num_records=num_records,
+                shard_options=grain.ShardOptions(
+                    shard_index=rank,
+                    shard_count=world_size,
+                    drop_remainder=static_args.get("drop_remainder", False),
+                ),
+                shuffle=static_args.get("shuffle", True),
+                seed=static_args.get("seed", 42),
+                num_epochs=static_args.get("num_epochs"),
+            )
+        print(
+            f"[GrainReader DEBUG] Sampler created, expected records for this rank: {len(sampler)}"
         )
 
-        try:
-            if not os.path.isdir(src_dir):
-                raise ValueError(f"Source directory {src_dir} does not exist")
+        # 5. Target output data type
+        self._output_type = static_args.get("output_data_type")
 
-            files = [
-                os.path.join(src_dir, f)
-                for f in os.listdir(src_dir)
-                if f.endswith(".json")
-            ]
-            if not files:
-                raise ValueError(f"No JSON files found in {src_dir}")
+        # 6. Build DataLoader
+        print("[GrainReader DEBUG] Building DataLoader")
+        self._dataloader = grain.DataLoader(
+            data_source=dataset,
+            sampler=sampler,
+            worker_count=static_args.get("num_threads", 0),
+        )
+        print("[GrainReader DEBUG] DataLoader built, creating iterator")
+        self._iterator = iter(self._dataloader)
+        print("[GrainReader DEBUG] Iterator created")
 
-            # 1. Create Data Source
-            ds = JsonDataSource(files)
-            if len(ds) == 0:
-                raise ValueError(f"No data found in JSON files in {src_dir}")
-
-            # 2. Create MapDataset
-            dataset = grain.MapDataset.source(ds)
-
-            # 3. Sharding via IndexSampler
-            index_sampler = grain.IndexSampler(
-                num_records=len(dataset),
-                shard_options=grain.ShardOptions(
-                    shard_index=rank, shard_count=world_size, drop_remainder=False
-                ),
-                shuffle=True,
-                seed=42,
-            )
-
-            # 4. Create DataLoader
-            self._dataloader = grain.DataLoader(
-                data_source=dataset, sampler=index_sampler, worker_count=0
-            )
-            self._iterator = iter(self._dataloader)
-            logger.info(f"GrainReader initialized successfully with {len(ds)} records")
-
-        except Exception as e:
-            logger.error(f"Failed to initialize GrainReader: {e}")
-            raise
+        logger.info(
+            f"[spmd_id={getattr(self, 'spmd_id', 'unknown')}] Grain pipeline initialized. "
+            f"Rank {rank}/{world_size} serving {len(sampler)} records."
+        )
 
     @operator("read")
-    def read(self) -> ReaderBatch:
+    def read(self) -> Any:
         """
-        Produce a batch of data using Google Grain.
+        Produces the next batch from the Grain iterator.
         """
+        return self.next_item()
+
+    def next_item(self) -> Any:
+        """
+        Internal implementation to fetch the next item from Grain iterator.
+        This can be safely called by subclasses.
+        """
+        rank = getattr(self, "rank", 0)
+        world_size = getattr(self, "world_size", 1)
+        static_args = getattr(self, "static_args", {})
+
+        # Check if rank or world_size changed (e.g. in multi-rank tests in same thread)
+        if self._iterator is not None:
+            if (
+                getattr(self, "_initialized_rank", None) != rank
+                or getattr(self, "_initialized_world_size", None) != world_size
+            ):
+                logger.info(
+                    f"Re-initializing GrainReader for new rank/world_size: {rank}/{world_size}"
+                )
+                self._iterator = None
+
         if self._iterator is None:
-            # Context should have been injected by the wrapper
-            static_args = getattr(self, "static_args", {})
-            rank = getattr(self, "rank", 0)
-            world_size = getattr(self, "world_size", 1)
-            self._initialize_grain(static_args, rank, world_size)
+            self._create_data_loader(static_args, rank, world_size)
+            self._initialized_rank = rank
+            self._initialized_world_size = world_size
 
         try:
-            # For simplicity, we read one record at a time
-            record = next(self._iterator)
-            print(
-                f"[spmd_id={getattr(self, 'spmd_id', 'unknown')} rank={getattr(self, 'rank', 0)}] Read record: {record}"
-            )
+            batch = next(self._iterator)
 
-            # Flatten record to ReaderBatch fields
-            # Ensure output arrays are at least 1D for TransportPlanner
-            if isinstance(record, dict):
-                batch = ReaderBatch(
-                    ids=np.atleast_1d(np.array(record.get("id", -1))),
-                    values=np.atleast_1d(np.array(record.get("value", 0.0))),
-                )
-            else:
-                batch = ReaderBatch(
-                    ids=np.atleast_1d(np.array([-1])),
-                    values=np.atleast_1d(np.array(record)),
-                )
+            # Cast to specialized data_type if requested
+            if self._output_type and not isinstance(batch, self._output_type):
+                if isinstance(batch, dict):
+                    return self._output_type(**batch)
+                return self._output_type(batch)
 
-            print(f"  - Produced batch object: {batch}")
-            # Ensure it's a dict for easy extraction if _extract_tensors expects it
-            # Actually with my recent change to worker.py, it should handle BaseModel or as_dict
             return batch
 
         except StopIteration:
-            logger.info("GrainReader reached end of dataset")
+            logger.debug("Reader reached end of data source.")
             return None
         except Exception as e:
-            logger.error(f"Error reading from Grain: {e}")
-            return None
+            logger.error(f"GrainReader pipeline failure: {e}")
+            raise
