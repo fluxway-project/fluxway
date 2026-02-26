@@ -213,7 +213,7 @@ class ControllerStateMachine:
 
         # Initiate topology registration (fire-and-forget, no await needed)
         try:
-            self._controller._initiate_topology_registration()
+            await self._controller._initiate_topology_registration()
         except Exception as e:
             logger.error(f"Failed to initiate topology registration: {e}")
 

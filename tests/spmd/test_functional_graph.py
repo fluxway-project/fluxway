@@ -57,7 +57,7 @@ def _mock_metas():
     from fluxway.common.types.configs import OperatorMeta
 
     # Shield physical validation logic, keep only topological logic
-    OperatorMeta.validate_tensor_io_match = lambda self, dst, src_is_output, ctx: None
+    # OperatorMeta.validate_tensor_io_match = lambda self, dst, src_is_output, ctx: None
 
     metas = {}
     for op in [

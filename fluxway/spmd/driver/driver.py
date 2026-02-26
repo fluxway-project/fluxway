@@ -31,11 +31,9 @@ from ...common.types import (
     DriverState,
     DriverStatus,
     HeartbeatConfig,
+    ReaderState,
     SPMDConfig,
     WorkerHeartbeat,
-    NodeType,
-    ReaderConfig,
-    ReaderState,
 )
 from ...common.utils import ensure_logging_configured
 from .state_machine import DriverStateMachine
@@ -69,8 +67,6 @@ if RAY_AVAILABLE:
             worker_bundle_indices: List[int],
             controller_handle: Optional[Any],
             graph_topology: Dict[str, Any],
-            node_type: NodeType = NodeType.SPMD,
-            reader_config: Optional[ReaderConfig] = None,
         ):
             """
             Initialize SPMD Driver.
@@ -94,8 +90,6 @@ if RAY_AVAILABLE:
             self.worker_bundle_indices = worker_bundle_indices
             self.controller_handle = controller_handle
             self.graph_topology = graph_topology
-            self.node_type = node_type
-            self.reader_config = reader_config
 
             # State machine
             self.state_machine = DriverStateMachine(self)
@@ -140,15 +134,14 @@ if RAY_AVAILABLE:
             self._init_timeout: float = 120.0
             self._init_start_time: float = 0.0
 
-            # Reader-specific state
-            self._reader_state: ReaderState = ReaderState.INITIALIZING
-            self._is_paused: bool = False  # Backpressure pause flag
-            self._file_tasks: List[Any] = []  # File read tasks for Reader mode
             self._busy_worker_ratio: float = 0.0  # Ratio of workers with full mailbox
 
-            node_type_str = "Reader" if node_type == NodeType.READER else "SPMD"
+            # Backpressure / Pause control
+            self._is_paused = False
+            self._source_state: Optional[ReaderState] = ReaderState.INITIALIZING
+
             logger.info(
-                f"[spmd_id={spmd_id}] {node_type_str}Driver initialized: spmd_id={spmd_id}, "
+                f"[spmd_id={spmd_id}] SPMD Driver initialized: spmd_id={spmd_id}, "
                 f"num_workers={config.num_workers}"
             )
 
@@ -176,11 +169,8 @@ if RAY_AVAILABLE:
                 True if workers were started successfully
             """
             try:
-                node_type_str = (
-                    "Reader" if self.node_type == NodeType.READER else "SPMD"
-                )
                 logger.info(
-                    f"[spmd_id={self.spmd_id}] Initializing {node_type_str} {self.spmd_id}"
+                    f"[spmd_id={self.spmd_id}] Initializing SPMD {self.spmd_id}"
                 )
 
                 # Set up worker synchronizer callbacks
@@ -189,10 +179,6 @@ if RAY_AVAILABLE:
                     block_worker_op=self._block_worker_op,
                     unblock_worker_op=self._unblock_worker_op,
                 )
-
-                # Reader-specific initialization
-                if self.node_type == NodeType.READER:
-                    self._initialize_reader()
 
                 # Start all worker actors
                 self._start_workers()
@@ -213,7 +199,7 @@ if RAY_AVAILABLE:
                 # all workers have reported their first heartbeat.
 
                 logger.info(
-                    f"[spmd_id={self.spmd_id}] {node_type_str} {self.spmd_id} workers started, "
+                    f"[spmd_id={self.spmd_id}] SPMD {self.spmd_id} workers started, "
                     f"waiting for worker heartbeats to confirm readiness"
                 )
                 return True
@@ -225,32 +211,6 @@ if RAY_AVAILABLE:
                 self.state_machine.trigger(DriverEvent.INIT_FAILED, error=str(e))
                 return False
 
-        def _initialize_reader(self) -> None:
-            """Initialize Reader mode by discovering files and creating read tasks."""
-            if self.reader_config is None:
-                raise ValueError("ReaderConfig is required for Reader node")
-
-            from ...reader.datasource import create_datasource
-
-            # Create datasource and get file tasks
-            datasource = create_datasource(
-                data_type=self.reader_config.data_type,
-                src_dir=self.reader_config.src_dir,
-                file_pattern=self.reader_config.file_pattern,
-                encoding=self.reader_config.encoding,
-            )
-
-            # Get file read tasks (partitioned by worker count)
-            self._file_tasks = datasource.get_read_tasks(
-                parallelism=self.reader_config.num_workers
-            )
-
-            logger.info(
-                f"[spmd_id={self.spmd_id}] Reader {self.spmd_id} initialized with {len(self._file_tasks)} file tasks"
-            )
-
-            self._reader_state = ReaderState.READING
-
         def _start_workers(self) -> None:
             """Start all worker actors."""
             from ..worker import SPMDWorker
@@ -258,31 +218,17 @@ if RAY_AVAILABLE:
             # Get self handle for registering with workers
             self_handle = ray.get_runtime_context().current_actor
 
-            # Determine worker name prefix
-            worker_prefix = (
-                "reader_worker" if self.node_type == NodeType.READER else "spmd_worker"
-            )
-
             for rank, bundle_idx in enumerate(self.worker_bundle_indices):
-                # Prepare reader task for this worker (if Reader mode)
-                reader_task = None
-                if self.node_type == NodeType.READER and self._file_tasks:
-                    if rank < len(self._file_tasks):
-                        reader_task = self._file_tasks[rank]
-
                 if self.placement_group is not None:
                     worker = SPMDWorker.options(
                         placement_group=self.placement_group,
                         placement_group_bundle_index=bundle_idx,
-                        name=f"{worker_prefix}_{self.spmd_id}_{rank}",
+                        name=f"spmd_worker_{self.spmd_id}_{rank}",
                     ).remote(
                         config=self.config,
                         rank=rank,
                         spmd_id=self.spmd_id,
                         driver_handle=self_handle,
-                        node_type=self.node_type,
-                        reader_task=reader_task,
-                        reader_config=self.reader_config,
                     )
                 else:
                     worker = SPMDWorker.remote(
@@ -290,9 +236,6 @@ if RAY_AVAILABLE:
                         rank=rank,
                         spmd_id=self.spmd_id,
                         driver_handle=self_handle,
-                        node_type=self.node_type,
-                        reader_task=reader_task,
-                        reader_config=self.reader_config,
                     )
 
                 self._worker_handles[rank] = worker
@@ -301,31 +244,32 @@ if RAY_AVAILABLE:
                     f"[spmd_id={self.spmd_id}] Started worker {rank} for SPMD {self.spmd_id}"
                 )
 
-            node_type_str = "Reader" if self.node_type == NodeType.READER else "SPMD"
             logger.info(
-                f"[spmd_id={self.spmd_id}] Started {len(self._worker_handles)} workers for {node_type_str} {self.spmd_id}"
+                f"[spmd_id={self.spmd_id}] Started {len(self._worker_handles)} workers for SPMD {self.spmd_id}"
             )
 
         def get_worker_handles(self) -> Dict[int, Any]:
             """Get all worker handles for topology registration."""
             return dict(self._worker_handles)
 
-        async def register_topology(
+        def register_topology(
             self,
-            predecessor_drivers: Dict[str, Any],  # {spmd_id: driver_handle}
-            successor_drivers: Dict[str, Any],  # {spmd_id: driver_handle}
+            predecessor_handlers: Dict[
+                str, Dict[int, Any]
+            ],  # {spmd_id: {rank: handle}}
+            successor_handlers: Dict[str, Dict[int, Any]],  # {spmd_id: {rank: handle}}
             predecessor_count: int,
             successor_count: int,
         ) -> None:
             """
-            Register topology by fetching worker handles from predecessor/successor drivers.
+            Register topology with provided worker handles.
 
             Called by Controller when all SPMDs are ready.
-            This is a fire-and-forget call - workers will auto-start after registration.
+            Worker handles are provided directly to avoid actor re-entrancy deadlocks.
 
             Args:
-                predecessor_drivers: {spmd_id: driver_handle} for predecessors
-                successor_drivers: {spmd_id: driver_handle} for successors
+                predecessor_handlers: {spmd_id: {rank: worker_handle}}
+                successor_handlers: {spmd_id: {rank: worker_handle}}
                 predecessor_count: expected predecessor count for workers
                 successor_count: expected successor count for workers
             """
@@ -338,41 +282,19 @@ if RAY_AVAILABLE:
             for worker in self._worker_handles.values():
                 worker.set_expected_topology.remote(predecessor_count, successor_count)
 
-            # Step 2: Fetch worker handles from predecessor drivers and register
-            for spmd_id, driver_handle in predecessor_drivers.items():
-                try:
-                    # Fetch worker handles from the predecessor driver
-                    worker_handles = await driver_handle.get_worker_handles.remote()
-                    # Register to all local workers
-                    for worker in self._worker_handles.values():
-                        worker.register_predecessor_handlers.remote(
-                            spmd_id, worker_handles
-                        )
-                    logger.debug(
-                        f"[spmd_id={self.spmd_id}] Registered predecessor {spmd_id} with {len(worker_handles)} workers"
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"[spmd_id={self.spmd_id}] Failed to register predecessor {spmd_id}: {e}"
-                    )
+            # Step 2: Register predecessor worker handles
+            for spmd_id, handlers in predecessor_handlers.items():
+                for worker in self._worker_handles.values():
+                    worker.register_predecessor_handlers.remote(spmd_id, handlers)
+                logger.debug(
+                    f"[spmd_id={self.spmd_id}] Registered predecessor {spmd_id}"
+                )
 
-            # Step 3: Fetch worker handles from successor drivers and register
-            for spmd_id, driver_handle in successor_drivers.items():
-                try:
-                    # Fetch worker handles from the successor driver
-                    worker_handles = await driver_handle.get_worker_handles.remote()
-                    # Register to all local workers
-                    for worker in self._worker_handles.values():
-                        worker.register_successor_handlers.remote(
-                            spmd_id, worker_handles
-                        )
-                    logger.debug(
-                        f"[spmd_id={self.spmd_id}] Registered successor {spmd_id} with {len(worker_handles)} workers"
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"[spmd_id={self.spmd_id}] Failed to register successor {spmd_id}: {e}"
-                    )
+            # Step 3: Register successor worker handles
+            for spmd_id, handlers in successor_handlers.items():
+                for worker in self._worker_handles.values():
+                    worker.register_successor_handlers.remote(spmd_id, handlers)
+                logger.debug(f"[spmd_id={self.spmd_id}] Registered successor {spmd_id}")
 
             logger.info(
                 f"[spmd_id={self.spmd_id}] SPMD {self.spmd_id}: Topology registration completed"
@@ -745,7 +667,7 @@ if RAY_AVAILABLE:
 
             heartbeat = DriverHeartbeat(
                 spmd_id=self.spmd_id,
-                timestamp=current_time,
+                timestamp=time.time(),
                 status=status,
                 state=self.state_machine.state,
                 error_message=self.state_machine.get_error_message(),
@@ -756,9 +678,7 @@ if RAY_AVAILABLE:
                 workers_ready=self._workers_ready,
                 workers_running=self._workers_running,
                 is_downstream_busy=self._is_paused,
-                reader_state=self._reader_state
-                if self.node_type == NodeType.READER
-                else None,
+                source_state=self._source_state,
                 busy_worker_ratio=self._busy_worker_ratio,
             )
 
@@ -901,7 +821,7 @@ if RAY_AVAILABLE:
             status = {
                 "spmd_id": self.spmd_id,
                 "state": self.state_machine.state.value,
-                "node_type": self.node_type.value,
+                "node_type": "spmd",  # Generic node type
                 "num_workers": self.config.num_workers,
                 "op_steps": self.worker_synchronizer.get_spmd_steps(),
                 "locked_ops": self.worker_synchronizer.get_locked_ops(),
@@ -909,88 +829,56 @@ if RAY_AVAILABLE:
             }
 
             # Add Reader-specific status
-            if self.node_type == NodeType.READER:
-                status.update(
-                    {
-                        "reader_state": self._reader_state.value,
-                        "is_paused": self._is_paused,
-                        "file_tasks_count": len(self._file_tasks),
-                    }
-                )
+            # Source nodes (like readers) are now generic SPMDs, so no special reader status
+            pass
 
             return status
 
         # =====================================================================
-        # Reader Backpressure Control
+        # Source Node Control
         # =====================================================================
 
-        def pause_reading(self) -> None:
+        def pause_sources(self) -> None:
             """
-            Pause data reading (called by Controller due to backpressure).
-
-            This method is called when downstream SPMDs report busy status.
+            Pause all source operators (called by Controller due to backpressure).
             """
-            if self.node_type != NodeType.READER:
-                logger.warning(
-                    f"[spmd_id={self.spmd_id}] pause_reading called on non-Reader node {self.spmd_id}"
-                )
+            if self._is_paused:
                 return
 
-            if self._is_paused:
-                return  # Already paused
-
             self._is_paused = True
-            self._reader_state = ReaderState.PAUSED
-            logger.info(
-                f"[spmd_id={self.spmd_id}] Reader {self.spmd_id} paused due to backpressure"
-            )
+            self._source_state = ReaderState.PAUSED
+            logger.info(f"[spmd_id={self.spmd_id}] Sources paused due to backpressure")
 
-            # Notify all workers to pause reading
             for worker in self._worker_handles.values():
                 try:
-                    worker.pause_reading.remote()
+                    worker.pause_sources.remote()
                 except Exception as e:
                     logger.error(
                         f"[spmd_id={self.spmd_id}] Failed to pause worker: {e}"
                     )
 
-        def resume_reading(self) -> None:
+        def resume_sources(self) -> None:
             """
-            Resume data reading (called by Controller when backpressure is relieved).
+            Resume all source operators (called by Controller when backpressure relieved).
             """
-            if self.node_type != NodeType.READER:
-                logger.warning(
-                    f"[spmd_id={self.spmd_id}] resume_reading called on non-Reader node {self.spmd_id}"
-                )
+            if not self._is_paused:
                 return
 
-            if not self._is_paused:
-                return  # Not paused
-
             self._is_paused = False
-            self._reader_state = ReaderState.READING
-            logger.info(
-                f"[spmd_id={self.spmd_id}] Reader {self.spmd_id} resumed reading"
-            )
+            self._source_state = ReaderState.READING
+            logger.info(f"[spmd_id={self.spmd_id}] Sources resumed")
 
-            # Notify all workers to resume reading
             for worker in self._worker_handles.values():
                 try:
-                    worker.resume_reading.remote()
+                    worker.resume_sources.remote()
                 except Exception as e:
                     logger.error(
                         f"[spmd_id={self.spmd_id}] Failed to resume worker: {e}"
                     )
 
-        def is_reader(self) -> bool:
-            """Check if this driver is a Reader."""
-            return self.node_type == NodeType.READER
-
-        def get_reader_state(self) -> Optional[ReaderState]:
-            """Get current Reader state."""
-            if self.node_type == NodeType.READER:
-                return self._reader_state
-            return None
+        def get_source_state(self) -> Optional[ReaderState]:
+            """Get current source state."""
+            return self._source_state
 
         def get_busy_worker_ratio(self) -> float:
             """Get ratio of workers with full mailbox."""

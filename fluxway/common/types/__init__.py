@@ -8,17 +8,17 @@ from .configs import (
     Node,
     Graph,
     GraphValidationResult,
-    # Resource and Scheduling Types (Section 2.1.2)
+    # Resource and Scheduling Types
     ResourceSpec,
     PlacementPlan,
     PlacementStrategy,
     ResourcePriority,
     DriverResourceSpec,
-    # State Management Types (Section 2.1.4)
+    # State Management Types
     GlobalState,
     SPMDState,
     WorkerTelemetry,
-    # Handle Types (Section 3.2.1, 6.1)
+    # Handle Types
     LogicalHandle,
     ActualHandle,
     NodeView,
@@ -26,6 +26,13 @@ from .configs import (
     EdgeShardingInfo,
     OperatorMeta,
     ArgumentType,
+    NodeType,
+    # Barrier Types
+    BarrierType,
+    BarrierConfig,
+    StandardBarrierConfig,
+    PeriodicBarrierConfig,
+    TolerantBarrierConfig,
     # Driver and Worker Status Types
     DriverStatus,
     WorkerStatus,
@@ -36,19 +43,21 @@ from .configs import (
     WorkerHeartbeat,
     DriverHeartbeat,
     HeartbeatConfig,
+    ReaderState,
+    MailboxStatus,
+    # Step/Lock Types
     AsyncStepConfig,
     SPMDOpStep,
     OpLockState,
-    # Reader types (new)
-    NodeType,
-    ReaderConfig,
-    ReaderState,
-    MailboxStatus,
+    # Transport markers
+    Data,
+    Control,
+    DataStream,
+    ControlStream,
 )
 
 # Sharding types: algebraic layer
 from .sharding import (
-    # Algebraic sharding (data-plane)
     PartitionSpec,
     P,
     PartitionStrategy,
@@ -64,32 +73,31 @@ from .sharding import (
 from .tensor import TransportTensor
 
 __all__ = [
-    # SPMD Configuration
     "SPMDConfig",
-    # Graph Builder Types
     "Edge",
     "Node",
     "Graph",
     "GraphValidationResult",
-    # Resource and Scheduling Types
     "ResourceSpec",
     "PlacementPlan",
     "PlacementStrategy",
     "ResourcePriority",
     "DriverResourceSpec",
-    # State Management Types
     "GlobalState",
     "SPMDState",
     "WorkerTelemetry",
-    # Handle Types
     "LogicalHandle",
     "ActualHandle",
     "NodeView",
-    # Operator metadata
     "EdgeShardingInfo",
     "OperatorMeta",
     "ArgumentType",
-    # Driver and Worker Status Types
+    "NodeType",
+    "BarrierType",
+    "BarrierConfig",
+    "StandardBarrierConfig",
+    "PeriodicBarrierConfig",
+    "TolerantBarrierConfig",
     "DriverStatus",
     "WorkerStatus",
     "ControllerState",
@@ -99,15 +107,15 @@ __all__ = [
     "WorkerHeartbeat",
     "DriverHeartbeat",
     "HeartbeatConfig",
+    "ReaderState",
+    "MailboxStatus",
     "AsyncStepConfig",
     "SPMDOpStep",
     "OpLockState",
-    # Reader types
-    "NodeType",
-    "ReaderConfig",
-    "ReaderState",
-    "MailboxStatus",
-    # Sharding types: algebraic (data-plane)
+    "Data",
+    "Control",
+    "DataStream",
+    "ControlStream",
     "PartitionSpec",
     "P",
     "PartitionStrategy",

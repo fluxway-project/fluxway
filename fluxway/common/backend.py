@@ -153,6 +153,13 @@ class TensorBackend(ABC):
         pass
 
     @abstractmethod
+    def unique(
+        self, x: Any, return_inverse: bool = False, return_counts: bool = False
+    ) -> Any:
+        """Returns the unique elements of the input tensor."""
+        pass
+
+    @abstractmethod
     def sum(self, x: Any, dim: Any = None) -> Any:
         pass
 
@@ -601,6 +608,13 @@ class JaxBackend(TensorBackend):
             return uniques, counts
 
         return uniques
+
+    def unique(
+        self, x: Any, return_inverse: bool = False, return_counts: bool = False
+    ) -> Any:
+        return self._jnp.unique(
+            x, return_inverse=return_inverse, return_counts=return_counts
+        )
 
     def sum(self, x: Any, dim: Any = None) -> Any:
         return self._jnp.sum(x, axis=dim)

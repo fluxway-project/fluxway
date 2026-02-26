@@ -29,7 +29,6 @@ from ...common.types import (
     PlacementStrategy,
     ResourcePriority,
 )
-from ...common.types.configs import NodeType
 from .pg_manager import PGManager
 
 if TYPE_CHECKING:
@@ -228,17 +227,10 @@ class Scheduler:
             priority = plan.spmd_priorities.get(spmd_id, ResourcePriority.MID)
 
             # Get worker count from graph node
-            # For Reader nodes, use reader_config.num_workers
-            # For SPMD nodes, use spmd_config.num_workers
             node = graph.nodes.get(spmd_id)
             num_workers = 1
-            if node:
-                if node.node_type == NodeType.READER and node.reader_config:
-                    # Reader nodes: use num_workers from ReaderConfig
-                    num_workers = node.reader_config.num_workers
-                elif node.spmd_config:
-                    # SPMD nodes: use num_workers from SPMDConfig
-                    num_workers = node.spmd_config.num_workers
+            if node and node.spmd_config:
+                num_workers = node.spmd_config.num_workers
 
             pg = await self._pg_manager.create_pg(
                 spmd_id=spmd_id,
@@ -296,8 +288,6 @@ class Scheduler:
                     if pg_info
                     else 0,
                     checkpoint_id=None,
-                    node_type=node.node_type,
-                    reader_config=node.reader_config,
                 )
             )
 

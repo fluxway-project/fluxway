@@ -125,15 +125,33 @@ class FunctionalGraph:
         return NodeProxy(name, self)
 
     def reader(
-        self, name: str, config: Optional[Dict[str, Any]] = None, **kwargs
+        self,
+        name: str,
+        src_dir: str,
+        data_type: str = "json",
+        batch_size: int = 1000,
+        file_pattern: str = "*",
+        num_workers: int = 1,
+        resource: Optional[Dict[str, Any]] = None,
+        description: str = "",
+        reader_class: Optional[Type] = None,
+        **static_args: Any,
     ) -> NodeProxy:
         """
-        Registers a Reader node and returns a proxy.
+        Add a Reader node and return its proxy.
         """
-        # Merge config dict with kwargs
-        full_config = (config or {}).copy()
-        full_config.update(kwargs)
-        self._builder.add_reader(name, **full_config)
+        self._builder.add_reader(
+            name=name,
+            src_dir=src_dir,
+            data_type=data_type,
+            batch_size=batch_size,
+            file_pattern=file_pattern,
+            num_workers=num_workers,
+            resource=resource,
+            description=description,
+            reader_class=reader_class,
+            **static_args,
+        )
         return NodeProxy(name, self)
 
     def compile(self, graph_name: str = "functional_graph") -> Any:

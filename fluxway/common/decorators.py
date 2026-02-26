@@ -1,12 +1,117 @@
 """
 Decorators for Fluxway framework.
 
-Provides @operator decorator to attach metadata (sharding, argument types) to user functions.
+Provides @operator and @data_type decorators to manage metadata and transport.
 """
 
-from typing import Any, Dict, List, Optional, Type, TypeVar, Tuple
+from typing import (
+    Any,
+    Dict,
+    List,
+    Optional,
+    Type,
+    TypeVar,
+    Tuple,
+    Union,
+    get_type_hints,
+    Annotated,
+)
 import functools
 import inspect
+from contextlib import contextmanager
+import threading
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Thread-local storage for operator context
+_operator_context = threading.local()
+
+
+@contextmanager
+def operator_context(static_args: Dict[str, Any], rank: int, world_size: int):
+    """Context manager to inject operator runtime context into current thread."""
+    prev_static = getattr(_operator_context, "static_args", {})
+    prev_rank = getattr(_operator_context, "rank", 0)
+    prev_world = getattr(_operator_context, "world_size", 1)
+
+    _operator_context.static_args = static_args
+    _operator_context.rank = rank
+    _operator_context.world_size = world_size
+    try:
+        yield _operator_context
+    finally:
+        _operator_context.static_args = prev_static
+        _operator_context.rank = prev_rank
+        _operator_context.world_size = prev_world
+
+
+def get_current_context():
+    """Access current operator thread context."""
+    return _operator_context
+
+
+def _is_fluxway_data_type(tp: Any) -> bool:
+    """Check if a type is marked with @data_type."""
+    if tp is None:
+        return False
+    # Handle Optional[T] or Union
+    origin = getattr(tp, "__origin__", None)
+    if origin is Union:
+        args = getattr(tp, "__args__", [])
+        return any(_is_fluxway_data_type(arg) for arg in args if arg is not type(None))
+
+    return hasattr(tp, "is_fluxway_data") and tp.is_fluxway_data()
+
+
+def _get_fluxway_streams(tp: Any) -> Tuple[List[str], List[str]]:
+    """
+    Extract Data (Worker-to-Worker) and Control (Driver-to-Driver) fields from a @data_type.
+    Returns: (data_fields, control_fields)
+    """
+    from fluxway.common.types.configs import ControlStream
+
+    if not _is_fluxway_data_type(tp):
+        return [], []
+
+    # Use include_extras=True to see Annotated markers
+    try:
+        # Important: tp might be a Union (e.g. Optional[T])
+        cls = tp
+        origin = getattr(tp, "__origin__", None)
+        if origin is Union:
+            args = getattr(tp, "__args__", [])
+            for arg in args:
+                if arg is not type(None) and _is_fluxway_data_type(arg):
+                    cls = arg
+                    break
+
+        hints = get_type_hints(cls, include_extras=True)
+    except Exception:
+        return [], []
+
+    data_fields = []
+    control_fields = []
+
+    for name, hint in hints.items():
+        if name.startswith("_"):
+            continue
+
+        # Check for Annotated markers
+        is_control = False
+        if hasattr(hint, "__metadata__"):
+            for meta in hint.__metadata__:
+                if meta is ControlStream:
+                    is_control = True
+                    break
+
+        if is_control:
+            control_fields.append(name)
+        else:
+            # Default to Data plane for all other public fields
+            data_fields.append(name)
+
+    return data_fields, control_fields
 
 
 def operator(
@@ -19,29 +124,7 @@ def operator(
     periodic_barrier: Optional[int] = None,
 ):
     """
-    Decorator to mark a function as a Fluxway operator and attach metadata.
-
-    Args:
-        name: Operator name (unique within SPMD)
-        input_sharding: Input parameter sharding spec. Dict[arg_name, raw_spec_dict]
-            Raw spec dict should contain basic types only:
-            - For static: {"type": "static", "axis": ["dp", None, "tp"]}
-            - For dynamic: {"type": "dynamic", "axis": [0], "fn": my_routing_fn}
-              where fn(tensor, tensor_meta, post_spec) -> routing result
-            - For replicate: {"type": "static", "axis": [None]} or omit sharding
-        output_sharding: Output return value sharding spec. Dict[field_name, raw_spec_dict]
-            Same format as input_sharding
-        state_argument: List of argument names to treat as state (control flow)
-        tensor_argument: List of argument names to treat as tensor (data flow)
-        static_argument: List of argument names to treat as static args
-        periodic_barrier: If set, use a periodic barrier that fires every N arrivals.
-            Useful for streaming or processing data as it arrives without
-            waiting for all expected shards of a global step.
-
-    Note:
-        Raw sharding specs are validated and stored as basic dicts.
-        They are dynamically resolved by the AsyncDataDistributor when
-        routing tensors between SPMD pipeline stages.
+    Mark a function as a Fluxway operator with automatic metadata inference.
     """
     from fluxway.common.types.configs import (
         ArgumentType,
@@ -51,371 +134,208 @@ def operator(
     )
 
     def decorator(func):
-        # 1. Validate arguments
-        # 1.1. Validate state_argument, tensor_argument, and static_argument are mutually exclusive (no overlap)
-        state_args = set(state_argument or [])
-        tensor_args = set(tensor_argument or [])
-        static_args = set(static_argument or [])
-        intersect = (
-            (state_args & tensor_args)
-            | (state_args & static_args)
-            | (tensor_args & static_args)
-        )
-        if intersect:
-            raise ValueError(
-                f"Arguments {intersect} are present in more than one of state_argument, tensor_argument, static_argument for operator '{func.__qualname__}'"
-            )
-
-        # 1.2. Validate that tensor_argument and input_sharding keys, if both present, match exactly
-        tensor_args = set(tensor_argument or [])
-        input_sharding_keys = set(input_sharding.keys()) if input_sharding else set()
-        if tensor_args != input_sharding_keys:
-            raise ValueError(
-                f"In operator '{func.__qualname__}', tensor_argument ({tensor_args}) and input_sharding keys ({input_sharding_keys}) must match exactly"
-            )
-
-        # 1.3. Validate periodic_barrier constraint: state_arg + tensor_arg must have exactly one element if periodic
-        if periodic_barrier is not None:
-            total_transferable_args = len(state_args) + len(tensor_args)
-            if total_transferable_args != 1:
-                raise ValueError(
-                    f"Operator '{func.__qualname__}' has periodic_barrier={periodic_barrier}, but state_argument + tensor_argument "
-                    f"count is {total_transferable_args} (state={len(state_args)}, tensor={len(tensor_args)}). "
-                    f"Periodic operators must have exactly one transferable argument."
-                )
-
-        # 2. Validate that both input and output are of fluxway_data type
-
-        # Helper to check fluxway_data: class has is_fluxway_data method (set by @data_type decorator)
-        def _is_fluxway_data_type(tp):
-            # Check if the class has the is_fluxway_data classmethod set by @data_type decorator
-            if hasattr(tp, "is_fluxway_data"):
-                # Try to call it as a classmethod to verify it's the right one
-                try:
-                    result = tp.is_fluxway_data()
-                    return result is True
-                except (TypeError, AttributeError):
-                    # If it's not callable or doesn't work as expected, check if it's the classmethod
-                    return isinstance(getattr(tp, "is_fluxway_data", None), classmethod)
-            return False
-
         sig = inspect.signature(func)
-        input_annots = []
-        for param in sig.parameters.values():
-            # Only check parameters that are not 'self' or 'cls'
-            if param.name in ("self", "cls"):
+
+        # --- 1. Automated Inference from Type Annotations ---
+        all_data_fields = set()
+        all_control_fields = set()
+
+        # Check arguments (for Input streams)
+        for param_name, param in sig.parameters.items():
+            if param_name in ("self", "cls"):
                 continue
-            if param.annotation is inspect.Parameter.empty:
+
+            tp = param.annotation
+
+            if tp is inspect.Parameter.empty:
                 raise TypeError(
-                    f"Argument '{param.name}' of operator '{func.__qualname__}' missing type annotation"
-                )
-            input_annots.append((param.name, param.annotation))
-
-        # Input arguments may be empty; if so, input_sharding, state_argument, tensor_argument, and static_argument must also be empty
-        if len(input_annots) == 0:
-            if (
-                input_sharding
-                or (state_argument and len(state_argument) > 0)
-                or (tensor_argument and len(tensor_argument) > 0)
-                or (static_argument and len(static_argument) > 0)
-            ):
-                raise ValueError(
-                    f"Operator '{func.__qualname__}' has no input arguments, so input_sharding, state_argument, tensor_argument, and static_argument must all be empty."
-                )
-        else:
-            # Check that all input types are fluxway_data
-            for arg_name, tp in input_annots:
-                if not _is_fluxway_data_type(tp):
-                    raise TypeError(
-                        f"Argument '{arg_name}' of operator '{func.__qualname__}' "
-                        f"must be a fluxway_data type (use @data_type on input class), got {tp}"
-                    )
-
-        # Check output type; allow None (no output)
-        return_annot = sig.return_annotation
-        if (
-            return_annot is inspect.Signature.empty
-            or return_annot is type(None)
-            or return_annot is None
-        ):
-            # If there is no output, then output_sharding must be empty
-            if output_sharding:
-                raise ValueError(
-                    f"Operator '{func.__qualname__}' has no output (return type is None), so output_sharding must be empty."
-                )
-        else:
-            if not _is_fluxway_data_type(return_annot):
-                raise TypeError(
-                    f"Output of operator '{func.__qualname__}' must be a fluxway_data type (use @data_type), got {return_annot}"
+                    f"Fluxway Operator Error: Argument '{param_name}' in '{func.__qualname__}' missing type annotation.\n"
+                    f"Fix: Add a type hint, e.g., 'def {func.__name__}(self, batch: MyDataType):'"
                 )
 
-        # 3. Validate that the set of custom fields of all input classes contains the union of state_argument, tensor_argument, and static_argument
-        # Only perform this check if there are input arguments
-        if len(input_annots) > 0:
-            all_input_fields = set()
-            for _, tp in input_annots:
-                # Assume all fields except those starting with "_" are custom fields
-                try:
-                    custom_fields = set()
-                    # Try dataclass_fields
-                    if hasattr(tp, "__dataclass_fields__"):
-                        custom_fields = {
-                            name
-                            for name in tp.__dataclass_fields__
-                            if not name.startswith("_")
-                        }
-                    # Try pydantic BaseModel
-                    elif hasattr(tp, "__fields__"):
-                        custom_fields = {
-                            name for name in tp.__fields__ if not name.startswith("_")
-                        }
-                    # fallback: try __annotations__
-                    elif hasattr(tp, "__annotations__"):
-                        custom_fields = {
-                            name
-                            for name in tp.__annotations__
-                            if not name.startswith("_")
-                        }
-                    else:
-                        raise Exception()
-                    all_input_fields.update(custom_fields)
-                except Exception as err:
-                    raise TypeError(
-                        f"Cannot extract fields from argument class {tp} for operator '{func.__qualname__}'"
-                    ) from err
+            if not _is_fluxway_data_type(tp):
+                continue
 
-            # The union set
-            all_specified = state_args | tensor_args | static_args
-            extra_in_specified = all_specified - all_input_fields
-            if extra_in_specified:
-                raise ValueError(
-                    f"Arguments {extra_in_specified} specified in state_argument, tensor_argument, or static_argument "
-                    f"do not exist in input data classes of operator '{func.__qualname__}'"
-                )
+            data_fields, control_fields = _get_fluxway_streams(tp)
+            all_data_fields.update(data_fields)
+            all_control_fields.update(control_fields)
 
-        # 4. Validate that all keys in output_sharding correspond to output data fields
-        if output_sharding:
-            # Extract all output data fields (ignore fields starting with an underscore)
-            output_fields = set()
-            try:
-                if hasattr(return_annot, "__dataclass_fields__"):
-                    output_fields = {
-                        name
-                        for name in return_annot.__dataclass_fields__
-                        if not name.startswith("_")
-                    }
-                elif hasattr(return_annot, "__fields__"):
-                    output_fields = {
-                        name
-                        for name in return_annot.__fields__
-                        if not name.startswith("_")
-                    }
-                elif hasattr(return_annot, "__annotations__"):
-                    output_fields = {
-                        name
-                        for name in return_annot.__annotations__
-                        if not name.startswith("_")
-                    }
-                else:
-                    raise Exception()
-            except Exception as err:
-                raise TypeError(
-                    f"Cannot extract fields from output class {return_annot} for operator '{func.__qualname__}'"
-                ) from err
-            output_sharding_keys = set(output_sharding.keys())
-            extra_in_sharding = output_sharding_keys - output_fields
-            if extra_in_sharding:
-                raise ValueError(
-                    f"output_sharding specifies keys {extra_in_sharding} which do not exist in the output data fields "
-                    f"for operator '{func.__qualname__}'"
-                )
-        # Store raw sharding specs as plain dicts (serializable, mesh-independent)
-        input_sharding_processed: Dict[str, Any] = {}
+        # Merge explicit overrides
+        final_tensors = list(
+            set(tensor_argument) if tensor_argument is not None else all_data_fields
+        )
+        final_states = list(
+            set(state_argument) if state_argument is not None else all_control_fields
+        )
+        final_statics = list(
+            set(static_argument) if static_argument is not None else set()
+        )
+
+        # --- 2. Deep Validation with Clear Messages ---
+        # Sharding vs Streams consistency
         if input_sharding:
-            for tensor_name, raw_spec in input_sharding.items():
-                spec_dict = (
-                    raw_spec if isinstance(raw_spec, dict) else raw_spec.__dict__
+            illegal_shards = set(input_sharding.keys()) & set(final_states)
+            if illegal_shards:
+                raise ValueError(
+                    f"Fluxway Operator Error: Field(s) {illegal_shards} in operator '{name}' are marked as Control (ControlStream), "
+                    f"but have sharding configured. Control fields are broadcast via Driver and do not support sharding.\n"
+                    f"Fix: Remove input_sharding for these fields OR change them to Data (DataStream) in @data_type definition."
                 )
-                if spec_dict.get("type") not in ("static", "dynamic", "replicated"):
-                    raise ValueError(
-                        f"input_sharding['{tensor_name}'] type must be 'static', 'dynamic', or 'replicated'"
-                    )
-                input_sharding_processed[tensor_name] = spec_dict
 
-        output_sharding_processed: Dict[str, Any] = {}
+            unknown_shards = set(input_sharding.keys()) - set(final_tensors)
+            if unknown_shards:
+                raise ValueError(
+                    f"Fluxway Operator Error: input_sharding contains unknown keys {unknown_shards} for operator '{name}'.\n"
+                    f"Fix: Ensure sharding keys match Data fields defined in the input @data_type class."
+                )
+
+        # Periodic barrier constraints
+        if periodic_barrier is not None:
+            if len(final_tensors) + len(final_states) != 1:
+                raise ValueError(
+                    f"Fluxway Operator Error: Periodic operator '{name}' must have exactly one input field (Data or Control), "
+                    f"but found {len(final_tensors)} Data fields and {len(final_states)} Control fields.\n"
+                    f"Fix: Use a @data_type with exactly one field for streaming/periodic processing."
+                )
+
+        # --- 3. Build Metadata ---
+        input_sharding_processed = {}
+        if input_sharding:
+            for k, v in input_sharding.items():
+                input_sharding_processed[k] = v if isinstance(v, dict) else v.__dict__
+
+        output_sharding_processed = {}
         if output_sharding:
-            for tensor_name, raw_spec in output_sharding.items():
-                spec_dict = (
-                    raw_spec if isinstance(raw_spec, dict) else raw_spec.__dict__
-                )
-                if spec_dict.get("type") not in ("static", "dynamic", "replicated"):
-                    raise ValueError(
-                        f"output_sharding['{tensor_name}'] type must be 'static', 'dynamic', or 'replicated'"
-                    )
-                output_sharding_processed[tensor_name] = spec_dict
+            for k, v in output_sharding.items():
+                output_sharding_processed[k] = v if isinstance(v, dict) else v.__dict__
 
-        # Prepare output_arguments
+        # Auto-infer output arguments from return type
         output_args = None
-        if output_sharding:
+        return_tp = sig.return_annotation
+        if (
+            return_tp is not None
+            and return_tp is not inspect.Signature.empty
+            and _is_fluxway_data_type(return_tp)
+        ):
+            out_data, out_control = _get_fluxway_streams(return_tp)
+            output_args = {
+                ArgumentType.TENSOR.value: out_data,
+                ArgumentType.STATE.value: out_control,
+            }
+        elif output_sharding:
             output_args = {ArgumentType.TENSOR.value: list(output_sharding.keys())}
 
-        # 2. Build metadata
-        if periodic_barrier is not None:
-            barrier_config = PeriodicBarrierConfig(n=periodic_barrier)
-        else:
-            barrier_config = StandardBarrierConfig()
+        barrier_config = (
+            PeriodicBarrierConfig(n=periodic_barrier)
+            if periodic_barrier is not None
+            else StandardBarrierConfig()
+        )
 
         meta = OperatorMeta(
             name=name,
-            input_sharding=input_sharding_processed,
-            output_sharding=output_sharding_processed,
             input_arguments={
-                ArgumentType.STATE.value: state_argument or [],
-                ArgumentType.TENSOR.value: tensor_argument or [],
-                ArgumentType.STATIC.value: static_argument or [],
+                ArgumentType.STATE.value: final_states,
+                ArgumentType.TENSOR.value: final_tensors,
+                ArgumentType.STATIC.value: list(final_statics),
             },
             output_arguments=output_args,
+            input_sharding=input_sharding_processed,
+            output_sharding=output_sharding_processed,
             barrier_config=barrier_config,
         )
 
-        # Attach metadata to the underlying function
-        # We attach it to both the wrapper and the original function if possible
+        # --- 4. Wrapper Generation ---
         func._flux_operator_meta = meta
 
-        # Check if function has 'self' parameter and convert to staticmethod
-        sig = inspect.signature(func)
-        params = list(sig.parameters.values())
-        has_self = params and params[0].name == "self"
+        import threading
 
-        if has_self:
-            # Remove 'self' parameter from signature
-            new_params = params[1:]  # Skip 'self'
-            new_sig = sig.replace(parameters=new_params)
+        _local = threading.local()
 
-            # Get the class that contains this method for instance creation
-            qualname_parts = func.__qualname__.split(".")
-            module = inspect.getmodule(func)
-            spmd_class = None
-            if len(qualname_parts) >= 2 and module:
-                class_name = qualname_parts[-2]
-                spmd_class = getattr(module, class_name, None)
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            # Get or create thread-local instance
+            if not hasattr(_local, "instance"):
+                # We need the class to instantiate it
+                cls = getattr(wrapper, "_flux_spmd_class", None)
+                if not cls:
+                    # Fallback: try to find it from qualname
+                    qualname_parts = func.__qualname__.split(".")
+                    if len(qualname_parts) >= 2:
+                        module = inspect.getmodule(func)
+                        cls = getattr(module, qualname_parts[-2], None)
 
-            # Create a wrapper function without 'self' parameter
-            # Use thread-local storage to ensure each thread gets its own instance
-            import threading
+                if not cls:
+                    raise RuntimeError(
+                        f"Fluxway Execution Error: Cannot instantiate class for operator '{name}'."
+                    )
+                _local.instance = cls()
 
-            _local = threading.local()
+            # Inject runtime context into the class instance
+            ctx = get_current_context()
+            if hasattr(ctx, "static_args"):
+                _local.instance.static_args = ctx.static_args
+            if hasattr(ctx, "rank"):
+                _local.instance.rank = ctx.rank
+            if hasattr(ctx, "world_size"):
+                _local.instance.world_size = ctx.world_size
 
-            def wrapper(*args, **kwargs):
-                # Get or create thread-local instance
-                if not hasattr(_local, "instance"):
-                    if spmd_class:
-                        try:
-                            _local.instance = spmd_class()
-                        except Exception:
-                            # If instance creation fails, create a minimal object
-                            class DummySelf:
-                                pass
+            return func(_local.instance, *args, **kwargs)
 
-                            _local.instance = DummySelf()
-                    else:
+        def set_spmd_class(cls):
+            wrapper._flux_spmd_class = cls
 
-                        class DummySelf:
-                            pass
+        wrapper._flux_set_spmd_class = set_spmd_class
+        wrapper._flux_operator_meta = meta
 
-                        _local.instance = DummySelf()
-
-                # Call original function with instance as self
-                return func(_local.instance, *args, **kwargs)
-
-            # Update function metadata
-            wrapper.__name__ = func.__name__
-            wrapper.__doc__ = func.__doc__
-            wrapper.__module__ = func.__module__
-            wrapper.__qualname__ = func.__qualname__
-            wrapper.__signature__ = new_sig
-            # Update annotations to exclude 'self'
-            if hasattr(func, "__annotations__"):
-                annotations = func.__annotations__.copy()
-                annotations.pop("self", None)
-                wrapper.__annotations__ = annotations
-
-            # Preserve metadata
-            wrapper._flux_operator_meta = meta
-
-            # Convert to staticmethod
-            return staticmethod(wrapper)
-        else:
-            # No 'self' parameter, return as-is but ensure it's a staticmethod
-            @functools.wraps(func)
-            def wrapper(*args, **kwargs):
-                return func(*args, **kwargs)
-
-            wrapper._flux_operator_meta = meta
-            wrapper = staticmethod(wrapper)
-            wrapper.__func__._flux_operator_meta = meta
-            return wrapper
+        return staticmethod(wrapper)
 
     return decorator
 
 
 def data_type():
     """
-    Decorator to mark a class as a fluxway transfer data type.
-
-    Usage:
-        @data_type()
-        class ActionState:
-            id: int
-            tensor: torch.Tensor
-            config: string
-
-    Returns:
-        Decorated class with metadata of fluxway transfer data.
+    Mark a class as a Fluxway transportable data type.
+    Enforces flattening and adds as_dict() for standard access.
     """
     T = TypeVar("T")
 
     def decorator(cls: Type[T]) -> Type[T]:
-        # Validate all custom class variables (excluding python built-in variables), and ensure none of them are of dict type.
-        # "Built-in variables" refer to those named like __xxx__.
-        # Custom variables include class variables and annotation fields (excluding functions/methods).
-        for var_name, var_value in cls.__dict__.items():
-            if var_name.startswith("__") and var_name.endswith("__"):
+        try:
+            hints = get_type_hints(cls, include_extras=True)
+        except Exception as e:
+            raise TypeError(
+                f"Fluxway Data Error: Cannot inspect type hints for '{cls.__name__}': {e}"
+            ) from e
+
+        for name, tp in hints.items():
+            if name.startswith("_"):
                 continue
-            # Exclude methods/functions
-            if callable(var_value):
-                continue
-            # Check if variable or its type hint is a dict
-            # Type hint: check __annotations__ if present
-            var_type = None
-            if "__annotations__" in cls.__dict__ and var_name in cls.__annotations__:
-                var_type = cls.__annotations__[var_name]
-            if isinstance(var_value, dict):
+
+            # Extract base type from Annotated if present
+            base_tp = tp
+            if hasattr(tp, "__origin__") and tp.__origin__ is Annotated:
+                base_tp = tp.__args__[0]
+
+            origin = getattr(base_tp, "__origin__", base_tp)
+            if origin is dict or origin is Dict:
                 raise TypeError(
-                    f"Class variable '{var_name}' is of dict type, which is not allowed for fluxway data class"
+                    f"Fluxway Data Error: Class '{cls.__name__}' field '{name}' uses 'dict', which is not supported.\n"
+                    f"Fix: Use a @data_type decorated dataclass instead of a dictionary."
                 )
-            if var_type is not None:
-                # allow typing.Dict or dict and similar
-                origin = getattr(var_type, "__origin__", None)
-                if (
-                    origin is dict
-                    or origin is Dict
-                    or var_type is dict
-                    or var_type is Dict
-                ):
-                    raise TypeError(
-                        f"Class annotation '{var_name}' is of dict type, which is not allowed for fluxway data class"
-                    )
+
         cls.is_fluxway_data = classmethod(lambda c: True)
+
+        if not hasattr(cls, "as_dict"):
+
+            def as_dict(self):
+                """Generic, library-agnostic dictionary conversion."""
+                return {k: v for k, v in self.__dict__.items() if not k.startswith("_")}
+
+            cls.as_dict = as_dict
 
         return cls
 
     return decorator
-
-
-# =============================================================================
-# SPMD Decorator (formerly in common/api/spmd.py)
-# =============================================================================
 
 
 def spmd(
@@ -425,115 +345,62 @@ def spmd(
     use_global_step_indexing: bool = False,
 ):
     """
-    Decorator to mark a class with SPMD execution configuration.
-
-    Usage:
-        @spmd(
-            resource={"nums_cpu": 4, "nums_gpu": 2},
-            mesh_axis_names=("data", "model"),
-            mesh_axis_shapes=(4, 2),
-            max_async_steps=10
-        )
-        class MySPMD:
-            def forward(self, state):
-                return process(state)
-
-    Args:
-        resource: Resource requirements dict
-        mesh_axis_names: Ordered tuple of mesh axis names (e.g., ("data", "model"))
-        mesh_axis_shapes: Ordered tuple of mesh axis sizes (e.g., (4, 2))
-        use_global_step_indexing: Whether to use global unique indexing for outputs (streaming mode)
-
-    Returns:
-        Decorated class with SPMD configuration
+    Configure a class for SPMD distributed execution.
     """
-    from fluxway.common.types import ResourceSpec, SPMDConfig  # Internal import
+    from fluxway.common.types import ResourceSpec, SPMDConfig
     from fluxway.common.mesh import DeviceMesh
 
     T = TypeVar("T")
 
-    # Parse resource specification
-    resource_spec = None
+    res_spec = None
     if resource:
-        resource_spec = ResourceSpec(
-            num_cpus=resource.get("nums_cpu", resource.get("num_cpus", 1)),
-            num_gpus=resource.get("nums_gpu", resource.get("num_gpus", 0)),
-            memory_gb=resource.get("memory", resource.get("memory_gb", 0.0)),
+        res_spec = ResourceSpec(
+            num_cpus=resource.get("num_cpus", 1),
+            num_gpus=resource.get("num_gpus", 0),
+            memory_gb=resource.get("memory_gb", 0.0),
         )
 
-    # Create DeviceMesh from axis tuples
     mesh = None
-    if mesh_axis_names is not None and mesh_axis_shapes is not None:
+    if mesh_axis_names and mesh_axis_shapes:
         mesh = DeviceMesh(axis_names=mesh_axis_names, device_shape=mesh_axis_shapes)
 
     def decorator(cls: Type[T]) -> Type[T]:
-        # Add attributes directly to the class
-        cls._resource = resource_spec
+        cls._resource = res_spec
         cls._mesh = mesh
-        cls._num_workers = None  # Determined by mesh at runtime
         cls._use_global_step_indexing = use_global_step_indexing
 
-        # Add methods directly to the class
+        # Link operators
+        for attr_name in dir(cls):
+            attr = getattr(cls, attr_name, None)
+            if hasattr(attr, "_flux_set_spmd_class"):
+                attr._flux_set_spmd_class(cls)
+
+        # Standard API
         cls.get_resource = classmethod(lambda c: c._resource)
         cls.get_mesh = classmethod(lambda c: c._mesh)
-        cls.get_num_workers = classmethod(
-            lambda c: int(getattr(c._mesh, "size", 1)) if c._mesh else 1
-        )
-        cls.get_use_global_step_indexing = classmethod(
-            lambda c: getattr(c, "_use_global_step_indexing", False)
-        )
+        cls.get_num_workers = classmethod(lambda c: c._mesh.size if c._mesh else 1)
         cls.is_fluxway_spmd = classmethod(lambda c: True)
-
-        def get_operator_meta(c, op_name: str):
-            """Get OperatorMeta for a given op_name (e.g. 'forward')."""
-            from fluxway.common.types import (
-                OperatorMeta,
-            )  # runtime import to avoid circular refs
-
-            if not isinstance(op_name, str):
-                raise TypeError(f"op_name must be a string, got {type(op_name)}")
-
-            # Find the method that has an OperatorMeta with the matching name
-            for attr_name in dir(c):
-                # Skip private attributes
-                if attr_name.startswith("__"):
-                    continue
-                method = getattr(c, attr_name, None)
-                if method is not None:
-                    meta = getattr(method, "_flux_operator_meta", None)
-                    if isinstance(meta, OperatorMeta) and meta.name == op_name:
-                        return meta
-            return None
-
-        cls.get_operator_meta = classmethod(get_operator_meta)
 
         def get_spmd_config(c) -> "SPMDConfig":
             from fluxway.common.types import SPMDConfig, OperatorMeta
 
-            operators = {}
-            operator_metas = {}
+            operators, metas = {}, {}
 
-            # Dynamically discover all operators
-            for attr_name in dir(c):
-                if attr_name.startswith("__"):
-                    continue
-                method = getattr(c, attr_name, None)
-                if method is not None:
-                    meta = getattr(method, "_flux_operator_meta", None)
-                    if isinstance(meta, OperatorMeta):
-                        op_name = meta.name
-                        operators[op_name] = method
-                        operator_metas[op_name] = meta
+            for name in dir(c):
+                attr = getattr(c, name, None)
+                meta = getattr(attr, "_flux_operator_meta", None)
+                if isinstance(meta, OperatorMeta):
+                    operators[meta.name] = attr
+                    metas[meta.name] = meta
 
             return SPMDConfig(
                 mesh=c._mesh,
                 use_global_step_indexing=c._use_global_step_indexing,
                 operators=operators,
-                operator_metas=operator_metas,
+                operator_metas=metas,
             )
 
         cls.get_spmd_config = classmethod(get_spmd_config)
-
         return cls
 
     return decorator

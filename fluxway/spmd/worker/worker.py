@@ -29,11 +29,16 @@ import time
 
 import ray
 
-from ...common.types import SPMDConfig, WorkerHeartbeat, WorkerStatus, WorkerTelemetry
-from ...common.types.configs import NodeType, ReaderConfig, MailboxStatus
-from ...common.types.tensor import TransportTensor
-from ...common.utils import ensure_logging_configured
-from ...rpc.protocol import DataPlaneCallable
+from fluxway.common.types import (
+    SPMDConfig,
+    WorkerHeartbeat,
+    WorkerStatus,
+    WorkerTelemetry,
+)
+from fluxway.common.types.configs import MailboxStatus
+from fluxway.common.types.tensor import TransportTensor
+from fluxway.common.utils import ensure_logging_configured
+from fluxway.rpc.protocol import DataPlaneCallable
 from .mailbox import WorkerMailbox
 from .operator_manager import OperatorManager
 
@@ -63,9 +68,6 @@ class SPMDWorker:
         rank: int,
         spmd_id: str = "",
         driver_handle: Optional[Any] = None,
-        node_type: NodeType = NodeType.SPMD,
-        reader_task: Optional[Any] = None,
-        reader_config: Optional[ReaderConfig] = None,
     ):
         """
         Initialize worker.
@@ -90,20 +92,11 @@ class SPMDWorker:
         # Driver handle for callbacks (Control Plane - Native Ray)
         self._driver_handle: Optional[Any] = driver_handle
 
-        # Node type
-        self.node_type = node_type
-        self.reader_task = reader_task
-        self.reader_config = reader_config
-
         # Mesh from config
         self._mesh = config.mesh
         self._total_rank = config.num_workers  # Total number of workers in this SPMD
 
-        # Operator Manager (topology parsed from config) - only for SPMD nodes
-        if node_type == NodeType.SPMD:
-            self._op_manager = OperatorManager(config, rank, spmd_id)
-        else:
-            self._op_manager = None
+        self._op_manager = OperatorManager(config, rank, spmd_id)
 
         # Execution step counters {op_name: step} - tracks which step is being/was executed
         self._current_steps: Dict[str, int] = dict.fromkeys(
@@ -164,6 +157,15 @@ class SPMDWorker:
         self._start_event = asyncio.Event()  # Signals when to start execution
         self._run_task: Optional[asyncio.Task] = None
 
+        # Source operator pause control
+        self._source_pause_events: Dict[str, asyncio.Event] = {
+            op_name: asyncio.Event()
+            for op_name in (self.config.operators if self.config else {})
+            if self._op_manager.is_source_operator(op_name)
+        }
+        for event in self._source_pause_events.values():
+            event.set()  # Initially all sources are running
+
         # Expected topology counts for auto-start detection
         self._expected_predecessor_count: int = 0
         self._expected_successor_count: int = 0
@@ -177,17 +179,7 @@ class SPMDWorker:
         # Tracks which (op_name, step) barriers have been registered to avoid double-declaring.
         self._barriers_declared: Dict[Tuple[str, int], bool] = {}
 
-        # Reader-specific state
-        self._is_reading_paused: bool = False  # Backpressure pause flag
-        self._reader_pause_event = asyncio.Event()
-        self._reader_pause_event.set()  # Initially not paused
-        self._reader_completed: bool = False  # Flag to indicate reading completion
-        self._batches_sent: int = 0  # Counter for batches sent
-
-        node_type_str = "Reader" if node_type == NodeType.READER else "SPMD"
-        logger.info(
-            f"{node_type_str}Worker initialized: spmd_id={spmd_id}, rank={rank}"
-        )
+        logger.info(f"SPMD Worker initialized: spmd_id={spmd_id}, rank={rank}")
 
         # Start heartbeat if driver_handle is provided
         if self._driver_handle is not None:
@@ -195,6 +187,13 @@ class SPMDWorker:
 
         # Start the run loop in background (will block until start() is called)
         self._start_run_loop()
+
+        # Inject operator context for this thread
+        from fluxway.common.decorators import operator_context
+
+        operator_context.static_args = self.config.static_args
+        operator_context.rank = self.rank
+        operator_context.world_size = self._total_rank
 
     # =========================================================================
     # Driver Handle Management
@@ -342,6 +341,20 @@ class SPMDWorker:
         self._running = True
         self._start_event.set()
         logger.info(f"[spmd_id={self.spmd_id}] Worker {self.rank} auto-started")
+
+        # Trigger source operators (operators with 0 input tensors)
+        asyncio.create_task(self._trigger_source_operators())
+
+    async def _trigger_source_operators(self) -> None:
+        """
+        Trigger initial steps for source operators (those with 0 input tensors).
+        """
+        source_ops = self._op_manager.get_source_operators()
+        for op_name in source_ops:
+            logger.info(
+                f"[spmd_id={self.spmd_id} rank={self.rank}] Triggering source operator: {op_name}"
+            )
+            await self._enqueue(op_name, 0)
 
     # =========================================================================
     # Op-Level Blocking
@@ -518,7 +531,7 @@ class SPMDWorker:
 
     async def _enqueue(self, op_name: str, step: int) -> None:
         """Enqueue a task for execution."""
-        from ...common.types.configs import OperatorMeta
+        from fluxway.common.types.configs import OperatorMeta
 
         meta = self._op_manager._get_operator_metadata(op_name)
         priority = meta.priority if isinstance(meta, OperatorMeta) else 0
@@ -550,8 +563,6 @@ class SPMDWorker:
 
         Blocks on PriorityQueue until tasks are available.
         Respects op-level blocking.
-
-        For Reader nodes, runs a different loop that actively reads data.
         """
         # Wait for start signal from driver
         logger.debug(
@@ -562,41 +573,6 @@ class SPMDWorker:
         logger.info(
             f"[spmd_id={self.spmd_id}] Worker {self.rank} execution loop started"
         )
-
-        # Debug: log node_type value
-        logger.debug(
-            f"[spmd_id={self.spmd_id}] Worker {self.rank} node_type={self.node_type} "
-            f"(type={type(self.node_type).__name__}), "
-            f"NodeType.READER={NodeType.READER} (type={type(NodeType.READER).__name__}), "
-            f"comparison={self.node_type == NodeType.READER}, "
-            f"str_comparison={str(self.node_type) == str(NodeType.READER)}, "
-            f"value_comparison={self.node_type.value == NodeType.READER.value if hasattr(self.node_type, 'value') else 'N/A'}"
-        )
-
-        # Reader mode: run reader loop
-        # Use both enum comparison and string comparison for safety
-        is_reader = (
-            self.node_type == NodeType.READER
-            or str(self.node_type) == str(NodeType.READER)
-            or (
-                hasattr(self.node_type, "value")
-                and self.node_type.value == NodeType.READER.value
-            )
-        )
-
-        if is_reader:
-            logger.debug(
-                f"[spmd_id={self.spmd_id}] Worker {self.rank} entering READER mode, calling _reader_loop()"
-            )
-            await self._reader_loop()
-            logger.debug(
-                f"[spmd_id={self.spmd_id}] Worker {self.rank} _reader_loop() returned"
-            )
-            return
-        else:
-            logger.debug(
-                f"[spmd_id={self.spmd_id}] Worker {self.rank} NOT entering READER mode, continuing with SPMD mode"
-            )
 
         # Normal SPMD mode: data-driven execution loop
         while self._running:
@@ -647,10 +623,10 @@ class SPMDWorker:
                         continue
 
                 # Execute (for periodic mode, execute any task that comes)
-                await self._execute_operator(op_name, step)
+                result = await self._execute_operator(op_name, step)
 
                 # Advance execution step counter
-                await self._advance_step(op_name)
+                await self._advance_step(op_name, result=result)
 
             except asyncio.CancelledError:
                 logger.info(
@@ -660,171 +636,6 @@ class SPMDWorker:
             except Exception as e:
                 logger.error(
                     f"[spmd_id={self.spmd_id} rank={self.rank}] Error in execution loop: {e}"
-                )
-
-    async def _reader_loop(self) -> None:
-        """
-        Reader data reading loop (async).
-
-        Actively reads data from assigned files and sends to downstream workers.
-        Respects backpressure by pausing when signaled.
-        """
-        logger.debug(
-            f"[spmd_id={self.spmd_id}] Reader worker {self.rank} _reader_loop started"
-        )
-
-        if self.reader_task is None:
-            logger.warning(
-                f"[spmd_id={self.spmd_id}] Reader worker {self.rank} has no file task, exiting"
-            )
-            self._reader_completed = True
-            return
-
-        if self.reader_config is None:
-            logger.error(
-                f"[spmd_id={self.spmd_id}] Reader worker {self.rank} has no reader config"
-            )
-            self._reader_completed = True
-            return
-
-        from ...reader.datasource import create_datasource
-
-        try:
-            logger.debug(
-                f"[spmd_id={self.spmd_id}] Reader worker {self.rank} creating datasource: "
-                f"data_type={self.reader_config.data_type}, src_dir={self.reader_config.src_dir}, "
-                f"file_pattern={self.reader_config.file_pattern}"
-            )
-
-            # Create datasource with tensor type conversion config
-            # tensor_name is not passed to datasource, it's only used when sending data
-            datasource = create_datasource(
-                data_type=self.reader_config.data_type,
-                src_dir=self.reader_config.src_dir,
-                file_pattern=self.reader_config.file_pattern,
-                encoding=self.reader_config.encoding,
-                tensor_type=self.reader_config.tensor_type,
-            )
-
-            logger.debug(
-                f"[spmd_id={self.spmd_id}] Reader worker {self.rank} datasource created successfully"
-            )
-
-            batch_size = self.reader_config.batch_size
-            step = 0
-
-            # Check if reader_task has files attribute
-            if not hasattr(self.reader_task, "files"):
-                logger.error(
-                    f"[spmd_id={self.spmd_id}] Reader worker {self.rank} reader_task has no 'files' attribute"
-                )
-                self._reader_completed = True
-                return
-
-            logger.info(
-                f"[spmd_id={self.spmd_id}] Reader worker {self.rank} starting to read {len(self.reader_task.files)} files"
-            )
-
-            # Read and send batches
-            for batch in datasource.read_batch(self.reader_task, batch_size):
-                if not self._running:
-                    break
-
-                # Wait for backpressure to clear (async)
-                while self._is_reading_paused and self._running:
-                    logger.debug(
-                        f"[spmd_id={self.spmd_id}] Reader worker {self.rank} paused due to backpressure"
-                    )
-                    try:
-                        await asyncio.wait_for(
-                            self._reader_pause_event.wait(), timeout=1.0
-                        )
-                        if self._reader_pause_event.is_set():
-                            break
-                    except asyncio.TimeoutError:
-                        continue
-
-                if not self._running:
-                    break
-
-                # Send batch to downstream workers
-                await self._send_reader_batch(batch, step)
-                step += 1
-                self._batches_sent += 1
-
-                logger.debug(
-                    f"[spmd_id={self.spmd_id}] Reader worker {self.rank} sent batch {step}"
-                )
-
-            logger.info(
-                f"[spmd_id={self.spmd_id}] Reader worker {self.rank} completed reading, "
-                f"sent {self._batches_sent} batches"
-            )
-            self._reader_completed = True
-
-        except Exception as e:
-            logger.error(
-                f"[spmd_id={self.spmd_id}] Reader worker {self.rank} error: {e}"
-            )
-            self._last_error = str(e)
-            self._reader_completed = True
-
-    async def _send_reader_batch(self, batch: Any, step: int) -> None:
-        """
-        Send a batch of data to downstream SPMD workers.
-
-        For periodic mode (reader's downstream), there should be exactly one tensor arg.
-        The batch is already converted to the target type by datasource.
-
-        Args:
-            batch: Batch of data to send (already converted by datasource, e.g., np.ndarray)
-            step: Current step number
-        """
-        if not self._successor_handlers:
-            logger.warning(
-                f"[spmd_id={self.spmd_id}] Reader worker {self.rank} has no successor handlers"
-            )
-            return
-
-        # Get tensor name from reader_config (parsed during build)
-        if not self.reader_config or not self.reader_config.tensor_name:
-            raise ValueError(
-                f"[spmd_id={self.spmd_id}] Reader worker {self.rank} has no tensor_name configured. "
-                f"Reader must have output_data_type specified when building the graph."
-            )
-        tensor_name = self.reader_config.tensor_name
-
-        # Batch is already converted by datasource to the target type (e.g., np.ndarray)
-        data_to_send = batch
-
-        # Wrap in TransportTensor
-        transport_tensor = TransportTensor.from_tensor(data_to_send)
-
-        # Send to all downstream SPMDs (round-robin to workers within each SPMD)
-        for spmd_id, handlers in self._successor_handlers.items():
-            if not handlers:
-                continue
-
-            # Determine target worker (round-robin based on step)
-            target_ranks = list(handlers.keys())
-            target_rank = target_ranks[step % len(target_ranks)]
-            handler = handlers[target_rank]
-
-            try:
-                # Send as target op data
-                await handler.receive_shards(
-                    self.reader_config.target_op,
-                    tensor_name,
-                    step,
-                    self.rank,
-                    [transport_tensor.flat_values],
-                    [int(transport_tensor.shape[0])],
-                    transport_tensor.is_ragged,
-                    transport_tensor.global_indices is not None,
-                )
-            except Exception as e:
-                logger.error(
-                    f"[spmd_id={self.spmd_id} rank={self.rank}] Failed to send batch to {spmd_id}:{target_rank}: {e}"
                 )
 
     async def stop(self) -> None:
@@ -911,7 +722,7 @@ class SPMDWorker:
                                 empty_tensor.global_indices is not None,
                             )
 
-    async def _execute_operator(self, op_name: str, step: int) -> None:
+    async def _execute_operator(self, op_name: str, step: int) -> Any:
         """Execute an operator: assemble data, execute, send outputs."""
         try:
             # --- Early check: all received shards are empty packets ---
@@ -923,16 +734,21 @@ class SPMDWorker:
                 )
                 await self._propagate_empty_packets(op_name, step)
                 await self._mailbox.clear_step(op_name, step)
-                return
+                return None
 
             # Assemble input data
             input_data = await self._assemble_input(op_name, step)
 
-            # Execute operator
-            logger.debug(
+            # Execute operator in a thread to avoid blocking the worker event loop
+            logger.info(
                 f"[spmd_id={self.spmd_id} rank={self.rank}] Executing: op={op_name}, step={step}"
             )
-            result = self._op_manager.execute(op_name, input_data)
+            result = await asyncio.to_thread(
+                self._op_manager.execute, op_name, input_data
+            )
+            logger.info(
+                f"[spmd_id={self.spmd_id} rank={self.rank}] Execution finished: op={op_name}, step={step}"
+            )
 
             if result is None:
                 logger.warning(
@@ -966,6 +782,8 @@ class SPMDWorker:
 
             # Clear mailbox
             await self._mailbox.clear_step(op_name, step)
+
+            return result
 
         except Exception as e:
             logger.error(
@@ -1042,6 +860,8 @@ class SPMDWorker:
         # Task 5: Construct final data_type object
         input_type = self._op_manager.get_operator_input_type(op_name)
         if input_type is None:
+            if self._op_manager.is_source_operator(op_name):
+                return None
             raise ValueError(
                 f"Cannot determine input type for operator {op_name}. "
                 f"Make sure the operator function has type annotations."
@@ -1224,7 +1044,7 @@ class SPMDWorker:
         backend = get_backend()
         shard_list = sorted(shards.items())
         valid_tensors = [
-            t for r, t in shard_list if backend.shape(t.flat_values)[0] > 0
+            (r, t) for r, t in shard_list if backend.shape(t.flat_values)[0] > 0
         ]
 
         if not valid_tensors:
@@ -1232,19 +1052,58 @@ class SPMDWorker:
                 backend.zeros((0,), dtype=backend.float32())
             )
 
-        merged_values = backend.cat([t.flat_values for t in valid_tensors], dim=0)
+        merged_values = backend.cat([t.flat_values for r, t in valid_tensors], dim=0)
+
         merged_indices = None
-        if all(t.global_indices is not None for t in valid_tensors):
+        if all(t.global_indices is not None for r, t in valid_tensors):
             merged_indices = backend.cat(
-                [t.global_indices for t in valid_tensors], dim=0
+                [t.global_indices for r, t in valid_tensors], dim=0
             )
 
-        return TransportTensor(merged_values, indices=merged_indices)
+        merged_origin_indices = None
+        if all(t.origin_indices is not None for r, t in valid_tensors):
+            merged_origin_indices = backend.cat(
+                [t.origin_indices for r, t in valid_tensors], dim=0
+            )
 
-    async def _advance_step(self, op_name: str) -> None:
+        origin_ranks_list = []
+        for r, t in valid_tensors:
+            count = backend.shape(t.flat_values)[0]
+            origin_ranks_list.append(backend.full((count,), r, dtype=backend.int32()))
+
+        merged_origin_ranks = (
+            backend.cat(origin_ranks_list, dim=0) if origin_ranks_list else None
+        )
+
+        return TransportTensor(
+            merged_values,
+            indices=merged_indices,
+            origin_ranks=merged_origin_ranks,
+            origin_indices=merged_origin_indices,
+        )
+
+    async def _advance_step(self, op_name: str, result: Any = "not_none") -> None:
         """Advance execution step counter for an operator."""
         self._current_steps[op_name] += 1
         new_step = self._current_steps[op_name]
+
+        # If it's a source operator, automatically trigger the next step if result is not None
+        if self._op_manager.is_source_operator(op_name):
+            import asyncio
+
+            # Wait if paused by backpressure
+            if op_name in self._source_pause_events:
+                await self._source_pause_events[op_name].wait()
+
+            # Re-enqueue next step if result is not None (streaming)
+            if result is not None:
+                asyncio.create_task(
+                    self._enqueue(op_name, new_step + 1)
+                )  # Use new_step + 1 for next step
+            else:
+                logger.info(
+                    f"[spmd_id={self.spmd_id} rank={self.rank}] Source operator {op_name} finished (returned None)"
+                )
 
         # Report op completion to driver
         self._report_op_completed(op_name, new_step)
@@ -1276,6 +1135,9 @@ class SPMDWorker:
         """
         if self._driver_handle is not None:
             try:
+                logger.info(
+                    f"[spmd_id={self.spmd_id} rank={self.rank}] Reporting op completion: {op_name}, step={step}"
+                )
                 self._driver_handle.report_worker_op_completed.remote(
                     self.rank, op_name, step
                 )
@@ -1355,10 +1217,23 @@ class SPMDWorker:
                             else input_tensor.global_indices
                         )
 
-                # Wrap in TransportTensor
-                transport_tensor = TransportTensor.from_tensor(
-                    tensor_data, indices=indices
-                )
+                # Wrap in TransportTensor or use as is
+                if isinstance(tensor_data, TransportTensor):
+                    transport_tensor = tensor_data
+                    if indices is not None and transport_tensor.global_indices is None:
+                        # Fallback to apply indices if not set by operator
+                        transport_tensor = TransportTensor(
+                            transport_tensor.flat_values,
+                            nested_splits=transport_tensor.nested_splits,
+                            indices=indices,
+                            global_shape=transport_tensor.global_shape,
+                            origin_ranks=transport_tensor.origin_ranks,
+                            origin_indices=transport_tensor.origin_indices,
+                        )
+                else:
+                    transport_tensor = TransportTensor.from_tensor(
+                        tensor_data, indices=indices
+                    )
 
                 if succ_info.is_self_loop:
                     await self._self_receive_tensor(
@@ -1400,13 +1275,13 @@ class SPMDWorker:
                     target_rank: int,
                     tensors: list,
                     counts: list,
+                    includes_indices: bool = False,
                     *,
                     _handlers=handlers,
                     _target_op=target_op,
                     _tensor_name=tensor_name,
                     _step=step,
                     _is_ragged=transport_tensor.is_ragged,
-                    _has_indices=transport_tensor.global_indices is not None,
                 ) -> bool:
                     handler = _handlers.get(target_rank)
                     if handler is None:
@@ -1426,7 +1301,7 @@ class SPMDWorker:
                             [empty_tensor],
                             [0],
                             _is_ragged,
-                            _has_indices,
+                            includes_indices,
                         )
                     else:
                         ref_task = handler.receive_shards(
@@ -1437,7 +1312,7 @@ class SPMDWorker:
                             tensors,
                             counts,
                             _is_ragged,
-                            _has_indices,
+                            includes_indices,
                         )
 
                     async def _wait_and_release(t=ref_task):
@@ -1517,26 +1392,32 @@ class SPMDWorker:
     def _extract_tensors(
         self, data: Any, output_sharding: Dict[str, ShardingSpec]
     ) -> Dict[str, Any]:
-        """Extract named tensors from output data."""
+        """
+        Extract named tensors from output data using generic attribute access.
+        Prioritizes getattr() for speed and library-agnostic field access.
+        """
         tensors: Dict[str, Any] = {}
 
-        if isinstance(data, dict):
-            for name in output_sharding.keys():
-                if name in data:
-                    tensors[name] = data[name]
-        elif hasattr(data, "__dict__"):
-            for name in output_sharding.keys():
-                if hasattr(data, name):
-                    tensors[name] = getattr(data, name)
+        # 1. Try getattr protocol (works for dataclass, pydantic, custom classes)
+        for name in output_sharding.keys():
+            val = getattr(data, name, None)
+            if val is not None:
+                tensors[name] = val
 
-        # If no specific tensors found, treat entire data as single tensor
+        # 2. Fallback to dict access if attributes didn't yield all expected keys
+        if len(tensors) < len(output_sharding) and isinstance(data, dict):
+            for name in output_sharding.keys():
+                if name not in tensors and name in data:
+                    tensors[name] = data[name]
+
+        # 3. If still no specific tensors found, treat entire data as single tensor (legacy fallback)
         if not tensors and output_sharding:
             first_name = next(iter(output_sharding.keys()))
             tensors[first_name] = data
 
         logger.debug(
-            f"[spmd_id={self.spmd_id} rank={self.rank}] _extract_tensors: output_sharding keys={list(output_sharding.keys())}, "
-            f"extracted tensors={list(tensors.keys())}, data_type={type(data).__name__}"
+            f"[spmd_id={self.spmd_id} rank={self.rank}] _extract_tensors: "
+            f"extracted={list(tensors.keys())}, data_type={type(data).__name__}"
         )
 
         return tensors
@@ -1581,7 +1462,7 @@ class SPMDWorker:
 
     def _extract_states(self, data: Any, state_names: List[str]) -> Dict[str, Any]:
         """
-        Extract named state values from output data.
+        Extract named state values from output data using generic attribute access.
 
         Args:
             data: Output data from operator execution
@@ -1592,14 +1473,17 @@ class SPMDWorker:
         """
         states: Dict[str, Any] = {}
 
-        if isinstance(data, dict):
+        # 1. Try getattr protocol
+        for name in state_names:
+            val = getattr(data, name, None)
+            if val is not None:
+                states[name] = val
+
+        # 2. Fallback to dict access
+        if len(states) < len(state_names) and isinstance(data, dict):
             for name in state_names:
-                if name in data:
+                if name not in states and name in data:
                     states[name] = data[name]
-        elif hasattr(data, "__dict__"):
-            for name in state_names:
-                if hasattr(data, name):
-                    states[name] = getattr(data, name)
 
         return states
 
@@ -1817,34 +1701,24 @@ class SPMDWorker:
         return self._running
 
     # =========================================================================
-    # Reader Backpressure Control
+    # Source Node Control
     # =========================================================================
 
-    def pause_reading(self) -> None:
+    def pause_sources(self) -> None:
         """
-        Pause data reading (for Reader nodes).
-
-        Called by driver when downstream is busy.
+        Pause all source operators (called by driver when downstream is busy).
         """
-        if self.node_type != NodeType.READER:
-            return
+        for event in self._source_pause_events.values():
+            event.clear()
+        logger.debug(f"[spmd_id={self.spmd_id}] Sources paused on worker {self.rank}")
 
-        self._is_reading_paused = True
-        self._reader_pause_event.clear()
-        logger.debug(f"[spmd_id={self.spmd_id}] Reader worker {self.rank} paused")
-
-    def resume_reading(self) -> None:
+    def resume_sources(self) -> None:
         """
-        Resume data reading (for Reader nodes).
-
-        Called by driver when downstream backpressure is relieved.
+        Resume all source operators (called by driver when backpressure relieved).
         """
-        if self.node_type != NodeType.READER:
-            return
-
-        self._is_reading_paused = False
-        self._reader_pause_event.set()
-        logger.debug(f"[spmd_id={self.spmd_id}] Reader worker {self.rank} resumed")
+        for event in self._source_pause_events.values():
+            event.set()
+        logger.debug(f"[spmd_id={self.spmd_id}] Sources resumed on worker {self.rank}")
 
     def is_reader_completed(self) -> bool:
         """Check if reader has completed reading all data."""

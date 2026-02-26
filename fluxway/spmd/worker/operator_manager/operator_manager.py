@@ -20,7 +20,7 @@ from fluxway.common.types.sharding import ShardingSpec
 from fluxway.common.mesh import DeviceMesh
 
 if TYPE_CHECKING:
-    from ....common.types import SPMDConfig, OperatorMeta
+    from fluxway.common.types import SPMDConfig, OperatorMeta
 
 logger = logging.getLogger(__name__)
 
@@ -101,8 +101,10 @@ class OperatorManager:
             self._operator_input_types[op_name] = None
             self._output_to_input_tensor_mapping[op_name] = {}
 
-        # Static arguments
+        # Static arguments from config
         self._static_args: Dict[str, Any] = {}
+        if hasattr(config, "static_args") and config.static_args:
+            self._static_args.update(config.static_args)
 
         # Thread lock
         self._lock = threading.Lock()
@@ -122,13 +124,33 @@ class OperatorManager:
 
     def _parse_operator_metadata(self) -> None:
         """
-        Parse operator metadata from @operator decorator.
+        Parse operator metadata from @operator decorator and config.topology.
 
         Extracts:
         - input/output sharding specs
         - expected state/tensor names
-        - predecessor/successor topology from EdgeShardingInfo
+        - predecessor/successor topology from EdgeShardingInfo and config.topology
         """
+        # 0. Parse from config.topology first (explicitly set by Builder)
+        if self._config and hasattr(self._config, "topology") and self._config.topology:
+            for op_name, top in self._config.topology.items():
+                if op_name not in self._predecessor_topology:
+                    self._predecessor_topology[op_name] = {}
+                for pred_id, info in top.predecessors.items():
+                    self._predecessor_topology[op_name][pred_id] = SPMDTopologyInfo(
+                        spmd_id=info.spmd_id,
+                        condition_fn=info.condition_fn,
+                        is_self_loop=(info.spmd_id == self._spmd_id),
+                    )
+                if op_name not in self._successor_topology:
+                    self._successor_topology[op_name] = {}
+                for succ_id, info in top.successors.items():
+                    self._successor_topology[op_name][succ_id] = SPMDTopologyInfo(
+                        spmd_id=info.spmd_id,
+                        condition_fn=info.condition_fn,
+                        is_self_loop=(info.spmd_id == self._spmd_id),
+                    )
+
         for op_name, operator in self._operators.items():
             if operator is None:
                 continue
@@ -173,7 +195,11 @@ class OperatorManager:
                 condition_fn = None
                 target_op = None  # Must be provided by EdgeShardingInfo
                 for edge_info in edge_info_list:
-                    merged_sharding.update(edge_info.tensor_sharding)
+                    # Convert raw sharding dicts to ShardingSpec objects if needed
+                    parsed_edge_sharding = self._parse_sharding_specs(
+                        edge_info.tensor_sharding
+                    )
+                    merged_sharding.update(parsed_edge_sharding)
                     if edge_info.condition_fn is not None:
                         condition_fn = edge_info.condition_fn
                     # Get target_op from EdgeShardingInfo (if available)
@@ -196,11 +222,15 @@ class OperatorManager:
             # 4. Parse successor topology from output_post_sharding
             # Structure: {spmd_id: List[EdgeShardingInfo]}
             for post_spmd_id, edge_info_list in meta.output_post_sharding.items():
-                merged_sharding: Dict[str, Any] = {}
+                merged_sharding: Dict[str, ShardingSpec] = {}
                 condition_fn = None
                 target_op = None  # Must be provided by EdgeShardingInfo
                 for edge_info in edge_info_list:
-                    merged_sharding.update(edge_info.tensor_sharding)
+                    # Convert raw sharding dicts to ShardingSpec objects if needed
+                    parsed_edge_sharding = self._parse_sharding_specs(
+                        edge_info.tensor_sharding
+                    )
+                    merged_sharding.update(parsed_edge_sharding)
                     if edge_info.condition_fn is not None:
                         condition_fn = edge_info.condition_fn
                     # Get target_op from EdgeShardingInfo (if available)
@@ -475,6 +505,32 @@ class OperatorManager:
         """Get expected tensor variable names."""
         return list(self._expected_tensor_names.get(op_name, []))
 
+    def is_source_operator(self, op_name: str) -> bool:
+        """
+        Check if an operator is a source operator.
+        A source operator:
+        1. Has 0 expected tensor inputs.
+        2. Has 0 predecessor SPMDs in the graph.
+        """
+        tensor_names = self.get_expected_tensor_names(op_name)
+        pred_ids = self.get_predecessor_ids(op_name)
+
+        has_no_tensors = len(tensor_names) == 0
+        has_no_predecessors = len(pred_ids) == 0
+
+        is_source = has_no_tensors and has_no_predecessors
+
+        if op_name in ["read", "process"]:
+            logger.info(
+                f"[OperatorManager] op={op_name} is_source={is_source}: has_no_tensors={has_no_tensors} ({tensor_names}), has_no_predecessors={has_no_predecessors} ({pred_ids})"
+            )
+
+        return is_source
+
+    def get_source_operators(self) -> List[str]:
+        """Get names of all source operators."""
+        return [op for op in self._operators if self.is_source_operator(op)]
+
     def get_expected_tensor_shards(self, op_name: str) -> Dict[str, int]:
         """
         Get pre-computed expected tensor shard counts based on topology.
@@ -525,8 +581,36 @@ class OperatorManager:
     # =========================================================================
 
     def get_output_sharding(self, op_name: str) -> Dict[str, ShardingSpec]:
-        """Get output sharding for an operator."""
-        return dict(self._output_sharding.get(op_name, {}))
+        """
+        Get output sharding for an operator.
+        If explicit sharding is not provided, defaults to Replicated on the current mesh
+        for all fields identified in output_arguments.
+        """
+        meta = self._get_operator_metadata(op_name)
+        explicit_sharding = {}
+        if meta.output_sharding:
+            for name, spec_dict in meta.output_sharding.items():
+                explicit_sharding[name] = ShardingSpec.from_dict(spec_dict)
+
+        # If we have inferred output arguments but no explicit sharding,
+        # default them to Replicated on current mesh.
+        if meta.output_arguments:
+            from fluxway.common.types.configs import ArgumentType
+
+            tensor_names = meta.output_arguments.get(ArgumentType.TENSOR.value, [])
+            for name in tensor_names:
+                if name not in explicit_sharding:
+                    # Default to Replicated on current mesh
+                    mesh = self._config.mesh
+                    if mesh is None:
+                        from fluxway.common.mesh import DeviceMesh
+
+                        mesh = DeviceMesh(device_shape=(1,), axis_names=("data",))
+                    from fluxway.common.types.sharding import PartitionSpec
+
+                    explicit_sharding[name] = ShardingSpec.chunk(mesh, PartitionSpec())
+
+        return explicit_sharding
 
     def get_output_state_names(self, op_name: str) -> List[str]:
         """
@@ -575,13 +659,22 @@ class OperatorManager:
         Returns:
             Operator output
         """
+        from ....common.decorators import operator_context
+
         operator = self._operators.get(op_name)
         if operator is None:
             logger.warning(f"No operator registered for {op_name}")
             return None
 
         try:
-            return operator(input_data)
+            with operator_context(
+                static_args=self._static_args,
+                rank=self._rank,
+                world_size=self._total_rank,
+            ):
+                if self.is_source_operator(op_name):
+                    return operator()
+                return operator(input_data)
         except Exception as e:
             logger.error(f"Execution failed for {op_name}: {e}")
             raise

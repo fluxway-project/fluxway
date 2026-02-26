@@ -35,7 +35,6 @@ from ..common.types import (
     DriverHeartbeat,
     Graph,
     HeartbeatConfig,
-    NodeType,
 )
 from ..common.utils import ensure_logging_configured
 from .monitor import Monitor
@@ -213,6 +212,15 @@ if RAY_AVAILABLE:
             """Get current controller state."""
             return self._state_machine.state
 
+        async def get_status(self) -> Dict[str, Any]:
+            """Get detailed controller status."""
+            return await self.get_cluster_status()
+
+        async def get_all_heartbeats(self) -> Dict[str, Any]:
+            """Get all latest heartbeats from all SPMDs."""
+            heartbeats = await self._heartbeat_manager.get_all_heartbeats()
+            return {spmd_id: hb.as_dict() for spmd_id, hb in heartbeats.items()}
+
         def is_initialized(self) -> bool:
             """Check if controller is initialized."""
             return self._initialized
@@ -323,12 +331,8 @@ if RAY_AVAILABLE:
             - If downstream is busy (busy_worker_ratio > threshold), pause the reader
             - If downstream is no longer busy, resume the reader
             """
-            # Get all reader nodes
-            reader_nodes = [
-                node_name
-                for node_name, node in self._graph.nodes.items()
-                if node.node_type == NodeType.READER
-            ]
+            # Source nodes are candidates for backpressure (e.g., readers)
+            reader_nodes = self._source_nodes
 
             for reader_id in reader_nodes:
                 # Get downstream SPMDs for this reader
@@ -601,30 +605,51 @@ if RAY_AVAILABLE:
         # Internal Methods for State Machine
         # =====================================================================
 
-        def _initiate_topology_registration(self) -> None:
+        async def _initiate_topology_registration(self) -> None:
             """
-            Initiate topology registration on all SPMDs (fire-and-forget).
+            Initiate topology registration on all SPMDs.
 
             This method:
-            1. Collects driver handles (not worker handles)
-            2. For each SPMD, calls register_topology with driver handles
-
-            All calls are async fire-and-forget. Workers will auto-start after
-            handler registration. State changes are observed via heartbeat.
+            1. Collects ALL worker handles from ALL drivers upfront to avoid actor deadlock.
+            2. For each SPMD, calls register_topology with actual worker handles.
             """
             all_spmd_ids = self._spmd_manager.get_all_spmd_ids()
             if not all_spmd_ids:
                 logger.warning("No SPMDs found, cannot initiate topology registration")
                 return
 
-            # Collect all driver handles: {spmd_id: driver_handle}
-            all_driver_handles: Dict[str, Any] = {}
+            # Collect all worker handles upfront to avoid actor re-entrancy deadlocks during registration
+            # {spmd_id: {rank: worker_handle}}
+            all_worker_handles: Dict[str, Dict[int, Any]] = {}
+
+            fetch_tasks = []
+            spmd_ids_to_fetch = []
+
             for spmd_id in all_spmd_ids:
                 driver = self._spmd_manager.get_driver_handle(spmd_id)
                 if driver is not None:
-                    all_driver_handles[spmd_id] = driver
+                    fetch_tasks.append(driver.get_worker_handles.remote())
+                    spmd_ids_to_fetch.append(spmd_id)
 
-            # For each SPMD, initiate topology registration (fire-and-forget)
+            if fetch_tasks:
+                try:
+                    results = await asyncio.gather(
+                        *[asyncio.wrap_future(t.future()) for t in fetch_tasks]
+                    )
+                    for spmd_id, worker_map in zip(
+                        spmd_ids_to_fetch, results, strict=True
+                    ):
+                        all_worker_handles[spmd_id] = worker_map
+                    logger.info(
+                        f"Collected worker handles for: {list(all_worker_handles.keys())}"
+                    )
+                    for sid, handles in all_worker_handles.items():
+                        logger.info(f"  - {sid}: {len(handles)} workers")
+                except Exception as e:
+                    logger.error(f"Failed to collect worker handles for topology: {e}")
+                    return
+
+            # Initiate topology registration on each driver
             for spmd_id in all_spmd_ids:
                 driver = self._spmd_manager.get_driver_handle(spmd_id)
                 if driver is None:
@@ -633,22 +658,29 @@ if RAY_AVAILABLE:
                 predecessors = self._spmd_manager.get_predecessors(spmd_id)
                 successors = self._spmd_manager.get_successors(spmd_id)
 
-                # Build predecessor/successor driver handles
-                pred_drivers = {
-                    p: all_driver_handles[p]
+                logger.info(
+                    f"Driver {spmd_id}: predecessors={predecessors}, successors={successors}"
+                )
+
+                # Build predecessor/successor worker handle maps: {spmd_id: {rank: handle}}
+                pred_handlers = {
+                    p: all_worker_handles[p]
                     for p in predecessors
-                    if p in all_driver_handles
+                    if p in all_worker_handles
                 }
-                succ_drivers = {
-                    s: all_driver_handles[s]
+                succ_handlers = {
+                    s: all_worker_handles[s]
                     for s in successors
-                    if s in all_driver_handles
+                    if s in all_worker_handles
                 }
 
+                logger.info(f"  - pred_handlers keys: {list(pred_handlers.keys())}")
+                logger.info(f"  - succ_handlers keys: {list(succ_handlers.keys())}")
+
                 try:
-                    # Fire-and-forget: don't wait for return
+                    # Now call register_topology with ACTUAL handles, bypassing the need for drivers to fetch them
                     driver.register_topology.remote(
-                        pred_drivers, succ_drivers, len(predecessors), len(successors)
+                        pred_handlers, succ_handlers, len(predecessors), len(successors)
                     )
                     logger.info(f"Initiated topology registration for SPMD {spmd_id}")
                 except Exception as e:
@@ -750,6 +782,7 @@ async def create_controller(
     graph: Graph,
     heartbeat_config: Optional[HeartbeatConfig] = None,
     async_step_config: Optional[AsyncStepConfig] = None,
+    runtime_env: Optional[Dict[str, Any]] = None,
 ) -> Any:
     """
     Create and initialize a Controller actor.
@@ -760,6 +793,7 @@ async def create_controller(
         graph: The task graph built using Builder
         heartbeat_config: Optional heartbeat configuration
         async_step_config: Optional async step configuration
+        runtime_env: Optional Ray runtime environment
 
     Returns:
         Controller actor handle
@@ -771,7 +805,7 @@ async def create_controller(
         raise RuntimeError("Ray is not available")
 
     # Create the actor
-    controller = ControllerActor.remote(
+    controller = ControllerActor.options(runtime_env=runtime_env).remote(
         graph=graph,
         heartbeat_config=heartbeat_config,
         async_step_config=async_step_config,

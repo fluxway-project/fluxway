@@ -151,7 +151,7 @@ class BaseDataDistributor:
             dest_devices,
             replication_factor,
             plan_global_indices,
-            padded_routing,
+            extra_routing_indices,
             sort_indices,
         ) = _jit_plan_and_pack(
             payloads_tuple,
@@ -189,10 +189,13 @@ class BaseDataDistributor:
                     if p_len is not None:
                         payload_tensors.append(p_len[device_id])
 
-                if padded_routing is not None:
-                    payload_tensors.append(padded_routing[device_id])
+                if extra_routing_indices is not None:
+                    payload_tensors.append(extra_routing_indices[device_id])
+                    includes_indices = True
+                else:
+                    includes_indices = False
 
-                yield targets, payload_tensors, [count], sort_indices
+                yield targets, payload_tensors, [count], sort_indices, includes_indices
         else:
             # Scatter-send
             for device_id, count in enumerate(counts_host):
@@ -207,10 +210,19 @@ class BaseDataDistributor:
                     if p_len is not None:
                         payload_tensors.append(p_len[device_id])
 
-                if padded_routing is not None:
-                    payload_tensors.append(padded_routing[device_id])
+                if extra_routing_indices is not None:
+                    payload_tensors.append(extra_routing_indices[device_id])
+                    includes_indices = True
+                else:
+                    includes_indices = False
 
-                yield [device_id], payload_tensors, [count], sort_indices
+                yield (
+                    [device_id],
+                    payload_tensors,
+                    [count],
+                    sort_indices,
+                    includes_indices,
+                )
 
 
 class SyncDataDistributor(BaseDataDistributor):
@@ -221,20 +233,26 @@ class SyncDataDistributor(BaseDataDistributor):
         local_data: Union[TransportTensor, List[TransportTensor]],
         source: Union[ShardingSpec, Layout],
         target: Union[ShardingSpec, Layout],
-        send_fn: Callable[[int, List[Any], List[int]], Any],
+        send_fn: Callable[[int, List[Any], List[int], bool], Any],
         global_shape: Any = None,
         capacity: Optional[Union[int, List[int]]] = None,
     ) -> Tuple[List[Any], Any]:
         """Performs synchronous distribution."""
         results = []
         meta_sort_indices = None
-        for targets, tensors, counts, sort_idx in self._plan_and_shard(
-            local_data, source, target, global_shape, capacity
-        ):
+        for (
+            targets,
+            tensors,
+            counts,
+            sort_idx,
+            includes_indices,
+        ) in self._plan_and_shard(local_data, source, target, global_shape, capacity):
             if meta_sort_indices is None:
                 meta_sort_indices = sort_idx
             for target_id in targets:
-                res = send_fn(target_id, tensors, counts)
+                res = send_fn(
+                    target_id, tensors, counts, includes_indices=includes_indices
+                )
                 results.append(res)
         return results, meta_sort_indices
 
@@ -247,20 +265,28 @@ class AsyncDataDistributor(BaseDataDistributor):
         local_data: Union[TransportTensor, List[TransportTensor]],
         source: Union[ShardingSpec, Layout],
         target: Union[ShardingSpec, Layout],
-        send_fn: Callable[[int, List[Any], List[int]], Coroutine[Any, Any, Any]],
+        send_fn: Callable[[int, List[Any], List[int], bool], Coroutine[Any, Any, Any]],
         global_shape: Any = None,
         capacity: Optional[Union[int, List[int]]] = None,
     ) -> Tuple[List[Any], Any]:
         """Performs asynchronous distribution."""
         tasks = []
         meta_sort_indices = None
-        for targets, tensors, counts, sort_idx in self._plan_and_shard(
-            local_data, source, target, global_shape, capacity
-        ):
+        for (
+            targets,
+            tensors,
+            counts,
+            sort_idx,
+            includes_indices,
+        ) in self._plan_and_shard(local_data, source, target, global_shape, capacity):
             if meta_sort_indices is None:
                 meta_sort_indices = sort_idx
             for target_id in targets:
-                tasks.append(send_fn(target_id, tensors, counts))
+                tasks.append(
+                    send_fn(
+                        target_id, tensors, counts, includes_indices=includes_indices
+                    )
+                )
 
         if not tasks:
             return [], meta_sort_indices
@@ -635,7 +661,7 @@ def _jit_plan_and_pack(
         padded_buffers_lists.append((padded_data, padded_lengths))
 
     # Pack routing indices similarly
-    padded_routing = None
+    padded_indices_payload = None
     if global_indices is not None:
         sorted_globals = backend.take(global_indices, sort_indices)
         dtype_route = getattr(sorted_globals, "dtype", None)
@@ -647,7 +673,7 @@ def _jit_plan_and_pack(
         def pack_routing(offset, count):
             return backend.dynamic_slice(padded_sorted_globals, (offset,), (capacity,))
 
-        padded_routing = backend.vmap(pack_routing)(send_offsets, send_counts)
+        padded_indices_payload = backend.vmap(pack_routing)(send_offsets, send_counts)
 
     return (
         padded_buffers_lists,
@@ -655,6 +681,6 @@ def _jit_plan_and_pack(
         dest_devices,
         replica_size,
         global_indices,
-        padded_routing,
+        padded_indices_payload,
         sort_indices,
     )

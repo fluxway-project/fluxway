@@ -194,9 +194,7 @@ class AsyncStepManager:
     def get_all_spmd_steps(self) -> Dict[str, SPMDOpStep]:
         """Get current steps for all SPMDs."""
         with self._lock:
-            return {
-                k: SPMDOpStep(**v.model_dump()) for k, v in self._spmd_steps.items()
-            }
+            return {k: SPMDOpStep(**v.as_dict()) for k, v in self._spmd_steps.items()}
 
     def is_op_locked(self, spmd_id: str, op_name: str) -> bool:
         """Check if a specific op is locked."""

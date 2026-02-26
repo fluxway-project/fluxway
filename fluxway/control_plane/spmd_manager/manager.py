@@ -24,7 +24,7 @@ try:
 except ImportError:
     RAY_AVAILABLE = False
 
-from ...common.types import SPMDConfig, NodeType, ReaderConfig
+from ...common.types import SPMDConfig
 
 logger = logging.getLogger(__name__)
 
@@ -37,12 +37,10 @@ class SPMDHandle:
     Worker handles are managed internally by the driver.
     """
 
-    def __init__(self, spmd_id: str, node_type: NodeType = NodeType.SPMD):
+    def __init__(self, spmd_id: str):
         self.spmd_id = spmd_id
-        self.node_type = node_type
         self._driver_handle: Optional[Any] = None  # ray.ActorHandle
         self._config: Optional[SPMDConfig] = None
-        self._reader_config: Optional[ReaderConfig] = None
         self._is_initialized: bool = False
 
     @property
@@ -133,8 +131,6 @@ class SPMDManager:
         worker_bundle_indices: Optional[List[int]] = None,
         driver_bundle_index: int = 0,
         checkpoint_id: Optional[str] = None,
-        node_type: NodeType = NodeType.SPMD,
-        reader_config: Optional[ReaderConfig] = None,
     ) -> Optional[SPMDHandle]:
         """
         Start an SPMD instance by creating its driver.
@@ -156,9 +152,8 @@ class SPMDManager:
             Handle to the started SPMD, or None on failure
         """
         # Create handle
-        handle = SPMDHandle(spmd_id, node_type=node_type)
+        handle = SPMDHandle(spmd_id)
         handle._config = config
-        handle._reader_config = reader_config
 
         if not RAY_AVAILABLE:
             logger.warning(
@@ -178,7 +173,7 @@ class SPMDManager:
             }
 
             # Create driver actor with placement group
-            driver_name = f"{'reader' if node_type == NodeType.READER else 'spmd'}_driver_{spmd_id}"
+            driver_name = f"spmd_driver_{spmd_id}"
 
             if placement_group is not None:
                 driver = SPMDDriver.options(
@@ -193,8 +188,6 @@ class SPMDManager:
                     or list(range(1, config.num_workers + 1)),
                     controller_handle=self._controller_handle,
                     graph_topology=graph_topology,
-                    node_type=node_type,
-                    reader_config=reader_config,
                 )
             else:
                 # No placement group - for testing or mock scenarios
@@ -206,8 +199,6 @@ class SPMDManager:
                     or list(range(1, config.num_workers + 1)),
                     controller_handle=self._controller_handle,
                     graph_topology=graph_topology,
-                    node_type=node_type,
-                    reader_config=reader_config,
                 )
 
             handle.set_driver_handle(driver)
@@ -307,8 +298,6 @@ class SPMDManager:
         placement_group: Optional[Any] = None,
         worker_bundle_indices: Optional[List[int]] = None,
         checkpoint_id: Optional[str] = None,
-        node_type: NodeType = NodeType.SPMD,
-        reader_config: Optional[ReaderConfig] = None,
     ) -> Optional[SPMDHandle]:
         """
         Restore an SPMD from checkpoint.
@@ -336,22 +325,7 @@ class SPMDManager:
             placement_group=placement_group,
             worker_bundle_indices=worker_bundle_indices,
             checkpoint_id=checkpoint_id,
-            node_type=node_type,
-            reader_config=reader_config,
         )
-
-    def get_reader_nodes(self) -> List[str]:
-        """Get all Reader node IDs."""
-        return [
-            spmd_id
-            for spmd_id, handle in self._spmd_handles.items()
-            if handle.node_type == NodeType.READER
-        ]
-
-    def is_reader_node(self, spmd_id: str) -> bool:
-        """Check if a node is a Reader node."""
-        handle = self._spmd_handles.get(spmd_id)
-        return handle is not None and handle.node_type == NodeType.READER
 
     def establish_topology(self, topology: Dict[str, List[str]]) -> None:
         """

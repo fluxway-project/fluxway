@@ -9,22 +9,9 @@ including various datasource implementations.
 from ..common.utils.logging import ensure_logging_configured
 
 
-from .datasource import (
-    BaseSource,
-    FileBaseSource,
-    JsonDatasource,
-    ReadTask,
-    FileReadTask,
-    create_datasource,
-)
+from .base_reader import BaseReader
+from .grain_reader import GrainReader
 
-__all__ = [
-    "BaseSource",
-    "FileBaseSource",
-    "JsonDatasource",
-    "ReadTask",
-    "FileReadTask",
-    "create_datasource",
-]
+__all__ = ["BaseReader", "GrainReader"]
 
 ensure_logging_configured()

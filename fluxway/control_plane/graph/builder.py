@@ -21,8 +21,6 @@ from ...common.types import (
     Edge,
     OperatorMeta,
     EdgeShardingInfo,
-    NodeType,
-    ReaderConfig,
     ResourceSpec,
     SPMDConfig,
 )
@@ -43,7 +41,6 @@ class Builder:
         self._nodes: Dict[str, Node] = {}
         self._edges: List[Edge] = []
         self._spmd_classes: Dict[str, Type] = {}
-        self._reader_configs: Dict[str, ReaderConfig] = {}  # Reader configurations
 
     def add_node(self, name: str, spmd_class: Type, description: str = "") -> "Builder":
         """
@@ -103,78 +100,29 @@ class Builder:
         num_workers: int = 1,
         resource: Optional[Dict[str, Any]] = None,
         description: str = "",
-        encoding: str = "utf-8",
-        output_data_type: Optional[Type] = None,
+        reader_class: Optional[Type] = None,
+        **static_args: Any,
     ) -> "Builder":
         """
         Add a Reader node to the graph.
 
-        Reader nodes are special nodes that actively read data from external sources
-        and push data to downstream SPMD nodes. Unlike normal SPMD nodes, Reader nodes
-        don't wait for upstream triggers - they actively generate data.
-
-        Args:
-            name: Unique identifier for the node
-            src_dir: Source data directory path
-            data_type: Data type to read (json, parquet, csv, etc.)
-            batch_size: Number of records per batch
-            file_pattern: Glob pattern for matching files (e.g., "*.json")
-            num_workers: Number of reader workers
-            resource: Resource requirements dict (nums_cpu, nums_gpu, memory)
-            description: Human-readable description of the node
-            encoding: File encoding (default: utf-8)
-            output_data_type: Output data type class (e.g., TensorOnly).
-                             If provided, reader will convert batch data to this type.
-                             The tensor field name from this type will be used when sending data.
-
-        Returns:
-            Self for method chaining
-
-        Raises:
-            ValueError: If node with same name already exists
-
-        Example:
-            builder.add_reader(
-                name="DataReader",
-                src_dir="/data/input",
-                data_type="json",
-                batch_size=1000,
-                num_workers=4,
-                resource={"nums_cpu": 1, "nums_gpu": 0, "memory": 10},
-                description="JSON data reader"
-            )
+        Reader nodes are now generic SPMD nodes that use a Reader class.
         """
-        if name in self._nodes:
-            raise ValueError(f"Node '{name}' already exists in the graph")
+        from ...reader.grain_reader import GrainReader
 
-        # Parse output_data_type to extract tensor field name and type
-        tensor_name = None
-        tensor_type = None
-        if output_data_type:
-            tensor_name, tensor_type = self._extract_tensor_field_info(output_data_type)
-            logger.debug(
-                f"Extracted tensor field name: {tensor_name}, type: {tensor_type}"
-            )
-            if not tensor_name:
-                raise ValueError(
-                    f"Cannot extract tensor field name from output_data_type {output_data_type.__name__}. "
-                    f"For eager mode (reader's downstream), output_data_type must have exactly one tensor field (np.ndarray)."
-                )
+        reader_cls = reader_class or GrainReader
 
-        # Create ReaderConfig
-        # Note: output_data_type is only used for parsing, not stored in ReaderConfig
-        reader_config = ReaderConfig(
-            src_dir=src_dir,
-            data_type=data_type,
-            batch_size=batch_size,
-            file_pattern=file_pattern,
-            num_workers=num_workers,
-            encoding=encoding,
-            tensor_name=tensor_name,
-            tensor_type=tensor_type,
-        )
+        # Combine specialized reader args with other static args
+        all_static_args = {
+            "src_dir": src_dir,
+            "data_type": data_type,
+            "batch_size": batch_size,
+            "file_pattern": file_pattern,
+            "num_workers": num_workers,
+            **static_args,
+        }
 
-        # Parse resource specification
+        # Handle resource
         resource_spec = None
         if resource:
             resource_spec = ResourceSpec(
@@ -183,96 +131,23 @@ class Builder:
                 memory_gb=resource.get("memory", resource.get("memory_gb", 0.0)),
             )
 
-        # Create SPMDConfig for Reader
-        # Reader uses num_workers from ReaderConfig, not from mesh
-        spmd_config = SPMDConfig(
-            # num_workers=num_workers, # Property is derived from mesh
-            max_async_steps=1  # Reader doesn't need async steps
-        )
+        # Add generic node
+        self.add_node(name, reader_cls, description)
 
-        # Create Node with READER type
-        node = Node(
-            name=name,
-            description=description,
-            resource=resource_spec,
-            spmd_config=spmd_config,
-            node_type=NodeType.READER,
-            reader_config=reader_config,
-        )
+        # Inject static args and resource if provided
+        node = self._nodes[name]
+        node.static_args.update(all_static_args)
+        if resource_spec:
+            node.resource = resource_spec
 
-        self._nodes[name] = node
-        self._reader_configs[name] = reader_config
+        # Reader nodes default to world_size == num_workers
+        if node.spmd_config:
+            # We don't have mesh yet in Node typically at this stage,
+            # but we can store it in static_args for now or wait for mesh creation.
+            # For now, just ensure static_args has it.
+            pass
 
         return self
-
-    def _extract_tensor_field_info(
-        self, output_data_type: Type
-    ) -> Tuple[Optional[str], Optional[Type]]:
-        """
-        Extract tensor field name and type from output_data_type.
-
-        For eager mode (reader's downstream), there should be exactly one tensor arg.
-        A tensor field is identified by having type np.ndarray (or compatible).
-
-        Args:
-            output_data_type: The output data type class (e.g., TensorOnly)
-
-        Returns:
-            Tuple of (tensor_field_name, tensor_field_type), or (None, None) if not found
-        """
-        import numpy as np
-
-        # Get field annotations
-        annotations = getattr(output_data_type, "__annotations__", {})
-
-        # Try dataclass_fields for more info
-        if hasattr(output_data_type, "__dataclass_fields__"):
-            fields = output_data_type.__dataclass_fields__
-            # Check each field's type
-            for field_name, field_info in fields.items():
-                if field_name.startswith("_"):
-                    continue
-                field_type = annotations.get(field_name, None)
-                # Check if type is np.ndarray or compatible
-                if field_type is np.ndarray or (
-                    hasattr(field_type, "__origin__")
-                    and getattr(field_type, "__origin__", None) is np.ndarray
-                ):
-                    return field_name, field_type
-                # Also check string representation
-                type_str = str(field_type)
-                if "ndarray" in type_str or "numpy" in type_str.lower():
-                    return field_name, field_type
-
-        # Fallback: check annotations directly
-        for field_name, field_type in annotations.items():
-            if field_name.startswith("_"):
-                continue
-            if field_type is np.ndarray:
-                return field_name, field_type
-            type_str = str(field_type)
-            if "ndarray" in type_str or "numpy" in type_str.lower():
-                return field_name, field_type
-
-        # If no tensor field found, return first non-private field as fallback
-        for field_name, field_type in annotations.items():
-            if not field_name.startswith("_"):
-                return field_name, field_type
-
-        return None, None
-
-    def _is_reader_node(self, name: str) -> bool:
-        """
-        Check if a node is a Reader node.
-
-        Args:
-            name: Node name to check
-
-        Returns:
-            True if the node is a Reader node
-        """
-        node = self._nodes.get(name)
-        return node is not None and node.node_type == NodeType.READER
 
     # -------------------------------------------------------------------------
     # Generic func edge (core API)
@@ -328,17 +203,6 @@ class Builder:
         # All edges go into _edges (no semantic distinction anymore)
         self._edges.append(edge)
 
-        # Skip sharding validation for Reader nodes (they don't have @spmd decorator)
-        if self._is_reader_node(source_node):
-            # Update Reader target_op (Reader only has one successor/operator target)
-            src_node = self._nodes[source_node]
-            if src_node.reader_config:
-                src_node.reader_config.target_op = target_op
-            return self
-
-        if self._is_reader_node(target_node):
-            return self
-
         # Validate and link sharding between source and target
         self._validate_and_link_edge(
             source_node, source_op, target_node, target_op, condition_fn
@@ -380,6 +244,29 @@ class Builder:
         src_cfg = src_node.spmd_config
         dst_cfg = dst_node.spmd_config
 
+        # 1. Update Topology in SPMDConfig
+        from ...common.types.configs import SPMDTopology, SPMDTopologyInfo
+
+        # Ensure topology entry exists for source op
+        if source_op not in src_cfg.topology:
+            src_cfg.topology[source_op] = SPMDTopology()
+        # Ensure topology entry exists for target op
+        if target_op not in dst_cfg.topology:
+            dst_cfg.topology[target_op] = SPMDTopology()
+
+        # Add successor info to source node
+        src_cfg.topology[source_op].successors[target_node] = SPMDTopologyInfo(
+            spmd_id=target_node,
+            condition_fn=condition_fn,
+            # tensor_map can be populated later if needed, but for now ID is enough
+        )
+
+        # Add predecessor info to target node
+        dst_cfg.topology[target_op].predecessors[source_node] = SPMDTopologyInfo(
+            spmd_id=source_node
+            # tensor_map can be populated later if needed
+        )
+
         def _get_fn_and_meta(
             cfg: SPMDConfig, op_name: str
         ) -> Tuple[Optional[Callable], Optional[OperatorMeta]]:
@@ -397,15 +284,7 @@ class Builder:
         self._ensure_meta_exists(source_node, source_op, src_meta, ctx)
         self._ensure_meta_exists(target_node, target_op, dst_meta, ctx)
 
-        # For self-loops (same node, different ops), skip tensor I/O validation
-        # because the data flows internally. State inference must still run.
-        is_self_loop = source_node == target_node
-
-        if not is_self_loop:
-            # 1) Validate tensor: src_op output vs dst_op input
-            src_meta.validate_tensor_io_match(dst_meta, src_is_output=True, ctx=ctx)
-
-        # 2) Validate & update state: src output_state vs dst input_state
+        # 1) Validate & update state: src output_state vs dst input_state
         src_meta.validate_and_update_state_output_match_dest_input(
             dst_meta=dst_meta,
             src_spmd_class=src_cls,
@@ -413,43 +292,41 @@ class Builder:
             ctx=ctx,
         )
 
-        # 3) Write back pre/post sharding to OperatorMeta
+        # 2) Write back pre/post sharding to OperatorMeta
         src_out = src_meta.output_sharding or {}
         dst_in = dst_meta.input_sharding or {}
 
-        if src_out or is_self_loop:
-            dst_meta.input_pre_sharding.setdefault(source_node, []).append(
-                EdgeShardingInfo(
-                    condition_fn=condition_fn,
-                    tensor_sharding=dict(src_out) if src_out else {},
-                    target_op=target_op,
-                )
+        dst_meta.input_pre_sharding.setdefault(source_node, []).append(
+            EdgeShardingInfo(
+                condition_fn=condition_fn,
+                tensor_sharding=dict(src_out) if src_out else {},
+                target_op=target_op,
             )
-            logger.debug(
-                "Builder linked input_pre_sharding: %s.%s <- %s.%s, tensor_keys=%s",
-                target_node,
-                target_op,
-                source_node,
-                source_op,
-                list(src_out.keys()),
-            )
+        )
+        logger.debug(
+            "Builder linked input_pre_sharding: %s.%s <- %s.%s, tensor_keys=%s",
+            target_node,
+            target_op,
+            source_node,
+            source_op,
+            list(src_out.keys()) if src_out else [],
+        )
 
-        if dst_in or is_self_loop:
-            src_meta.output_post_sharding.setdefault(target_node, []).append(
-                EdgeShardingInfo(
-                    condition_fn=condition_fn,
-                    tensor_sharding=dict(dst_in) if dst_in else {},
-                    target_op=target_op,
-                )
+        src_meta.output_post_sharding.setdefault(target_node, []).append(
+            EdgeShardingInfo(
+                condition_fn=condition_fn,
+                tensor_sharding=dict(dst_in) if dst_in else {},
+                target_op=target_op,
             )
-            logger.debug(
-                "Builder linked output_post_sharding: %s.%s -> %s.%s, tensor_keys=%s",
-                source_node,
-                source_op,
-                target_node,
-                target_op,
-                list(dst_in.keys()),
-            )
+        )
+        logger.debug(
+            "Builder linked output_post_sharding: %s.%s -> %s.%s, tensor_keys=%s",
+            source_node,
+            source_op,
+            target_node,
+            target_op,
+            list(dst_in.keys()) if dst_in else [],
+        )
 
     def build(self, name: str = "") -> Graph:
         """
@@ -475,6 +352,11 @@ class Builder:
                     f"Edge references non-existent target node: {edge.target_node}"
                 )
 
+        # Sync static_args to spmd_config
+        for node in self._nodes.values():
+            if node.static_args:
+                node.spmd_config.static_args.update(node.static_args)
+
         graph = Graph(name=name, nodes=self._nodes.copy(), edges=self._edges.copy())
 
         return graph
@@ -488,7 +370,6 @@ class Builder:
         """
         self._nodes.clear()
         self._spmd_classes.clear()
-        self._reader_configs.clear()
         self._edges.clear()
         return self
 

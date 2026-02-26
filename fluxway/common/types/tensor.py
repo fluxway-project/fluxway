@@ -21,10 +21,14 @@ class TransportTensor:
         nested_splits: Optional[List[Any]] = None,
         indices: Optional[Any] = None,
         global_shape: Optional[Tuple[int, ...]] = None,
+        origin_ranks: Optional[Any] = None,
+        origin_indices: Optional[Any] = None,
     ):
         self._flat_values = flat_values
         self._nested_splits = nested_splits if nested_splits is not None else []
         self._global_shape = global_shape
+        self._origin_ranks = origin_ranks
+        self._origin_indices = origin_indices
 
         if isinstance(indices, ContinuousTopology):
             self._global_indices = None
@@ -142,6 +146,41 @@ class TransportTensor:
     def topology(self) -> Optional[List[Any]]:
         """Topology metadata derived from nested_splits. None for dense."""
         return self._nested_splits if self._nested_splits else None
+
+    @property
+    def origin_ranks(self) -> Optional[Any]:
+        return self._origin_ranks
+
+    @property
+    def origin_indices(self) -> Optional[Any]:
+        return self._origin_indices
+
+    def unique_with_routing(self) -> Tuple["TransportTensor", "TransportTensor"]:
+        """
+        Performs unique on flat_values.
+        Returns (compacted_tensor, inverse_indices_tensor).
+        The compacted_tensor has origin_indices automatically set to allow O(1) restoration.
+        """
+        backend = get_backend()
+        uniques, inverse = backend.unique(self.flat_values, return_inverse=True)
+
+        origin_indices = backend.arange(
+            0, backend.shape(uniques)[0], dtype=backend.int32()
+        )
+
+        compacted = TransportTensor(
+            flat_values=uniques,
+            indices=uniques,  # Use values as global routing keys
+            origin_indices=origin_indices,
+            nested_splits=[],
+        )
+
+        # inverse_indices must retain the original nested_splits (ragged structure)
+        inverse_tt = TransportTensor(
+            flat_values=inverse, nested_splits=self.nested_splits
+        )
+
+        return compacted, inverse_tt
 
     @classmethod
     def from_lists(cls, data: List[Any], dtype=None) -> "TransportTensor":
@@ -682,6 +721,8 @@ class TransportTensor:
                 self._nested_splits,
                 self._global_indices,
                 self._index_descriptor,
+                self._origin_ranks,
+                self._origin_indices,
             ),
         )
 
@@ -691,17 +732,28 @@ class TransportTensor:
             parts.append(f"global_indices={self._global_indices}")
         if self._index_descriptor is not None:
             parts.append(f"descriptor={self._index_descriptor}")
+        if self._origin_ranks is not None:
+            parts.append(f"origin_ranks={self._origin_ranks}")
+        if self._origin_indices is not None:
+            parts.append(f"origin_indices={self._origin_indices}")
         return f"TransportTensor({', '.join(parts)})"
 
 
 def _reconstruct_transport_tensor(
-    flat_values, nested_splits, global_indices, index_descriptor
+    flat_values,
+    nested_splits,
+    global_indices,
+    index_descriptor,
+    origin_ranks=None,
+    origin_indices=None,
 ):
     """Pickle reconstruction helper (top-level function for pickling)."""
     return TransportTensor(
         flat_values,
         nested_splits,
         indices=index_descriptor if index_descriptor is not None else global_indices,
+        origin_ranks=origin_ranks,
+        origin_indices=origin_indices,
     )
 
 
@@ -715,16 +767,26 @@ except ImportError:
 if _JAX_AVAILABLE:
 
     def _tt_flatten(v):
-        children = (v._flat_values, v._nested_splits, v._global_indices)
+        children = (
+            v._flat_values,
+            v._nested_splits,
+            v._global_indices,
+            v._origin_ranks,
+            v._origin_indices,
+        )
         aux_data = (v._index_descriptor,)
         return children, aux_data
 
     def _tt_unflatten(aux_data, children):
-        flat_values, nested_splits, global_indices = children
+        flat_values, nested_splits, global_indices, origin_ranks, origin_indices = (
+            children
+        )
         return TransportTensor(
             flat_values,
             nested_splits,
             indices=aux_data[0] if aux_data[0] is not None else global_indices,
+            origin_ranks=origin_ranks,
+            origin_indices=origin_indices,
         )
 
     jax.tree_util.register_pytree_node(TransportTensor, _tt_flatten, _tt_unflatten)
