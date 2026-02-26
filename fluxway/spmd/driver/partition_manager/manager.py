@@ -102,6 +102,5 @@ class PartitionManager:
         Compute routing between source and target meshes.
 
         TODO: Implement routing computation
-        TODO: Return LayoutSpec
         """
         pass

@@ -235,11 +235,21 @@ class JsonDatasource(FileBaseSource):
             # Convert entire List[Dict] to np.ndarray
             # This converts the list of dicts directly to a numpy array
             return np.array(batch)
-        else:
-            raise NotImplementedError(
-                f"Tensor type conversion for {self.tensor_type} is not implemented. "
-                f"Only np.ndarray and list are currently supported."
-            )
+        
+        # Add JAX support
+        try:
+            import jax
+            import jax.numpy as jnp
+            if self.tensor_type is jax.Array or self.tensor_type is getattr(jax, "Array", None):
+                # Convert to jax array (via numpy for safety)
+                return jnp.array(np.array(batch))
+        except ImportError:
+            pass
+
+        raise NotImplementedError(
+            f"Tensor type conversion for {self.tensor_type} is not implemented. "
+            f"Only np.ndarray, jax.Array and list are currently supported."
+        )
 
     def read_all(self, task: ReadTask) -> List[Dict[str, Any]]:
         """

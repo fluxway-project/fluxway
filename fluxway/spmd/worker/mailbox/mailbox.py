@@ -7,7 +7,7 @@ Control plane: state scalars from Driver.
 Completion tracking is event-driven, not polled:
   - Each (op_type, step) has a StepBarrier composed of ArrivalBarriers.
   - When all expected shards and states arrive, the barrier fires automatically.
-  - Worker registers an on_ready callback; no _check_and_enqueue polling needed.
+  - Worker registers an on_ready callback.
 
 Zero-copy shard writing is supported via TransportReceiver delegation.
 """

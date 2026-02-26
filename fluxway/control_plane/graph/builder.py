@@ -101,7 +101,7 @@ class Builder:
         data_type: str = "json",
         batch_size: int = 1000,
         file_pattern: str = "*",
-        worker_count: int = 1,
+        num_workers: int = 1,
         resource: Optional[Dict[str, Any]] = None,
         description: str = "",
         encoding: str = "utf-8",
@@ -120,7 +120,7 @@ class Builder:
             data_type: Data type to read (json, parquet, csv, etc.)
             batch_size: Number of records per batch
             file_pattern: Glob pattern for matching files (e.g., "*.json")
-            worker_count: Number of reader workers
+            num_workers: Number of reader workers
             resource: Resource requirements dict (nums_cpu, nums_gpu, memory)
             description: Human-readable description of the node
             encoding: File encoding (default: utf-8)
@@ -140,7 +140,7 @@ class Builder:
                 src_dir="/data/input",
                 data_type="json",
                 batch_size=1000,
-                worker_count=4,
+                num_workers=4,
                 resource={"nums_cpu": 1, "nums_gpu": 0, "memory": 10},
                 description="JSON data reader"
             )
@@ -169,7 +169,7 @@ class Builder:
             data_type=data_type,
             batch_size=batch_size,
             file_pattern=file_pattern,
-            worker_count=worker_count,
+            num_workers=num_workers,
             encoding=encoding,
             tensor_name=tensor_name,
             tensor_type=tensor_type,
@@ -185,9 +185,9 @@ class Builder:
             )
 
         # Create SPMDConfig for Reader
-        # Reader uses worker_count from ReaderConfig, not from mesh
+        # Reader uses num_workers from ReaderConfig, not from mesh
         spmd_config = SPMDConfig(
-            worker_count=worker_count,
+            # num_workers=num_workers, # Property is derived from mesh
             max_async_steps=1,  # Reader doesn't need async steps
         )
 
@@ -330,7 +330,14 @@ class Builder:
         self._forward_edges.append(edge)
 
         # Skip sharding validation for Reader nodes (they don't have @spmd decorator)
-        if self._is_reader_node(source_node) or self._is_reader_node(target_node):
+        if self._is_reader_node(source_node):
+            # Update Reader target_op (Reader only has one successor/operator target)
+            src_node = self._nodes[source_node]
+            if src_node.reader_config:
+                src_node.reader_config.target_op = target_op
+            return self
+
+        if self._is_reader_node(target_node):
             return self
 
         # Validate and link sharding between source and target

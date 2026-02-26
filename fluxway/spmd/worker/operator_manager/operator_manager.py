@@ -254,7 +254,7 @@ class OperatorManager:
         parsed = {}
         for tensor_name, raw_spec in raw_specs.items():
             if isinstance(raw_spec, dict):
-                sharding_type = raw_spec.get("type", "dense")
+                sharding_type = raw_spec.get("type", "static")
                 if sharding_type == "replicated":
                     parsed[tensor_name] = ShardingSpec(
                         strategy=ChunkPartition(),
@@ -262,7 +262,7 @@ class OperatorManager:
                         partition=PartitionSpec(),
                         routing_dim=0,
                     )
-                elif sharding_type == "sparse":
+                elif sharding_type == "dynamic":
                     pass  # will handle shortly
             elif isinstance(raw_spec, ShardingSpec):
                 parsed[tensor_name] = raw_spec
@@ -329,7 +329,7 @@ class OperatorManager:
 
                 total_count = 0
                 input_spec = self._input_sharding.get(op_name, {}).get(tensor_name)
-                input_is_sparse = (
+                input_is_dynamic = (
                     input_spec.is_content_addressable if input_spec else False
                 )
 
@@ -337,15 +337,15 @@ class OperatorManager:
                     op_name
                 ].items():
                     pre_sharding = pre_info.tensor_sharding.get(tensor_name)
-                    pre_is_sparse = (
+                    pre_is_dynamic = (
                         pre_sharding.is_content_addressable if pre_sharding else False
                     )
 
-                    if pre_is_sparse or input_is_sparse:
-                        # Sparse involved: expect from all ranks
+                    if pre_is_dynamic or input_is_dynamic:
+                        # Dynamic involved: expect from all ranks
                         total_count += pre_info.total_rank
                     else:
-                        # Dense-to-dense topology defaults to expecting shards
+                        # Static-to-static topology defaults to expecting shards
                         # based on layout. Since we removed _input_routing_strategies,
                         # AsyncDataDistributor fully encapsulates routing, we relax
                         # expected shards calculation or defer it. For now, fallback to total_rank

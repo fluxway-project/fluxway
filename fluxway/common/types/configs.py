@@ -506,65 +506,8 @@ class NodeView(BaseModel):
         pass
 
 
-# =============================================================================
-# Dual-Stream Convergence Types (Section 3.2.2)
-# =============================================================================
 
 
-class ControlConfig(BaseModel):
-    """
-    Control configuration for a single batch.
-
-    Contains all control plane parameters needed for computation.
-    """
-
-    batch_id: str = ""
-    global_step: int = 0
-    learning_rate: float = 0.001
-    clip_norm: float = 1.0
-    is_training: bool = True
-    # TODO: Add more control parameters as needed
-
-
-class PartitionOp(str, Enum):
-    """Vectorized partition operations for routing."""
-
-    DIV_MOD = "div_mod"  # Dense/Slicing: (val // p0) % p1
-    HASH_MOD = "hash_mod"  # Sparse/Embedding: hash(val) % p0
-    REPLICATE = "replicate"  # Broadcast to all target_ranks
-
-
-class LayoutSpec(BaseModel):
-    """Receiver-side layout specification for a batch."""
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    op: PartitionOp
-    params: List[int] = Field(default_factory=list)
-    topology_map: Optional[List[int]] = None  # PID -> physical rank
-    target_ranks: Optional[List[int]] = None  # For REPLICATE mode
-
-
-class RPCPayload(BaseModel):
-    """Payload for tensor data transfer via RPC."""
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    op_name: str
-    name: str
-    step: int
-    sender_rank: int
-    data: Any
-
-
-class DependencySpec(BaseModel):
-    """
-    Receiver-side view defining expected signals for a batch.
-
-    Used by Ticket Barrier to determine when all shards have arrived.
-    """
-
-    expected_shards: int = 0  # Ticket threshold (usually = sender world size)
 
 
 # =============================================================================
@@ -710,27 +653,6 @@ class DriverResourceSpec(BaseModel):
     memory_gb: float = 1.0
 
 
-class SPMDPlacementSpec(BaseModel):
-    """Complete SPMD resource configuration."""
-
-    spmd_id: str
-    driver_resource: DriverResourceSpec = Field(default_factory=DriverResourceSpec)
-    worker_resource: Optional["ResourceSpec"] = None  # Single worker resource
-    num_workers: int = 1
-
-    @property
-    def total_worker_cpus(self) -> int:
-        """Total worker CPUs."""
-        if self.worker_resource is None:
-            return self.num_workers
-        return self.worker_resource.num_cpus * self.num_workers
-
-    @property
-    def total_worker_gpus(self) -> int:
-        """Total worker GPUs."""
-        if self.worker_resource is None:
-            return 0
-        return self.worker_resource.num_gpus * self.num_workers
 
 
 class SPMDOpStep(BaseModel):

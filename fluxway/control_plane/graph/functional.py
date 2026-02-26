@@ -1,4 +1,4 @@
-from typing import Any, Callable, Optional, Type
+from typing import Any, Callable, Dict, Optional, Type
 from ...common.types.configs import SPMDConfig
 from .builder import Builder
 
@@ -124,11 +124,14 @@ class FunctionalGraph:
         self._builder.add_node(name, spmd_class, description=description)
         return NodeProxy(name, self)
 
-    def reader(self, name: str, config: Any, *args, **kwargs) -> NodeProxy:
+    def reader(self, name: str, config: Optional[Dict[str, Any]] = None, **kwargs) -> NodeProxy:
         """
         Registers a Reader node and returns a proxy.
         """
-        self._builder.add_reader(name, config, *args, **kwargs)
+        # Merge config dict with kwargs
+        full_config = (config or {}).copy()
+        full_config.update(kwargs)
+        self._builder.add_reader(name, **full_config)
         return NodeProxy(name, self)
 
     def compile(self, graph_name: str = "functional_graph") -> Any:

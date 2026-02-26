@@ -811,9 +811,9 @@ class SPMDWorker:
             handler = handlers[target_rank]
 
             try:
-                # Send as forward op data (reader always targets the downstream's "forward" op)
+                # Send as target op data
                 await handler.receive_shards(
-                    "forward",
+                    self.reader_config.target_op,
                     tensor_name,
                     step,
                     self.rank,
@@ -1265,9 +1265,6 @@ class SPMDWorker:
 
             for s in to_enqueue:
                 await self._enqueue(op_name, s)
-
-            # Also check if we have pending data for the new execution step
-            await self._check_and_enqueue(op_name, new_step)
 
     def _report_op_completed(self, op_name: str, step: int) -> None:
         """

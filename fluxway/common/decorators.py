@@ -25,10 +25,10 @@ def operator(
         name: Operator name (unique within SPMD)
         input_sharding: Input parameter sharding spec. Dict[arg_name, raw_spec_dict]
             Raw spec dict should contain basic types only:
-            - For dense: {"type": "dense", "axis": ["dp", None, "tp"]}
-            - For sparse: {"type": "sparse", "axis": [0], "fn": my_routing_fn}
+            - For static: {"type": "static", "axis": ["dp", None, "tp"]}
+            - For dynamic: {"type": "dynamic", "axis": [0], "fn": my_routing_fn}
               where fn(tensor, tensor_meta, post_spec) -> routing result
-            - For replicate: {"type": "dense", "axis": [None]} or omit sharding
+            - For replicate: {"type": "static", "axis": [None]} or omit sharding
         output_sharding: Output return value sharding spec. Dict[field_name, raw_spec_dict]
             Same format as input_sharding
         state_argument: List of argument names to treat as state (control flow)
@@ -236,9 +236,9 @@ def operator(
                 spec_dict = (
                     raw_spec if isinstance(raw_spec, dict) else raw_spec.__dict__
                 )
-                if spec_dict.get("type") not in ("dense", "sparse", "replicated"):
+                if spec_dict.get("type") not in ("static", "dynamic", "replicated"):
                     raise ValueError(
-                        f"input_sharding['{tensor_name}'] type must be 'dense', 'sparse', or 'replicated'"
+                        f"input_sharding['{tensor_name}'] type must be 'static', 'dynamic', or 'replicated'"
                     )
                 input_sharding_processed[tensor_name] = spec_dict
 
@@ -248,9 +248,9 @@ def operator(
                 spec_dict = (
                     raw_spec if isinstance(raw_spec, dict) else raw_spec.__dict__
                 )
-                if spec_dict.get("type") not in ("dense", "sparse", "replicated"):
+                if spec_dict.get("type") not in ("static", "dynamic", "replicated"):
                     raise ValueError(
-                        f"output_sharding['{tensor_name}'] type must be 'dense', 'sparse', or 'replicated'"
+                        f"output_sharding['{tensor_name}'] type must be 'static', 'dynamic', or 'replicated'"
                     )
                 output_sharding_processed[tensor_name] = spec_dict
 

@@ -14,7 +14,6 @@ from .configs import (
     PlacementStrategy,
     ResourcePriority,
     DriverResourceSpec,
-    SPMDPlacementSpec,
     # State Management Types (Section 2.1.4)
     GlobalState,
     SPMDState,
@@ -23,13 +22,6 @@ from .configs import (
     LogicalHandle,
     ActualHandle,
     NodeView,
-    # Dual-Stream Convergence Types (Section 3.2.2)
-    ControlConfig,
-    # ULP Protocol Types (Section 4.2, 4.3)
-    PartitionOp,
-    LayoutSpec,
-    DependencySpec,
-    RPCPayload,
     # Operator metadata
     EdgeShardingInfo,
     OperatorMeta,
@@ -85,7 +77,6 @@ __all__ = [
     "PlacementStrategy",
     "ResourcePriority",
     "DriverResourceSpec",
-    "SPMDPlacementSpec",
     # State Management Types
     "GlobalState",
     "SPMDState",
@@ -94,13 +85,6 @@ __all__ = [
     "LogicalHandle",
     "ActualHandle",
     "NodeView",
-    # Dual-Stream Convergence Types
-    "ControlConfig",
-    # ULP Protocol Types
-    "PartitionOp",
-    "LayoutSpec",
-    "DependencySpec",
-    "RPCPayload",
     # Operator metadata
     "EdgeShardingInfo",
     "OperatorMeta",
