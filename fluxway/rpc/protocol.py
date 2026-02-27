@@ -24,11 +24,11 @@ class DataPlaneCallable:
         # if we move to a different high-performance transport (e.g., gRPC/UCX).
         return await self._handle.receive_shards.remote(*args, **kwargs)
 
-    async def receive_states(self, *args, **kwargs) -> Any:
+    async def receive_control(self, *args, **kwargs) -> Any:
         """
         Data Plane: Method for state data transmission.
         """
-        return await self._handle.receive_states.remote(*args, **kwargs)
+        return await self._handle.receive_control.remote(*args, **kwargs)
 
     def __repr__(self):
         return f"DataPlaneCallable(handle={self._handle})"

@@ -115,7 +115,7 @@ class WorkerSynchronizer:
                 old_spmd_step = self._spmd_steps.get(op_name, 0)
                 self._spmd_steps[op_name] = step
 
-                logger.info(f"SPMD {self.spmd_id} completed {op_name} step {step}")
+                logger.debug(f"SPMD {self.spmd_id} completed {op_name} step {step}")
 
                 # Report to controller (outside lock)
                 should_report = step > old_spmd_step
@@ -146,7 +146,7 @@ class WorkerSynchronizer:
                     op_name, False
                 ):
                     self._worker_op_locked[rank][op_name] = True
-                    logger.info(
+                    logger.debug(
                         f"Blocking worker {rank} {op_name} in SPMD {self.spmd_id} "
                         f"(step {worker_step}, min={min_step})"
                     )
@@ -161,7 +161,7 @@ class WorkerSynchronizer:
             for rank in range(self.num_workers):
                 if self._worker_op_locked[rank].get(op_name, False):
                     self._worker_op_locked[rank][op_name] = False
-                    logger.info(
+                    logger.debug(
                         f"Unblocking worker {rank} {op_name} in SPMD {self.spmd_id}"
                     )
                     if self._unblock_worker_op:
@@ -192,7 +192,7 @@ class WorkerSynchronizer:
         """
         with self._lock:
             self._op_locked[op_name] = True
-            logger.info(f"SPMD {self.spmd_id} {op_name} blocked by controller")
+            logger.debug(f"SPMD {self.spmd_id} {op_name} blocked by controller")
 
         # Block all workers
         if self._block_worker_op:
@@ -214,7 +214,7 @@ class WorkerSynchronizer:
         """
         with self._lock:
             self._op_locked[op_name] = False
-            logger.info(f"SPMD {self.spmd_id} {op_name} unblocked by controller")
+            logger.debug(f"SPMD {self.spmd_id} {op_name} unblocked by controller")
 
             # Unblock workers (unless they're blocked by step diff)
             workers_to_unblock = [

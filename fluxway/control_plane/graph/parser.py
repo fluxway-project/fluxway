@@ -15,7 +15,7 @@ from typing import Dict, List, Optional, Any, Union, Set
 from pathlib import Path
 from collections import deque
 
-from ...common.types import Graph, Node, Edge, GraphValidationResult, SPMDConfig
+from fluxway.common.types import Graph, Node, Edge, GraphValidationResult, SPMDConfig
 
 
 class GraphParser:

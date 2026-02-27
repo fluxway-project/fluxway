@@ -6,7 +6,7 @@ from fluxway.reader import GrainReader
 from .data_types import RaggedInput
 
 
-@spmd()
+@spmd(mesh_axis_names=("worker",), mesh_axis_shapes=(1,))
 class RecommendationReader(GrainReader):
     """
     Standard Reader SPMD for Recommendation Example.
@@ -49,7 +49,13 @@ class RecommendationReader(GrainReader):
         # Build Grain DataLoader
         super()._create_data_loader(static_args, rank, world_size)
 
-    @operator("read")
+    @operator(
+        "read",
+        output_sharding={
+            "feature1": {"type": "static", "axis": [0]},
+            "feature2": {"type": "static", "axis": [0]},
+        },
+    )
     def read(self) -> Optional[RaggedInput]:
         """
         Produces a batch of RaggedInput for downstream operators.

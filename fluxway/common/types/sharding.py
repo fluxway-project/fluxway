@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import enum
 from typing import Any, List, Optional, Tuple, Union, Dict
+from pydantic import Field, model_validator
 
 from fluxway.common.backend import get_backend
 from fluxway.common.mesh import DeviceMesh
@@ -14,15 +15,12 @@ from fluxway.common.topology import (
     RaggedTopology,
     CallableTopology,
 )
+from fluxway.common.types.configs import FluxwayBaseSchema, ConfigDict
 
 
 # ============================================================
 # Enums — Routing Semantics
 # ============================================================
-
-
-from fluxway.common.types.configs import FluxwayBaseSchema, ConfigDict
-from pydantic import Field, model_validator
 
 
 class RoutingParadigm(str, enum.Enum):
@@ -54,7 +52,7 @@ class PartitionSpec(FluxwayBaseSchema):
 
     @property
     def partitions(self) -> Dict[int, Tuple[str, ...]]:
-        result = {}
+        result: Dict[int, Tuple[str, ...]] = {}
         for i, s in enumerate(self.specs):
             if s is not None:
                 if isinstance(s, (str, int)):
@@ -65,7 +63,7 @@ class PartitionSpec(FluxwayBaseSchema):
 
     def to_named_spec(self, mesh: DeviceMesh) -> PartitionSpec:
         """Converts integer axis indices to mesh axis names."""
-        new_specs = []
+        new_specs: List[Optional[Union[str, Tuple[str, ...]]]] = []
         for s in self.specs:
             if isinstance(s, int):
                 if s < len(mesh.axis_names):
@@ -330,31 +328,7 @@ class Layout(FluxwayBaseSchema):
             sub_sizes.append(self.mesh.shape[axis_idx])
         return _ravel_multi_index(sub_coords, sub_sizes)
 
-    def logical_to_physical(self, logical_ranks: Any, dim: int) -> Any:
-        """Map logical partition ranks to physical device ranks via mesh."""
-        backend = get_backend()
-        if not self.partitions or dim not in self.partitions:
-            return backend.zeros_like(logical_ranks)
-        coords = [
-            backend.zeros(backend.shape(logical_ranks), dtype=backend.int32())
-            for _ in self.mesh.shape
-        ]
-        # In multi-axis mode per dim, reverse unravel is needed.
-        # For our main flows (dynamic routing) it's mostly single axis routing,
-        # but we handle the single axis case cleanly here. Complex multi-axis reverse
-        # routing may require unravel_index over sub-mesh.
-        axes = self.partitions[dim]
-        if len(axes) > 1:
-            raise NotImplementedError(
-                "logical_to_physical not fully supported for multi-axis joint routing yet."
-            )
-        axis_name = axes[0]
-        axis_idx = self.mesh.axis_names.index(axis_name)
-        coords[axis_idx] = logical_ranks
-        mesh_ids = backend.tensor(self.mesh.device_ids, dtype=backend.int32())
-        return mesh_ids[tuple(coords)]
-
-    def get_local_indices(self, rank: int, dim: int) -> Any:
+    def get_shard_indices(self, rank: int, dim: int) -> Any:
         """Returns the global indices held by this rank along a specific dimension."""
         backend = get_backend()
         effective_rank = self.get_shard_rank(rank, dim)
@@ -478,30 +452,121 @@ class ShardingSpec(FluxwayBaseSchema):
             replica_size=self.replica_size,
         )
 
-    def get_expected_local_indices(
-        self, rank: int, local_dim_size: int, dim: int = 0
-    ) -> Optional[Any]:
-        """Returns expected global indices for implicit mesh inference (chunk only)."""
-        backend = get_backend()
-        if not isinstance(self.strategy, ChunkPartition):
-            return None
+    def resolve_producers(
+        self, target_spec: "ShardingSpec", target_rank: int, dim: int = 0
+    ) -> List[int]:
+        """
+        Determine which source ranks produce data that overlaps with target_rank's shard.
+        """
+        source_world = self.mesh.size if self.mesh else 1
+        target_world = target_spec.mesh.size if target_spec.mesh else 1
 
-        if self.mesh is None:
-            return None
+        if (
+            getattr(self.strategy, "routing_paradigm", None) != RoutingParadigm.STATIC
+            or getattr(target_spec.strategy, "routing_paradigm", None)
+            != RoutingParadigm.STATIC
+        ):
+            return list(range(source_world))
 
-        if not self.partitions or dim not in self.partitions:
-            return backend.arange(0, local_dim_size, dtype=backend.int32())
+        if not isinstance(self.strategy, ChunkPartition) or not isinstance(
+            target_spec.strategy, ChunkPartition
+        ):
+            return list(range(source_world))
 
-        coords = self.mesh.get_coordinate(rank)
-        sub_coords = []
-        sub_sizes = []
-        for ax in self.partitions[dim]:
-            axis_idx = self.mesh.axis_names.index(ax)
-            sub_coords.append(coords[axis_idx])
-            sub_sizes.append(self.mesh.shape[axis_idx])
-        effective_rank = _ravel_multi_index(sub_coords, sub_sizes)
-        start = effective_rank * local_dim_size
-        return backend.arange(start, start + local_dim_size, dtype=backend.int32())
+        scale = max(source_world, target_world)
+        dummy_dim_size = 1024 * scale
+
+        source_layout = self._to_layout((dummy_dim_size,))
+        target_layout = target_spec._to_layout((dummy_dim_size,))
+
+        t_logic = target_layout.get_shard_rank(target_rank, dim)
+        t_ews = target_layout.shard_size(dim)
+
+        def get_chunk_bounds(rank, world_size, dim_size):
+            chunk_size = max((dim_size + world_size - 1) // world_size, 1)
+            start = rank * chunk_size
+            end = min(start + chunk_size, dim_size)
+            return start, end
+
+        if t_ews <= 1:
+            t_start, t_end = 0, dummy_dim_size
+        else:
+            t_start, t_end = get_chunk_bounds(t_logic, t_ews, dummy_dim_size)
+
+        if t_start >= t_end:
+            return []
+
+        producers = []
+        s_ews = source_layout.shard_size(dim)
+        for sr in range(source_world):
+            if s_ews <= 1:
+                s_start, s_end = 0, dummy_dim_size
+            else:
+                s_logic = source_layout.get_shard_rank(sr, dim)
+                s_start, s_end = get_chunk_bounds(s_logic, s_ews, dummy_dim_size)
+
+            if s_start < s_end and max(t_start, s_start) < min(t_end, s_end):
+                producers.append(sr)
+
+        return sorted(set(producers))
+
+    def resolve_consumers(
+        self, target_spec: "ShardingSpec", source_rank: int, dim: int = 0
+    ) -> List[int]:
+        """
+        Determine which target ranks consume data produced by source_rank's shard.
+        """
+        source_world = self.mesh.size if self.mesh else 1
+        target_world = target_spec.mesh.size if target_spec.mesh else 1
+
+        if (
+            getattr(self.strategy, "routing_paradigm", None) != RoutingParadigm.STATIC
+            or getattr(target_spec.strategy, "routing_paradigm", None)
+            != RoutingParadigm.STATIC
+        ):
+            return list(range(target_world))
+
+        if not isinstance(self.strategy, ChunkPartition) or not isinstance(
+            target_spec.strategy, ChunkPartition
+        ):
+            return list(range(target_world))
+
+        scale = max(source_world, target_world)
+        dummy_dim_size = 1024 * scale
+
+        source_layout = self._to_layout((dummy_dim_size,))
+        target_layout = target_spec._to_layout((dummy_dim_size,))
+
+        s_logic = source_layout.get_shard_rank(source_rank, dim)
+        s_ews = source_layout.shard_size(dim)
+
+        def get_chunk_bounds(rank, world_size, dim_size):
+            chunk_size = max((dim_size + world_size - 1) // world_size, 1)
+            start = rank * chunk_size
+            end = min(start + chunk_size, dim_size)
+            return start, end
+
+        if s_ews <= 1:
+            s_start, s_end = 0, dummy_dim_size
+        else:
+            s_start, s_end = get_chunk_bounds(s_logic, s_ews, dummy_dim_size)
+
+        if s_start >= s_end:
+            return []
+
+        consumers = []
+        t_ews = target_layout.shard_size(dim)
+        for tr in range(target_world):
+            if t_ews <= 1:
+                t_start, t_end = 0, dummy_dim_size
+            else:
+                t_logic = target_layout.get_shard_rank(tr, dim)
+                t_start, t_end = get_chunk_bounds(t_logic, t_ews, dummy_dim_size)
+
+            if t_start < t_end and max(t_start, s_start) < min(t_end, s_end):
+                consumers.append(tr)
+
+        return sorted(set(consumers))
 
     # ---- Factory Methods ----
 

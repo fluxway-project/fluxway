@@ -24,7 +24,7 @@ try:
 except ImportError:
     RAY_AVAILABLE = False
 
-from ...common.types import SPMDConfig
+from fluxway.common.types import SPMDConfig
 
 logger = logging.getLogger(__name__)
 
@@ -352,7 +352,7 @@ class SPMDManager:
                 if source not in self._reverse_topology[target]:
                     self._reverse_topology[target].append(source)
 
-        logger.info(f"Established topology with {len(topology)} SPMDs")
+        logger.debug(f"Established topology with {len(topology)} SPMDs")
 
         # Notify existing drivers of topology update
         if RAY_AVAILABLE:

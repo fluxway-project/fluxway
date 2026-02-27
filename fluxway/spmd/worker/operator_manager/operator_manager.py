@@ -17,6 +17,7 @@ import inspect
 
 from fluxway.common.types.configs import ArgumentType
 from fluxway.common.types.sharding import ShardingSpec
+from fluxway.common.types import EdgeShardingInfo
 from fluxway.common.mesh import DeviceMesh
 
 if TYPE_CHECKING:
@@ -38,7 +39,8 @@ class SPMDTopologyInfo:
     """
 
     spmd_id: str
-    total_rank: int = 1
+    world_size: int = 1
+
     mesh: Optional[DeviceMesh] = None
     # Tensor sharding: {tensor_name: ShardingSpec}
     tensor_sharding: Dict[str, ShardingSpec] = field(default_factory=dict)
@@ -74,12 +76,12 @@ class OperatorManager:
         self._config = config  # Store config for explicit meta access
         self._mesh = config.mesh  # DeviceMesh from config
         self._rank = rank
-        self._total_rank = config.num_workers
+        self._world_size = config.num_workers
         self._spmd_id = spmd_id
 
         # Register operators
         # Register operators dynamically from config
-        self._operators: Dict[str, Optional[Callable]] = config.operators
+        self._operators: Dict[str, Callable] = config.operators
 
         # Initialize per-operator dictionaries
         self._input_sharding: Dict[str, Dict[str, ShardingSpec]] = {}
@@ -197,7 +199,12 @@ class OperatorManager:
             for pre_spmd_id, edge_info_list in meta.input_pre_sharding.items():
                 merged_sharding: Dict[str, ShardingSpec] = {}
                 condition_fn = None
-                target_op = None  # Must be provided by EdgeShardingInfo
+                # Default to same op_name if not in EdgeShardingInfo.
+                # This fallback design balances two scenarios:
+                # 1. Graph Mode: Builder usually defines explicit target_op for complex routed edges.
+                # 2. Eager Mode: Lacks full topology compilation, so we use duck-typing routing:
+                #    if a source sends data here, it's implicitly targeting the current op_name.
+                target_op = op_name
                 tensor_map = {}
                 for edge_info in edge_info_list:
                     # Convert raw sharding dicts to ShardingSpec objects if needed
@@ -213,12 +220,12 @@ class OperatorManager:
                     if edge_info.tensor_map:
                         tensor_map.update(edge_info.tensor_map)
 
-                # Infer total_rank from sharding spec's mesh if available
-                total_rank = self._infer_total_rank_from_sharding(merged_sharding)
+                # Infer world_size from sharding spec's mesh if available
+                world_size = self._infer_world_size_from_sharding(merged_sharding)
 
                 self._predecessor_topology[op_name][pre_spmd_id] = SPMDTopologyInfo(
                     spmd_id=pre_spmd_id,
-                    total_rank=total_rank,
+                    world_size=world_size,
                     mesh=self._extract_mesh_from_sharding(merged_sharding),
                     tensor_sharding=merged_sharding,
                     condition_fn=condition_fn,
@@ -232,7 +239,11 @@ class OperatorManager:
             for post_spmd_id, edge_info_list in meta.output_post_sharding.items():
                 merged_sharding: Dict[str, ShardingSpec] = {}
                 condition_fn = None
-                target_op = None  # Must be provided by EdgeShardingInfo
+                # Default to same op_name if not explicitly specified.
+                # As the sender, if the downstream target isn't explicitly defined (e.g., via Builder),
+                # we assume symmetric execution by triggering the identically-named operator on the successor.
+                # This maintains compatibility with both compiled Graph edge mapping and dynamic Eager execution.
+                target_op = op_name
                 tensor_map = {}
                 for edge_info in edge_info_list:
                     # Convert raw sharding dicts to ShardingSpec objects if needed
@@ -248,11 +259,11 @@ class OperatorManager:
                     if edge_info.tensor_map:
                         tensor_map.update(edge_info.tensor_map)
 
-                total_rank = self._infer_total_rank_from_sharding(merged_sharding)
+                world_size = self._infer_world_size_from_sharding(merged_sharding)
 
                 self._successor_topology[op_name][post_spmd_id] = SPMDTopologyInfo(
                     spmd_id=post_spmd_id,
-                    total_rank=total_rank,
+                    world_size=world_size,
                     mesh=self._extract_mesh_from_sharding(merged_sharding),
                     tensor_sharding=merged_sharding,
                     condition_fn=condition_fn,
@@ -315,7 +326,7 @@ class OperatorManager:
             return None
         return getattr(operator, "_flux_operator_meta", None)
 
-    def _infer_total_rank_from_sharding(self, sharding_map: Dict[str, Any]) -> int:
+    def _infer_world_size_from_sharding(self, sharding_map: Dict[str, Any]) -> int:
         """Infer total rank from sharding specs."""
         for spec in sharding_map.values():
             if isinstance(spec, ShardingSpec) and spec.mesh is not None:
@@ -357,35 +368,29 @@ class OperatorManager:
                     from fluxway.common.types.configs import PeriodicBarrierConfig
 
                     n = 1
-                    if isinstance(meta.barrier_config, PeriodicBarrierConfig):
+                    if meta and isinstance(meta.barrier_config, PeriodicBarrierConfig):
                         n = meta.barrier_config.n
                     expected[tensor_name] = n
                     continue
 
                 total_count = 0
                 input_spec = self._input_sharding.get(op_name, {}).get(tensor_name)
-                input_is_dynamic = (
-                    input_spec.is_content_addressable if input_spec else False
-                )
-
                 for pre_spmd_id, pre_info in self._predecessor_topology[
                     op_name
                 ].items():
-                    pre_sharding = pre_info.tensor_sharding.get(tensor_name)
-                    pre_is_dynamic = (
-                        pre_sharding.is_content_addressable if pre_sharding else False
-                    )
+                    # Check if this predecessor actually provides this tensor
+                    # tensor_sharding uses target-side names (after mapping)
+                    if tensor_name not in pre_info.tensor_sharding:
+                        continue
 
-                    if pre_is_dynamic or input_is_dynamic:
-                        # Dynamic involved: expect from all ranks
-                        total_count += pre_info.total_rank
+                    pre_sharding = pre_info.tensor_sharding.get(tensor_name)
+                    if pre_sharding and input_spec:
+                        # Use pure Python analytical resolution
+                        deps = pre_sharding.resolve_producers(input_spec, self._rank)
+                        total_count += len(deps)
                     else:
-                        # Static-to-static topology defaults to expecting shards
-                        # based on layout. Since we removed _input_routing_strategies,
-                        # AsyncDataDistributor fully encapsulates routing, we relax
-                        # expected shards calculation or defer it. For now, fallback to total_rank
-                        # or better logic if required (e.g. geometric overlap).
-                        total_count += pre_info.total_rank
+                        # Full fallback for dynamic/unknown cases
+                        total_count += pre_info.world_size
 
                 expected[tensor_name] = total_count
 
@@ -498,7 +503,7 @@ class OperatorManager:
         from fluxway.common.types.configs import BarrierType
 
         meta = self._get_operator_metadata(op_name)
-        if not meta:
+        if not meta or not getattr(meta, "barrier_config", None):
             return False
         return meta.barrier_config.type == BarrierType.PERIODIC
 
@@ -512,23 +517,41 @@ class OperatorManager:
 
     def is_source_operator(self, op_name: str) -> bool:
         """
-        Check if an operator is a source operator.
-        A source operator:
-        1. Has 0 expected tensor inputs.
-        2. Has 0 predecessor SPMDs in the graph.
+        Check if an operator is a source operator (data producer).
+        A source operator is identified by:
+        1. Explicit metadata: @operator(..., is_source=True)
+        2. Graph topology: Has no predecessor SPMDs AND no incoming tensor arguments.
+
+        Note: Source operators can still have static/state arguments (e.g., from Driver),
+        but they do not depend on other operators for execution triggers.
         """
+        meta = self._get_operator_metadata(op_name)
+        if meta is None:
+            return False
+
+        # 1. Respect explicit user marking if available
+        if meta.is_source is True:
+            # Strong validation: A source should not have tensor inputs from other nodes
+            pred_ids = self.get_predecessor_ids(op_name)
+            if pred_ids:
+                logger.warning(
+                    f"[Fluxway Operator Warning] Operator '{op_name}' is explicitly marked as 'is_source=True', "
+                    f"but it has predecessor SPMDs: {pred_ids}. This might indicate a graph configuration error."
+                )
+            return True
+
+        if meta.is_source is False:
+            return False
+
+        # 2. Automated Inference (when meta.is_source is None)
         tensor_names = self.get_expected_tensor_names(op_name)
         pred_ids = self.get_predecessor_ids(op_name)
 
         has_no_tensors = len(tensor_names) == 0
         has_no_predecessors = len(pred_ids) == 0
 
+        # Heuristic: No upstream dependency implies it's a source (e.g., Reader or standalone op)
         is_source = has_no_tensors and has_no_predecessors
-
-        if op_name in ["read", "process"]:
-            logger.info(
-                f"[OperatorManager] op={op_name} is_source={is_source}: has_no_tensors={has_no_tensors} ({tensor_names}), has_no_predecessors={has_no_predecessors} ({pred_ids})"
-            )
 
         return is_source
 
@@ -581,6 +604,42 @@ class OperatorManager:
         """Get predecessor topology info for an operator."""
         return dict(self._predecessor_topology.get(op_name, {}))
 
+    def get_all_input_pre_sharding(
+        self, op_name: str
+    ) -> Dict[str, List[EdgeShardingInfo]]:
+        """
+        Get all input pre-sharding strategies for an operator.
+        Returns a map from predecessor spmd_id to a list of EdgeShardingInfo.
+        """
+        meta = self._get_operator_metadata(op_name)
+        if not meta:
+            return {}
+        return dict(meta.input_pre_sharding)
+
+    def get_edge_input_sharding_strategies(
+        self, op_name: str, spmd_id: str
+    ) -> List[EdgeShardingInfo]:
+        """
+        Get input sharding strategies for a specific incoming edge.
+        """
+        meta = self._get_operator_metadata(op_name)
+        if not meta:
+            return []
+        return meta.input_pre_sharding.get(spmd_id, [])
+
+    def get_tensor_input_sharding_spec(
+        self, op_name: str, spmd_id: str, tensor_name: str
+    ) -> Optional[ShardingSpec]:
+        """
+        Resolve the ShardingSpec for a specific tensor coming from a specific predecessor.
+        Uses the pre-parsed predecessor topology which already contains normalized ShardingSpecs.
+        """
+        pre_info = self.get_predecessor_info(op_name, spmd_id)
+        if not pre_info:
+            return None
+
+        return pre_info.tensor_sharding.get(tensor_name)
+
     # =========================================================================
     # Sharding Query
     # =========================================================================
@@ -592,9 +651,12 @@ class OperatorManager:
         for all fields identified in output_arguments.
         """
         meta = self._get_operator_metadata(op_name)
+        explicit_sharding = {}
+        if not meta:
+            return explicit_sharding
+
         from fluxway.common.types.sharding import ShardingConfig, ShardingSpec
 
-        explicit_sharding = {}
         if meta.output_sharding:
             for name, spec_dict in meta.output_sharding.items():
                 if isinstance(spec_dict, dict):
@@ -660,18 +722,18 @@ class OperatorManager:
     # Execution
     # =========================================================================
 
-    def execute(self, op_name: str, input_data: Any) -> Any:
+    def execute(self, op_name: str, *args, **kwargs) -> Any:
         """
         Execute an operator.
 
         Args:
             op_name: Operator name to execute
-            input_data: Assembled input data (already constructed as data_type object)
+            *args, **kwargs: Assembled input data (can be data_type object or kwargs)
 
         Returns:
             Operator output
         """
-        from ....common.decorators import operator_context
+        from fluxway.common.decorators import operator_context
 
         operator = self._operators.get(op_name)
         if operator is None:
@@ -682,11 +744,11 @@ class OperatorManager:
             with operator_context(
                 static_args=self._static_args,
                 rank=self._rank,
-                world_size=self._total_rank,
+                world_size=self._world_size,
             ):
                 if self.is_source_operator(op_name):
                     return operator()
-                return operator(input_data)
+                return operator(*args, **kwargs)
         except Exception as e:
             logger.error(f"Execution failed for {op_name}: {e}")
             raise

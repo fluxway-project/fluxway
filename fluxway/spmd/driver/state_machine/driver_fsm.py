@@ -18,7 +18,7 @@ import logging
 import threading
 from typing import TYPE_CHECKING, Callable, Dict, Optional
 
-from ....common.types import DriverState, DriverEvent
+from fluxway.common.types import DriverState, DriverEvent
 
 if TYPE_CHECKING:
     from ..driver import SPMDDriver
@@ -116,7 +116,7 @@ class DriverStateMachine:
                 rank = kwargs.get("rank")
                 if rank is not None and rank in self._error_workers:
                     del self._error_workers[rank]
-                logger.info(f"Worker {rank} recovered in SPMD {self._driver.spmd_id}")
+                logger.debug(f"Worker {rank} recovered in SPMD {self._driver.spmd_id}")
 
             elif event == DriverEvent.INIT_FAILED:
                 error = kwargs.get("error", "Initialization failed")
@@ -126,7 +126,7 @@ class DriverStateMachine:
             # Perform state transition
             old_state = self._state
             self._state = next_state
-            logger.info(
+            logger.debug(
                 f"SPMD {self._driver.spmd_id} state transition: "
                 f"{old_state} -> {next_state} (event: {event})"
             )
@@ -181,11 +181,11 @@ class DriverStateMachine:
         Note: Heartbeat is already started in initialize() (before READY),
         so we do NOT call _start_heartbeat() here.
         """
-        logger.info(f"SPMD {self._driver.spmd_id} is ready")
+        logger.debug(f"SPMD {self._driver.spmd_id} is ready")
 
     def _on_enter_running(self) -> None:
         """Called when entering RUNNING state."""
-        logger.info(f"SPMD {self._driver.spmd_id} is running")
+        logger.debug(f"SPMD {self._driver.spmd_id} is running")
 
     def _on_enter_blocked(self) -> None:
         """Called when entering BLOCKED state."""
@@ -211,7 +211,7 @@ class DriverStateMachine:
 
     def _on_enter_completed(self) -> None:
         """Called when entering COMPLETED state."""
-        logger.info(f"SPMD {self._driver.spmd_id} completed")
+        logger.debug(f"SPMD {self._driver.spmd_id} completed")
         # Report completion to controller
         self._driver._report_completion()
 
@@ -227,4 +227,4 @@ class DriverStateMachine:
             self._state = DriverState.INITIALIZING
             self._error_workers.clear()
             self._error_message = None
-        logger.info(f"SPMD {self._driver.spmd_id} state machine reset")
+        logger.debug(f"SPMD {self._driver.spmd_id} state machine reset")

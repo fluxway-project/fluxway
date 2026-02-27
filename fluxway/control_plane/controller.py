@@ -126,7 +126,7 @@ if RAY_AVAILABLE:
             )
             self._paused_readers: set = set()  # Set of paused reader IDs
 
-            logger.info(f"ControllerActor created with {len(graph.nodes)} nodes")
+            logger.debug(f"ControllerActor created with {len(graph.nodes)} nodes")
 
         def _find_source_nodes(self) -> List[str]:
             """Find nodes with no predecessors (source nodes)."""
@@ -168,6 +168,15 @@ if RAY_AVAILABLE:
                 self_handle = ray.runtime_context.get_runtime_context().current_actor
                 self._spmd_manager.set_controller_handle(self_handle)
 
+                # Assign specific max_steps to each node based on global config and overrides
+                for node_id, node in self._graph.nodes.items():
+                    limit = self._async_step_config.node_max_steps.get(
+                        node_id, self._async_step_config.max_steps
+                    )
+                    if limit is not None:
+                        node.spmd_config.max_steps = limit
+                        logger.debug(f"Assigned max_steps={limit} to node {node_id}")
+
                 # Register SPMDs for heartbeat monitoring
                 for node_name in self._graph.nodes:
                     self._heartbeat_manager.register_spmd(node_name)
@@ -190,7 +199,7 @@ if RAY_AVAILABLE:
                 await self._state_machine.trigger_event(ControllerEvent.INIT_COMPLETE)
 
                 self._initialized = True
-                logger.info(
+                logger.debug(
                     f"Controller initialized with {len(self._graph.nodes)} SPMDs, "
                     f"waiting for drivers to report ready via heartbeat"
                 )
@@ -292,7 +301,7 @@ if RAY_AVAILABLE:
             """Check step differences and apply lock/unlock actions."""
             # 1. Check for completion if max_steps is set
             if self._async_step_manager.is_all_completed():
-                logger.info("All operators reached max_steps, triggering completion")
+                logger.debug("All operators reached max_steps, triggering completion")
                 self._state_machine.transit(ControllerEvent.ALL_DRIVERS_COMPLETED)
                 return
 
@@ -311,7 +320,7 @@ if RAY_AVAILABLE:
             if driver is not None:
                 try:
                     await driver.block_op.remote(op_name)
-                    logger.info(f"Locked {spmd_id} {op_name}")
+                    logger.debug(f"Locked {spmd_id} {op_name}")
                 except Exception as e:
                     logger.error(f"Failed to lock {spmd_id} {op_name}: {e}")
 
@@ -321,7 +330,7 @@ if RAY_AVAILABLE:
             if driver is not None:
                 try:
                     await driver.unblock_op.remote(op_name)
-                    logger.info(f"Unlocked {spmd_id} {op_name}")
+                    logger.debug(f"Unlocked {spmd_id} {op_name}")
                 except Exception as e:
                     logger.error(f"Failed to unlock {spmd_id} {op_name}: {e}")
 
@@ -373,7 +382,7 @@ if RAY_AVAILABLE:
                 try:
                     await driver.pause_reading.remote()
                     self._paused_readers.add(reader_id)
-                    logger.info(f"Paused reader {reader_id} due to backpressure")
+                    logger.debug(f"Paused reader {reader_id} due to backpressure")
                 except Exception as e:
                     logger.error(f"Failed to pause reader {reader_id}: {e}")
 
@@ -389,7 +398,7 @@ if RAY_AVAILABLE:
                 try:
                     await driver.resume_reading.remote()
                     self._paused_readers.discard(reader_id)
-                    logger.info(f"Resumed reader {reader_id}")
+                    logger.debug(f"Resumed reader {reader_id}")
                 except Exception as e:
                     logger.error(f"Failed to resume reader {reader_id}: {e}")
 
@@ -466,7 +475,7 @@ if RAY_AVAILABLE:
             Args:
                 spmd_id: SPMD identifier
             """
-            logger.info(f"SPMD {spmd_id} reported completion")
+            logger.debug(f"SPMD {spmd_id} reported completion")
 
             # Check if all SPMDs are completed
             all_completed = True
@@ -506,7 +515,7 @@ if RAY_AVAILABLE:
 
         async def unblock_all_spmds(self) -> None:
             """Unblock all SPMD operations (called during recovery)."""
-            logger.info("Unblocking all SPMDs")
+            logger.debug("Unblocking all SPMDs")
 
             tasks = []
             for spmd_id in self._spmd_manager.get_all_spmd_ids():
@@ -575,7 +584,7 @@ if RAY_AVAILABLE:
 
             Triggers: PENDING → TOPOLOGY_REGISTERING → _initiate_topology_registration()
             """
-            logger.info(
+            logger.debug(
                 "All drivers are ready (workers_ready=True), triggering topology registration"
             )
             await self._state_machine.trigger_event(ControllerEvent.ALL_DRIVERS_READY)
@@ -585,7 +594,7 @@ if RAY_AVAILABLE:
 
             Triggers: TOPOLOGY_REGISTERING → RUNNING → start heartbeat monitoring
             """
-            logger.info("All workers are running after topology registration")
+            logger.debug("All workers are running after topology registration")
             await self._state_machine.trigger_event(
                 ControllerEvent.ALL_SPMDS_TOPOLOGY_READY
             )
@@ -599,7 +608,7 @@ if RAY_AVAILABLE:
 
         async def _on_driver_recovered(self, spmd_id: str) -> None:
             """Callback when a driver recovers."""
-            logger.info(f"Driver {spmd_id} recovered")
+            logger.debug(f"Driver {spmd_id} recovered")
 
             # Check if all error drivers have recovered
             error_spmds = self._state_machine.get_error_spmds()
@@ -647,11 +656,11 @@ if RAY_AVAILABLE:
                         spmd_ids_to_fetch, results, strict=True
                     ):
                         all_worker_handles[spmd_id] = worker_map
-                    logger.info(
+                    logger.debug(
                         f"Collected worker handles for: {list(all_worker_handles.keys())}"
                     )
                     for sid, handles in all_worker_handles.items():
-                        logger.info(f"  - {sid}: {len(handles)} workers")
+                        logger.debug(f"  - {sid}: {len(handles)} workers")
                 except Exception as e:
                     logger.error(f"Failed to collect worker handles for topology: {e}")
                     return
@@ -665,7 +674,7 @@ if RAY_AVAILABLE:
                 predecessors = self._spmd_manager.get_predecessors(spmd_id)
                 successors = self._spmd_manager.get_successors(spmd_id)
 
-                logger.info(
+                logger.debug(
                     f"Driver {spmd_id}: predecessors={predecessors}, successors={successors}"
                 )
 
@@ -681,15 +690,15 @@ if RAY_AVAILABLE:
                     if s in all_worker_handles
                 }
 
-                logger.info(f"  - pred_handlers keys: {list(pred_handlers.keys())}")
-                logger.info(f"  - succ_handlers keys: {list(succ_handlers.keys())}")
+                logger.debug(f"  - pred_handlers keys: {list(pred_handlers.keys())}")
+                logger.debug(f"  - succ_handlers keys: {list(succ_handlers.keys())}")
 
                 try:
                     # Now call register_topology with ACTUAL handles, bypassing the need for drivers to fetch them
                     driver.register_topology.remote(
                         pred_handlers, succ_handlers, len(predecessors), len(successors)
                     )
-                    logger.info(f"Initiated topology registration for SPMD {spmd_id}")
+                    logger.debug(f"Initiated topology registration for SPMD {spmd_id}")
                 except Exception as e:
                     logger.error(
                         f"Failed to initiate topology registration for {spmd_id}: {e}"
@@ -701,7 +710,7 @@ if RAY_AVAILABLE:
 
             Called when entering COMPLETED or FAILED state.
             """
-            logger.info("Cleaning up all SPMDs")
+            logger.debug("Cleaning up all SPMDs")
 
             # Stop heartbeat monitoring
             await self._heartbeat_manager.stop_monitoring_async()
@@ -731,7 +740,7 @@ if RAY_AVAILABLE:
             Args:
                 save_checkpoint: Whether to save checkpoint before stopping
             """
-            logger.info("Stopping controller")
+            logger.debug("Stopping controller")
 
             # Block all SPMDs first
             await self.block_all_spmds()
@@ -743,7 +752,7 @@ if RAY_AVAILABLE:
             # Cleanup
             await self._cleanup_all_spmds()
 
-            logger.info("Controller stopped")
+            logger.debug("Controller stopped")
 
         async def get_cluster_status(self) -> Dict[str, str]:
             """

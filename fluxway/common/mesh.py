@@ -151,6 +151,14 @@ class DeviceMesh:
     def __repr__(self) -> str:
         return f"DeviceMesh(shape={self.shape}, axis_names={self.axis_names})"
 
+    def __hash__(self):
+        return hash((self.shape, self.axis_names))
+
+    def __eq__(self, other):
+        if not isinstance(other, DeviceMesh):
+            return False
+        return self.shape == other.shape and self.axis_names == other.axis_names
+
     def to_backend_mesh(self, backend_engine: Any = None):
         """Convert to the mesh representation of the corresponding backend framework (e.g. JAX Mesh or PyTorch DeviceMesh)."""
         raise NotImplementedError("Backend conversion not implemented yet.")

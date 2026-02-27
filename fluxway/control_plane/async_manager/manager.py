@@ -17,7 +17,7 @@ import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
-from ...common.types import AsyncStepConfig, Graph, SPMDOpStep, OpLockState
+from fluxway.common.types import AsyncStepConfig, Graph, SPMDOpStep, OpLockState
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +145,7 @@ class AsyncStepManager:
                     continue
 
                 # Get allowed step difference from target operator
-                limit = self._config.default_max_drift
+                limit = self._config.default_max_inflight_steps
                 target_node_obj = self._graph.nodes.get(target)
                 if target_node_obj:
                     target_meta = target_node_obj.spmd_config.operator_metas.get(
@@ -216,13 +216,13 @@ class AsyncStepManager:
         self._lock_states[key] = OpLockState(
             spmd_id=spmd_id, op_name=op_name, locked_at=timestamp, reason=reason
         )
-        logger.info(f"Locked {spmd_id} {op_name}: {reason}")
+        logger.debug(f"Locked {spmd_id} {op_name}: {reason}")
 
     def _clear_locked(self, spmd_id: str, op_name: str) -> None:
         """Clear op lock (must hold lock)."""
         key = (spmd_id, op_name)
         self._lock_states.pop(key, None)
-        logger.info(f"Unlocked {spmd_id} {op_name}")
+        logger.debug(f"Unlocked {spmd_id} {op_name}")
 
     def _can_unlock(self, spmd_id: str, op_name: str, current_time: float) -> bool:
         """Check if an op can be unlocked (must hold lock)."""

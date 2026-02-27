@@ -86,6 +86,10 @@ class TensorBackend(ABC):
         pass
 
     @abstractmethod
+    def dtype(self, tensor: Any) -> Any:
+        pass
+
+    @abstractmethod
     def shape(self, tensor: Any) -> Any:
         pass
 
@@ -252,6 +256,14 @@ class TensorBackend(ABC):
         """
         pass
 
+    @abstractmethod
+    def index_update(self, x: Any, indices: Any, values: Any) -> Any:
+        """
+        Perform indexed update: x[indices] = values.
+        Returns the updated tensor (may be in-place for some backends).
+        """
+        pass
+
 
 class TorchBackend(TensorBackend):
     def __init__(self):
@@ -308,6 +320,9 @@ class TorchBackend(TensorBackend):
     def is_scalar(self, obj: Any) -> bool:
         return self._torch.is_tensor(obj) and obj.ndim == 0
 
+    def dtype(self, tensor: Any) -> Any:
+        return tensor.dtype
+
     def shape(self, tensor: Any) -> Any:
         return tensor.shape
 
@@ -318,15 +333,16 @@ class TorchBackend(TensorBackend):
         return self._torch.reshape(x, shape)
 
     def unravel_index(self, indices: Any, shape: Tuple[int, ...]) -> Any:
-        return self._torch.unravel_index(indices, shape)
-
-        # Fallback implementation
-        res = []
-        curr = indices
-        for dim in reversed(shape):
-            res.append(curr % dim)
-            curr = curr // dim
-        return tuple(reversed(res))
+        try:
+            return self._torch.unravel_index(indices, shape)
+        except AttributeError:
+            # Fallback implementation for older PyTorch versions (< 1.10)
+            res = []
+            curr = indices
+            for dim in reversed(shape):
+                res.append(curr % dim)
+                curr = curr // dim
+            return tuple(reversed(res))
 
     def floor_divide(self, x: Any, y: Any) -> Any:
         return self._torch.floor_divide(x, y)
@@ -507,6 +523,10 @@ class TorchBackend(TensorBackend):
 
         return DLPackObject(to_dlpack(sliced_tensor), device=device_tuple)
 
+    def index_update(self, x: Any, indices: Any, values: Any) -> Any:
+        x[indices] = values
+        return x
+
 
 class JaxBackend(TensorBackend):
     def __init__(self):
@@ -562,6 +582,9 @@ class JaxBackend(TensorBackend):
 
     def is_scalar(self, obj: Any) -> bool:
         return self.is_tensor(obj) and obj.ndim == 0
+
+    def dtype(self, tensor: Any) -> Any:
+        return tensor.dtype
 
     def shape(self, tensor: Any) -> Any:
         return tensor.shape
@@ -714,6 +737,9 @@ class JaxBackend(TensorBackend):
     def get_dlpack_slice(self, tensor: Any, cursor: Optional[Any] = None) -> Any:
         # returns a zero-copy wrapper for JAX
         return JAXViewWrapper(tensor, cursor) if cursor is not None else tensor
+
+    def index_update(self, x: Any, indices: Any, values: Any) -> Any:
+        return x.at[indices].set(values)
 
 
 class JAXViewWrapper:

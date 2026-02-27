@@ -31,7 +31,6 @@ def test_static_to_static():
         src_spec=src_spec, dst_spec=dst_spec, data_shape=(100,), local_rank=0
     )
 
-    assert plan.dim == 0
     assert plan.target_num_workers == 4
 
     counts = plan.send_counts.tolist()

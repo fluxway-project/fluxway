@@ -34,8 +34,8 @@ def test_chunk_layout_dense():
     assert layout.is_static is True
     assert layout.topology_morphology == TopologyMorphology.CONTINUOUS
 
-    indices0 = layout.get_local_indices(0, 0)
-    indices1 = layout.get_local_indices(1, 0)
+    indices0 = layout.get_shard_indices(0, 0)
+    indices1 = layout.get_shard_indices(1, 0)
 
     assert jnp.array_equal(indices0, jnp.arange(0, 50, dtype=jnp.int32))
     assert jnp.array_equal(indices1, jnp.arange(50, 100, dtype=jnp.int32))
@@ -49,8 +49,8 @@ def test_chunk_layout_multidim():
 
     assert layout.partitions[1] == ("x",)
 
-    indices0 = layout.get_local_indices(0, 1)
-    indices1 = layout.get_local_indices(1, 1)
+    indices0 = layout.get_shard_indices(0, 1)
+    indices1 = layout.get_shard_indices(1, 1)
 
     assert jnp.array_equal(indices0, jnp.arange(0, 5, dtype=jnp.int32))
     assert jnp.array_equal(indices1, jnp.arange(5, 10, dtype=jnp.int32))
@@ -63,8 +63,8 @@ def test_chunk_layout_ragged():
     spec = ShardingSpec.chunk(mesh=mesh, partition=P("x"))
     layout = spec._to_layout(data_shape=(2,), topology=RaggedTopology(splits=splits))
 
-    indices0 = layout.get_local_indices(0, 0)
-    indices1 = layout.get_local_indices(1, 0)
+    indices0 = layout.get_shard_indices(0, 0)
+    indices1 = layout.get_shard_indices(1, 0)
 
     assert jnp.array_equal(indices0, jnp.array([0], dtype=jnp.int32))
     assert jnp.array_equal(indices1, jnp.array([1], dtype=jnp.int32))
@@ -79,8 +79,8 @@ def test_cyclic_layout():
     spec = ShardingSpec.cyclic(mesh=mesh, partition=P("x"))
     layout = spec._to_layout(data_shape=(10,))
 
-    indices0 = layout.get_local_indices(0, 0)
-    indices1 = layout.get_local_indices(1, 0)
+    indices0 = layout.get_shard_indices(0, 0)
+    indices1 = layout.get_shard_indices(1, 0)
 
     assert jnp.array_equal(indices0, jnp.arange(0, 10, 2, dtype=jnp.int32))
     assert jnp.array_equal(indices1, jnp.arange(1, 10, 2, dtype=jnp.int32))
@@ -96,9 +96,9 @@ def test_hash_layout_with_topology():
     spec = ShardingSpec.hash(mesh=mesh, partition=P("x"))
     layout = spec._to_layout(data_shape=(2,), topology=RaggedTopology(splits=splits))
 
-    indices0 = layout.get_local_indices(0, 0)
-    indices1 = layout.get_local_indices(1, 0)
-    indices2 = layout.get_local_indices(2, 0)
+    indices0 = layout.get_shard_indices(0, 0)
+    indices1 = layout.get_shard_indices(1, 0)
+    indices2 = layout.get_shard_indices(2, 0)
 
     assert jnp.array_equal(indices0, jnp.array([0], dtype=jnp.int32))
     assert jnp.array_equal(indices1, jnp.array([1], dtype=jnp.int32))
@@ -114,9 +114,9 @@ def test_hash_layout_with_routing_indices():
     spec = ShardingSpec.hash(mesh=mesh, partition=P("x"))
     layout = spec._to_layout(data_shape=(4,), topology=IndexedTopology(indices=dep))
 
-    indices0 = layout.get_local_indices(0, 0)
-    indices1 = layout.get_local_indices(1, 0)
-    indices2 = layout.get_local_indices(2, 0)
+    indices0 = layout.get_shard_indices(0, 0)
+    indices1 = layout.get_shard_indices(1, 0)
+    indices2 = layout.get_shard_indices(2, 0)
 
     assert jnp.array_equal(indices0, jnp.array([1], dtype=jnp.int32))
     assert jnp.array_equal(indices1, jnp.array([2], dtype=jnp.int32))
@@ -135,9 +135,9 @@ def test_hash_layout_with_custom_function():
         data_shape=(4,), topology=CallableTopology(hash_fn=custom_hash)
     )
 
-    indices0 = layout.get_local_indices(0, 0)
-    indices1 = layout.get_local_indices(1, 0)
-    indices2 = layout.get_local_indices(2, 0)
+    indices0 = layout.get_shard_indices(0, 0)
+    indices1 = layout.get_shard_indices(1, 0)
+    indices2 = layout.get_shard_indices(2, 0)
 
     assert jnp.array_equal(indices0, jnp.array([0, 3], dtype=jnp.int32))
     assert jnp.array_equal(indices1, jnp.array([2], dtype=jnp.int32))
@@ -150,9 +150,9 @@ def test_hash_layout_default():
     spec = ShardingSpec.hash(mesh=mesh, partition=P("x"))
     layout = spec._to_layout(data_shape=(6,))
 
-    indices0 = layout.get_local_indices(0, 0)
-    indices1 = layout.get_local_indices(1, 0)
-    indices2 = layout.get_local_indices(2, 0)
+    indices0 = layout.get_shard_indices(0, 0)
+    indices1 = layout.get_shard_indices(1, 0)
+    indices2 = layout.get_shard_indices(2, 0)
 
     assert jnp.array_equal(indices0, jnp.array([0, 3], dtype=jnp.int32))
     assert jnp.array_equal(indices1, jnp.array([1, 4], dtype=jnp.int32))
@@ -169,8 +169,8 @@ def test_greedy_layout():
     spec = ShardingSpec.greedy(mesh=mesh, partition=P("x"))
     layout = spec._to_layout(data_shape=(3,), topology=RaggedTopology(splits=splits))
 
-    indices0 = layout.get_local_indices(0, 0)
-    indices1 = layout.get_local_indices(1, 0)
+    indices0 = layout.get_shard_indices(0, 0)
+    indices1 = layout.get_shard_indices(1, 0)
 
     assert jnp.array_equal(indices0, jnp.array([0, 2], dtype=jnp.int32))
     assert jnp.array_equal(indices1, jnp.array([1], dtype=jnp.int32))
@@ -191,8 +191,8 @@ def test_follow_layout():
     follow_spec = ShardingSpec.follow(src_layout, dim=0)
     follow_layout = follow_spec._to_layout(data_shape=(4,))
 
-    indices0 = follow_layout.get_local_indices(0, 0)
-    indices1 = follow_layout.get_local_indices(1, 0)
+    indices0 = follow_layout.get_shard_indices(0, 0)
+    indices1 = follow_layout.get_shard_indices(1, 0)
 
     assert jnp.array_equal(indices0, jnp.array([0, 2], dtype=jnp.int32))
     assert jnp.array_equal(indices1, jnp.array([1, 3], dtype=jnp.int32))
@@ -214,8 +214,8 @@ def test_derive_from():
 
     layout = val_spec._to_layout(data_shape=(4, 16))
 
-    indices0 = layout.get_local_indices(0, 0)
-    indices1 = layout.get_local_indices(1, 0)
+    indices0 = layout.get_shard_indices(0, 0)
+    indices1 = layout.get_shard_indices(1, 0)
 
     assert jnp.array_equal(indices0, jnp.array([0, 2], dtype=jnp.int32))
     assert jnp.array_equal(indices1, jnp.array([1, 3], dtype=jnp.int32))
@@ -233,10 +233,10 @@ def test_implicit_replication():
     chunk0 = jnp.arange(0, 5, dtype=jnp.int32)
     chunk1 = jnp.arange(5, 10, dtype=jnp.int32)
 
-    assert jnp.array_equal(layout.get_local_indices(0, 0), chunk0)
-    assert jnp.array_equal(layout.get_local_indices(1, 0), chunk0)
-    assert jnp.array_equal(layout.get_local_indices(2, 0), chunk1)
-    assert jnp.array_equal(layout.get_local_indices(3, 0), chunk1)
+    assert jnp.array_equal(layout.get_shard_indices(0, 0), chunk0)
+    assert jnp.array_equal(layout.get_shard_indices(1, 0), chunk0)
+    assert jnp.array_equal(layout.get_shard_indices(2, 0), chunk1)
+    assert jnp.array_equal(layout.get_shard_indices(3, 0), chunk1)
 
     assert layout.replica_axes == ["y"]
     assert layout.replica_size == 2
@@ -252,7 +252,7 @@ def test_multi_axis_chunk_2x3():
     layout = spec._to_layout(data_shape=(12,))
 
     for r in range(6):
-        indices = layout.get_local_indices(r, 0)
+        indices = layout.get_shard_indices(r, 0)
         expected = jnp.arange(r * 2, r * 2 + 2, dtype=jnp.int32)
         assert jnp.array_equal(indices, expected), f"Rank {r}: {indices} != {expected}"
 
@@ -268,11 +268,11 @@ def test_multi_axis_replication():
 
     chunk0 = jnp.arange(0, 2, dtype=jnp.int32)
     for r in [0, 1, 2]:
-        assert jnp.array_equal(layout.get_local_indices(r, 0), chunk0), f"Rank {r}"
+        assert jnp.array_equal(layout.get_shard_indices(r, 0), chunk0), f"Rank {r}"
 
     chunk1 = jnp.arange(2, 4, dtype=jnp.int32)
     for r in [3, 4, 5]:
-        assert jnp.array_equal(layout.get_local_indices(r, 0), chunk1), f"Rank {r}"
+        assert jnp.array_equal(layout.get_shard_indices(r, 0), chunk1), f"Rank {r}"
 
 
 def test_multi_axis_cyclic():
@@ -282,16 +282,16 @@ def test_multi_axis_cyclic():
     layout = spec._to_layout(data_shape=(8,))
 
     assert jnp.array_equal(
-        layout.get_local_indices(0, 0), jnp.array([0, 4], dtype=jnp.int32)
+        layout.get_shard_indices(0, 0), jnp.array([0, 4], dtype=jnp.int32)
     )
     assert jnp.array_equal(
-        layout.get_local_indices(1, 0), jnp.array([1, 5], dtype=jnp.int32)
+        layout.get_shard_indices(1, 0), jnp.array([1, 5], dtype=jnp.int32)
     )
     assert jnp.array_equal(
-        layout.get_local_indices(2, 0), jnp.array([2, 6], dtype=jnp.int32)
+        layout.get_shard_indices(2, 0), jnp.array([2, 6], dtype=jnp.int32)
     )
     assert jnp.array_equal(
-        layout.get_local_indices(3, 0), jnp.array([3, 7], dtype=jnp.int32)
+        layout.get_shard_indices(3, 0), jnp.array([3, 7], dtype=jnp.int32)
     )
 
 
@@ -318,13 +318,13 @@ def test_non_divisible_shard_sizes():
     # chunk size = max((10 + 3 - 1) // 3, 1) = 4
     # r0: 0:4, r1: 4:8, r2: 8:10
     assert jnp.array_equal(
-        layout.get_local_indices(0, 0), jnp.arange(0, 4, dtype=jnp.int32)
+        layout.get_shard_indices(0, 0), jnp.arange(0, 4, dtype=jnp.int32)
     )
     assert jnp.array_equal(
-        layout.get_local_indices(1, 0), jnp.arange(4, 8, dtype=jnp.int32)
+        layout.get_shard_indices(1, 0), jnp.arange(4, 8, dtype=jnp.int32)
     )
     assert jnp.array_equal(
-        layout.get_local_indices(2, 0), jnp.arange(8, 10, dtype=jnp.int32)
+        layout.get_shard_indices(2, 0), jnp.arange(8, 10, dtype=jnp.int32)
     )
 
 
@@ -336,13 +336,13 @@ def test_zero_sized_outputs():
     layout = spec._to_layout(data_shape=(2,))
 
     assert jnp.array_equal(
-        layout.get_local_indices(0, 0), jnp.arange(0, 1, dtype=jnp.int32)
+        layout.get_shard_indices(0, 0), jnp.arange(0, 1, dtype=jnp.int32)
     )
     assert jnp.array_equal(
-        layout.get_local_indices(1, 0), jnp.arange(1, 2, dtype=jnp.int32)
+        layout.get_shard_indices(1, 0), jnp.arange(1, 2, dtype=jnp.int32)
     )
-    assert len(layout.get_local_indices(2, 0)) == 0
-    assert len(layout.get_local_indices(3, 0)) == 0
+    assert len(layout.get_shard_indices(2, 0)) == 0
+    assert len(layout.get_shard_indices(3, 0)) == 0
 
 
 def test_mixed_static_dynamic_strategies():
@@ -353,8 +353,8 @@ def test_mixed_static_dynamic_strategies():
     layout = spec._to_layout(data_shape=(6, 128))
 
     # rank = 0: coords(0, 0), dim 0 routing = 0 (hash)
-    indices0_0 = layout.get_local_indices(0, 0)  # dim 0
-    indices0_1 = layout.get_local_indices(0, 1)  # dim 1
+    indices0_0 = layout.get_shard_indices(0, 0)  # dim 0
+    indices0_1 = layout.get_shard_indices(0, 1)  # dim 1
 
     assert jnp.array_equal(indices0_0, jnp.array([0, 2, 4], dtype=jnp.int32))
     assert jnp.array_equal(indices0_1, jnp.arange(0, 128, dtype=jnp.int32))
@@ -370,10 +370,10 @@ def test_scalar_tensor_empty_partitions():
     assert layout.replica_axes == ["x", "y"]
 
     assert jnp.array_equal(
-        layout.get_local_indices(0, 0), jnp.arange(0, 10, dtype=jnp.int32)
+        layout.get_shard_indices(0, 0), jnp.arange(0, 10, dtype=jnp.int32)
     )
     assert jnp.array_equal(
-        layout.get_local_indices(3, 1), jnp.arange(0, 10, dtype=jnp.int32)
+        layout.get_shard_indices(3, 1), jnp.arange(0, 10, dtype=jnp.int32)
     )
 
 

@@ -1,3 +1,4 @@
+from typing import Any, Type
 import sys
 import os
 import copy
@@ -9,9 +10,15 @@ from fluxway.common.types.configs import SPMDConfig
 from fluxway.common.decorators import spmd, operator
 
 
-@spmd()
+@spmd(mesh_axis_names=("data",), mesh_axis_shapes=(1,))
 class DummySPMD:
     """Mock SPMD for testing graph topology."""
+
+    # Stubs for static analysis
+    @classmethod
+    def get_spmd_config(cls) -> Any: ...
+    @classmethod
+    def get_resource(cls) -> Any: ...
 
     @operator
     def compute(self, *args, **kwargs):
@@ -79,15 +86,38 @@ def _mock_metas():
             input_arguments={},
             output_arguments={},
             # Inject virtual sharding info to trigger Builder's EdgeShardingInfo routing records
-            input_sharding={"dummy_tensor": {"type": "replicated"}},
-            output_sharding={"dummy_tensor": {"type": "replicated"}},
+            # Support arbitrary names for topology testing
+            input_sharding={
+                k: {"type": "replicated"}
+                for k in [
+                    "dummy_tensor",
+                    "input1",
+                    "input2",
+                    "h_obs",
+                    "h_action",
+                    "h_reward",
+                    "h_train",
+                ]
+            },
+            output_sharding={
+                k: {"type": "replicated"}
+                for k in [
+                    "dummy_tensor",
+                    "input1",
+                    "input2",
+                    "h_obs",
+                    "h_action",
+                    "h_reward",
+                    "h_train",
+                ]
+            },
         )
     DummySPMD.get_operator_metas = classmethod(lambda cls: metas)
 
     # Intercept configuration acquisition to ensure Builder gets metas processed by Mock
     orig_get_config = DummySPMD.get_spmd_config
 
-    def mock_get_config(cls):
+    def mock_get_config(cls: Type["DummySPMD"]) -> SPMDConfig:
         config = orig_get_config()
         if config is None:
             config = SPMDConfig()

@@ -12,7 +12,7 @@ Responsibilities:
 
 from typing import Any, Dict, List
 
-from ....common.types import SPMDState
+from fluxway.common.types import SPMDState
 
 
 class StatefulExecutor:
@@ -111,7 +111,7 @@ class StatefulExecutor:
 
         The actual execution is driven by the Worker's mailbox:
         workers begin processing when all expected shards for that (op_name, step)
-        have arrived via receive_shards / receive_states.
+        have arrived via receive_shards / receive_control.
 
         Args:
             op_name: Name of the operator to execute (e.g., "train_step", "rollout")

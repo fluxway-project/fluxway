@@ -1,5 +1,5 @@
 from typing import Any, Callable, Dict, Optional, Type
-from ...common.types.configs import SPMDConfig
+from fluxway.common.types.configs import SPMDConfig
 from .builder import Builder
 
 

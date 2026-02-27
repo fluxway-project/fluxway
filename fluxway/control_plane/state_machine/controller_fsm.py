@@ -19,7 +19,7 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING, Dict
 
-from ...common.types import ControllerState, ControllerEvent
+from fluxway.common.types import ControllerState, ControllerEvent
 
 if TYPE_CHECKING:
     from ..controller import ControllerActor
@@ -138,12 +138,12 @@ class ControllerStateMachine:
                 spmd_id = kwargs.get("spmd_id")
                 if spmd_id and spmd_id in self._error_spmds:
                     del self._error_spmds[spmd_id]
-                logger.info(f"Driver recovered: {spmd_id}")
+                logger.debug(f"Driver recovered: {spmd_id}")
 
             # Perform state transition
             old_state = self._state
             self._state = next_state
-            logger.info(
+            logger.debug(
                 f"State transition: {old_state} -> {next_state} (event: {event})"
             )
 
@@ -196,7 +196,7 @@ class ControllerStateMachine:
         Resources are allocated and SPMDs are started (fire-and-forget).
         Waiting for all drivers to report workers_ready via heartbeat.
         """
-        logger.info(
+        logger.debug(
             "Controller entering PENDING state, waiting for all drivers to report workers_ready"
         )
 
@@ -207,7 +207,7 @@ class ControllerStateMachine:
         Initiates topology registration on all SPMDs (fire-and-forget).
         Workers will auto-start after handler registration.
         """
-        logger.info(
+        logger.debug(
             "Controller entering TOPOLOGY_REGISTERING state, initiating topology registration"
         )
 
@@ -223,12 +223,12 @@ class ControllerStateMachine:
         All workers are running after topology registration.
         Starts heartbeat timeout monitoring.
         """
-        logger.info("Controller entering RUNNING state")
+        logger.debug("Controller entering RUNNING state")
 
         # Start heartbeat timeout monitoring now that system is fully initialized
         try:
             await self._controller._heartbeat_manager.start_monitoring_async()
-            logger.info("Heartbeat timeout monitoring started")
+            logger.debug("Heartbeat timeout monitoring started")
         except Exception as e:
             logger.error(f"Failed to start heartbeat monitoring: {e}")
 
@@ -261,7 +261,7 @@ class ControllerStateMachine:
 
         Reclaims all SPMD resources and performs cleanup.
         """
-        logger.info("Controller entering COMPLETED state")
+        logger.debug("Controller entering COMPLETED state")
 
         try:
             await self._controller._cleanup_all_spmds()
@@ -290,4 +290,4 @@ class ControllerStateMachine:
         async with self._lock:
             self._state = ControllerState.INITIALIZING
             self._error_spmds.clear()
-        logger.info("Controller state machine reset")
+        logger.debug("Controller state machine reset")

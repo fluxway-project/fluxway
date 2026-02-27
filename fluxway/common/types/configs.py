@@ -129,6 +129,10 @@ class SPMDConfig(FluxwayBaseSchema):
     #   - standard operators: output_step = _current_step
     use_global_step_indexing: bool = False
 
+    # Global step limit for the SPMD. If set, source operators will self-terminate
+    # after reaching this step count.
+    max_steps: Optional[int] = None
+
     @property
     def num_workers(self) -> int:
         """Derive world size (total workers) from mesh size."""
@@ -310,6 +314,7 @@ class OperatorMeta(FluxwayBaseSchema):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     name: str
+    is_source: Optional[bool] = None  # Explicitly mark as source (producer)
     priority: int = 0  # Priority for execution order (lower value -> higher priority)
     max_inflight_steps: int = (
         0  # Max steps predecessors can lead (backpressure_threshold)
@@ -682,7 +687,12 @@ class AsyncStepConfig(FluxwayBaseSchema):
     """Configuration for async step difference control."""
 
     max_steps: Optional[int] = None  # Maximum steps to run (global limit)
-    default_max_drift: int = 0  # Maximum generic step difference for flow control
+    node_max_steps: Dict[str, int] = Field(
+        default_factory=dict
+    )  # Per-node step overrides
+    default_max_inflight_steps: int = (
+        0  # Maximum generic step difference for flow control
+    )
     min_lock_duration: float = (
         1.0  # Minimum lock duration (prevent frequent lock/unlock)
     )

@@ -41,6 +41,8 @@ class DenseOutput:
     # Metadata for backward pass (to be used by Self-Loop)
     inv1: TransportTensor
     inv2: TransportTensor
+    emb1_unique: TransportTensor
+    emb2_unique: TransportTensor
 
 
 @data_type()

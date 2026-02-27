@@ -25,7 +25,7 @@ try:
 except ImportError:
     RAY_AVAILABLE = False
 
-from ...common.types import (
+from fluxway.common.types import (
     DriverEvent,
     DriverHeartbeat,
     DriverState,
@@ -35,7 +35,7 @@ from ...common.types import (
     SPMDConfig,
     WorkerHeartbeat,
 )
-from ...common.utils import ensure_logging_configured
+from fluxway.common.utils import ensure_logging_configured
 from .state_machine import DriverStateMachine
 from .synchronizer import SPMDSynchronizer
 from .synchronizer.worker_sync import WorkerSynchronizer
@@ -140,7 +140,7 @@ if RAY_AVAILABLE:
             self._is_paused = False
             self._source_state: Optional[ReaderState] = ReaderState.INITIALIZING
 
-            logger.info(
+            logger.debug(
                 f"[spmd_id={spmd_id}] SPMD Driver initialized: spmd_id={spmd_id}, "
                 f"num_workers={config.num_workers}"
             )
@@ -169,7 +169,7 @@ if RAY_AVAILABLE:
                 True if workers were started successfully
             """
             try:
-                logger.info(
+                logger.debug(
                     f"[spmd_id={self.spmd_id}] Initializing SPMD {self.spmd_id}"
                 )
 
@@ -198,7 +198,7 @@ if RAY_AVAILABLE:
                 # It will be triggered in receive_worker_heartbeat() when
                 # all workers have reported their first heartbeat.
 
-                logger.info(
+                logger.debug(
                     f"[spmd_id={self.spmd_id}] SPMD {self.spmd_id} workers started, "
                     f"waiting for worker heartbeats to confirm readiness"
                 )
@@ -244,7 +244,7 @@ if RAY_AVAILABLE:
                     f"[spmd_id={self.spmd_id}] Started worker {rank} for SPMD {self.spmd_id}"
                 )
 
-            logger.info(
+            logger.debug(
                 f"[spmd_id={self.spmd_id}] Started {len(self._worker_handles)} workers for SPMD {self.spmd_id}"
             )
 
@@ -273,7 +273,7 @@ if RAY_AVAILABLE:
                 predecessor_count: expected predecessor count for workers
                 successor_count: expected successor count for workers
             """
-            logger.info(
+            logger.debug(
                 f"[spmd_id={self.spmd_id}] SPMD {self.spmd_id}: Starting topology registration with "
                 f"{predecessor_count} predecessors, {successor_count} successors"
             )
@@ -296,7 +296,7 @@ if RAY_AVAILABLE:
                     worker.register_successor_handlers.remote(spmd_id, handlers)
                 logger.debug(f"[spmd_id={self.spmd_id}] Registered successor {spmd_id}")
 
-            logger.info(
+            logger.debug(
                 f"[spmd_id={self.spmd_id}] SPMD {self.spmd_id}: Topology registration completed"
             )
 
@@ -312,7 +312,7 @@ if RAY_AVAILABLE:
 
         def stop(self, save_checkpoint: bool = True) -> None:
             """Stop execution."""
-            logger.info(f"[spmd_id={self.spmd_id}] Stopping SPMD {self.spmd_id}")
+            logger.debug(f"[spmd_id={self.spmd_id}] Stopping SPMD {self.spmd_id}")
 
             # Stop heartbeat
             self._stop_heartbeat()
@@ -372,21 +372,21 @@ if RAY_AVAILABLE:
             if not self._workers_ready:
                 if len(self._worker_heartbeat_times) >= self.config.num_workers:
                     self._workers_ready = True
-                    logger.info(
+                    logger.debug(
                         f"[spmd_id={self.spmd_id}] All {self.config.num_workers} workers are ready for SPMD {self.spmd_id}"
                     )
 
                     # Event-driven: trigger INIT_COMPLETE now that all workers are alive
                     if self.state_machine.state == DriverState.INITIALIZING:
                         self.state_machine.trigger(DriverEvent.INIT_COMPLETE)
-                        logger.info(
+                        logger.debug(
                             f"[spmd_id={self.spmd_id}] INIT_COMPLETE triggered by worker heartbeats "
                             f"for SPMD {self.spmd_id}"
                         )
 
             # Check if all workers are running (workers_running)
             if not self._workers_running and self._workers_ready:
-                from ...common.types import WorkerStatus
+                from fluxway.common.types import WorkerStatus
 
                 all_running = all(
                     hb.status == WorkerStatus.RUNNING
@@ -397,14 +397,14 @@ if RAY_AVAILABLE:
                     and len(self._worker_heartbeats) >= self.config.num_workers
                 ):
                     self._workers_running = True
-                    logger.info(
+                    logger.debug(
                         f"[spmd_id={self.spmd_id}] All workers are running for SPMD {self.spmd_id} "
                         f"(topology registration complete)"
                     )
                     # Trigger READY → RUNNING transition
                     if self.state_machine.state == DriverState.READY:
                         self.state_machine.trigger(DriverEvent.START)
-                        logger.info(
+                        logger.debug(
                             f"[spmd_id={self.spmd_id}] START triggered, "
                             f"driver state: READY → RUNNING"
                         )
@@ -525,7 +525,7 @@ if RAY_AVAILABLE:
             self, target_op: str, names: List[str], step: int, values: List[Any]
         ) -> None:
             """
-            Broadcast control_arguments to all workers via receive_states.
+            Broadcast control_arguments to all workers via receive_control.
 
             Args:
                 target_op: Target operator type on the receiving workers
@@ -535,7 +535,7 @@ if RAY_AVAILABLE:
             """
             for rank, worker in self._worker_handles.items():
                 try:
-                    worker.receive_states.remote(target_op, step, names, values)
+                    worker.receive_control.remote(target_op, step, names, values)
                     logger.debug(
                         f"[spmd_id={self.spmd_id}] Broadcasted step {step} control_arguments {names} to worker {rank}"
                     )
@@ -706,7 +706,7 @@ if RAY_AVAILABLE:
             Returns:
                 True if recovery successful
             """
-            logger.info(
+            logger.debug(
                 f"[spmd_id={self.spmd_id}] Attempting to recover worker {rank} in SPMD {self.spmd_id}"
             )
 
@@ -752,7 +752,7 @@ if RAY_AVAILABLE:
                 if self.state_machine.is_running():
                     worker.start.remote()
 
-                logger.info(
+                logger.debug(
                     f"[spmd_id={self.spmd_id}] Successfully recovered worker {rank}"
                 )
                 return True
@@ -847,7 +847,7 @@ if RAY_AVAILABLE:
 
             self._is_paused = True
             self._source_state = ReaderState.PAUSED
-            logger.info(f"[spmd_id={self.spmd_id}] Sources paused due to backpressure")
+            logger.debug(f"[spmd_id={self.spmd_id}] Sources paused due to backpressure")
 
             for worker in self._worker_handles.values():
                 try:
@@ -866,7 +866,7 @@ if RAY_AVAILABLE:
 
             self._is_paused = False
             self._source_state = ReaderState.READING
-            logger.info(f"[spmd_id={self.spmd_id}] Sources resumed")
+            logger.debug(f"[spmd_id={self.spmd_id}] Sources resumed")
 
             for worker in self._worker_handles.values():
                 try:

@@ -1,3 +1,9 @@
+import os
+
+# Force CPU and hide GPUs before any imports (JAX/Ray)
+os.environ["JAX_PLATFORMS"] = "cpu"
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
 import ray
 import asyncio
 import argparse
@@ -5,15 +11,15 @@ from fluxway.control_plane.graph.functional import FunctionalGraph
 from fluxway.control_plane.controller import create_controller
 from fluxway.common.types.configs import AsyncStepConfig
 
-from .input_spmd import InputSPMD
-from .sparse_spmd import SparseEmbeddingSPMD
-from .dense_spmd import DenseSPMD
-from .reader import RecommendationReader
+from fluxway.example.recommendation.input_spmd import InputSPMD
+from fluxway.example.recommendation.sparse_spmd import SparseEmbeddingSPMD
+from fluxway.example.recommendation.dense_spmd import DenseSPMD
+from fluxway.example.recommendation.reader import RecommendationReader
 
 
 async def run_training(args):
     # Set JAX_PLATFORMS=cpu in runtime_env to ensure all Ray actors use CPU
-    runtime_env = {"env_vars": {"JAX_PLATFORMS": "cpu", "CUDA_VISIBLE_DEVICES": "-1"}}
+    runtime_env = {"env_vars": {"JAX_PLATFORMS": "cpu", "CUDA_VISIBLE_DEVICES": ""}}
 
     if not ray.is_initialized():
         ray.init(ignore_reinit_error=True, runtime_env=runtime_env)
@@ -21,20 +27,33 @@ async def run_training(args):
     graph = FunctionalGraph()
 
     # 1. Define Nodes
+    reader = graph.node("TrainingReader", RecommendationReader)
     input_node = graph.node("InputProcessor", InputSPMD)
     table1 = graph.node("EmbeddingTable1", SparseEmbeddingSPMD)
     table2 = graph.node("EmbeddingTable2", SparseEmbeddingSPMD)
     dense = graph.node("DenseLayers", DenseSPMD)
 
+    r"""
+            reader
+              |
+          input_node
+        /     |      \
+      |       |        |
+    table1  table2     |
+      |       |        |
+      ------------------
+              |
+            dense
+    """
+
     # 2. Source Data (Custom Reader)
-    reader = graph.node("TrainingReader", RecommendationReader)
     h_raw = reader.read()
 
     # 3. Forward Pass
     h_proc = input_node.process(h_raw)
 
-    h_emb1 = table1.lookup(unique_ids=h_proc.unique_ids1)
-    h_emb2 = table2.lookup(unique_ids=h_proc.unique_ids2)
+    h_emb1 = table1.lookup(unique_ids=h_proc.unique_ids1).sparse_features
+    h_emb2 = table2.lookup(unique_ids=h_proc.unique_ids2).sparse_features
 
     h_forward = dense.forward(
         emb1=h_emb1, inv1=h_proc.inv1, emb2=h_emb2, inv2=h_proc.inv2
@@ -43,8 +62,8 @@ async def run_training(args):
     # 4. Backward Pass
     h_grads = dense.backward(context=h_forward)
 
-    _ = table1.update(grads=h_grads)
-    _ = table2.update(grads=h_grads)
+    _ = table1.update(grads=h_grads.grad1)
+    _ = table2.update(grads=h_grads.grad2)
 
     # 6. Compile and Start
     task_graph = graph.compile("End-to-End_Training_Flow")

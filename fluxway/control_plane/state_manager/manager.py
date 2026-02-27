@@ -11,7 +11,7 @@ Responsibilities:
 
 from typing import Dict, List, Optional
 
-from ...common.types import GlobalState, SPMDState
+from fluxway.common.types import GlobalState, SPMDState
 
 
 class StateManager:

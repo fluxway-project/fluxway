@@ -22,7 +22,7 @@ try:
 except ImportError:
     RAY_AVAILABLE = False
 
-from ...common.types import (
+from fluxway.common.types import (
     Graph,
     ResourceSpec,
     PlacementPlan,
@@ -112,7 +112,7 @@ class Scheduler:
                 logger.error("Failed to initialize SPMDs")
                 return False
 
-            logger.info(f"Successfully scheduled {len(plan.spmd_placements)} SPMDs")
+            logger.debug(f"Successfully scheduled {len(plan.spmd_placements)} SPMDs")
             return True
 
         except Exception as e:
@@ -169,7 +169,7 @@ class Scheduler:
         if self._spmd_manager is not None:
             topology = self._build_topology(graph)
             self._spmd_manager.establish_topology(topology)
-            logger.info(f"Topology established for {len(topology)} SPMDs")
+            logger.debug(f"Topology established for {len(topology)} SPMDs")
 
     def _generate_plan(self, graph: Graph) -> PlacementPlan:
         """
@@ -329,7 +329,7 @@ class Scheduler:
 
         TODO: Implement shared PG creation
         """
-        logger.info(f"create_shared_pg called for SPMDs {spmd_ids} (not implemented)")
+        logger.debug(f"create_shared_pg called for SPMDs {spmd_ids} (not implemented)")
         return None
 
     def preempt_spmd(self, spmd_id: str, reason: str) -> bool:

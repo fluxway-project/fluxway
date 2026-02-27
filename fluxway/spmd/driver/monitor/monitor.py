@@ -12,7 +12,7 @@ Responsibilities:
 
 from typing import Dict, Optional
 
-from ....common.types import WorkerTelemetry
+from fluxway.common.types import WorkerTelemetry
 
 
 class SPMDMonitor:

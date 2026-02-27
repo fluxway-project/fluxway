@@ -73,7 +73,7 @@ class StepBarrier:
         barrier = self._tensor_barriers.get(name)
         if barrier is not None:
             fired = barrier.arrive()
-            logger.info(
+            logger.debug(
                 f"[StepBarrier] TENSOR ARRIVED: name={name}, count={barrier.count}/{barrier.target}, fired={fired}"
             )
             if self._periodic:
@@ -90,7 +90,7 @@ class StepBarrier:
         barrier = self._state_barriers.get(name)
         if barrier is not None:
             fired = barrier.arrive()
-            logger.info(
+            logger.debug(
                 f"[StepBarrier] STATE ARRIVED: name={name}, count={barrier.count}/{barrier.target}, fired={fired}"
             )
             if self._periodic:

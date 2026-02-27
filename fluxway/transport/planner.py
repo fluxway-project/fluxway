@@ -21,7 +21,6 @@ class TransportPlan:
     sort_indices: Any
     dest_devices: Any
     send_counts: Any
-    dim: int
     target_num_workers: int
     replication_factor: int = 1
     global_indices: Optional[Any] = None
@@ -78,9 +77,12 @@ class TransportPlanner:
         # N-D Native logic extracts the correct dimensionalities implicitly.
         # Default destination dimension 0 is passed to respect returning a legacy single
         # dimension for 1D layout serialization/inspection in tests.
-        routing_dim = (
-            dst_layout.routing_dim if dst_layout.routing_dim is not None else 0
-        )
+        routing_dim = dst_layout.routing_dim
+        if routing_dim is None:
+            if dst_layout.partitions:
+                routing_dim = next(iter(dst_layout.partitions.keys()))
+            else:
+                routing_dim = 0
 
         # Call internal static method (JIT-friendly)
         (
@@ -99,7 +101,7 @@ class TransportPlanner:
             dst_strategy=dst_layout.strategy,
             dst_mesh=dst_layout.mesh,
             dst_partitions=dst_layout.partitions,
-            src_layout_local_indices_fn=src_layout.get_local_indices,
+            src_layout_local_indices_fn=src_layout.get_shard_indices,
             local_rank=local_rank,
         )
 
@@ -107,7 +109,6 @@ class TransportPlanner:
             sort_indices=sort_indices,
             dest_devices=dest_devices,
             send_counts=send_counts,
-            dim=routing_dim,
             target_num_workers=target_num_workers,
             replication_factor=replica_size,
             global_indices=global_indices,
@@ -199,14 +200,15 @@ class TransportPlanner:
 
         # Step 2: Compute target devices across all topological constraints (Cartesian Mapping)
         for d in range(ndim):
-            if not dst_partitions or d not in dst_partitions:
+            if not dst_mesh or not dst_partitions or d not in dst_partitions:
                 continue
 
             is_dynamic_dim = dst_is_content_addressable and (d in routing_dims)
+            base_strategy = dst_strategy if dst_strategy is not None else _CHUNK
             strategy = (
-                dst_strategy
+                base_strategy
                 if is_dynamic_dim
-                else (dst_strategy if not dst_is_content_addressable else _CHUNK)
+                else (base_strategy if not dst_is_content_addressable else _CHUNK)
             )
 
             if d == primary_dim and src_indices is not None:
@@ -235,17 +237,20 @@ class TransportPlanner:
             if not isinstance(unraveled, tuple):
                 unraveled = (unraveled,)
 
-            for ax_idx, coord_tensor in zip(axis_indices, unraveled, strict=False):
-                # Only attempt JAX broadcast reshaping if the coordinate array is pure 1D and we
-                # actually have multiple disjoint partitions mapping independently.
-                # Otherwise, 1D array matches perfectly (e.g., dynamically flattened Payload).
+            for ax_idx, coord_tensor in zip(axis_indices, unraveled, strict=False):  # type: ignore
+                # When a tensor has multiple dimensions (ndim > 1) and we partition different dimensions onto different mesh axes,
+                # we need to combine these 1D coordinate transformations into a single N-D mesh coordinate system.
+                # JAX Array Broadcasting achieves this: if we reshape the coord_tensor for dimension `d` to have size `N` along
+                # dimension `d` and size `1` everywhere else, JAX will automatically broadcast (Cartesian product) them together later.
                 if len(dst_partitions) == 1:
                     mesh_coords[ax_idx] = coord_tensor
                 else:
                     if len(backend.shape(coord_tensor)) == 1:
-                        rs = [1] * ndim
-                        rs[d] = -1
-                        mesh_coords[ax_idx] = backend.reshape(coord_tensor, rs)
+                        new_shape = [1] * ndim
+                        new_shape[d] = -1
+                        mesh_coords[ax_idx] = backend.reshape(
+                            coord_tensor, tuple(new_shape)
+                        )
                     else:
                         mesh_coords[ax_idx] = coord_tensor
 
@@ -295,7 +300,7 @@ class TransportPlanner:
                 )
                 if not isinstance(rep_unraveled, tuple):
                     rep_unraveled = (rep_unraveled,)
-                for ax_id, r_coord in zip(rep_axis_idx, rep_unraveled, strict=False):
+                for ax_id, r_coord in zip(rep_axis_idx, rep_unraveled, strict=False):  # type: ignore
                     expanded_coords[ax_id] = backend.reshape(r_coord, (1, num_replicas))
 
             dest_devices = mesh.coordinate_to_device(tuple(expanded_coords))

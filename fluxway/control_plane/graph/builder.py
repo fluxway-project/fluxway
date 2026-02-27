@@ -15,7 +15,7 @@ Usage:
 from typing import Any, Dict, List, Optional, Callable, Type, Tuple
 import logging
 
-from ...common.types import (
+from fluxway.common.types import (
     Graph,
     Node,
     Edge,
@@ -23,6 +23,7 @@ from ...common.types import (
     EdgeShardingInfo,
     ResourceSpec,
 )
+from fluxway.common.mesh import DeviceMesh
 
 
 logger = logging.getLogger(__name__)
@@ -41,7 +42,13 @@ class Builder:
         self._edges: List[Edge] = []
         self._spmd_classes: Dict[str, Type] = {}
 
-    def add_node(self, name: str, spmd_class: Type, description: str = "") -> "Builder":
+    def add_node(
+        self,
+        name: str,
+        spmd_class: Type,
+        description: str = "",
+        mesh: Optional[DeviceMesh] = None,
+    ) -> "Builder":
         """
         Add a node to the graph.
 
@@ -49,6 +56,8 @@ class Builder:
             name: Unique identifier for the node
             spmd_class: The SPMD class decorated with @fluxway.spmd
             description: Human-readable description of the node
+            mesh: Optional DeviceMesh override. If provided, it takes precedence
+                  over the mesh defined in the @spmd decorator.
 
         Returns:
             Self for method chaining
@@ -56,6 +65,7 @@ class Builder:
         Raises:
             ValueError: If node with same name already exists
             ValueError: If spmd_class is not decorated with @fluxway.spmd
+            ValueError: If no valid DeviceMesh is found or provided
         """
         if name in self._nodes:
             raise ValueError(f"Node '{name}' already exists in the graph")
@@ -70,6 +80,22 @@ class Builder:
         # Get resource and config from the decorated class
         resource = spmd_class.get_resource()
         spmd_config = spmd_class.get_spmd_config()
+
+        if mesh is not None:
+            spmd_config.mesh = mesh
+
+        if not isinstance(spmd_config.mesh, DeviceMesh):
+            raise ValueError(
+                f"\n[Fluxway Graph Error] Node '{name}' (class '{spmd_class.__name__}') has no valid mesh defined.\n"
+                f"  Every SPMD node in Fluxway must run on a DeviceMesh.\n"
+                f"  Fix: Provide a mesh in @spmd decorator or pass it to add_node().\n\n"
+                f"       @spmd(\n"
+                f'           mesh_axis_names=("data",),\n'
+                f"           mesh_axis_shapes=(4,),\n"
+                f"           ...\n"
+                f"       )\n"
+                f"       class {spmd_class.__name__}:"
+            )
 
         node = Node(
             name=name,
@@ -118,43 +144,40 @@ class Builder:
                              that will be passed to the reader as static_args.
         """
         from ...reader.grain_reader import GrainReader
+        from fluxway.common.mesh import DeviceMesh
 
         reader_cls = reader_class or GrainReader
 
-        # Merge data_source into static_args for the reader instance
-        all_static_args = {**reader_kwargs}
-        if data_source is not None:
-            all_static_args["data_source"] = data_source
-
-        # Handle resource specification
-        resource_spec = None
-        if resource:
-            resource_spec = ResourceSpec(
-                num_cpus=resource.get("num_cpus", 1),
-                num_gpus=resource.get("num_gpus", 0),
-                memory_gb=resource.get("memory_gb", 0.0),
-            )
-
-        # Add as a generic SPMD node
-        self.add_node(name, reader_cls, description)
-
-        # Inject configuration
-        node = self._nodes[name]
-        node.static_args.update(all_static_args)
-        if resource_spec:
-            node.resource = resource_spec
-
-        # Establish parallel execution mesh
-        from ...common.mesh import DeviceMesh
-
+        # 1. Establish parallel execution mesh BEFORE adding node
         if mesh_shape and mesh_axis_names:
-            node.spmd_config.mesh = DeviceMesh(
+            reader_mesh = DeviceMesh(
                 device_shape=mesh_shape, axis_names=mesh_axis_names
             )
         else:
             # Default to flat 1D mesh for simple data parallelism
-            node.spmd_config.mesh = DeviceMesh(
+            reader_mesh = DeviceMesh(
                 device_shape=(num_workers,), axis_names=("worker",)
+            )
+
+        # 2. Add as an SPMD node with the explicitly created mesh
+        # This triggers the mandatory mesh check in add_node
+        self.add_node(name, reader_cls, description, mesh=reader_mesh)
+
+        # 3. Inject additional configuration
+        node = self._nodes[name]
+
+        # Merge data_source into static_args
+        all_static_args = {**reader_kwargs}
+        if data_source is not None:
+            all_static_args["data_source"] = data_source
+        node.static_args.update(all_static_args)
+
+        # Handle resource specification
+        if resource:
+            node.resource = ResourceSpec(
+                num_cpus=resource.get("num_cpus", 1),
+                num_gpus=resource.get("num_gpus", 0),
+                memory_gb=resource.get("memory_gb", 0.0),
             )
 
         return self
@@ -293,60 +316,62 @@ class Builder:
     ) -> None:
         """
         Validate and link operator metadata between two nodes.
-
-        Writes back pre/post sharding info into OperatorMeta so that
-        worker processes can read routing info from SPMDConfig.
+        Refactored into discrete validation and linking phases.
         """
-        src_node = self._nodes[source_node]
-        dst_node = self._nodes[target_node]
+        ctx = f"edge {source_node}.{source_op} -> {target_node}.{target_op}"
+        tensor_map = self._build_tensor_map(source_output, target_input)
 
-        src_cfg = src_node.spmd_config
-        dst_cfg = dst_node.spmd_config
+        # 1. Validation Phase (Strict checks on metadata, IO, and Sharding)
+        src_meta, dst_meta, effective_sharding = self._validate_edge_io(
+            source_node, source_op, target_node, target_op, tensor_map, ctx
+        )
 
-        # 1. Update Topology in SPMDConfig
-        from ...common.types.configs import SPMDTopology, SPMDTopologyInfo
+        # 2. Linking Phase (Update topology and sharding info in SPMDConfigs)
+        self._link_topology(
+            source_node, source_op, target_node, target_op, condition_fn, tensor_map
+        )
+        self._link_sharding(
+            source_node,
+            source_op,
+            target_node,
+            target_op,
+            src_meta,
+            dst_meta,
+            effective_sharding,
+            condition_fn,
+            tensor_map,
+        )
 
-        # Ensure topology entry exists for source op
-        if source_op not in src_cfg.topology:
-            src_cfg.topology[source_op] = SPMDTopology()
-        # Ensure topology entry exists for target op
-        if target_op not in dst_cfg.topology:
-            dst_cfg.topology[target_op] = SPMDTopology()
-
-        # Build tensor map if specified
+    def _build_tensor_map(
+        self, source_output: Optional[str], target_input: Optional[str]
+    ) -> Dict[str, str]:
+        """Build tensor name mapping between source and target."""
         tensor_map = {}
         if source_output and target_input:
             tensor_map[source_output] = target_input
         elif source_output:
-            # If only source_output is specified, we assume it maps to its own name in target
             tensor_map[source_output] = source_output
         elif target_input:
-            # If only target_input is specified, we assume source provides it with the same name
             tensor_map[target_input] = target_input
+        return tensor_map
 
-        # Add successor info to source node
-        if target_node not in src_cfg.topology[source_op].successors:
-            src_cfg.topology[source_op].successors[target_node] = SPMDTopologyInfo(
-                spmd_id=target_node, condition_fn=condition_fn, tensor_map=tensor_map
-            )
-        else:
-            # Merge tensor_map if edge already exists
-            src_cfg.topology[source_op].successors[target_node].tensor_map.update(
-                tensor_map
-            )
+    def _validate_edge_io(
+        self,
+        source_node: str,
+        source_op: str,
+        target_node: str,
+        target_op: str,
+        tensor_map: Dict[str, str],
+        ctx: str,
+    ) -> Tuple[OperatorMeta, OperatorMeta, Dict[str, Any]]:
+        """
+        Unified validation for edge IO.
+        Returns (source_meta, target_meta, { 'src_specs': ..., 'dst_specs': ..., 'src_names': ..., 'dst_names': ... })
+        """
+        src_cfg = self._nodes[source_node].spmd_config
+        dst_cfg = self._nodes[target_node].spmd_config
 
-        # Add predecessor info to target node
-        if source_node not in dst_cfg.topology[target_op].predecessors:
-            dst_cfg.topology[target_op].predecessors[source_node] = SPMDTopologyInfo(
-                spmd_id=source_node, tensor_map=tensor_map
-            )
-        else:
-            # Merge tensor_map if edge already exists
-            dst_cfg.topology[target_op].predecessors[source_node].tensor_map.update(
-                tensor_map
-            )
-
-        ctx = f"edge {source_node}.{source_op} -> {target_node}.{target_op}"
+        # 1. Ensure Metadata Exists
         src_meta = self._ensure_meta_exists(
             source_node, source_op, src_cfg.operator_metas.get(source_op), ctx
         )
@@ -354,7 +379,7 @@ class Builder:
             target_node, target_op, dst_cfg.operator_metas.get(target_op), ctx
         )
 
-        # 1) Validate & update state: src output_state vs dst input_state
+        # 2. Validate State Metadata
         src_cls = self._spmd_classes[source_node]
         src_meta.validate_and_update_state_output_match_dest_input(
             dst_meta=dst_meta,
@@ -363,59 +388,159 @@ class Builder:
             ctx=ctx,
         )
 
-        # 2) Write back pre/post sharding to OperatorMeta
-        src_out = src_meta.output_sharding or {}
-        dst_in = dst_meta.input_sharding or {}
+        # 3. Validate and Extract Sharding Specs
+        from fluxway.common.types.sharding import ShardingConfig
+        from fluxway.common.types.configs import ArgumentType
 
-        # If tensor_map is used, we should only link the specified tensors
-        # If not, we link all overlapping names (default behavior)
+        def to_spec(raw, mesh):
+            if isinstance(raw, dict):
+                return ShardingConfig.model_validate(raw).to_spec(mesh)
+            return raw
+
+        src_out_specs = {
+            k: to_spec(v, src_cfg.mesh)
+            for k, v in (src_meta.output_sharding or {}).items()
+        }
+        dst_in_specs = {
+            k: to_spec(v, dst_cfg.mesh)
+            for k, v in (dst_meta.input_sharding or {}).items()
+        }
+
+        if tensor_map:
+            src_names = list(tensor_map.keys())
+            dst_names = list(tensor_map.values())
+        else:
+            src_args = src_meta.get_arguments(
+                is_output=True, arg_type=ArgumentType.TENSOR
+            )
+            dst_args = dst_meta.get_arguments(
+                is_output=False, arg_type=ArgumentType.TENSOR
+            )
+            src_names = [n for n in src_args if n in dst_args]
+            dst_names = src_names
+
+        for name in src_names:
+            if name not in src_out_specs:
+                raise ValueError(
+                    f"\n[Fluxway Sharding Error] In {ctx}:\n"
+                    f"  Output tensor '{name}' in operator '{source_node}.{source_op}' has no sharding defined.\n"
+                    f"  Fix: Add output_sharding={{'{name}': ...}} to the @operator decorator."
+                )
+
+        for name in dst_names:
+            if name not in dst_in_specs:
+                raise ValueError(
+                    f"\n[Fluxway Sharding Error] In {ctx}:\n"
+                    f"  Input tensor '{name}' in operator '{target_node}.{target_op}' has no sharding defined.\n"
+                    f"  Fix: Add input_sharding={{'{name}': ...}} to the @operator decorator."
+                )
+
+        return (
+            src_meta,
+            dst_meta,
+            {
+                "src_out_specs": src_out_specs,
+                "dst_in_specs": dst_in_specs,
+                "src_names": src_names,
+                "dst_names": dst_names,
+            },
+        )
+
+    def _link_topology(
+        self,
+        source_node: str,
+        source_op: str,
+        target_node: str,
+        target_op: str,
+        condition_fn: Optional[Callable[..., bool]],
+        tensor_map: Dict[str, str],
+    ) -> None:
+        """Link nodes within the SPMDConfig topology dictionaries."""
+        src_cfg = self._nodes[source_node].spmd_config
+        dst_cfg = self._nodes[target_node].spmd_config
+        from fluxway.common.types.configs import SPMDTopology, SPMDTopologyInfo
+
+        # Ensure entries
+        src_cfg.topology.setdefault(source_op, SPMDTopology())
+        dst_cfg.topology.setdefault(target_op, SPMDTopology())
+
+        # Link Successor
+        if target_node not in src_cfg.topology[source_op].successors:
+            src_cfg.topology[source_op].successors[target_node] = SPMDTopologyInfo(
+                spmd_id=target_node, condition_fn=condition_fn, tensor_map=tensor_map
+            )
+        else:
+            src_cfg.topology[source_op].successors[target_node].tensor_map.update(
+                tensor_map
+            )
+
+        # Link Predecessor
+        if source_node not in dst_cfg.topology[target_op].predecessors:
+            dst_cfg.topology[target_op].predecessors[source_node] = SPMDTopologyInfo(
+                spmd_id=source_node, tensor_map=tensor_map
+            )
+        else:
+            dst_cfg.topology[target_op].predecessors[source_node].tensor_map.update(
+                tensor_map
+            )
+
+    def _link_sharding(
+        self,
+        source_node: str,
+        source_op: str,
+        target_node: str,
+        target_op: str,
+        src_meta: OperatorMeta,
+        dst_meta: OperatorMeta,
+        effective_sharding: Dict[str, Any],
+        condition_fn: Optional[Callable[..., bool]],
+        tensor_map: Dict[str, str],
+    ) -> None:
+        """Inject edge sharding information into OperatorMeta objects."""
+        src_out_specs = effective_sharding["src_out_specs"]
+        dst_in_specs = effective_sharding["dst_in_specs"]
+
         if tensor_map:
             effective_src_out = {
-                tensor_map[src_name]: spec
-                for src_name, spec in src_out.items()
-                if src_name in tensor_map
+                target_name: src_out_specs[src_name]
+                for src_name, target_name in tensor_map.items()
             }
             effective_dst_in = {
-                src_name: dst_in[dst_name]
-                for src_name, dst_name in tensor_map.items()
-                if dst_name in dst_in
+                src_name: dst_in_specs[target_name]
+                for src_name, target_name in tensor_map.items()
             }
         else:
-            effective_src_out = src_out
-            effective_dst_in = dst_in
+            src_names = effective_sharding["src_names"]
+            dst_names = effective_sharding["dst_names"]
+            effective_src_out = {n: src_out_specs[n] for n in src_names}
+            effective_dst_in = {n: dst_in_specs[n] for n in dst_names}
+
+        # Source -> Successor Sharding
 
         dst_meta.input_pre_sharding.setdefault(source_node, []).append(
             EdgeShardingInfo(
                 condition_fn=condition_fn,
-                tensor_sharding=dict(effective_src_out) if effective_src_out else {},
+                tensor_sharding=effective_src_out,
                 target_op=target_op,
                 tensor_map=tensor_map,
             )
         )
-        logger.debug(
-            "Builder linked input_pre_sharding: %s.%s <- %s.%s, tensor_keys=%s",
-            target_node,
-            target_op,
-            source_node,
-            source_op,
-            list(effective_src_out.keys()) if effective_src_out else [],
-        )
-
         src_meta.output_post_sharding.setdefault(target_node, []).append(
             EdgeShardingInfo(
                 condition_fn=condition_fn,
-                tensor_sharding=dict(effective_dst_in) if effective_dst_in else {},
+                tensor_sharding=effective_dst_in,
                 target_op=target_op,
                 tensor_map=tensor_map,
             )
         )
+
         logger.debug(
-            "Builder linked output_post_sharding: %s.%s -> %s.%s, tensor_keys=%s",
+            "Builder linked sharding: %s.%s <-> %s.%s, tensor_keys=%s",
             source_node,
             source_op,
             target_node,
             target_op,
-            list(effective_dst_in.keys()) if effective_dst_in else [],
+            list(effective_src_out.keys()),
         )
 
     def build(self, name: str = "") -> Graph:

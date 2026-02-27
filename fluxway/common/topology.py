@@ -1,6 +1,9 @@
+from builtins import slice as python_slice
 from dataclasses import dataclass
 import enum
 from typing import Any, List, Callable
+
+
 from fluxway.common.backend import get_backend
 
 
@@ -17,6 +20,12 @@ class Topology:
 
     @property
     def morphology(self) -> TopologyMorphology:
+        raise NotImplementedError
+
+    def materialize(self) -> Any:
+        raise NotImplementedError
+
+    def slice(self, start: Any, end: Any) -> "Topology":
         raise NotImplementedError
 
 
@@ -54,21 +63,22 @@ class ContinuousTopology(Topology):
             return backend.arange(
                 self.start,
                 self.start + self.step * self.count,
-                step=self.step,
+                self.step,
                 dtype=backend.int32(),
             )
         raise ValueError(f"Cannot materialize pattern={self.pattern}")
 
-    def slice(self, start: int, end: int) -> "ContinuousTopology":
+    def slice(self, start: Any, end: Any) -> "ContinuousTopology":
         """Derive descriptor for a sub-range. O(1) for chunk/cyclic."""
-        size = end - start
+        backend = get_backend()
+        s = int(backend.item(start)) if backend.is_tensor(start) else int(start)
+        e = int(backend.item(end)) if backend.is_tensor(end) else int(end)
+        size = e - s
         if self.pattern == IndexPattern.CONTIGUOUS:
-            return ContinuousTopology(
-                IndexPattern.CONTIGUOUS, self.start + start, 1, size
-            )
+            return ContinuousTopology(IndexPattern.CONTIGUOUS, self.start + s, 1, size)
         elif self.pattern == IndexPattern.STRIDED:
             return ContinuousTopology(
-                IndexPattern.STRIDED, self.start + start * self.step, self.step, size
+                IndexPattern.STRIDED, self.start + s * self.step, self.step, size
             )
         raise ValueError(f"Cannot slice pattern={self.pattern}")
 
@@ -85,7 +95,7 @@ class ContinuousTopology(Topology):
         )
 
     @staticmethod
-    def from_slice(s: slice, size: int) -> "ContinuousTopology":
+    def from_slice(s: python_slice, size: int) -> "ContinuousTopology":
         start = s.start if s.start is not None else 0
         step = s.step if s.step is not None else 1
         stop = s.stop if s.stop is not None else size
@@ -115,6 +125,14 @@ class RaggedTopology(Topology):
     def morphology(self) -> TopologyMorphology:
         return TopologyMorphology.RAGGED
 
+    def materialize(self) -> Any:
+        raise NotImplementedError("RaggedTopology cannot be materialized directly.")
+
+    def slice(self, start: Any, end: Any) -> "RaggedTopology":
+        raise NotImplementedError(
+            "RaggedTopology slice must be handled by TransportTensor."
+        )
+
 
 @dataclass(frozen=True)
 class IndexedTopology(Topology):
@@ -126,6 +144,24 @@ class IndexedTopology(Topology):
     def morphology(self) -> TopologyMorphology:
         return TopologyMorphology.INDEXED
 
+    def materialize(self) -> Any:
+        return self.indices
+
+    def slice(self, start: Any, end: Any) -> "IndexedTopology":
+        backend = get_backend()
+        is_start_static = isinstance(start, int) or backend.is_scalar(start)
+        is_end_static = isinstance(end, int) or backend.is_scalar(end)
+
+        if is_start_static and is_end_static:
+            s = int(start)
+            e = int(end)
+            return IndexedTopology(self.indices[s:e])
+
+        # Tensor path: Avoid JAX tracer concretization errors
+        idx_range = backend.arange(start, end, dtype=backend.int32())
+        sliced_indices = backend.take(self.indices, idx_range)
+        return IndexedTopology(sliced_indices)
+
 
 @dataclass(frozen=True)
 class CallableTopology(Topology):
@@ -136,6 +172,14 @@ class CallableTopology(Topology):
     @property
     def morphology(self) -> TopologyMorphology:
         return TopologyMorphology.INDEXED
+
+    def materialize(self) -> Any:
+        raise NotImplementedError(
+            "CallableTopology cannot be materialized without input."
+        )
+
+    def slice(self, start: Any, end: Any) -> "CallableTopology":
+        raise NotImplementedError("CallableTopology cannot be sliced directly.")
 
 
 try:

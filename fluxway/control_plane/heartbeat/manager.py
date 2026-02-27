@@ -15,7 +15,12 @@ import logging
 import time
 from typing import Awaitable, Callable, Dict, List, Optional, Set, Union
 
-from ...common.types import DriverHeartbeat, DriverStatus, DriverState, HeartbeatConfig
+from fluxway.common.types import (
+    DriverHeartbeat,
+    DriverStatus,
+    DriverState,
+    HeartbeatConfig,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +102,7 @@ class HeartbeatManager:
         """
         self._registered_spmds.add(spmd_id)
         self._missed_counts[spmd_id] = 0
-        logger.info(f"Registered SPMD {spmd_id} for heartbeat monitoring")
+        logger.debug(f"Registered SPMD {spmd_id} for heartbeat monitoring")
 
     def unregister_spmd(self, spmd_id: str) -> None:
         """
@@ -112,7 +117,7 @@ class HeartbeatManager:
         self._heartbeats.pop(spmd_id, None)
         self._missed_counts.pop(spmd_id, None)
         self._error_drivers.discard(spmd_id)
-        logger.info(f"Unregistered SPMD {spmd_id} from heartbeat monitoring")
+        logger.debug(f"Unregistered SPMD {spmd_id} from heartbeat monitoring")
 
     async def receive_heartbeat(self, heartbeat: DriverHeartbeat) -> None:
         """
@@ -135,7 +140,7 @@ class HeartbeatManager:
             was_in_error = spmd_id in self._error_drivers
             if was_in_error and heartbeat.status == DriverStatus.HEALTHY:
                 self._error_drivers.discard(spmd_id)
-                logger.info(f"Driver {spmd_id} recovered from error")
+                logger.debug(f"Driver {spmd_id} recovered from error")
                 # Will call callback outside lock
 
             # Check if driver reported error
@@ -154,7 +159,7 @@ class HeartbeatManager:
                 if self._check_all_ready_internal():
                     self._all_ready_triggered = True
                     should_trigger_ready = True
-                    logger.info("All drivers are ready (workers_ready=True)")
+                    logger.debug("All drivers are ready (workers_ready=True)")
 
             # Check if all workers are running (first time) — Phase 2
             should_trigger_running = False
@@ -162,7 +167,7 @@ class HeartbeatManager:
                 if self._check_all_workers_running_internal():
                     self._all_workers_running_triggered = True
                     should_trigger_running = True
-                    logger.info("All workers are running (workers_running=True)")
+                    logger.debug("All workers are running (workers_running=True)")
 
         # Call callbacks outside lock to prevent deadlock
         if was_in_error and heartbeat.status == DriverStatus.HEALTHY:
@@ -362,7 +367,7 @@ class HeartbeatManager:
                 "No running event loop, monitoring will start when loop runs"
             )
 
-        logger.info("Heartbeat monitoring started")
+        logger.debug("Heartbeat monitoring started")
 
     async def start_monitoring_async(self) -> None:
         """Start the heartbeat monitoring loop (async version)."""
@@ -371,7 +376,7 @@ class HeartbeatManager:
 
         self._monitoring = True
         self._monitor_task = asyncio.create_task(self._monitor_loop())
-        logger.info("Heartbeat monitoring started (async)")
+        logger.debug("Heartbeat monitoring started (async)")
 
     def stop_monitoring(self) -> None:
         """Stop the heartbeat monitoring loop."""
@@ -379,7 +384,7 @@ class HeartbeatManager:
         if self._monitor_task:
             self._monitor_task.cancel()
             self._monitor_task = None
-        logger.info("Heartbeat monitoring stopped")
+        logger.debug("Heartbeat monitoring stopped")
 
     async def stop_monitoring_async(self) -> None:
         """Stop the heartbeat monitoring loop (async version)."""
@@ -391,11 +396,11 @@ class HeartbeatManager:
             except asyncio.CancelledError:
                 pass
             self._monitor_task = None
-        logger.info("Heartbeat monitoring stopped (async)")
+        logger.debug("Heartbeat monitoring stopped (async)")
 
     async def _monitor_loop(self) -> None:
         """Async monitoring loop that checks for heartbeat timeouts."""
-        logger.info("Heartbeat monitor loop started")
+        logger.debug("Heartbeat monitor loop started")
 
         while self._monitoring:
             try:
@@ -407,7 +412,7 @@ class HeartbeatManager:
 
             await asyncio.sleep(self._config.heartbeat_interval)
 
-        logger.info("Heartbeat monitor loop ended")
+        logger.debug("Heartbeat monitor loop ended")
 
     async def _check_heartbeat_timeouts(self) -> None:
         """Check for heartbeat timeouts and trigger callbacks."""

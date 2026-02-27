@@ -38,8 +38,8 @@ def worker_config(mock_mesh):
 
 
 @pytest.mark.asyncio
-async def test_worker_self_receive_tensor(worker_config):
-    """Verify that _self_receive_tensor correctly calls receive_shards with unpacked payloads."""
+async def test_worker_self_receive_data(worker_config):
+    """Verify that _self_receive_data correctly calls receive_shards with unpacked payloads."""
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
     cls = cls.modified_class if cls else SPMDWorker
     worker = cls(worker_config, rank=0)
@@ -49,7 +49,7 @@ async def test_worker_self_receive_tensor(worker_config):
 
     test_tensor = TransportTensor.from_tensor(np.array([1.0, 2.0]))
 
-    await worker._self_receive_tensor(
+    await worker._self_receive_data(
         target_op="op2", name="grad", step=5, tensor=test_tensor
     )
 
@@ -68,19 +68,19 @@ async def test_worker_self_receive_tensor(worker_config):
 
 @pytest.mark.asyncio
 async def test_worker_self_receive_state(worker_config):
-    """Verify that _self_receive_state correctly calls receive_states with wrapped arguments."""
+    """Verify that _self_receive_state correctly calls receive_control with wrapped arguments."""
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
     cls = cls.modified_class if cls else SPMDWorker
     worker = cls(worker_config, rank=0)
 
-    # Mock receive_states
-    worker.receive_states = AsyncMock()
+    # Mock receive_control
+    worker.receive_control = AsyncMock()
 
     await worker._self_receive_state(target_op="update", name="lr", step=10, data=0.01)
 
-    # Verify call signature matches the NEW receive_states signature
-    worker.receive_states.assert_called_once()
-    _, kwargs = worker.receive_states.call_args
+    # Verify call signature matches the NEW receive_control signature
+    worker.receive_control.assert_called_once()
+    _, kwargs = worker.receive_control.call_args
     assert kwargs["op_name"] == "update"
     assert kwargs["step"] == 10
     assert kwargs["names"] == ["lr"]

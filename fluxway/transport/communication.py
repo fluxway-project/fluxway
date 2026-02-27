@@ -28,7 +28,9 @@ class BaseDataDistributor:
         self.local_rank = local_rank
 
     def _ensure_layout(
-        self, spec_or_layout: Union[ShardingSpec, Layout], data_shape: Tuple[int, ...]
+        self,
+        spec_or_layout: Union[ShardingSpec, Layout],
+        data_shape: Optional[Tuple[int, ...]],
     ) -> Layout:
         if isinstance(spec_or_layout, Layout):
             return spec_or_layout
@@ -64,31 +66,31 @@ class BaseDataDistributor:
         else:
             local_shape = tuple(backend.shape(primary.flat_values))
 
-        # Routing indices or implicit inference.
-        src_indices = primary.global_indices
-        if (
-            src_indices is None
-            and isinstance(source, ShardingSpec)
-            and not source.is_content_addressable
-        ):
-            source_routing_dim = (
-                source.routing_dim if source.routing_dim is not None else 0
-            )
-            dim_size = (
-                local_shape[source_routing_dim]
-                if source_routing_dim < len(local_shape)
-                else 0
-            )
-            src_indices = source.get_expected_local_indices(
-                self.local_rank, dim_size, source_routing_dim
-            )
-
         src_shape_arg = (
             None
             if (isinstance(source, ShardingSpec) and source.is_content_addressable)
             else local_shape
         )
         src_layout = self._ensure_layout(source, src_shape_arg)
+
+        # Routing indices or implicit inference.
+        src_indices = primary.global_indices
+        if src_indices is None and not src_layout.is_content_addressable:
+            source_routing_dim = (
+                src_layout.routing_dim if src_layout.routing_dim is not None else 0
+            )
+            if isinstance(source_routing_dim, tuple):
+                source_routing_dim = source_routing_dim[0]
+            dim_size = (
+                local_shape[source_routing_dim]
+                if source_routing_dim < len(local_shape)
+                else 0
+            )
+            effective_rank = src_layout.get_shard_rank(
+                self.local_rank, source_routing_dim
+            )
+            start = effective_rank * dim_size
+            src_indices = backend.arange(start, start + dim_size, dtype=backend.int32())
 
         # For dst layout, prefer explicit global_shape, then src_layout.data_shape.
         dst_shape_arg = (
@@ -175,11 +177,13 @@ class BaseDataDistributor:
             dst_layout.strategy,
             dst_layout.mesh,
             dst_partitions_tuple,
-            src_layout.get_local_indices,
+            src_layout.get_shard_indices,
             self.local_rank,
             dst_routing_values,
             static_shapes_tuple,
         )
+
+        is_dynamic = source.is_content_addressable or target.is_content_addressable
 
         counts_host = backend.to_numpy(valid_counts).flatten()
         is_replicated = replication_factor > 1
@@ -189,7 +193,7 @@ class BaseDataDistributor:
             sorted_dest_host = backend.to_numpy(dest_devices)
             for device_id, count in enumerate(counts_host):
                 count = int(count)
-                if count == 0:
+                if count == 0 and not is_dynamic:
                     continue
 
                 # Fetch target group (from host memory)
@@ -213,7 +217,7 @@ class BaseDataDistributor:
             # Scatter-send
             for device_id, count in enumerate(counts_host):
                 count = int(count)
-                if count == 0:
+                if count == 0 and not is_dynamic:
                     continue
 
                 # Dynamic Payload Assembly (filter out None)

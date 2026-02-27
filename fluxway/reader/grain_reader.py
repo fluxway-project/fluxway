@@ -38,30 +38,19 @@ class GrainReader(BaseReader):
         """
         Constructs the Google Grain DataLoader pipeline.
         """
-        print(
-            f"[GrainReader DEBUG] Starting _create_data_loader for rank {rank}/{world_size}"
-        )
         if grain is None:
             raise ImportError("google-grain not found. Install it to use GrainReader.")
 
-        # 1. Get DataSource
         data_source = static_args.get("data_source")
         if data_source is None:
             raise ValueError("GrainReader requires 'data_source' in static_args.")
-        print(f"[GrainReader DEBUG] Data source length: {len(data_source)}")
 
-        # 2. Create MapDataset
-        print("[GrainReader DEBUG] Creating MapDataset source")
         dataset = grain.MapDataset.source(data_source)
 
-        # 3. Apply Transformations
         transformations = static_args.get("transformations", [])
-        print(f"[GrainReader DEBUG] Applying {len(transformations)} transformations")
         for tx in transformations:
             dataset = dataset.map(tx)
 
-        # 4. Get Sampler (Default to IndexSampler with SPMD sharding)
-        print("[GrainReader DEBUG] Creating IndexSampler")
         sampler = static_args.get("sampler")
         if sampler is None:
             num_records = len(data_source)
@@ -76,30 +65,22 @@ class GrainReader(BaseReader):
                 seed=static_args.get("seed", 42),
                 num_epochs=static_args.get("num_epochs"),
             )
-        print(
-            f"[GrainReader DEBUG] Sampler created, expected records for this rank: {len(sampler)}"
-        )
 
-        # 5. Target output data type
         self._output_type = static_args.get("output_data_type")
 
-        # 6. Build DataLoader
-        print("[GrainReader DEBUG] Building DataLoader")
         self._dataloader = grain.DataLoader(
             data_source=dataset,
             sampler=sampler,
             worker_count=static_args.get("num_threads", 0),
         )
-        print("[GrainReader DEBUG] DataLoader built, creating iterator")
         self._iterator = iter(self._dataloader)
-        print("[GrainReader DEBUG] Iterator created")
 
         logger.info(
             f"[spmd_id={getattr(self, 'spmd_id', 'unknown')}] Grain pipeline initialized. "
             f"Rank {rank}/{world_size} serving {len(sampler)} records."
         )
 
-    @operator("read")
+    @operator("read", is_source=True)
     def read(self) -> Any:
         """
         Produces the next batch from the Grain iterator.

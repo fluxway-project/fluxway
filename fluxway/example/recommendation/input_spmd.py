@@ -5,7 +5,13 @@ from .data_types import RaggedInput, InputNodeOutput
 
 def hash_routing(tensor, mesh):
     """Modulo-based routing for P2P."""
-    return jnp.mod(tensor.flat_values, mesh.size)
+    from fluxway.common.types.tensor import TransportTensor
+
+    if isinstance(tensor, TransportTensor) and tensor.global_indices is not None:
+        val = tensor.global_indices
+    else:
+        val = tensor.flat_values if isinstance(tensor, TransportTensor) else tensor
+    return jnp.mod(val, mesh.size)
 
 
 @spmd(mesh_axis_names=("dp",), mesh_axis_shapes=(2,))
@@ -17,6 +23,10 @@ class InputSPMD:
     @operator(
         name="process",
         data_argument=["feature1", "feature2"],
+        input_sharding={
+            "feature1": {"type": "static", "axis": [0]},
+            "feature2": {"type": "static", "axis": [0]},
+        },
         output_sharding={
             "unique_ids1": {"type": "dynamic", "axis": [0], "fn": "hash_routing"},
             "unique_ids2": {"type": "dynamic", "axis": [0], "fn": "hash_routing"},

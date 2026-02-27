@@ -13,7 +13,7 @@ Responsibilities:
 
 from typing import Any, Dict, List, Optional
 
-from ....common.types import LogicalHandle, ActualHandle, NodeView
+from fluxway.common.types import LogicalHandle, ActualHandle, NodeView
 
 
 class WorkerView:

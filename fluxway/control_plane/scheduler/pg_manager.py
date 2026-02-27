@@ -26,7 +26,7 @@ except ImportError:
     RAY_AVAILABLE = False
     PlacementGroup = Any  # type: ignore
 
-from ...common.types import (
+from fluxway.common.types import (
     ResourceSpec,
     PlacementStrategy,
     ResourcePriority,
@@ -122,7 +122,7 @@ class PGManager:
             self._spmd_to_num_workers[spmd_id] = num_workers
             self._spmd_to_driver_resource[spmd_id] = driver_res
 
-            logger.info(
+            logger.debug(
                 f"Created placement group for SPMD {spmd_id}: "
                 f"driver={driver_res}, worker={resource}, count={num_workers}"
             )
@@ -179,7 +179,7 @@ class PGManager:
         if pg is not None and RAY_AVAILABLE:
             try:
                 remove_placement_group(pg)
-                logger.info(f"Released placement group for SPMD {spmd_id}")
+                logger.debug(f"Released placement group for SPMD {spmd_id}")
             except Exception as e:
                 logger.error(f"Error releasing placement group for {spmd_id}: {e}")
 
