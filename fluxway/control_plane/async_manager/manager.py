@@ -144,22 +144,32 @@ class AsyncStepManager:
                 ):
                     continue
 
+                # Get allowed step difference from target operator
+                limit = self._config.default_max_drift
+                target_node_obj = self._graph.nodes.get(target)
+                if target_node_obj:
+                    target_meta = target_node_obj.spmd_config.operator_metas.get(
+                        target_op
+                    )
+                    if target_meta is not None:
+                        limit = getattr(target_meta, "max_inflight_steps", limit)
+
                 diff = source_step - target_step
 
                 # Check if need to lock source's op
-                if diff > self._config.max_step_diff:
+                if diff > limit:
                     if not self._is_locked(source, source_op):
                         actions.append((source, source_op, True))
                         self._set_locked(
                             source,
                             source_op,
                             current_time,
-                            f"Step diff {diff} > {self._config.max_step_diff} "
+                            f"Step diff {diff} > {limit} "
                             f"(edge: {source}.{source_op} -> {target}.{target_op})",
                         )
 
                 # Check if can unlock (diff within half of max)
-                elif diff <= self._config.max_step_diff // 2:
+                elif diff <= max(1, limit // 2):
                     if self._is_locked(source, source_op):
                         # ONLY unlock if NOT reached max_steps
                         if (

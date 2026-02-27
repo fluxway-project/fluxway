@@ -1,4 +1,3 @@
-import jax
 import jax.numpy as jnp
 from fluxway.common.decorators import spmd, operator
 from fluxway.common.types.tensor import TransportTensor
@@ -34,7 +33,7 @@ class SparseEmbeddingSPMD:
         """
         Receives a dict containing 'unique_ids'.
         """
-        rank = jax.process_index() if hasattr(jax, "process_index") else 0
+        rank = self.rank
         uids = data["unique_ids"]
 
         ids = uids.flat_values

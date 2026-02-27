@@ -61,7 +61,7 @@ def _is_fluxway_data_type(tp: Any) -> bool:
         args = getattr(tp, "__args__", [])
         return any(_is_fluxway_data_type(arg) for arg in args if arg is not type(None))
 
-    return hasattr(tp, "is_fluxway_data") and tp.is_fluxway_data()
+    return getattr(tp, "is_fluxway_data", lambda: False)()
 
 
 def _get_fluxway_streams(tp: Any) -> Tuple[List[str], List[str]]:
@@ -122,6 +122,7 @@ def operator(
     data_argument: Optional[List[str]] = None,
     static_argument: Optional[List[str]] = None,
     periodic_barrier: Optional[int] = None,
+    max_inflight_steps: int = 0,
 ):
     """
     Mark a function as a Fluxway operator with automatic metadata inference.
@@ -235,6 +236,7 @@ def operator(
 
         meta = OperatorMeta(
             name=name,
+            max_inflight_steps=max_inflight_steps,
             input_arguments={
                 ArgumentType.STATE.value: final_states,
                 ArgumentType.TENSOR.value: final_tensors,
@@ -274,12 +276,9 @@ def operator(
 
             # Inject runtime context into the class instance
             ctx = get_current_context()
-            if hasattr(ctx, "static_args"):
-                _local.instance.static_args = ctx.static_args
-            if hasattr(ctx, "rank"):
-                _local.instance.rank = ctx.rank
-            if hasattr(ctx, "world_size"):
-                _local.instance.world_size = ctx.world_size
+            _local.instance.static_args = ctx.static_args
+            _local.instance.rank = ctx.rank
+            _local.instance.world_size = ctx.world_size
 
             return func(_local.instance, *args, **kwargs)
 
@@ -374,8 +373,7 @@ def spmd(
         # Link operators
         for attr_name in dir(cls):
             attr = getattr(cls, attr_name, None)
-            if hasattr(attr, "_flux_set_spmd_class"):
-                attr._flux_set_spmd_class(cls)
+            getattr(attr, "_flux_set_spmd_class", lambda c: None)(cls)
 
         # Standard API
         cls.get_resource = classmethod(lambda c: c._resource)

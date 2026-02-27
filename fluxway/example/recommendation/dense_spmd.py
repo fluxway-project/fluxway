@@ -1,4 +1,3 @@
-import jax
 import jax.numpy as jnp
 from fluxway.common.decorators import spmd, operator
 from fluxway.common.types.tensor import TransportTensor
@@ -28,7 +27,7 @@ class DenseSPMD:
         emb2: LookupOutput,
         inv2: TransportTensor,
     ) -> DenseOutput:
-        rank = jax.process_index() if hasattr(jax, "process_index") else 0
+        rank = self.rank
 
         # O(1) Reconstructions
         f1_rec = emb1.sparse_features.gather(inv1.flat_values)
@@ -48,7 +47,7 @@ class DenseSPMD:
         },
     )
     def backward(self, context: DenseOutput) -> dict:
-        rank = jax.process_index() if hasattr(jax, "process_index") else 0
+        rank = self.rank
         print(f"[DenseSPMD] Worker {rank} Backward starting.")
 
         # Simulate backprop to unique ID space

@@ -46,6 +46,8 @@ class SPMDTopologyInfo:
     condition_fn: Optional[Callable[..., bool]] = None
     # Target op name for cross-op edges (e.g., train_step->update)
     target_op: Optional[str] = None
+    # Map of output tensors to target operator input tensors
+    tensor_map: Dict[str, str] = field(default_factory=dict)
     # Whether this is a self-loop edge (source_node == target_node)
     is_self_loop: bool = False
 
@@ -103,7 +105,7 @@ class OperatorManager:
 
         # Static arguments from config
         self._static_args: Dict[str, Any] = {}
-        if hasattr(config, "static_args") and config.static_args:
+        if config.static_args:
             self._static_args.update(config.static_args)
 
         # Thread lock
@@ -132,7 +134,7 @@ class OperatorManager:
         - predecessor/successor topology from EdgeShardingInfo and config.topology
         """
         # 0. Parse from config.topology first (explicitly set by Builder)
-        if self._config and hasattr(self._config, "topology") and self._config.topology:
+        if self._config and self._config.topology:
             for op_name, top in self._config.topology.items():
                 if op_name not in self._predecessor_topology:
                     self._predecessor_topology[op_name] = {}
@@ -140,6 +142,7 @@ class OperatorManager:
                     self._predecessor_topology[op_name][pred_id] = SPMDTopologyInfo(
                         spmd_id=info.spmd_id,
                         condition_fn=info.condition_fn,
+                        tensor_map=info.tensor_map,
                         is_self_loop=(info.spmd_id == self._spmd_id),
                     )
                 if op_name not in self._successor_topology:
@@ -148,6 +151,7 @@ class OperatorManager:
                     self._successor_topology[op_name][succ_id] = SPMDTopologyInfo(
                         spmd_id=info.spmd_id,
                         condition_fn=info.condition_fn,
+                        tensor_map=info.tensor_map,
                         is_self_loop=(info.spmd_id == self._spmd_id),
                     )
 
@@ -194,6 +198,7 @@ class OperatorManager:
                 merged_sharding: Dict[str, ShardingSpec] = {}
                 condition_fn = None
                 target_op = None  # Must be provided by EdgeShardingInfo
+                tensor_map = {}
                 for edge_info in edge_info_list:
                     # Convert raw sharding dicts to ShardingSpec objects if needed
                     parsed_edge_sharding = self._parse_sharding_specs(
@@ -202,9 +207,11 @@ class OperatorManager:
                     merged_sharding.update(parsed_edge_sharding)
                     if edge_info.condition_fn is not None:
                         condition_fn = edge_info.condition_fn
-                    # Get target_op from EdgeShardingInfo (if available)
-                    if hasattr(edge_info, "target_op"):
+                    # Get target_op and tensor_map from EdgeShardingInfo
+                    if edge_info.target_op:
                         target_op = edge_info.target_op
+                    if edge_info.tensor_map:
+                        tensor_map.update(edge_info.tensor_map)
 
                 # Infer total_rank from sharding spec's mesh if available
                 total_rank = self._infer_total_rank_from_sharding(merged_sharding)
@@ -216,6 +223,7 @@ class OperatorManager:
                     tensor_sharding=merged_sharding,
                     condition_fn=condition_fn,
                     target_op=target_op,
+                    tensor_map=tensor_map,
                     is_self_loop=(pre_spmd_id == self._spmd_id),
                 )
 
@@ -225,6 +233,7 @@ class OperatorManager:
                 merged_sharding: Dict[str, ShardingSpec] = {}
                 condition_fn = None
                 target_op = None  # Must be provided by EdgeShardingInfo
+                tensor_map = {}
                 for edge_info in edge_info_list:
                     # Convert raw sharding dicts to ShardingSpec objects if needed
                     parsed_edge_sharding = self._parse_sharding_specs(
@@ -233,9 +242,11 @@ class OperatorManager:
                     merged_sharding.update(parsed_edge_sharding)
                     if edge_info.condition_fn is not None:
                         condition_fn = edge_info.condition_fn
-                    # Get target_op from EdgeShardingInfo (if available)
-                    if hasattr(edge_info, "target_op"):
+                    # Get target_op and tensor_map from EdgeShardingInfo
+                    if edge_info.target_op:
                         target_op = edge_info.target_op
+                    if edge_info.tensor_map:
+                        tensor_map.update(edge_info.tensor_map)
 
                 total_rank = self._infer_total_rank_from_sharding(merged_sharding)
 
@@ -246,6 +257,7 @@ class OperatorManager:
                     tensor_sharding=merged_sharding,
                     condition_fn=condition_fn,
                     target_op=target_op,
+                    tensor_map=tensor_map,
                     is_self_loop=(post_spmd_id == self._spmd_id),
                 )
 
@@ -342,7 +354,11 @@ class OperatorManager:
             for tensor_name in self._expected_tensor_names.get(op_name, []):
                 # If periodic_trigger is enabled, expect N shards to trigger execution (default N=1)
                 if is_periodic:
-                    n = getattr(meta.barrier_config, "n", 1)
+                    from fluxway.common.types.configs import PeriodicBarrierConfig
+
+                    n = 1
+                    if isinstance(meta.barrier_config, PeriodicBarrierConfig):
+                        n = meta.barrier_config.n
                     expected[tensor_name] = n
                     continue
 

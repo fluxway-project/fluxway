@@ -224,9 +224,7 @@ class SPMDWorker:
             - periodic_barrier=True: output_step = total_rank * current_step + local_rank
             - standard (non-periodic): output_step = current_step
         """
-        use_global_step_indexing = getattr(
-            self.config, "use_global_step_indexing", False
-        )
+        use_global_step_indexing = self.config.use_global_step_indexing
         if not use_global_step_indexing:
             return input_step
         if is_periodic:
@@ -422,6 +420,10 @@ class SPMDWorker:
         # Lazily declare the step barrier on first data arrival
         self._ensure_step_declared(op_name, step)
 
+        logger.info(
+            f"[spmd_id={self.spmd_id} rank={self.rank}] RECEIVED STATES: op={op_name}, step={step}, names={names}"
+        )
+
         # Cache in mailbox — barrier fires on_ready automatically
         await self._mailbox.deposit_states(
             op_name, step=step, names=names, values=values
@@ -471,6 +473,10 @@ class SPMDWorker:
 
         # Lazily declare the step barrier on first data arrival
         self._ensure_step_declared(op_name, step)
+
+        logger.info(
+            f"[spmd_id={self.spmd_id} rank={self.rank}] RECEIVED SHARDS: op={op_name}, step={step}, name={name}, sender={sender_rank}"
+        )
 
         # Cache in mailbox — barrier fires on_ready automatically
         await self._mailbox.deposit_shards(
@@ -770,7 +776,7 @@ class SPMDWorker:
                 logger.debug(
                     f"[spmd_id={self.spmd_id}] periodic_trigger=True: input_step={step}, current_step={current_step}, "
                     f"output_step={output_step}, rank={self.rank}, total_rank={self._total_rank}, "
-                    f"use_global_step_indexing={getattr(self.config, 'use_global_step_indexing', False)}"
+                    f"use_global_step_indexing={self.config.use_global_step_indexing}"
                 )
 
             # Send output
@@ -1169,13 +1175,7 @@ class SPMDWorker:
             return False
 
         # ShardingSpecs like HASH and DYNAMIC require explicit indices
-        partition_type_name = getattr(
-            getattr(target_spec, "partition_type", None), "name", ""
-        )
-        if partition_type_name in ("HASH", "DYNAMIC"):
-            return True
-
-        return False
+        return target_spec.is_content_addressable
 
     async def _send_output(
         self, op_name: str, step: int, result: Any, *, exec_step: Optional[int] = None
@@ -1197,6 +1197,9 @@ class SPMDWorker:
             target_op = succ_info.target_op
 
             for tensor_name, tensor_data in tensors_to_send.items():
+                # Get the actual target name if mapped (e.g., unique_ids1 -> unique_ids)
+                target_tensor_name = succ_info.tensor_map.get(tensor_name, tensor_name)
+
                 # 1. Check if we need to propagate indices to this specific target
                 propagate_indices = self._should_propagate_indices(
                     op_name, spmd_id, tensor_name
@@ -1237,7 +1240,7 @@ class SPMDWorker:
 
                 if succ_info.is_self_loop:
                     await self._self_receive_tensor(
-                        target_op, tensor_name, step, transport_tensor
+                        target_op, target_tensor_name, step, transport_tensor
                     )
                     continue
 
@@ -1279,7 +1282,7 @@ class SPMDWorker:
                     *,
                     _handlers=handlers,
                     _target_op=target_op,
-                    _tensor_name=tensor_name,
+                    _tensor_name=target_tensor_name,
                     _step=step,
                     _is_ragged=transport_tensor.is_ragged,
                 ) -> bool:
@@ -1364,13 +1367,14 @@ class SPMDWorker:
                 names_to_send = []
                 values_to_send = []
                 for state_name, state_value in state_data.items():
+                    target_state_name = succ_info.tensor_map.get(state_name, state_name)
                     if succ_info.is_self_loop:
                         # Self-loop: directly set as static arg
                         await self._self_receive_state(
-                            target_op, state_name, step, state_value
+                            target_op, target_state_name, step, state_value
                         )
                     elif self.rank == 0:
-                        names_to_send.append(state_name)
+                        names_to_send.append(target_state_name)
                         values_to_send.append(state_value)
 
                 if names_to_send:

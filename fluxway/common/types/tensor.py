@@ -373,12 +373,8 @@ class TransportTensor:
         backend = get_backend()
 
         # Check for integer/scalar optimization path
-        is_start_int = isinstance(start, int) or (
-            hasattr(start, "shape") and start.ndim == 0 and hasattr(start, "item")
-        )
-        is_end_int = isinstance(end, int) or (
-            hasattr(end, "shape") and end.ndim == 0 and hasattr(end, "item")
-        )
+        is_start_int = isinstance(start, int) or backend.is_scalar(start)
+        is_end_int = isinstance(end, int) or backend.is_scalar(end)
 
         # Parse static shape
         l0_static = None

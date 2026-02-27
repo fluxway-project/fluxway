@@ -76,10 +76,10 @@ class SPMDHandle:
         if self._driver_handle is None:
             raise RuntimeError(f"Driver handle not set for SPMD {self.spmd_id}")
 
-        if not hasattr(self._driver_handle, method):
+        method_fn = getattr(self._driver_handle, method, None)
+        if method_fn is None:
             raise AttributeError(f"Driver does not have method: {method}")
 
-        method_fn = getattr(self._driver_handle, method)
         return method_fn.remote(*args, **kwargs)
 
 

@@ -98,7 +98,7 @@ if RAY_AVAILABLE:
             self.worker_synchronizer = WorkerSynchronizer(
                 spmd_id=spmd_id,
                 num_workers=config.num_workers,
-                max_worker_step_diff=config.max_async_steps,
+                max_worker_step_skew=config.max_worker_step_skew,
             )
 
             # Existing components

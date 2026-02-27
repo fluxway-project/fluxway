@@ -21,7 +21,7 @@ from fluxway.common.topology import (
 # ============================================================
 
 
-from fluxway.common.types.configs import FluxwayBaseModel, ConfigDict
+from fluxway.common.types.configs import FluxwayBaseSchema, ConfigDict
 from pydantic import Field, model_validator
 
 
@@ -37,7 +37,7 @@ class RoutingParadigm(str, enum.Enum):
 # ============================================================
 
 
-class PartitionSpec(FluxwayBaseModel):
+class PartitionSpec(FluxwayBaseSchema):
     """Maps tensor dimensions to device mesh axes by position."""
 
     model_config = ConfigDict(frozen=True)
@@ -95,7 +95,7 @@ P = PartitionSpec
 # ============================================================
 
 
-class ShardingConfig(FluxwayBaseModel):
+class ShardingConfig(FluxwayBaseSchema):
     """Bridge model to parse user-provided sharding dictionaries."""
 
     sharding_type: str = Field(default="static", alias="type")
@@ -132,7 +132,7 @@ class ShardingConfig(FluxwayBaseModel):
 # ============================================================
 
 
-class PartitionStrategy(FluxwayBaseModel):
+class PartitionStrategy(FluxwayBaseSchema):
     """Base class for partitioning strategies.
 
     Encapsulates core algorithm for determining rank assignments (partitioning logic)
@@ -258,7 +258,7 @@ def _ravel_multi_index(coords, sizes):
     return result
 
 
-class Layout(FluxwayBaseModel):
+class Layout(FluxwayBaseSchema):
     """Data distribution description describing physical placement on a DeviceMesh."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
@@ -399,7 +399,7 @@ class Layout(FluxwayBaseModel):
 # ============================================================
 
 
-class ShardingSpec(FluxwayBaseModel):
+class ShardingSpec(FluxwayBaseSchema):
     """Algebraic partitioning description linking a stragety, mesh, and specific layout."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)

@@ -22,7 +22,6 @@ from ...common.types import (
     OperatorMeta,
     EdgeShardingInfo,
     ResourceSpec,
-    SPMDConfig,
 )
 
 
@@ -62,12 +61,10 @@ class Builder:
             raise ValueError(f"Node '{name}' already exists in the graph")
 
         # Validate that spmd_class is decorated with @fluxway.spmd
-        if (
-            not hasattr(spmd_class, "is_fluxway_spmd")
-            or not spmd_class.is_fluxway_spmd()
-        ):
+        if not getattr(spmd_class, "is_fluxway_spmd", lambda: False)():
             raise ValueError(
-                f"Class '{spmd_class.__name__}' must be decorated with @fluxway.spmd"
+                f"Class '{spmd_class.__name__}' is not a valid Fluxway SPMD. "
+                f"Did you forget to add the @spmd decorator?"
             )
 
         # Get resource and config from the decorated class
@@ -93,59 +90,72 @@ class Builder:
     def add_reader(
         self,
         name: str,
-        src_dir: str,
-        data_type: str = "json",
-        batch_size: int = 1000,
-        file_pattern: str = "*",
+        data_source: Any = None,
+        reader_class: Optional[Type] = None,
         num_workers: int = 1,
+        mesh_shape: Optional[Tuple[int, ...]] = None,
+        mesh_axis_names: Optional[Tuple[str, ...]] = None,
         resource: Optional[Dict[str, Any]] = None,
         description: str = "",
-        reader_class: Optional[Type] = None,
-        **static_args: Any,
+        **reader_kwargs: Any,
     ) -> "Builder":
         """
-        Add a Reader node to the graph.
+        Add a Reader node to the graph with a generic data source.
 
-        Reader nodes are now generic SPMD nodes that use a Reader class.
+        This is the modern, source-driven API for adding data input nodes.
+        It defaults to GrainReader which uses Google Grain for distributed loading.
+
+        Args:
+            name: Unique name for the reader node
+            data_source: The underlying data source object (e.g., Grain DataSource)
+            reader_class: Custom reader class (defaults to GrainReader)
+            num_workers: Number of parallel workers if no mesh is provided
+            mesh_shape: Optional multi-dimensional mesh shape
+            mesh_axis_names: Names for mesh axes
+            resource: Resource requirements (num_cpus, num_gpus, etc.)
+            description: Optional description
+            **reader_kwargs: Additional configuration (batch_size, shuffle, etc.)
+                             that will be passed to the reader as static_args.
         """
         from ...reader.grain_reader import GrainReader
 
         reader_cls = reader_class or GrainReader
 
-        # Combine specialized reader args with other static args
-        all_static_args = {
-            "src_dir": src_dir,
-            "data_type": data_type,
-            "batch_size": batch_size,
-            "file_pattern": file_pattern,
-            "num_workers": num_workers,
-            **static_args,
-        }
+        # Merge data_source into static_args for the reader instance
+        all_static_args = {**reader_kwargs}
+        if data_source is not None:
+            all_static_args["data_source"] = data_source
 
-        # Handle resource
+        # Handle resource specification
         resource_spec = None
         if resource:
             resource_spec = ResourceSpec(
-                num_cpus=resource.get("nums_cpu", resource.get("num_cpus", 1)),
-                num_gpus=resource.get("nums_gpu", resource.get("num_gpus", 0)),
-                memory_gb=resource.get("memory", resource.get("memory_gb", 0.0)),
+                num_cpus=resource.get("num_cpus", 1),
+                num_gpus=resource.get("num_gpus", 0),
+                memory_gb=resource.get("memory_gb", 0.0),
             )
 
-        # Add generic node
+        # Add as a generic SPMD node
         self.add_node(name, reader_cls, description)
 
-        # Inject static args and resource if provided
+        # Inject configuration
         node = self._nodes[name]
         node.static_args.update(all_static_args)
         if resource_spec:
             node.resource = resource_spec
 
-        # Reader nodes default to world_size == num_workers
-        if node.spmd_config:
-            # We don't have mesh yet in Node typically at this stage,
-            # but we can store it in static_args for now or wait for mesh creation.
-            # For now, just ensure static_args has it.
-            pass
+        # Establish parallel execution mesh
+        from ...common.mesh import DeviceMesh
+
+        if mesh_shape and mesh_axis_names:
+            node.spmd_config.mesh = DeviceMesh(
+                device_shape=mesh_shape, axis_names=mesh_axis_names
+            )
+        else:
+            # Default to flat 1D mesh for simple data parallelism
+            node.spmd_config.mesh = DeviceMesh(
+                device_shape=(num_workers,), axis_names=("worker",)
+            )
 
         return self
 
@@ -160,6 +170,8 @@ class Builder:
         target_node: str,
         target_op: str,
         condition_fn: Optional[Callable[..., bool]] = None,
+        source_output: Optional[str] = None,
+        target_input: Optional[str] = None,
     ) -> "Builder":
         """
         Add a generic edge specifying source and target op names.
@@ -173,6 +185,8 @@ class Builder:
             target_node: Target node name
             target_op: Target node's op name (e.g., "forward", "reward")
             condition_fn: Optional condition function
+            source_output: Optional specific output field name from source op
+            target_input: Optional specific input field name for target op
 
         Returns:
             Self for method chaining
@@ -205,7 +219,13 @@ class Builder:
 
         # Validate and link sharding between source and target
         self._validate_and_link_edge(
-            source_node, source_op, target_node, target_op, condition_fn
+            source_node,
+            source_op,
+            target_node,
+            target_op,
+            condition_fn,
+            source_output,
+            target_input,
         )
 
         return self
@@ -216,13 +236,50 @@ class Builder:
 
     def _ensure_meta_exists(
         self, node_name: str, method_name: str, meta: Optional[OperatorMeta], ctx: str
-    ) -> None:
+    ) -> OperatorMeta:
         """Ensure that an operator meta exists for the given node/method; otherwise raise."""
         if meta is None:
-            raise ValueError(
-                f"{ctx}: SPMD '{node_name}' does not define operator '{method_name}' "
-                f"or it is not decorated with @operator."
+            spmd_class = self._spmd_classes[node_name]
+            class_name = spmd_class.__name__
+
+            op_name_by_fn = {}
+            for attr_name in dir(spmd_class):
+                # Use getattr on the class to avoid triggering property descriptors if any
+                attr = getattr(spmd_class, attr_name, None)
+                m = getattr(attr, "_flux_operator_meta", None)
+                if m is not None:
+                    op_name_by_fn[attr_name] = m.name
+
+            if method_name in op_name_by_fn:
+                actual_op_name = op_name_by_fn[method_name]
+                raise ValueError(
+                    f"\n[Fluxway Graph Error] In {ctx}:\n"
+                    f"  You referred to operator '{method_name}', which is the name of a function in '{class_name}'.\n"
+                    f"  However, this function is decorated as @operator(name='{actual_op_name}').\n"
+                    f"  Fix: Change your code to use '{actual_op_name}' instead of '{method_name}' in the builder (add_func_edge)."
+                )
+
+            if getattr(spmd_class, method_name, None) is not None:
+                raise ValueError(
+                    f"\n[Fluxway Graph Error] In {ctx}:\n"
+                    f"  Method '{method_name}' exists in class '{class_name}' but it is NOT decorated with @operator.\n"
+                    f"  Every method used in the graph must have the @operator decorator to define its sharding and IO.\n"
+                    f"  Fix: Add @operator to '{class_name}.{method_name}':\n\n"
+                    f"       @operator(name='{method_name}', ...)\n"
+                    f"       def {method_name}(self, ...):"
+                )
+
+            available_ops = list(
+                self._nodes[node_name].spmd_config.operator_metas.keys()
             )
+            raise ValueError(
+                f"\n[Fluxway Graph Error] In {ctx}:\n"
+                f"  SPMD '{node_name}' (class {class_name}) has no operator named '{method_name}'.\n"
+                f"  Available operators for this node: {available_ops}\n"
+                f"  Fix: Check for typos in your add_func_edge call, or ensure the method exists and is decorated with @operator."
+            )
+
+        return meta
 
     def _validate_and_link_edge(
         self,
@@ -231,6 +288,8 @@ class Builder:
         target_node: str,
         target_op: str,
         condition_fn: Optional[Callable[..., bool]],
+        source_output: Optional[str] = None,
+        target_input: Optional[str] = None,
     ) -> None:
         """
         Validate and link operator metadata between two nodes.
@@ -254,37 +313,49 @@ class Builder:
         if target_op not in dst_cfg.topology:
             dst_cfg.topology[target_op] = SPMDTopology()
 
+        # Build tensor map if specified
+        tensor_map = {}
+        if source_output and target_input:
+            tensor_map[source_output] = target_input
+        elif source_output:
+            # If only source_output is specified, we assume it maps to its own name in target
+            tensor_map[source_output] = source_output
+        elif target_input:
+            # If only target_input is specified, we assume source provides it with the same name
+            tensor_map[target_input] = target_input
+
         # Add successor info to source node
-        src_cfg.topology[source_op].successors[target_node] = SPMDTopologyInfo(
-            spmd_id=target_node,
-            condition_fn=condition_fn,
-            # tensor_map can be populated later if needed, but for now ID is enough
-        )
+        if target_node not in src_cfg.topology[source_op].successors:
+            src_cfg.topology[source_op].successors[target_node] = SPMDTopologyInfo(
+                spmd_id=target_node, condition_fn=condition_fn, tensor_map=tensor_map
+            )
+        else:
+            # Merge tensor_map if edge already exists
+            src_cfg.topology[source_op].successors[target_node].tensor_map.update(
+                tensor_map
+            )
 
         # Add predecessor info to target node
-        dst_cfg.topology[target_op].predecessors[source_node] = SPMDTopologyInfo(
-            spmd_id=source_node
-            # tensor_map can be populated later if needed
+        if source_node not in dst_cfg.topology[target_op].predecessors:
+            dst_cfg.topology[target_op].predecessors[source_node] = SPMDTopologyInfo(
+                spmd_id=source_node, tensor_map=tensor_map
+            )
+        else:
+            # Merge tensor_map if edge already exists
+            dst_cfg.topology[target_op].predecessors[source_node].tensor_map.update(
+                tensor_map
+            )
+
+        ctx = f"edge {source_node}.{source_op} -> {target_node}.{target_op}"
+        src_meta = self._ensure_meta_exists(
+            source_node, source_op, src_cfg.operator_metas.get(source_op), ctx
+        )
+        dst_meta = self._ensure_meta_exists(
+            target_node, target_op, dst_cfg.operator_metas.get(target_op), ctx
         )
 
-        def _get_fn_and_meta(
-            cfg: SPMDConfig, op_name: str
-        ) -> Tuple[Optional[Callable], Optional[OperatorMeta]]:
-            fn = cfg.operators.get(op_name)
-            meta = cfg.operator_metas.get(op_name)
-            if fn is None:
-                return None, None
-            return fn, meta
-
-        _, src_meta = _get_fn_and_meta(src_cfg, source_op)
-        _, dst_meta = _get_fn_and_meta(dst_cfg, target_op)
-
-        src_cls = self._spmd_classes[source_node]
-        ctx = f"edge {source_node}.{source_op} -> {target_node}.{target_op}"
-        self._ensure_meta_exists(source_node, source_op, src_meta, ctx)
-        self._ensure_meta_exists(target_node, target_op, dst_meta, ctx)
-
         # 1) Validate & update state: src output_state vs dst input_state
+        src_cls = self._spmd_classes[source_node]
         src_meta.validate_and_update_state_output_match_dest_input(
             dst_meta=dst_meta,
             src_spmd_class=src_cls,
@@ -296,11 +367,29 @@ class Builder:
         src_out = src_meta.output_sharding or {}
         dst_in = dst_meta.input_sharding or {}
 
+        # If tensor_map is used, we should only link the specified tensors
+        # If not, we link all overlapping names (default behavior)
+        if tensor_map:
+            effective_src_out = {
+                tensor_map[src_name]: spec
+                for src_name, spec in src_out.items()
+                if src_name in tensor_map
+            }
+            effective_dst_in = {
+                src_name: dst_in[dst_name]
+                for src_name, dst_name in tensor_map.items()
+                if dst_name in dst_in
+            }
+        else:
+            effective_src_out = src_out
+            effective_dst_in = dst_in
+
         dst_meta.input_pre_sharding.setdefault(source_node, []).append(
             EdgeShardingInfo(
                 condition_fn=condition_fn,
-                tensor_sharding=dict(src_out) if src_out else {},
+                tensor_sharding=dict(effective_src_out) if effective_src_out else {},
                 target_op=target_op,
+                tensor_map=tensor_map,
             )
         )
         logger.debug(
@@ -309,14 +398,15 @@ class Builder:
             target_op,
             source_node,
             source_op,
-            list(src_out.keys()) if src_out else [],
+            list(effective_src_out.keys()) if effective_src_out else [],
         )
 
         src_meta.output_post_sharding.setdefault(target_node, []).append(
             EdgeShardingInfo(
                 condition_fn=condition_fn,
-                tensor_sharding=dict(dst_in) if dst_in else {},
+                tensor_sharding=dict(effective_dst_in) if effective_dst_in else {},
                 target_op=target_op,
+                tensor_map=tensor_map,
             )
         )
         logger.debug(
@@ -325,7 +415,7 @@ class Builder:
             source_op,
             target_node,
             target_op,
-            list(dst_in.keys()) if dst_in else [],
+            list(effective_dst_in.keys()) if effective_dst_in else [],
         )
 
     def build(self, name: str = "") -> Graph:

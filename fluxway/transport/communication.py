@@ -469,7 +469,7 @@ class TransportReceiver:
                     count = int(counts[i] if i < len(counts) else counts[0])
                     if backend.name() == "torch":
                         sender_bufs[i][:count] = tensor[:count]
-                    elif backend.name() == "jax" and hasattr(tensor, "shape"):
+                    elif backend.name() == "jax" and backend.is_tensor(tensor):
                         sender_bufs[i] = _jit_write_at_zero(
                             tensor, sender_bufs[i], count
                         )
@@ -504,7 +504,7 @@ class TransportReceiver:
 
                     if backend.name() == "torch":
                         self.target_buffers[i][offset : offset + count] = tensor[:count]
-                    elif backend.name() == "jax" and hasattr(tensor, "shape"):
+                    elif backend.name() == "jax" and backend.is_tensor(tensor):
                         self.target_buffers[i] = _jit_write_at_offset(
                             tensor, self.target_buffers[i], count, offset
                         )
@@ -631,7 +631,7 @@ def _jit_plan_and_pack(
             reordered_data = backend.take(data, sort_indices)
 
             # Pad buffer to ensure safety for vmap slice-out
-            dtype_data = getattr(reordered_data, "dtype", None)
+            dtype_data = backend.dtype(reordered_data)
             pad_amount = item_cap  # Safe margin
             pad_shape = (pad_amount,) + backend.shape(reordered_data)[1:]
             padded_reordered = backend.cat(
@@ -684,7 +684,7 @@ def _jit_plan_and_pack(
             send_flat_offsets = backend.take(reordered_flat_offsets, send_offsets)
 
             # Pad buffer to ensure safety for vmap slice-out
-            dtype_data = getattr(reordered_data, "dtype", None)
+            dtype_data = backend.dtype(reordered_data)
             pad_shape = (flat_cap,) + backend.shape(reordered_data)[1:]
             padded_reordered = backend.cat(
                 [reordered_data, backend.zeros(pad_shape, dtype=dtype_data)], dim=0
@@ -704,7 +704,7 @@ def _jit_plan_and_pack(
 
             # Correctly handle item-level lengths
             reordered_lengths = reordered_item_lengths
-            dtype_len = getattr(reordered_lengths, "dtype", None)
+            dtype_len = backend.dtype(reordered_lengths)
             pad_shape_len = (item_cap,) + backend.shape(reordered_lengths)[1:]
             padded_reordered_len = backend.cat(
                 [reordered_lengths, backend.zeros(pad_shape_len, dtype=dtype_len)],
@@ -726,7 +726,7 @@ def _jit_plan_and_pack(
     padded_indices_payload = None
     if global_indices is not None:
         sorted_globals = backend.take(global_indices, sort_indices)
-        dtype_route = getattr(sorted_globals, "dtype", None)
+        dtype_route = backend.dtype(sorted_globals)
         pad_shape_route = (item_cap,) + backend.shape(sorted_globals)[1:]
         padded_sorted_globals = backend.cat(
             [sorted_globals, backend.zeros(pad_shape_route, dtype=dtype_route)], dim=0

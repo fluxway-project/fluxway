@@ -103,6 +103,11 @@ class TensorBackend(ABC):
         pass
 
     @abstractmethod
+    def is_scalar(self, obj: Any) -> bool:
+        """Check if obj is a scalar tensor (ndim == 0)."""
+        pass
+
+    @abstractmethod
     def floor_divide(self, x: Any, y: Any) -> Any:
         pass
 
@@ -300,6 +305,9 @@ class TorchBackend(TensorBackend):
     def is_tensor(self, obj: Any) -> bool:
         return self._torch.is_tensor(obj)
 
+    def is_scalar(self, obj: Any) -> bool:
+        return self._torch.is_tensor(obj) and obj.ndim == 0
+
     def shape(self, tensor: Any) -> Any:
         return tensor.shape
 
@@ -310,8 +318,7 @@ class TorchBackend(TensorBackend):
         return self._torch.reshape(x, shape)
 
     def unravel_index(self, indices: Any, shape: Tuple[int, ...]) -> Any:
-        if hasattr(self._torch, "unravel_index"):
-            return self._torch.unravel_index(indices, shape)
+        return self._torch.unravel_index(indices, shape)
 
         # Fallback implementation
         res = []
@@ -414,12 +421,11 @@ class TorchBackend(TensorBackend):
                 slice_len = update.shape[i]
                 slices.append(slice(s, s + slice_len))
             x[tuple(slices)] = update
+        elif self.is_scalar(start):
+            s = int(start)
+            x[s : s + update.shape[0]] = update
         else:
-            if hasattr(start, "item"):
-                s = start.item()
-                x[s : s + update.shape[0]] = update
-            else:
-                raise NotImplementedError(f"Unsupported start type: {type(start)}")
+            raise NotImplementedError(f"Unsupported start type: {type(start)}")
 
         return x
 
@@ -434,9 +440,7 @@ class TorchBackend(TensorBackend):
         )
 
     def vmap(self, fun: Any, in_axes: Any = 0, out_axes: Any = 0) -> Any:
-        if hasattr(self._torch, "vmap"):
-            return self._torch.vmap(fun, in_dims=in_axes, out_dims=out_axes)
-        raise NotImplementedError("torch.vmap requires newer PyTorch version")
+        return self._torch.vmap(fun, in_dims=in_axes, out_dims=out_axes)
 
     def tree_map(self, fun: Any, tree: Any) -> Any:
         try:
@@ -556,6 +560,9 @@ class JaxBackend(TensorBackend):
     def is_tensor(self, obj: Any) -> bool:
         return isinstance(obj, (self._jnp.ndarray, self._np.ndarray))
 
+    def is_scalar(self, obj: Any) -> bool:
+        return self.is_tensor(obj) and obj.ndim == 0
+
     def shape(self, tensor: Any) -> Any:
         return tensor.shape
 
@@ -670,14 +677,10 @@ class JaxBackend(TensorBackend):
     def dynamic_slice(self, x: Any, start: Any, size: Any) -> Any:
         # Ensure start/size are tuples for JAX compatibility
         ndim = x.ndim
-        if isinstance(start, (int, float)) or (
-            hasattr(start, "ndim") and start.ndim == 0
-        ):
+        if isinstance(start, (int, float)) or self.is_scalar(start):
             start = (start,) + (0,) * (ndim - 1)
 
-        if (
-            isinstance(size, (int, float)) or (hasattr(size, "ndim") and size.ndim == 0)
-        ) and ndim == 1:
+        if (isinstance(size, (int, float)) or self.is_scalar(size)) and ndim == 1:
             size = (size,)
 
         return self._jax.lax.dynamic_slice(x, start, size)
@@ -686,7 +689,7 @@ class JaxBackend(TensorBackend):
         # Ensure start is a tuple matching input dimensions
         if isinstance(start, int):
             start = (start,) + (0,) * (x.ndim - 1)
-        elif hasattr(start, "ndim") and start.ndim == 0:
+        elif self.is_scalar(start):
             start = (start,) + (0,) * (x.ndim - 1)
         elif isinstance(start, (list, tuple)) and len(start) < x.ndim:
             start = tuple(start) + (0,) * (x.ndim - len(start))

@@ -24,18 +24,18 @@ class WorkerSynchronizer:
     and reports SPMD-level progress to controller.
     """
 
-    def __init__(self, spmd_id: str, num_workers: int, max_worker_step_diff: int = 1):
+    def __init__(self, spmd_id: str, num_workers: int, max_worker_step_skew: int = 1):
         """
         Initialize WorkerSynchronizer.
 
         Args:
             spmd_id: SPMD identifier
             num_workers: Number of workers in this SPMD
-            max_worker_step_diff: Maximum allowed step difference between workers
+            max_worker_step_skew: Maximum allowed step difference (skew) between workers
         """
         self.spmd_id = spmd_id
         self.num_workers = num_workers
-        self.max_worker_step_diff = max_worker_step_diff
+        self.max_worker_step_skew = max_worker_step_skew
 
         # Worker-level step tracking: rank -> {op_name -> step}
         self._worker_steps: Dict[int, Dict[str, int]] = {
@@ -138,7 +138,7 @@ class WorkerSynchronizer:
         min_step = min(steps)
         diff = max_step - min_step
 
-        if diff > self.max_worker_step_diff:
+        if diff > self.max_worker_step_skew:
             # Block workers that are too far ahead
             for rank in range(self.num_workers):
                 worker_step = self._worker_steps[rank].get(op_name, 0)
@@ -156,7 +156,7 @@ class WorkerSynchronizer:
                         except Exception as e:
                             logger.error(f"Error blocking worker {rank}: {e}")
 
-        elif diff <= self.max_worker_step_diff // 2:
+        elif diff <= self.max_worker_step_skew // 2:
             # Unblock workers when difference is small enough
             for rank in range(self.num_workers):
                 if self._worker_op_locked[rank].get(op_name, False):

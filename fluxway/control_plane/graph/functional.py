@@ -12,13 +12,27 @@ class OpHandle:
     compilation phase; it contains no actual tensor data.
     """
 
-    def __init__(self, node_id: str, op_name: str, graph: "FunctionalGraph"):
+    def __init__(
+        self,
+        node_id: str,
+        op_name: str,
+        graph: "FunctionalGraph",
+        output_name: Optional[str] = None,
+    ):
         self.node_id = node_id
         self.op_name = op_name
         self._graph = graph
+        self.output_name = output_name
+
+    def __getattr__(self, name: str) -> "OpHandle":
+        """Allows selecting a specific output field, e.g. h_proc.unique_ids1"""
+        return OpHandle(self.node_id, self.op_name, self._graph, output_name=name)
 
     def __repr__(self):
-        return f"OpHandle({self.node_id}.{self.op_name})"
+        res = f"OpHandle({self.node_id}.{self.op_name})"
+        if self.output_name:
+            res += f".{self.output_name}"
+        return res
 
 
 class NodeProxy:
@@ -36,12 +50,6 @@ class NodeProxy:
     def __getattr__(self, op_name: str) -> Callable[..., OpHandle]:
         """
         Intercepts method calls to dynamically construct graph edges.
-
-        Example:
-            actor = graph.node("Actor", ActorSPMD)
-            h_rollout = actor.rollout()
-            # actor.rollout -> returns _call_op closure
-            # _call_op() -> logs op and returns new OpHandle
         """
 
         def _call_op(
@@ -49,23 +57,37 @@ class NodeProxy:
             condition_fn: Optional[Callable[..., bool]] = None,
             **kwargs,
         ) -> OpHandle:
-            inputs = list(args) + list(kwargs.values())
-
-            # Register edges for all inputs
-            for in_handle in inputs:
+            # Register edges for positional arguments
+            for in_handle in args:
                 if not isinstance(in_handle, OpHandle):
                     raise TypeError(
                         f"Inputs must be OpHandle instances. Got {type(in_handle)} "
                         f"for arg to {self.node_id}.{op_name}"
                     )
 
-                # Implicitly handles both inter-node edges and intra-node self-loops
                 self._graph._builder.add_func_edge(
                     source_node=in_handle.node_id,
                     source_op=in_handle.op_name,
                     target_node=self.node_id,
                     target_op=op_name,
                     condition_fn=condition_fn,
+                    source_output=in_handle.output_name,
+                )
+
+            # Register edges for keyword arguments (with explicit target mapping)
+            for target_arg, in_handle in kwargs.items():
+                if not isinstance(in_handle, OpHandle):
+                    # Allow non-OpHandle kwargs (passed as static args maybe? No, builder doesn't support it here)
+                    continue
+
+                self._graph._builder.add_func_edge(
+                    source_node=in_handle.node_id,
+                    source_op=in_handle.op_name,
+                    target_node=self.node_id,
+                    target_op=op_name,
+                    condition_fn=condition_fn,
+                    source_output=in_handle.output_name,
+                    target_input=target_arg,
                 )
 
             return OpHandle(self.node_id, op_name, self._graph)

@@ -13,7 +13,7 @@ from .reader import RecommendationReader
 
 async def run_training(args):
     # Set JAX_PLATFORMS=cpu in runtime_env to ensure all Ray actors use CPU
-    runtime_env = {"env_vars": {"JAX_PLATFORMS": "cpu"}}
+    runtime_env = {"env_vars": {"JAX_PLATFORMS": "cpu", "CUDA_VISIBLE_DEVICES": "-1"}}
 
     if not ray.is_initialized():
         ray.init(ignore_reinit_error=True, runtime_env=runtime_env)
@@ -33,10 +33,12 @@ async def run_training(args):
     # 3. Forward Pass
     h_proc = input_node.process(h_raw)
 
-    h_emb1 = table1.lookup(unique_ids=h_proc)
-    h_emb2 = table2.lookup(unique_ids=h_proc)
+    h_emb1 = table1.lookup(unique_ids=h_proc.unique_ids1)
+    h_emb2 = table2.lookup(unique_ids=h_proc.unique_ids2)
 
-    h_forward = dense.forward(emb1=h_emb1, inv1=h_proc, emb2=h_emb2, inv2=h_proc)
+    h_forward = dense.forward(
+        emb1=h_emb1, inv1=h_proc.inv1, emb2=h_emb2, inv2=h_proc.inv2
+    )
 
     # 4. Backward Pass
     h_grads = dense.backward(context=h_forward)
@@ -62,7 +64,9 @@ async def run_training(args):
         # Wait for completion
         completed = await controller.wait_for_completion.remote()
         if completed:
-            print(f"\n[Fluxway] Training completed successfully after {args.steps} steps.")
+            print(
+                f"\n[Fluxway] Training completed successfully after {args.steps} steps."
+            )
         else:
             print("\n[Fluxway] Training failed or timed out.")
 

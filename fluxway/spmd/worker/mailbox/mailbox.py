@@ -73,9 +73,16 @@ class StepBarrier:
         barrier = self._tensor_barriers.get(name)
         if barrier is not None:
             fired = barrier.arrive()
+            logger.info(
+                f"[StepBarrier] TENSOR ARRIVED: name={name}, count={barrier.count}/{barrier.target}, fired={fired}"
+            )
             if self._periodic:
                 return fired
             return self._check()
+        else:
+            logger.warning(
+                f"[StepBarrier] UNEXPECTED TENSOR: name={name}, expected={list(self._tensor_barriers.keys())}"
+            )
         return False
 
     def state_arrived(self, name: str) -> bool:
@@ -83,9 +90,16 @@ class StepBarrier:
         barrier = self._state_barriers.get(name)
         if barrier is not None:
             fired = barrier.arrive()
+            logger.info(
+                f"[StepBarrier] STATE ARRIVED: name={name}, count={barrier.count}/{barrier.target}, fired={fired}"
+            )
             if self._periodic:
                 return fired
             return self._check()
+        else:
+            logger.warning(
+                f"[StepBarrier] UNEXPECTED STATE: name={name}, expected={list(self._state_barriers.keys())}"
+            )
         return False
 
     def satisfy_tensor(self, name: str) -> bool:
@@ -122,6 +136,16 @@ class StepBarrier:
         if tensors_ok and states_ok:
             self._combined.set()
             return True
+
+        # Log why it's not ready
+        waiting_tensors = [
+            n for n, b in self._tensor_barriers.items() if not b.is_done()
+        ]
+        waiting_states = [n for n, b in self._state_barriers.items() if not b.is_done()]
+        logger.debug(
+            f"[StepBarrier] NOT READY: waiting_tensors={waiting_tensors}, waiting_states={waiting_states}"
+        )
+
         return False
 
     def is_ready(self) -> bool:
@@ -235,11 +259,18 @@ class WorkerMailbox:
 
         staleness_dict = {}
         if barrier_config and barrier_config.type == BarrierType.TOLERANT:
-            staleness_dict = getattr(barrier_config, "staleness", {})
+            from fluxway.common.types.configs import TolerantBarrierConfig
+
+            if isinstance(barrier_config, TolerantBarrierConfig):
+                staleness_dict = barrier_config.staleness
+                policy = barrier_config.retrieval_policy
+            else:
+                staleness_dict = {}
+                policy = "latest"
+
             self._staleness_config[op_name] = staleness_dict
             self._expected_tensor_counts[op_name] = expected_tensors
             self._expected_state_names[op_name] = expected_states
-            policy = getattr(barrier_config, "retrieval_policy", "latest")
             # Currently apply one policy per operator for all its staleness configs
             self._retrieval_policy.setdefault(op_name, {})
             for name in staleness_dict:
@@ -250,7 +281,13 @@ class WorkerMailbox:
                 # Use n from barrier_config if available
                 # Note: StepBarrier currently assumes n is the same for all inputs in periodic mode.
                 # For now we use barrier_config.n if it is PeriodicBarrierConfig.
-                n = getattr(barrier_config, "n", 1)
+                from fluxway.common.types.configs import PeriodicBarrierConfig
+
+                n = (
+                    barrier_config.n
+                    if isinstance(barrier_config, PeriodicBarrierConfig)
+                    else 1
+                )
                 self._periodic_barriers[op_name] = StepBarrier(
                     expected_tensors, expected_states, periodic=True
                 )
