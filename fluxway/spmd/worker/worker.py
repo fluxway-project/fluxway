@@ -19,11 +19,8 @@ This implementation uses Ray's async actor API for concurrency.
 See: https://docs.ray.io/en/latest/ray-core/actors/async_api.html
 """
 
-from fluxway.common.mesh import DeviceMesh
-from fluxway.common.types.sharding import ShardingSpec, PartitionSpec
-from typing import Any, Dict, List, Optional, Tuple
-from fluxway.common.backend import get_backend
 import asyncio
+from collections import defaultdict
 import logging
 import time
 
@@ -35,12 +32,18 @@ from fluxway.common.types import (
     WorkerStatus,
     WorkerTelemetry,
 )
-from fluxway.common.types.configs import MailboxStatus
+from fluxway.common.index_descriptor import IndexDescriptor
 from fluxway.common.types.tensor import TransportTensor
+from fluxway.common.mesh import DeviceMesh
+from fluxway.common.types.sharding import ShardingSpec, PartitionSpec
+from typing import Any, Dict, List, Optional, Tuple
+from fluxway.common.backend import get_backend
+from fluxway.common.types.configs import MailboxStatus
 from fluxway.common.utils import ensure_logging_configured
 from fluxway.rpc.protocol import DataPlaneCallable
 from .mailbox import WorkerMailbox
 from .operator_manager import OperatorManager
+from fluxway.transport.communication import AsyncDataDistributor
 
 
 logger = logging.getLogger(__name__)
@@ -321,6 +324,13 @@ class SPMDWorker:
             len(self._successor_handlers) >= self._expected_successor_count
         )
 
+        print(
+            f"[{self.spmd_id} Rank {self.rank}] _check_and_auto_start: "
+            f"pred={len(self._predecessor_handlers)}/{self._expected_predecessor_count} "
+            f"succ={len(self._successor_handlers)}/{self._expected_successor_count}",
+            flush=True,
+        )
+
         if pred_registered and succ_registered:
             logger.debug(
                 f"[spmd_id={self.spmd_id}] Worker {self.rank}: All handlers registered "
@@ -332,12 +342,20 @@ class SPMDWorker:
 
     def _auto_start(self) -> None:
         """Internal auto-start method."""
+        print(
+            f"[{self.spmd_id} Rank {self.rank}] _auto_start CALLED. _running={self._running}",
+            flush=True,
+        )
         if self._running:
             return
 
         self._running = True
         self._start_event.set()
         logger.debug(f"[spmd_id={self.spmd_id}] Worker {self.rank} auto-started")
+        print(
+            f"[{self.spmd_id} Rank {self.rank}] Worker auto-started successfully.",
+            flush=True,
+        )
 
         # Trigger source operators (operators with 0 input tensors)
         asyncio.create_task(self._trigger_source_operators())
@@ -347,9 +365,17 @@ class SPMDWorker:
         Trigger initial steps for source operators (those with 0 input tensors).
         """
         source_ops = self._op_manager.get_source_operators()
+        print(
+            f"[{self.spmd_id} Rank {self.rank}] _trigger_source_operators CALLED. source_ops={source_ops}",
+            flush=True,
+        )
         for op_name in source_ops:
             logger.debug(
                 f"[spmd_id={self.spmd_id} rank={self.rank}] Triggering source operator: {op_name}"
+            )
+            print(
+                f"[{self.spmd_id} Rank {self.rank}] Enqueuing source op: {op_name}",
+                flush=True,
             )
             await self._enqueue(op_name, 0)
 
@@ -436,57 +462,71 @@ class SPMDWorker:
     async def receive_shards(
         self,
         op_name: str,
-        name: str,
+        names: List[str],
         step: int,
+        sender_id: str,
         sender_rank: int,
-        payloads: List[Any],
-        counts: List[int],
-        is_ragged: bool = False,
-        has_indices: bool = False,
-    ) -> None:
+        payload_groups: List[List[Any]],
+        counts_groups: List[List[int]],
+        is_ragged: Optional[List[bool]] = None,
+        has_spatial_indices: Optional[List[bool]] = None,
+        has_origin_indices: Optional[List[bool]] = None,
+    ) -> int:
+        """Receive multiple tensor shards from upstream worker (data plane).
+
+        Args:
+            op_name: Target operator name
+            names: List of tensor names in the bundle
+            step: Execution step
+            sender_id: Source SPMD ID
+            sender_rank: Source worker rank
+            payload_groups: List of payload lists (one per tensor)
+            counts_groups: List of count lists (one per tensor)
+            is_ragged: Flags for ragged layout per tensor (default False)
+            has_spatial_indices: Flags for spatial indices per tensor (default False)
+            has_origin_indices: Flags for logical assembly indices per tensor (default False)
         """
-        Receive tensor shard data from upstream worker (data plane).
+        # Ensure metadata lists are provided, or default to False
+        num = len(names)
+        is_ragged = is_ragged if is_ragged is not None else [False] * num
+        has_spatial_indices = (
+            has_spatial_indices if has_spatial_indices is not None else [False] * num
+        )
+        has_origin_indices = (
+            has_origin_indices if has_origin_indices is not None else [False] * num
+        )
+        """
+        Receive multiple tensor shards from upstream worker (data plane).
 
         Args:
             op_name: Operator name
-            name: Tensor variable name
+            names: Tensor variable names
             step: Step number
             sender_rank: Sender's rank
-            payloads: Raw data arrays for the shards
-            counts: Number of values for each payload
-            is_ragged: Indicates if ragged lengths are included
-            has_indices: Indicates if routing indices are included
+            is_ragged: Indicates if ragged lengths are included for each tensor
+            has_spatial_indices: Indicates if routing indices are included for each tensor
+            has_origin_indices: Indicates if assembly (logical) indices are included for each tensor
         """
-        # Normal mode: step-ordered execution
-        exec_step = self._current_steps.get(op_name, 0)
-
-        # Drop stale data (data for steps already executed)
-        # Note: periodic ops don't have stale steps as they use virtual sequence
-        is_periodic = (
-            self._op_manager.is_periodic_trigger(op_name) if self._op_manager else False
-        )
-        if not is_periodic and step < exec_step:
-            logger.warning(
-                f"[spmd_id={self.spmd_id}] Dropping stale tensor data: op={op_name}, name={name}, "
-                f"step={step} < exec_step={exec_step}, rank={sender_rank}"
-            )
-            return
+        if len(names) != len(set(names)):
+            raise ValueError(f"[receive_shards] Duplicate names in bundle: {names}")
 
         # Lazily declare the step barrier on first data arrival
         self._ensure_step_declared(op_name, step)
 
-        logger.debug(
-            f"[spmd_id={self.spmd_id} rank={self.rank}] RECEIVED SHARDS: op={op_name}, step={step}, name={name}, sender={sender_rank}"
-        )
-
         # Cache in mailbox — barrier fires on_ready automatically
-        await self._mailbox.deposit_shards(
-            op_name, name, step, sender_rank, payloads, counts, is_ragged, has_indices
+        watermark = await self._mailbox.deposit_shards(
+            op_name,
+            names,
+            step,
+            sender_id,
+            sender_rank,
+            payload_groups,
+            counts_groups,
+            is_ragged,
+            has_spatial_indices,
+            has_origin_indices,
         )
-        logger.debug(
-            f"[spmd_id={self.spmd_id}] Worker {self.rank} received shards: op={op_name}, name={name}, "
-            f"step={step}, sender_rank={sender_rank}"
-        )
+        return watermark
 
     def _ensure_step_declared(self, op_name: str, step: int) -> None:
         """
@@ -531,6 +571,10 @@ class SPMDWorker:
         Schedules _enqueue as an asyncio task so the lock in deposit_shards/
         deposit_states can return immediately without blocking on queue insertion.
         """
+        print(
+            f"[Worker {self.spmd_id} Rank {self.rank}] _on_step_ready: op={op_name}, step={step}",
+            flush=True,
+        )
         logger.debug(
             f"[spmd_id={self.spmd_id} rank={self.rank}] Step ready: op={op_name}, step={step}"
         )
@@ -540,6 +584,10 @@ class SPMDWorker:
         """Enqueue a task for execution."""
         from fluxway.common.types.configs import OperatorMeta
 
+        print(
+            f"[Worker {self.spmd_id} Rank {self.rank}] _enqueue CALLED: op={op_name}, step={step}",
+            flush=True,
+        )
         meta = self._op_manager._get_operator_metadata(op_name)
         priority = meta.priority if isinstance(meta, OperatorMeta) else 0
         await self._execution_queue.put((-priority, step, op_name))
@@ -585,7 +633,15 @@ class SPMDWorker:
         while self._running:
             try:
                 # Blocking wait for next task (async)
+                print(
+                    f"[Worker {self.spmd_id} Rank {self.rank}] Execution loop waiting for task in _execution_queue...",
+                    flush=True,
+                )
                 priority, step, op_name = await self._execution_queue.get()
+                print(
+                    f"[Worker {self.spmd_id} Rank {self.rank}] Execution loop picked up task: {op_name} step={step} priority={priority}",
+                    flush=True,
+                )
 
                 # Check if we should stop
                 if not self._running:
@@ -600,8 +656,16 @@ class SPMDWorker:
                     logger.debug(
                         f"[spmd_id={self.spmd_id}] Task held (op blocked): op={op_name}, step={step}"
                     )
+                    print(
+                        f"[{self.spmd_id}] OP BLOCKED in queue: op={op_name} step={step}",
+                        flush=True,
+                    )
                     continue
 
+                print(
+                    f"[{self.spmd_id}] Task processing: op={op_name} step={step}",
+                    flush=True,
+                )
                 # Check if this op is in periodic_trigger mode
                 is_periodic = (
                     self._op_manager.is_periodic_trigger(op_name)
@@ -673,11 +737,12 @@ class SPMDWorker:
             shards = all_tensor_shards[tensor_name]
             if not shards:
                 return False
-            for rank, tensor in shards.items():
+            for key, tensor_list in shards.items():
                 backend = get_backend()
-                shape = backend.shape(tensor.flat_values)
-                if shape and shape[0] > 0:
-                    return False
+                for tensor in tensor_list:
+                    shape = backend.shape(tensor.flat_values)
+                    if shape and shape[0] > 0:
+                        return False
         return True
 
     async def _propagate_empty_packets(self, op_name: str, step: int) -> None:
@@ -687,6 +752,8 @@ class SPMDWorker:
 
         output_sharding = self._op_manager.get_output_sharding(op_name)
         successor_ids = self._op_manager.get_successor_ids(op_name)
+        # Deduplicate to avoid redundant transmissions
+        successor_ids = sorted(set(successor_ids))
         if not successor_ids:
             return
 
@@ -703,6 +770,13 @@ class SPMDWorker:
 
             target_op = succ_info.target_op or op_name
             for tensor_name in output_sharding:
+                if succ_info.tensor_map:
+                    if tensor_name not in succ_info.tensor_map:
+                        continue
+                    target_tensor_name = succ_info.tensor_map[tensor_name]
+                else:
+                    target_tensor_name = tensor_name
+
                 # Create an empty TransportTensor
                 backend = get_backend()
                 empty_tensor = TransportTensor.from_tensor(
@@ -711,7 +785,7 @@ class SPMDWorker:
 
                 if succ_info.is_self_loop:
                     await self._self_receive_data(
-                        target_op, tensor_name, output_step, empty_tensor
+                        target_op, target_tensor_name, output_step, empty_tensor
                     )
                 else:
                     handlers = self._successor_handlers.get(spmd_id, {})
@@ -732,13 +806,15 @@ class SPMDWorker:
                         if handler is not None:
                             await handler.receive_shards(
                                 target_op,
-                                tensor_name,
+                                [target_tensor_name],
                                 output_step,
+                                self.spmd_id,
                                 self.rank,
-                                [empty_tensor.flat_values],
-                                [0],
-                                empty_tensor.is_ragged,
-                                empty_tensor.global_indices is not None,
+                                [[empty_tensor.flat_values]],
+                                [[0]],
+                                [False],
+                                [False],
+                                [False],
                             )
 
     async def _execute_operator(self, op_name: str, step: int) -> Any:
@@ -757,7 +833,15 @@ class SPMDWorker:
 
             # Assemble input data
             try:
+                print(
+                    f"[Worker {self.spmd_id} Rank {self.rank}] start assembling input for {op_name} step={step}",
+                    flush=True,
+                )
                 input_data = await self._assemble_input(op_name, step)
+                print(
+                    f"[Worker {self.spmd_id} Rank {self.rank}] input assembled for {op_name} step={step}. Keys: {list(input_data.keys()) if isinstance(input_data, dict) else 'non-dict'}",
+                    flush=True,
+                )
             except Exception as e:
                 logger.error(
                     f"[spmd_id={self.spmd_id} rank={self.rank}] Failed to assemble input data for "
@@ -766,8 +850,9 @@ class SPMDWorker:
                 raise e
 
             # Execute operator in a thread to avoid blocking the worker event loop
-            logger.debug(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] Executing: op={op_name}, step={step}"
+            print(
+                f"[Worker {self.spmd_id} Rank {self.rank}] Calling _op_manager.execute: op={op_name}, step={step}",
+                flush=True,
             )
             if isinstance(input_data, dict):
                 result = await asyncio.to_thread(
@@ -777,6 +862,10 @@ class SPMDWorker:
                 result = await asyncio.to_thread(
                     self._op_manager.execute, op_name, input_data
                 )
+            print(
+                f"[Worker {self.spmd_id} Rank {self.rank}] Execution finished: op={op_name}, step={step}",
+                flush=True,
+            )
             logger.debug(
                 f"[spmd_id={self.spmd_id} rank={self.rank}] Execution finished: op={op_name}, step={step}"
             )
@@ -817,6 +906,9 @@ class SPMDWorker:
             return result
 
         except Exception as e:
+            import traceback
+
+            traceback.print_exc()
             logger.error(
                 f"[spmd_id={self.spmd_id} rank={self.rank}] Operator {op_name} execution failed: {e}"
             )
@@ -859,6 +951,7 @@ class SPMDWorker:
         # Check if periodic_trigger mode
         is_periodic = self._op_manager.is_periodic_trigger(op_name)
 
+        # Arival maybe a list of tensors or a single tensor
         tensor_args: Dict[str, Optional[TransportTensor]] = {}
         for tensor_name in expected_tensor_names:
             if tensor_name not in all_tensor_shards:
@@ -869,9 +962,10 @@ class SPMDWorker:
             shards = all_tensor_shards[tensor_name]
 
             if is_periodic:
-                # Periodic mode: use first shard directly, no assembly needed
-                first_rank = next(iter(shards.keys()))
-                tensor_args[tensor_name] = shards[first_rank]
+                # Periodic mode: merge all shards arrived for this periodic trigger
+                # We use _assemble_to_dynamic_tensor which simply concatenates all shards.
+                merged_tensor = self._assemble_to_dynamic_tensor(tensor_name, shards)
+                tensor_args[tensor_name] = merged_tensor
             else:
                 # Normal mode: assemble tensor based on sharding
                 assembled_tensor = await self._assemble_tensor(
@@ -881,12 +975,6 @@ class SPMDWorker:
 
         # Cache assembled tensors (they carry their own indices/meta)
         self._last_assembled_tensors[op_name] = tensor_args
-
-        for tn, tensor in tensor_args.items():
-            logger.debug(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] _assemble_input cached tensor: op={op_name}, step={step}, "
-                f"tensor={tn}, has_indices={(tensor.global_indices is not None) if tensor else None}"
-            )
 
         # Task 5: Construct final data_type object
         input_type = self._op_manager.get_operator_input_type(op_name)
@@ -938,8 +1026,42 @@ class SPMDWorker:
 
         return kwargs
 
+    def _get_values(self, obj: Any) -> Any:
+        """Helper to get raw values from either TransportTensor or raw array."""
+        if isinstance(obj, TransportTensor):
+            return obj.flat_values
+        return obj
+
+    def _get_spatial_indices(self, obj: Any) -> Optional[Any]:
+        """Helper to get global indices from TransportTensor."""
+        if isinstance(obj, TransportTensor):
+            return obj.spatial_indices
+        return None
+
+    def _flatten_shards(
+        self, shards: Dict[Any, List[TransportTensor]], index: int = 0
+    ) -> List[TransportTensor]:
+        """Flatten shards from a specific index in the payload lists across all senders."""
+        flat = []
+        for key in sorted(shards.keys()):
+            tensor_list = shards[key]
+            if index < len(tensor_list):
+                flat.append(tensor_list[index])
+        return flat
+
+    def _flatten_shards_with_ranks(
+        self, shards: Dict[Any, List[TransportTensor]], index: int = 0
+    ) -> List[Tuple[Any, TransportTensor]]:
+        """Flatten shards and include their sender keys (ranks)."""
+        flat = []
+        for key in sorted(shards.keys()):
+            tensor_list = shards[key]
+            if index < len(tensor_list):
+                flat.append((key, tensor_list[index]))
+        return flat
+
     async def _assemble_tensor(
-        self, op_name: str, tensor_name: str, shards: Dict[int, TransportTensor]
+        self, op_name: str, tensor_name: str, shards: Dict[Any, List[TransportTensor]]
     ) -> TransportTensor:
         """Assemble tensor shards into a complete TransportTensor."""
         input_sharding = self._op_manager.get_input_sharding(op_name)
@@ -960,7 +1082,7 @@ class SPMDWorker:
 
             if has_dynamic_predecessor:
                 return self._assemble_dynamic_to_static_tensor(
-                    tensor_name, shards, input_spec
+                    op_name, tensor_name, shards, input_spec
                 )
             else:
                 return await self._assemble_static_to_static_tensor(
@@ -973,7 +1095,7 @@ class SPMDWorker:
         self,
         op_name: str,
         tensor_name: str,
-        shards: Dict[int, TransportTensor],
+        shards: Dict[Any, List[TransportTensor]],
         input_spec: ShardingSpec,
         predecessor_topology: Dict[str, Any],
     ) -> TransportTensor:
@@ -987,12 +1109,18 @@ class SPMDWorker:
             if source_spec:
                 deps = source_spec.resolve_producers(input_spec, self.rank)
                 for rank in deps:
-                    if rank in shards:
-                        shard_list.append(shards[rank])
+                    key = (pre_spmd_id, rank)
+                    if key in shards:
+                        shard_list.extend(
+                            self._flatten_shards({key: shards[key]}, index=0)
+                        )
             else:
                 for rank in range(pre_info.world_size):
-                    if rank in shards:
-                        shard_list.append(shards[rank])
+                    key = (pre_spmd_id, rank)
+                    if key in shards:
+                        shard_list.extend(
+                            self._flatten_shards({key: shards[key]}, index=0)
+                        )
 
         if not shard_list:
             raise ValueError(f"No shards for {tensor_name}")
@@ -1001,32 +1129,39 @@ class SPMDWorker:
             return shard_list[0]
 
         # Concatenate shards using backend
-        flat_values = [s.flat_values for s in shard_list]
+        flat_values = [self._get_values(s) for s in shard_list]
         merged_values = backend.cat(flat_values, dim=0)
 
         merged_indices = None
-        if all(s.global_indices is not None for s in shard_list):
-            merged_indices = backend.cat([s.global_indices for s in shard_list], dim=0)
+        if all(s.index_descriptor is not None for s in shard_list):
+            descriptors = [s.index_descriptor for s in shard_list]
+            merged_indices = IndexDescriptor.concatenate(descriptors)
 
         # Propagate global_shape from shards
-        global_shape = shard_list[0].global_shape
+        first_shard = shard_list[0]
+        global_shape = (
+            first_shard.global_shape if hasattr(first_shard, "global_shape") else None
+        )
 
         return TransportTensor(
-            merged_values, indices=merged_indices, global_shape=global_shape
+            merged_values, spatial_indices=merged_indices, global_shape=global_shape
         )
 
     def _assemble_dynamic_to_static_tensor(
         self,
+        op_name: str,
         tensor_name: str,
-        shards: Dict[int, TransportTensor],
+        shards: Dict[Any, List[TransportTensor]],
         input_spec: ShardingSpec,
     ) -> TransportTensor:
-        """Assemble dynamic-to-static (Sparse-to-Dense) tensor using global_indices."""
+        """Assemble dynamic-to-static (Sparse-to-Dense) tensor using spatial_indices."""
         backend = get_backend()
 
-        # Merge all non-empty shards
+        # Consistent flattening of multi-tensor parameters
         valid_shards = [
-            s for s in shards.values() if backend.shape(s.flat_values)[0] > 0
+            s
+            for s in self._flatten_shards(shards)
+            if backend.shape(self._get_values(s))[0] > 0
         ]
         if not valid_shards:
             return TransportTensor.from_tensor(
@@ -1034,28 +1169,42 @@ class SPMDWorker:
             )
 
         # Simple 1D path for now (Sparse-to-Dense typically assumes 1D indices for scattering)
-        all_values = backend.cat([s.flat_values for s in valid_shards], dim=0)
+        all_values = backend.cat([self._get_values(s) for s in valid_shards], dim=0)
         # Materialize indices if needed
         all_indices_list = []
         for s in valid_shards:
-            idx = s.global_indices
+            # For assembly into a static tensor, we prioritize origin_indices (logical offsets)
+            idx = s.origin_indices
             if idx is None:
-                # Should not happen for sparse, fallback to arange if absolutely needed
-                num = backend.shape(s.flat_values)[0]
+                # Fallback to spatial_indices (global keys) - works if they represent global addresses
+                idx = self._get_spatial_indices(s)
+
+            if idx is None:
+                # Fallback to local arange
+                num = backend.shape(self._get_values(s))[0]
                 idx = backend.arange(0, num, dtype=backend.int32())
             all_indices_list.append(idx)
         all_indices = backend.cat(all_indices_list, dim=0)
 
-        # Infer global length to compute local range
+        # Infer global length for the routed dimension (usually batch axis)
         max_idx = int(backend.item(backend.max(all_indices)))
-        global_shape = (max_idx + 1,)
+        inferred_dim_size = max_idx + 1
 
-        internal_layout = input_spec.lower(global_shape, self.rank)
-        local_shape = internal_layout.get_local_shape()
-        dense_slices = internal_layout.dense_slices
+        # Multi-dimensional GSPMD support: Combine inferred dim size with static feature dimensions.
+        val_shape = list(backend.shape(all_values))
+        routing_dim = getattr(input_spec, "routing_dim", 0)
+        if isinstance(routing_dim, (list, tuple)):
+            routing_dim = routing_dim[
+                0
+            ]  # TODO(He Jia): Only support 1D routing dim for now
 
-        slice_start = dense_slices[0].start
-        slice_end = dense_slices[0].end
+        global_shape_list = val_shape
+        global_shape_list[routing_dim] = inferred_dim_size
+        global_shape = tuple(global_shape_list)
+
+        layout = input_spec._to_layout(global_shape)
+        local_shape = layout.get_shard_shape(self.rank)
+        slice_start, slice_end = layout.get_shard_bounds(self.rank, 0)
 
         mask = (all_indices >= slice_start) & (all_indices < slice_end)
         local_indices = all_indices[mask] - slice_start
@@ -1070,54 +1219,71 @@ class SPMDWorker:
         return TransportTensor.from_tensor(assembled_data, global_shape=global_shape)
 
     def _assemble_to_dynamic_tensor(
-        self, tensor_name: str, shards: Dict[int, TransportTensor]
+        self, tensor_name: str, shards: Dict[Any, List[TransportTensor]]
     ) -> TransportTensor:
-        """Assemble to-dynamic (Any -> Sparse) tensor by merging shards."""
+        """Assemble to-dynamic (Any -> Dynamic) tensor by merging shards."""
         backend = get_backend()
-        shard_list = sorted(shards.items())
+        shard_list = self._flatten_shards_with_ranks(shards, index=0)
         valid_tensors = [
-            (r, t) for r, t in shard_list if backend.shape(t.flat_values)[0] > 0
+            (r, t) for r, t in shard_list if backend.shape(self._get_values(t))[0] > 0
         ]
 
         if not valid_tensors:
-            return TransportTensor.from_tensor(
-                backend.zeros((0,), dtype=backend.float32())
-            )
+            # Derive dtype from received shards (even if empty) to maintain consistency
+            dtype = shard_list[0][1].dtype if shard_list else backend.float32()
+            return TransportTensor.from_tensor(backend.zeros((0,), dtype=dtype))
 
-        merged_values = backend.cat([t.flat_values for r, t in valid_tensors], dim=0)
+        merged_values = backend.cat(
+            [self._get_values(t) for r, t in valid_tensors], dim=0
+        )
 
         merged_indices = None
-        if all(t.global_indices is not None for r, t in valid_tensors):
+        if all(self._get_spatial_indices(t) is not None for r, t in valid_tensors):
             merged_indices = backend.cat(
-                [t.global_indices for r, t in valid_tensors], dim=0
+                [self._get_spatial_indices(t) for r, t in valid_tensors], dim=0
             )
 
         merged_origin_indices = None
-        if all(t.origin_indices is not None for r, t in valid_tensors):
+        if all(
+            hasattr(t, "origin_indices") and t.origin_indices is not None
+            for r, t in valid_tensors
+        ):
             merged_origin_indices = backend.cat(
                 [t.origin_indices for r, t in valid_tensors], dim=0
             )
 
-        origin_ranks_list = []
-        for r, t in valid_tensors:
-            count = backend.shape(t.flat_values)[0]
-            origin_ranks_list.append(backend.full((count,), r, dtype=backend.int32()))
+        # DETERMINISTIC SORTING: Restore original order using origin_indices
+        # This is critical for sparse-to-dense flows where the downstream expects
+        # a specific sequence (e.g., for inv_map indexing).
+        if merged_origin_indices is not None:
+            # Sort all merged buffers based on origin_indices
+            sort_idx = backend.argsort(merged_origin_indices)
 
-        merged_origin_ranks = (
-            backend.cat(origin_ranks_list, dim=0) if origin_ranks_list else None
-        )
+            merged_values = backend.take(merged_values, sort_idx)
+            if merged_indices is not None:
+                merged_indices = backend.take(merged_indices, sort_idx)
+
+            # Update origin_indices to be sorted (ascending)
+            merged_origin_indices = backend.take(merged_origin_indices, sort_idx)
+
+        global_shape = backend.shape(merged_values)
 
         return TransportTensor(
             merged_values,
-            indices=merged_indices,
-            origin_ranks=merged_origin_ranks,
+            spatial_indices=merged_indices,
+            global_shape=global_shape,
             origin_indices=merged_origin_indices,
         )
 
     async def _advance_step(self, op_name: str, result: Any = "not_none") -> None:
         """Advance execution step counter for an operator."""
+        old_step = self._current_steps[op_name]
         self._current_steps[op_name] += 1
         new_step = self._current_steps[op_name]
+        print(
+            f"[Worker {self.spmd_id} Rank {self.rank}] _advance_step: op={op_name}, {old_step} -> {new_step}",
+            flush=True,
+        )
 
         # If it's a source operator, automatically trigger the next step
         if self._op_manager.is_source_operator(op_name):
@@ -1217,8 +1383,13 @@ class SPMDWorker:
 
         output_sharding = self._op_manager.get_output_sharding(op_name)
         tensors_to_send = self._extract_tensors(result, output_sharding)
-        successor_ids = self._op_manager.get_successor_ids(op_name)
+        successor_ids = sorted(set(self._op_manager.get_successor_ids(op_name)))
         input_tensors = self._last_assembled_tensors.get(op_name, {})
+
+        print(
+            f"[Worker {self.spmd_id} Rank {self.rank}] _send_output: op={op_name}, step={step}, out_tensors={list(tensors_to_send.keys())}, successors={successor_ids}",
+            flush=True,
+        )
 
         for spmd_id in successor_ids:
             succ_info = self._op_manager.get_successor_info(op_name, spmd_id)
@@ -1227,71 +1398,67 @@ class SPMDWorker:
 
             target_op = succ_info.target_op or op_name
 
+            # batches: Groups tensors by their sharding transformation (source -> target).
+            # This allows AsyncDataDistributor to optimize routing for multiple tensors at once.
+            # Key: (source_spec, target_spec)
+            # Value: list of (tensor_name, target_tensor_name, transport_tensor, propagate_indices)
+            batches = defaultdict(list)
+
             for tensor_name, tensor_data in tensors_to_send.items():
-                # Get the actual target name if mapped (e.g., unique_ids1 -> unique_ids)
-                # If tensor_map is present, it acts as an allow-list.
-                if succ_info.tensor_map:
+                # 1. Map output tensor name to successor's expected input name
+                if succ_info.tensor_map is not None:
                     if tensor_name not in succ_info.tensor_map:
                         continue
                     target_tensor_name = succ_info.tensor_map[tensor_name]
                 else:
                     target_tensor_name = tensor_name
 
-                # 1. Check if we need to propagate indices to this specific target
+                # 2. Decide if we need to send global indices (e.g., for Hash/Dynamic routing)
                 propagate_indices = self._should_propagate_indices(
                     op_name, spmd_id, tensor_name
                 )
 
-                # 2. Extract indices if pass-through is possible
+                # 3. Try to retrieve indices from original input for passthrough/metadata
                 input_tensor = input_tensors.get(tensor_name)
                 indices = None
 
                 if input_tensor is not None:
                     if propagate_indices:
-                        indices = input_tensor.global_indices
+                        indices = input_tensor.spatial_indices
                     else:
-                        # Optimization: zero-cost descriptor instead of full tensor
                         indices = (
                             input_tensor.index_descriptor
                             if input_tensor.index_descriptor is not None
-                            else input_tensor.global_indices
+                            else input_tensor.spatial_indices
                         )
 
-                # Wrap in TransportTensor or use as is
+                # 4. Wrap data into TransportTensor for the communication layer
                 if isinstance(tensor_data, TransportTensor):
                     transport_tensor = tensor_data
-                    if indices is not None and transport_tensor.global_indices is None:
-                        # Fallback to apply indices if not set by operator
+                    # Attach indices if the current TransportTensor is missing them
+                    if indices is not None and transport_tensor.spatial_indices is None:
                         transport_tensor = TransportTensor(
                             transport_tensor.flat_values,
                             nested_splits=transport_tensor.nested_splits,
-                            indices=indices,
+                            spatial_indices=indices,
                             global_shape=transport_tensor.global_shape,
-                            origin_ranks=transport_tensor.origin_ranks,
                             origin_indices=transport_tensor.origin_indices,
                         )
                 else:
                     transport_tensor = TransportTensor.from_tensor(
-                        tensor_data, indices=indices
+                        tensor_data, spatial_indices=indices
                     )
 
+                # 5. Fast path for self-loops: bypass network and send to self
                 if succ_info.is_self_loop:
                     await self._self_receive_data(
                         target_op, target_tensor_name, step, transport_tensor
                     )
                     continue
 
-                handlers = self._successor_handlers.get(spmd_id, {})
-                if not handlers:
-                    continue
-
-                from fluxway.transport.communication import AsyncDataDistributor
-
-                distributor = AsyncDataDistributor(self.rank)
-
+                # 6. Resolve ShardingSpecs for both source and target sides
                 source_spec = output_sharding.get(tensor_name)
                 if source_spec is None:
-                    # Default: replicated on self mesh
                     source_mesh = self._mesh
                     if source_mesh is None:
                         source_mesh = DeviceMesh(
@@ -1301,7 +1468,6 @@ class SPMDWorker:
 
                 target_spec = succ_info.tensor_sharding.get(tensor_name)
                 if target_spec is None:
-                    # Default: replicated on target mesh (or self mesh if target mesh unknown)
                     target_mesh = (
                         succ_info.mesh if succ_info.mesh is not None else self._mesh
                     )
@@ -1311,63 +1477,191 @@ class SPMDWorker:
                         )
                     target_spec = ShardingSpec.chunk(target_mesh, PartitionSpec())
 
+                # 7. Collect into batches for efficient bulk distribution
+                batches[(source_spec, target_spec)].append(
+                    (
+                        tensor_name,
+                        target_tensor_name,
+                        transport_tensor,
+                        propagate_indices,
+                    )
+                )
+
+            handlers = self._successor_handlers.get(spmd_id, {})
+            if not handlers:
+                continue
+
+            distributor = AsyncDataDistributor(self.rank)
+
+            for (source_spec, target_spec), batch in batches.items():
+                batch_tensor_names = []
+                batch_target_names = []
+                batch_transport_tensors = []
+                batch_is_ragged = []
+
+                for t_name, t_target_name, t_tensor, _ in batch:
+                    batch_tensor_names.append(t_name)
+                    batch_target_names.append(t_target_name)
+                    batch_transport_tensors.append(t_tensor)
+                    batch_is_ragged.append(t_tensor.is_ragged)
+
                 async def _send_fn(
                     target_rank: int,
                     tensors: list,
                     counts: list,
-                    includes_indices: bool = False,
+                    has_spatial_indices_list: Optional[list] = None,
+                    is_ragged_list: Optional[list] = None,
+                    has_origin_indices_list: Optional[list] = None,
                     *,
                     _handlers=handlers,
                     _target_op=target_op,
-                    _tensor_name=target_tensor_name,
+                    _target_names=batch_target_names,
                     _step=step,
-                    _is_ragged=transport_tensor.is_ragged,
+                    _is_ragged=batch_is_ragged,
+                    _batch_tensors=batch_transport_tensors,
                 ) -> bool:
                     handler = _handlers.get(target_rank)
                     if handler is None:
+                        logger.warning(
+                            f"[Worker {_step}] handler for {self.spmd_id} target_rank={target_rank} is None"
+                        )
                         return False
 
+                    # Send bundle to target rank
                     await self._send_semaphore.acquire()
 
                     count = int(counts[0]) if counts else 0
                     if count == 0:
                         backend = get_backend()
-                        empty_tensor = backend.zeros((0,), dtype=backend.float32())
+                        # Use actual batch_tensors metadata to create correctly typed empty shards
+                        empty_shards = [
+                            [backend.zeros((0,), dtype=tt.dtype)]
+                            for tt in _batch_tensors
+                        ]
                         ref_task = handler.receive_shards(
                             _target_op,
-                            _tensor_name,
+                            _target_names,
                             _step,
+                            self.spmd_id,
                             self.rank,
-                            [empty_tensor],
-                            [0],
-                            _is_ragged,
-                            includes_indices,
+                            empty_shards,
+                            [[0] for _ in _target_names],
+                            is_ragged=[tt.is_ragged for tt in _batch_tensors],
+                            has_spatial_indices=[
+                                tt.spatial_indices is not None for tt in _batch_tensors
+                            ],
+                            has_origin_indices=[
+                                tt.origin_indices is not None for tt in _batch_tensors
+                            ],
                         )
                     else:
+                        # AsyncDataDistributor yields a flat list of tensors.
+                        # Since we packed multiple TransportTensors, we need to unflatten them
+                        # back into groups per tensor to send to the worker.
+                        # Each tt yields (data, optional lengths, optional indices)
+                        # The layout in `tensors` is deterministic based on `payload_tensors.append`
+                        payload_groups: List[List[Any]] = []
+                        counts_groups: List[List[int]] = []
+                        cursor = 0
+                        c_cursor = 0
+
+                        # Global Routing indices (appended ONCE for the whole bundle at the end in communication.py)
+                        # We extract it now to insert it into the correct tensor's group during unflattening.
+                        global_indices_tensor = None
+                        global_indices_count = None
+                        if (
+                            has_spatial_indices_list
+                            and any(has_spatial_indices_list)
+                            and len(tensors) > cursor
+                        ):
+                            # The last tensor in the flat list is the global routing indices
+                            global_indices_tensor = tensors[-1]
+                            global_indices_count = counts[-1]
+
+                        for i, (ragged, has_asmb) in enumerate(
+                            zip(_is_ragged, has_origin_indices_list, strict=True)  # type: ignore
+                        ):
+                            group_payloads = []
+                            group_counts = []
+
+                            # Primary data
+                            if cursor < len(tensors) and c_cursor < len(counts):
+                                group_payloads.append(tensors[cursor])
+                                group_counts.append(counts[c_cursor])
+                                cursor += 1
+                                c_cursor += 1
+                            else:
+                                raise RuntimeError(
+                                    f"Unexpected end of tensors/counts while unflattening primary data for {op_name}"
+                                )
+
+                            # Ragged lengths
+                            if ragged:
+                                if cursor < len(tensors) and c_cursor < len(counts):
+                                    group_payloads.append(tensors[cursor])
+                                    group_counts.append(counts[c_cursor])
+                                    cursor += 1
+                                    c_cursor += 1
+                                else:
+                                    raise RuntimeError(
+                                        f"Unexpected end of tensors/counts while unflattening lengths for ragged tensor in {op_name}"
+                                    )
+
+                            # Spatial Indices (Routing)
+                            # Shared spatial indices are appended to the first payload group if flagged
+                            if (
+                                has_spatial_indices_list
+                                and has_spatial_indices_list[i]
+                                and global_indices_tensor is not None
+                            ):
+                                group_payloads.append(global_indices_tensor)
+                                group_counts.append(global_indices_count)
+
+                            # Assembly indices (Origin)
+                            if has_asmb:
+                                if cursor < len(tensors) and c_cursor < len(counts):
+                                    group_payloads.append(tensors[cursor])
+                                    group_counts.append(counts[c_cursor])
+                                    cursor += 1
+                                    c_cursor += 1
+                                else:
+                                    raise RuntimeError(
+                                        f"Unexpected end of tensors/counts while unflattening assembly indices for {op_name}"
+                                    )
+
+                            payload_groups.append(group_payloads)
+                            counts_groups.append(group_counts)
+
+                        # Skip the global indices in tensors list if we consumed them
+                        if global_indices_tensor is not None:
+                            cursor += 1
+                            c_cursor += 1
+
                         ref_task = handler.receive_shards(
                             _target_op,
-                            _tensor_name,
+                            _target_names,
                             _step,
+                            self.spmd_id,
                             self.rank,
-                            tensors,
-                            counts,
-                            _is_ragged,
-                            includes_indices,
+                            payload_groups,
+                            counts_groups,
+                            is_ragged=is_ragged_list or _is_ragged,
+                            has_spatial_indices=has_spatial_indices_list,
+                            has_origin_indices=has_origin_indices_list,
                         )
 
-                    async def _wait_and_release(t=ref_task):
+                    async def _wait_and_release(t=ref_task, target_r=target_rank):
                         try:
-                            # Await the call to get the downstream Mailbox watermark
                             watermark = await t
                             if (
                                 isinstance(watermark, int)
                                 and watermark > self._high_watermark
                             ):
-                                # Apply adaptive throttling backoff
                                 await asyncio.sleep(0.05)
                         except Exception as e:
-                            logger.debug(
-                                f"[spmd_id={self.spmd_id}] Error tracing ACK for backpressure: {e}"
+                            logger.error(
+                                f"[spmd_id={self.spmd_id}] Error tracing ACK for backpressure: {e}",
+                                exc_info=True,
                             )
                         finally:
                             self._send_semaphore.release()
@@ -1376,7 +1670,7 @@ class SPMDWorker:
                     return True
 
                 await distributor.distribute(
-                    transport_tensor,
+                    batch_transport_tensors,
                     source=source_spec,
                     target=target_spec,
                     send_fn=_send_fn,
@@ -1456,6 +1750,12 @@ class SPMDWorker:
             first_name = next(iter(output_sharding.keys()))
             tensors[first_name] = data
 
+        for name in list(tensors.keys()):
+            val = tensors[name]
+            if not isinstance(val, TransportTensor):
+                val = TransportTensor.from_tensor(val)
+                tensors[name] = val
+
         logger.debug(
             f"[spmd_id={self.spmd_id} rank={self.rank}] _extract_tensors: "
             f"extracted={list(tensors.keys())}, data_type={type(data).__name__}"
@@ -1475,15 +1775,31 @@ class SPMDWorker:
             f"[spmd_id={self.spmd_id} rank={self.rank}] Self-loop data passing: {name} step={step} "
             f"-> {target_op}"
         )
+        # Construct group per payload (data, lengths, indices)
+        group = [tensor.flat_values]
+        if tensor.is_ragged:
+            # Reconstruct lengths from splits
+            splits = tensor.nested_splits[0]
+            lengths = splits[1:] - splits[:-1]
+            group.append(lengths)
+        if tensor.spatial_indices is not None:
+            group.append(tensor.spatial_indices)
+        if tensor.origin_indices is not None:
+            group.append(tensor.origin_indices)
+
+        # Scalar handling: use [1] for count if shape is empty
+        row_count = int(tensor.shape[0]) if tensor.shape else 1
         await self.receive_shards(
             target_op,
-            name,
+            [name],
             step,
+            self.spmd_id,
             self.rank,
-            [tensor.flat_values],
-            [int(tensor.shape[0])],
-            tensor.is_ragged,
-            tensor.global_indices is not None,
+            [group],
+            [[row_count]],
+            is_ragged=[tensor.is_ragged],
+            has_spatial_indices=[tensor.spatial_indices is not None],
+            has_origin_indices=[tensor.origin_indices is not None],
         )
 
     async def _self_receive_state(

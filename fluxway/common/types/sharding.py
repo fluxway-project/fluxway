@@ -8,12 +8,12 @@ from pydantic import Field, model_validator
 
 from fluxway.common.backend import get_backend
 from fluxway.common.mesh import DeviceMesh
-from fluxway.common.topology import (
-    TopologyMorphology,
-    Topology,
-    IndexedTopology,
-    RaggedTopology,
-    CallableTopology,
+from fluxway.common.index_descriptor import (
+    IndexMorphology,
+    IndexDescriptor,
+    ExplicitIndex,
+    RaggedIndex,
+    FunctionalIndex,
 )
 from fluxway.common.types.configs import FluxwayBaseSchema, ConfigDict
 
@@ -40,11 +40,11 @@ class PartitionSpec(FluxwayBaseSchema):
 
     model_config = ConfigDict(frozen=True)
 
-    specs: Tuple[Optional[Union[str, int, Tuple[str, ...]]], ...] = Field(
+    specs: Tuple[Optional[Union[str, Tuple[str, ...]]], ...] = Field(
         default_factory=tuple
     )
 
-    def __init__(self, *specs: Optional[Union[str, int, Tuple[str, ...]]]):
+    def __init__(self, *specs: Optional[Union[str, Tuple[str, ...]]]):
         if len(specs) == 1 and isinstance(specs[0], (list, tuple)) and not specs[0]:
             super().__init__(specs=())
         else:
@@ -55,28 +55,11 @@ class PartitionSpec(FluxwayBaseSchema):
         result: Dict[int, Tuple[str, ...]] = {}
         for i, s in enumerate(self.specs):
             if s is not None:
-                if isinstance(s, (str, int)):
-                    result[i] = (str(s),)
+                if isinstance(s, str):
+                    result[i] = (s,)
                 else:
                     result[i] = tuple(str(x) for x in s)
         return result
-
-    def to_named_spec(self, mesh: DeviceMesh) -> PartitionSpec:
-        """Converts integer axis indices to mesh axis names."""
-        new_specs: List[Optional[Union[str, Tuple[str, ...]]]] = []
-        for s in self.specs:
-            if isinstance(s, int):
-                if s < len(mesh.axis_names):
-                    new_specs.append(mesh.axis_names[s])
-                else:
-                    new_specs.append(None)
-            elif isinstance(s, tuple):
-                new_specs.append(
-                    tuple(mesh.axis_names[x] if isinstance(x, int) else x for x in s)
-                )
-            else:
-                new_specs.append(s)
-        return PartitionSpec(*new_specs)
 
     def __repr__(self) -> str:
         return f"P({', '.join(repr(s) for s in self.specs)})"
@@ -97,13 +80,26 @@ class ShardingConfig(FluxwayBaseSchema):
     """Bridge model to parse user-provided sharding dictionaries."""
 
     sharding_type: str = Field(default="static", alias="type")
-    axis: List[Union[str, int]] = Field(default_factory=list)
+    axis: List[str] = Field(default_factory=list)
     fn: Optional[str] = None
     routing_dim: Union[int, Tuple[int, ...]] = 0
 
     def to_spec(self, mesh: DeviceMesh) -> ShardingSpec:
         """Converts declarative config to an executable ShardingSpec."""
-        ps = PartitionSpec(*self.axis).to_named_spec(mesh)
+        for a in self.axis:
+            if not isinstance(a, str):
+                raise ValueError(
+                    f"Fluxway Sharding Error: Invalid axis '{a}' of type {type(a)}. "
+                    f"Sharding axis must be a mesh axis name (str), e.g., 'dp' or 'shard'. "
+                    f"Positional integers (0, 1) are not allowed as they are ambiguous in GSPMD."
+                )
+            if a not in mesh.axis_names:
+                raise ValueError(
+                    f"Fluxway Sharding Error: Axis '{a}' not found in DeviceMesh axis names: {mesh.axis_names}. "
+                    f"Please use valid axis names defined in the @spmd decorator."
+                )
+
+        ps = PartitionSpec(*self.axis)
 
         if self.sharding_type == "replicated" or (
             self.sharding_type == "static" and not self.axis
@@ -134,7 +130,7 @@ class PartitionStrategy(FluxwayBaseSchema):
     """Base class for partitioning strategies.
 
     Encapsulates core algorithm for determining rank assignments (partitioning logic)
-    along with derived metadata indicating how the topology should be interpreted.
+    along with derived metadata indicating how the index_desc should be interpreted.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
@@ -146,7 +142,7 @@ class PartitionStrategy(FluxwayBaseSchema):
         indices: Any,
         dim_size: int,
         num_workers: int,
-        topology: Optional[Topology] = None,
+        index_desc: Optional[IndexDescriptor] = None,
     ) -> Any:
         raise NotImplementedError
 
@@ -163,7 +159,7 @@ class ChunkPartition(PartitionStrategy):
 
     routing_paradigm: RoutingParadigm = RoutingParadigm.STATIC
 
-    def __call__(self, indices, dim_size, num_workers, topology=None):
+    def __call__(self, indices, dim_size, num_workers, index_desc=None):
         backend = get_backend()
         chunk_size = max((dim_size + num_workers - 1) // num_workers, 1)
         ranks = indices // chunk_size
@@ -179,7 +175,7 @@ class CyclicPartition(PartitionStrategy):
 
     routing_paradigm: RoutingParadigm = RoutingParadigm.STATIC
 
-    def __call__(self, indices, dim_size, num_workers, topology=None):
+    def __call__(self, indices, dim_size, num_workers, index_desc=None):
         backend = get_backend()
         return backend.mod(indices, num_workers)
 
@@ -189,15 +185,15 @@ class IndexedPartition(PartitionStrategy):
 
     routing_paradigm: RoutingParadigm = RoutingParadigm.DYNAMIC
 
-    def __call__(self, indices, dim_size, num_workers, topology=None):
+    def __call__(self, indices, dim_size, num_workers, index_desc=None):
         backend = get_backend()
 
-        if isinstance(topology, IndexedTopology):
-            values = topology.indices
-        elif isinstance(topology, CallableTopology):
-            values = topology.hash_fn(indices)
-        elif isinstance(topology, RaggedTopology):
-            starts = topology.splits[0][:-1]
+        if isinstance(index_desc, ExplicitIndex):
+            values = index_desc.indices
+        elif isinstance(index_desc, FunctionalIndex):
+            values = index_desc.hash_fn(indices)
+        elif isinstance(index_desc, RaggedIndex):
+            starts = index_desc.splits[0][:-1]
             values = backend.take(starts, indices)
         else:
             values = indices
@@ -210,15 +206,15 @@ class GreedyPartition(PartitionStrategy):
 
     routing_paradigm: RoutingParadigm = RoutingParadigm.DYNAMIC
 
-    def __call__(self, indices, dim_size, num_workers, topology=None):
+    def __call__(self, indices, dim_size, num_workers, index_desc=None):
         backend = get_backend()
 
-        if isinstance(topology, RaggedTopology):
-            splits = topology.splits[0]
+        if isinstance(index_desc, RaggedIndex):
+            splits = index_desc.splits[0]
             lengths = splits[1:] - splits[:-1]
             lengths_list = backend.to_numpy(lengths).tolist()
-        elif isinstance(topology, IndexedTopology):
-            lengths = topology.indices
+        elif isinstance(index_desc, ExplicitIndex):
+            lengths = index_desc.indices
             lengths_list = backend.to_numpy(lengths).tolist()
         else:
             lengths_list = [1] * dim_size
@@ -263,11 +259,11 @@ class Layout(FluxwayBaseSchema):
 
     data_shape: Tuple[int, ...]
     mesh: DeviceMesh
-    topology: Optional[Topology] = None
+    index_desc: Optional[IndexDescriptor] = None
     partitions: Optional[Dict[int, Tuple[str, ...]]] = None
     strategy: Optional[PartitionStrategy] = None
     routing_dim: Optional[Union[int, Tuple[int, ...]]] = None
-    replica_axes: Optional[List[str]] = None
+    replica_axes: Optional[Tuple[str, ...]] = None
     replica_size: int = 1
 
     @model_validator(mode="after")
@@ -280,7 +276,7 @@ class Layout(FluxwayBaseSchema):
             repl = sorted(all_axes - used, key=lambda x: self.mesh.axis_names.index(x))
             if repl:
                 # We use object.__setattr__ because the model is frozen
-                object.__setattr__(self, "replica_axes", repl)
+                object.__setattr__(self, "replica_axes", tuple(repl))
                 size = 1
                 for ax in repl:
                     size *= self.mesh.shape[self.mesh.axis_names.index(ax)]
@@ -288,16 +284,16 @@ class Layout(FluxwayBaseSchema):
         return self
 
     @property
-    def topology_morphology(self) -> TopologyMorphology:
-        if self.topology is not None:
-            return self.topology.morphology
+    def index_desc_morphology(self) -> IndexMorphology:
+        if self.index_desc is not None:
+            return self.index_desc.morphology
         if self.strategy and self.strategy.routing_paradigm == RoutingParadigm.DYNAMIC:
-            return TopologyMorphology.INDEXED
-        return TopologyMorphology.CONTINUOUS
+            return IndexMorphology.INDEXED
+        return IndexMorphology.CONTINUOUS
 
     @property
     def is_static(self) -> bool:
-        return self.topology is None
+        return self.index_desc is None
 
     @property
     def num_workers(self) -> int:
@@ -328,20 +324,55 @@ class Layout(FluxwayBaseSchema):
             sub_sizes.append(self.mesh.shape[axis_idx])
         return _ravel_multi_index(sub_coords, sub_sizes)
 
+    def get_shard_shape(self, rank: int) -> Tuple[int, ...]:
+        """Returns the shape of the local shard for a given rank."""
+        backend = get_backend()
+        return tuple(
+            int(backend.shape(self.get_shard_indices(rank, i))[0])
+            for i in range(len(self.data_shape))
+        )
+
+    def get_shard_bounds(self, rank: int, dim: int) -> Tuple[int, int]:
+        """Returns the (start, end) index bounds for a given dimension and rank."""
+        world_size = self.shard_size(dim)
+        dim_size = self.data_shape[dim]
+
+        # Standard full replication or not partitioned on this dim
+        if world_size == 1 or not self.partitions or dim not in self.partitions:
+            return 0, dim_size
+
+        effective_rank = self.get_shard_rank(rank, dim)
+        fn = self.strategy
+
+        if isinstance(fn, ChunkPartition):
+            chunk_size = (dim_size + world_size - 1) // world_size
+            start = effective_rank * chunk_size
+            end = min(start + chunk_size, dim_size)
+            return start, end
+
+        # Fallback for non-chunk: use min/max of indices as coarse bounds
+        indices = self.get_shard_indices(rank, dim)
+        backend = get_backend()
+        if backend.shape(indices)[0] == 0:
+            return 0, 0
+        return int(backend.item(backend.min(indices))), int(
+            backend.item(backend.max(indices))
+        ) + 1
+
     def get_shard_indices(self, rank: int, dim: int) -> Any:
         """Returns the global indices held by this rank along a specific dimension."""
         backend = get_backend()
         effective_rank = self.get_shard_rank(rank, dim)
-        ews = self.shard_size(dim)
+        world_size = self.shard_size(dim)
         dim_size = self.data_shape[dim]
 
         # Standard full replication or not partitioned on this dim
-        if ews == 1 or not self.partitions or dim not in self.partitions:
+        if world_size == 1 or not self.partitions or dim not in self.partitions:
             return backend.arange(0, dim_size, dtype=backend.int32())
 
         fn = self.strategy
         if isinstance(fn, ChunkPartition):
-            chunk_size = (dim_size + ews - 1) // ews
+            chunk_size = (dim_size + world_size - 1) // world_size
             start = effective_rank * chunk_size
             end = min(start + chunk_size, dim_size)
             if start >= end:
@@ -350,21 +381,27 @@ class Layout(FluxwayBaseSchema):
 
         elif isinstance(fn, CyclicPartition):
             return backend.arange(
-                effective_rank, dim_size, step=ews, dtype=backend.int32()
+                effective_rank, dim_size, step=world_size, dtype=backend.int32()
             )
 
         # Fallback: materialize and filter
+        # If dim_size is unknown (-1), we return an empty array to avoid JAX compile errors in nonzero(size=-1)
+        if dim_size < 0:
+            return backend.zeros((0,), dtype=backend.int32())
+
         indices = backend.arange(0, dim_size, dtype=backend.int32())
-        target_ranks = fn(indices, dim_size, ews, topology=self.topology)
+        target_ranks = fn(indices, dim_size, world_size, index_desc=self.index_desc)
         mask = target_ranks == effective_rank
-        nz = backend.nonzero(mask)
-        return backend.reshape(nz, (-1,))
+        nz = backend.nonzero(mask, size=dim_size)
+        # nz is a tuple (indices_array,) in jax, must unpack the first element for 1D unless use flatnonzero
+        idx = nz[0] if isinstance(nz, (list, tuple)) else nz
+        return backend.reshape(idx, (-1,))
 
     @property
     def is_content_addressable(self) -> bool:
-        return self.topology_morphology in (
-            TopologyMorphology.RAGGED,
-            TopologyMorphology.INDEXED,
+        return self.index_desc_morphology in (
+            IndexMorphology.RAGGED,
+            IndexMorphology.INDEXED,
         )
 
 
@@ -383,7 +420,7 @@ class ShardingSpec(FluxwayBaseSchema):
     partition: PartitionSpec
     routing_dim: Union[int, Tuple[int, ...]] = 0
 
-    replica_axes: Optional[List[str]] = Field(default=None)
+    replica_axes: Optional[Tuple[str, ...]] = Field(default=None)
     replica_size: int = Field(default=1)
 
     def __init__(
@@ -402,6 +439,16 @@ class ShardingSpec(FluxwayBaseSchema):
             **kwargs,
         )
 
+    @property
+    def is_dynamic(self) -> bool:
+        """Alias for is_content_addressable for GSPMD-style intuition."""
+        return self.strategy.routing_paradigm == RoutingParadigm.DYNAMIC
+
+    @property
+    def is_content_addressable(self) -> bool:
+        """Technical description: routing is determined by data content/values."""
+        return self.is_dynamic
+
     @model_validator(mode="after")
     def _compute_replica_info(self) -> "ShardingSpec":
         if self.mesh is not None:
@@ -412,7 +459,7 @@ class ShardingSpec(FluxwayBaseSchema):
             all_axes = set(self.mesh.axis_names)
             repl = sorted(all_axes - used, key=lambda x: self.mesh.axis_names.index(x))
             if repl:
-                object.__setattr__(self, "replica_axes", repl)
+                object.__setattr__(self, "replica_axes", tuple(repl))
                 size = 1
                 for ax in repl:
                     size *= self.mesh.shape[self.mesh.axis_names.index(ax)]
@@ -423,14 +470,10 @@ class ShardingSpec(FluxwayBaseSchema):
     def partitions(self):
         return self.partition.partitions
 
-    @property
-    def is_content_addressable(self) -> bool:
-        return self.strategy.routing_paradigm == RoutingParadigm.DYNAMIC
-
     def _to_layout(
         self,
         data_shape: Optional[Tuple[int, ...]] = None,
-        topology: Optional[Topology] = None,
+        index_desc: Optional[IndexDescriptor] = None,
     ) -> Layout:
         """Internal: evaluate specification into a concrete Layout."""
         if data_shape is None:
@@ -444,7 +487,7 @@ class ShardingSpec(FluxwayBaseSchema):
         return Layout(
             data_shape=data_shape,
             mesh=self.mesh,
-            topology=topology,
+            index_desc=index_desc,
             partitions=self.partitions,
             strategy=self.strategy,
             routing_dim=self.routing_dim,
@@ -480,7 +523,7 @@ class ShardingSpec(FluxwayBaseSchema):
         target_layout = target_spec._to_layout((dummy_dim_size,))
 
         t_logic = target_layout.get_shard_rank(target_rank, dim)
-        t_ews = target_layout.shard_size(dim)
+        t_world_size = target_layout.shard_size(dim)
 
         def get_chunk_bounds(rank, world_size, dim_size):
             chunk_size = max((dim_size + world_size - 1) // world_size, 1)
@@ -488,22 +531,22 @@ class ShardingSpec(FluxwayBaseSchema):
             end = min(start + chunk_size, dim_size)
             return start, end
 
-        if t_ews <= 1:
+        if t_world_size <= 1:
             t_start, t_end = 0, dummy_dim_size
         else:
-            t_start, t_end = get_chunk_bounds(t_logic, t_ews, dummy_dim_size)
+            t_start, t_end = get_chunk_bounds(t_logic, t_world_size, dummy_dim_size)
 
         if t_start >= t_end:
             return []
 
         producers = []
-        s_ews = source_layout.shard_size(dim)
+        s_world_size = source_layout.shard_size(dim)
         for sr in range(source_world):
-            if s_ews <= 1:
+            if s_world_size <= 1:
                 s_start, s_end = 0, dummy_dim_size
             else:
                 s_logic = source_layout.get_shard_rank(sr, dim)
-                s_start, s_end = get_chunk_bounds(s_logic, s_ews, dummy_dim_size)
+                s_start, s_end = get_chunk_bounds(s_logic, s_world_size, dummy_dim_size)
 
             if s_start < s_end and max(t_start, s_start) < min(t_end, s_end):
                 producers.append(sr)
@@ -538,7 +581,7 @@ class ShardingSpec(FluxwayBaseSchema):
         target_layout = target_spec._to_layout((dummy_dim_size,))
 
         s_logic = source_layout.get_shard_rank(source_rank, dim)
-        s_ews = source_layout.shard_size(dim)
+        s_world_size = source_layout.shard_size(dim)
 
         def get_chunk_bounds(rank, world_size, dim_size):
             chunk_size = max((dim_size + world_size - 1) // world_size, 1)
@@ -546,22 +589,22 @@ class ShardingSpec(FluxwayBaseSchema):
             end = min(start + chunk_size, dim_size)
             return start, end
 
-        if s_ews <= 1:
+        if s_world_size <= 1:
             s_start, s_end = 0, dummy_dim_size
         else:
-            s_start, s_end = get_chunk_bounds(s_logic, s_ews, dummy_dim_size)
+            s_start, s_end = get_chunk_bounds(s_logic, s_world_size, dummy_dim_size)
 
         if s_start >= s_end:
             return []
 
         consumers = []
-        t_ews = target_layout.shard_size(dim)
+        t_world_size = target_layout.shard_size(dim)
         for tr in range(target_world):
-            if t_ews <= 1:
+            if t_world_size <= 1:
                 t_start, t_end = 0, dummy_dim_size
             else:
                 t_logic = target_layout.get_shard_rank(tr, dim)
-                t_start, t_end = get_chunk_bounds(t_logic, t_ews, dummy_dim_size)
+                t_start, t_end = get_chunk_bounds(t_logic, t_world_size, dummy_dim_size)
 
             if t_start < t_end and max(t_start, s_start) < min(t_end, s_end):
                 consumers.append(tr)
@@ -612,18 +655,20 @@ class ShardingSpec(FluxwayBaseSchema):
         if source_layout.strategy is None:
             raise ValueError("Cannot follow a Layout without strategy")
 
-        captured_meta = source_layout.topology
+        captured_meta = source_layout.index_desc
         captured_strategy = source_layout.strategy
 
         class _FollowPartition(PartitionStrategy):
-            """Wraps a captured strategy with bound topology."""
+            """Wraps a captured strategy with bound index_desc."""
 
             model_config = ConfigDict(frozen=True)
             routing_paradigm: RoutingParadigm = captured_strategy.routing_paradigm
 
-            def __call__(self, indices, dim_size, num_workers, topology=None):
-                meta = captured_meta if captured_meta is not None else topology
-                return captured_strategy(indices, dim_size, num_workers, topology=meta)
+            def __call__(self, indices, dim_size, num_workers, index_desc=None):
+                meta = captured_meta if captured_meta is not None else index_desc
+                return captured_strategy(
+                    indices, dim_size, num_workers, index_desc=meta
+                )
 
             @property
             def name(self) -> str:
@@ -646,12 +691,12 @@ class ShardingSpec(FluxwayBaseSchema):
     def derive_from(
         driver_spec: ShardingSpec,
         driver_data_shape: Tuple[int, ...],
-        driver_topology: Any = None,
+        driver_index_desc: Any = None,
         follow_dim: int = 0,
     ) -> ShardingSpec:
-        """One-liner for routing_indices distribution."""
+        """One-liner for spatial_indices distribution."""
         driver_layout = driver_spec._to_layout(
-            driver_data_shape, topology=driver_topology
+            driver_data_shape, index_desc=driver_index_desc
         )
         return ShardingSpec.follow(driver_layout, dim=follow_dim)
 

@@ -4,9 +4,18 @@ from fluxway.common.types.tensor import TransportTensor
 from .data_types import LookupOutput
 
 
-def route_back(tensor, mesh):
-    """Routing unique embeddings back to origin Dense workers."""
-    return tensor.origin_ranks
+def route_to_dense(tensor, mesh):
+    """Calculates destination rank based on origin_indices."""
+    if tensor.origin_indices is None:
+        return 0
+
+    # Assume uniform chunk sharding on the target (Dense)
+    # We use global_shape to determine the logical batch size
+    global_rows = tensor.global_shape[0] if tensor.global_shape else 100
+    rows_per_rank = (global_rows + mesh.size - 1) // mesh.size
+
+    target_ranks = tensor.origin_indices // rows_per_rank
+    return jnp.clip(target_ranks, 0, mesh.size - 1)
 
 
 @spmd(mesh_axis_names=("shard",), mesh_axis_shapes=(4,))
@@ -26,10 +35,14 @@ class SparseEmbeddingSPMD:
         # We can dynamically name the tensor argument via metadata
         data_argument=["unique_ids"],
         input_sharding={
-            "unique_ids": {"type": "dynamic", "axis": [0], "fn": "hash_routing"}
+            "unique_ids": {"type": "dynamic", "axis": ["shard"], "fn": "hash_routing"}
         },
         output_sharding={
-            "sparse_features": {"type": "dynamic", "axis": [0], "fn": "route_back"}
+            "sparse_features": {
+                "type": "dynamic",
+                "axis": ["shard"],
+                "fn": "route_to_dense",
+            }
         },
     )
     def lookup(self, unique_ids: TransportTensor) -> LookupOutput:
@@ -52,8 +65,7 @@ class SparseEmbeddingSPMD:
 
         output = TransportTensor(
             embeddings,
-            indices=unique_ids.global_indices,  # Propagate global IDs for backward routing
-            origin_ranks=unique_ids.origin_ranks,
+            spatial_indices=unique_ids.spatial_indices,  # Propagate global IDs for backward routing
             origin_indices=unique_ids.origin_indices,
         )
         return LookupOutput(sparse_features=output)
@@ -62,14 +74,14 @@ class SparseEmbeddingSPMD:
         name="update",
         data_argument=["grads"],
         input_sharding={
-            "grads": {"type": "dynamic", "axis": [0], "fn": "hash_routing"}
+            "grads": {"type": "dynamic", "axis": ["shard"], "fn": "hash_routing"}
         },
     )
     def update(self, grads: TransportTensor) -> None:
-        ids = grads.global_indices
+        ids = grads.spatial_indices
         if ids is None:
             print(
-                f"[SparseSPMD] Worker {self.rank} Update Error: Gradients missing global_indices"
+                f"[SparseSPMD] Worker {self.rank} Update Error: Gradients missing spatial_indices"
             )
             return
 
@@ -91,8 +103,8 @@ class SparseEmbeddingSPMD:
 
 
 def hash_routing(tensor, mesh):
-    if isinstance(tensor, TransportTensor) and tensor.global_indices is not None:
-        val = tensor.global_indices
+    if isinstance(tensor, TransportTensor) and tensor.spatial_indices is not None:
+        val = tensor.spatial_indices
     else:
         val = tensor.flat_values if isinstance(tensor, TransportTensor) else tensor
     return jnp.mod(val, mesh.size)

@@ -23,7 +23,7 @@ class TransportPlan:
     send_counts: Any
     target_num_workers: int
     replication_factor: int = 1
-    global_indices: Optional[Any] = None
+    spatial_indices: Optional[Any] = None
 
     @property
     def is_replicated(self) -> bool:
@@ -89,19 +89,19 @@ class TransportPlanner:
             sort_indices,
             dest_devices,
             send_counts,
-            global_indices,
+            spatial_indices,
             target_num_workers,
             replica_size,
         ) = TransportPlanner._compute_plan_internal(
             src_indices=src_indices,
             data_values=data_values,
-            dst_topology=dst_layout.topology,
+            dst_index_desc=dst_layout.index_desc,
             dst_routing_dim=routing_dim,
             dst_data_shape=dst_layout.data_shape,
             dst_strategy=dst_layout.strategy,
             dst_mesh=dst_layout.mesh,
             dst_partitions=dst_layout.partitions,
-            src_layout_local_indices_fn=src_layout.get_shard_indices,
+            src_shard_resolver=src_layout.get_shard_indices,
             local_rank=local_rank,
         )
 
@@ -111,26 +111,31 @@ class TransportPlanner:
             send_counts=send_counts,
             target_num_workers=target_num_workers,
             replication_factor=replica_size,
-            global_indices=global_indices,
+            spatial_indices=spatial_indices,
         )
 
     @staticmethod
     def _compute_plan_internal(
         src_indices: Optional[Any],
         data_values: Optional[Any],
-        dst_topology: Any,
+        dst_index_desc: Any,
         dst_routing_dim: Optional[Union[int, Tuple[int, ...]]],
         dst_data_shape: Tuple[int, ...],
         dst_strategy: Optional[Callable],
         dst_mesh: Optional[Any],
         dst_partitions: Optional[dict],
-        src_layout_local_indices_fn: Callable[[int, int], Any],
+        src_shard_resolver: Callable[[int, int], Any],
         local_rank: int,
     ) -> Tuple[Any, Any, Any, Any, int, int]:
         """Internal static logical core for JIT compilation."""
         backend = get_backend()
 
         dst_num_workers = dst_mesh.size if dst_mesh else 1
+        print(
+            f"[Planner] Compute plan: local_rank={local_rank}, src_indices={src_indices}, dst_num_workers={dst_num_workers}, dst_data_shape={dst_data_shape}",
+            flush=True,
+        )
+
         dst_is_content_addressable = (
             getattr(dst_strategy, "routing_paradigm", None) is not None
             and dst_strategy.routing_paradigm.name == "DYNAMIC"
@@ -161,11 +166,9 @@ class TransportPlanner:
         # Fallback for explicit src_indices overriding the primary dimension.
         primary_dim = routing_dims[0] if routing_dims else 0
         if src_indices is not None:
-            primary_src_global_indices = src_indices
+            primary_src_spatial_indices = src_indices
         else:
-            primary_src_global_indices = src_layout_local_indices_fn(
-                local_rank, primary_dim
-            )
+            primary_src_spatial_indices = src_shard_resolver(local_rank, primary_dim)
 
         # =====================================================================
         # [ N-D Cross-Mesh Routing & Cartesian Broadcasting ]
@@ -216,7 +219,7 @@ class TransportPlanner:
             elif is_dynamic_dim and data_values is not None:
                 indices_for_routing = data_values
             else:
-                indices_for_routing = src_layout_local_indices_fn(local_rank, d)
+                indices_for_routing = src_shard_resolver(local_rank, d)
 
             # Identify sub-mesh assigned to this tensor dimension
             axes = dst_partitions[d]
@@ -230,7 +233,7 @@ class TransportPlanner:
                 indices_for_routing,
                 dim_size=dst_data_shape[d],
                 num_workers=sub_num_workers,
-                topology=dst_topology if is_dynamic_dim else None,
+                index_desc=dst_index_desc if is_dynamic_dim else None,
             )
 
             unraveled = backend.unravel_index(logical_ranks_d, sub_mesh_shape)
@@ -326,7 +329,7 @@ class TransportPlanner:
             sort_indices,
             dest_devices,
             send_counts,
-            primary_src_global_indices,
+            primary_src_spatial_indices,
             dst_num_workers,
             num_replicas,
         )
@@ -337,11 +340,11 @@ class TransportPlanner:
         dst_spec: ShardingSpec,
         data_shape: Tuple[int, ...],
         local_rank: int,
-        topology: Any = None,
+        index_desc: Any = None,
     ) -> TransportPlan:
         """High-level Diff API."""
-        src_layout = src_spec._to_layout(data_shape, topology)
-        dst_layout = dst_spec._to_layout(data_shape, topology)
+        src_layout = src_spec._to_layout(data_shape, index_desc)
+        dst_layout = dst_spec._to_layout(data_shape, index_desc)
         return TransportPlanner.compute_plan(src_layout, dst_layout, local_rank)
 
 

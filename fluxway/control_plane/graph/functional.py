@@ -1,5 +1,4 @@
 from typing import Any, Callable, Dict, Optional, Type
-from fluxway.common.types.configs import SPMDConfig
 from .builder import Builder
 
 
@@ -57,12 +56,60 @@ class NodeProxy:
             condition_fn: Optional[Callable[..., bool]] = None,
             **kwargs,
         ) -> OpHandle:
+            # Fetch target arguments to map positional args
+            target_node = self._graph._builder._nodes.get(self.node_id)
+            all_target_args = []
+            if target_node:
+                target_meta = target_node.spmd_config.operator_metas.get(op_name)
+                if target_meta:
+                    from fluxway.common.types.configs import ArgumentType
+
+                    tensor_args = target_meta.get_arguments(
+                        is_output=False, arg_type=ArgumentType.TENSOR
+                    )
+                    state_args = target_meta.get_arguments(
+                        is_output=False, arg_type=ArgumentType.STATE
+                    )
+                    all_target_args = tensor_args + state_args
+
             # Register edges for positional arguments
-            for in_handle in args:
+            for i, in_handle in enumerate(args):
                 if not isinstance(in_handle, OpHandle):
                     raise TypeError(
                         f"Inputs must be OpHandle instances. Got {type(in_handle)} "
                         f"for arg to {self.node_id}.{op_name}"
+                    )
+
+                # Fetch the source argument names from the source operator
+                src_node = self._graph._builder._nodes.get(in_handle.node_id)
+                src_output_names = []
+                if src_node:
+                    src_meta = src_node.spmd_config.operator_metas.get(
+                        in_handle.op_name
+                    )
+                    if src_meta:
+                        from fluxway.common.types.configs import ArgumentType
+
+                        src_output_names = src_meta.get_arguments(
+                            is_output=True, arg_type=ArgumentType.TENSOR
+                        )
+
+                # If specific output field is not selected, and source has exactly one tensor output, infer it.
+                inferred_source_output = in_handle.output_name
+                if inferred_source_output is None and len(src_output_names) == 1:
+                    inferred_source_output = src_output_names[0]
+
+                # Map positional target arguments, but if the user passed a single
+                # handle for an operator with multiple inputs, treat it as a bundle (intersection).
+                if (
+                    len(args) == 1
+                    and len(all_target_args) > 1
+                    and inferred_source_output is None
+                ):
+                    target_input = None
+                else:
+                    target_input = (
+                        all_target_args[i] if i < len(all_target_args) else None
                     )
 
                 self._graph._builder.add_func_edge(
@@ -71,7 +118,8 @@ class NodeProxy:
                     target_node=self.node_id,
                     target_op=op_name,
                     condition_fn=condition_fn,
-                    source_output=in_handle.output_name,
+                    source_output=inferred_source_output,
+                    target_input=target_input,
                 )
 
             # Register edges for keyword arguments (with explicit target mapping)
@@ -80,13 +128,32 @@ class NodeProxy:
                     # Allow non-OpHandle kwargs (passed as static args maybe? No, builder doesn't support it here)
                     continue
 
+                # Fetch the source argument names from the source operator
+                src_node = self._graph._builder._nodes.get(in_handle.node_id)
+                src_output_names = []
+                if src_node:
+                    src_meta = src_node.spmd_config.operator_metas.get(
+                        in_handle.op_name
+                    )
+                    if src_meta:
+                        from fluxway.common.types.configs import ArgumentType
+
+                        src_output_names = src_meta.get_arguments(
+                            is_output=True, arg_type=ArgumentType.TENSOR
+                        )
+
+                # If specific output field is not selected, and source has exactly one tensor output, infer it.
+                inferred_source_output = in_handle.output_name
+                if inferred_source_output is None and len(src_output_names) == 1:
+                    inferred_source_output = src_output_names[0]
+
                 self._graph._builder.add_func_edge(
                     source_node=in_handle.node_id,
                     source_op=in_handle.op_name,
                     target_node=self.node_id,
                     target_op=op_name,
                     condition_fn=condition_fn,
-                    source_output=in_handle.output_name,
+                    source_output=inferred_source_output,
                     target_input=target_arg,
                 )
 
@@ -122,13 +189,7 @@ class FunctionalGraph:
         self._builder = Builder()
 
     def node(
-        self,
-        name: str,
-        spmd_class: Type,
-        description: str = "",
-        config: Optional[SPMDConfig] = None,
-        *args,
-        **kwargs,
+        self, name: str, spmd_class: Type, description: str = "", *args, **kwargs
     ) -> NodeProxy:
         """
         Registers an SPMD node and returns a proxy for functional graph construction.
@@ -137,13 +198,12 @@ class FunctionalGraph:
             name: Unique identifier for the node.
             spmd_class: The SPMDWorker subclass to instantiate.
             description: Human-readable description of the node.
-            config: Optional SPMDConfig.
-            *args, **kwargs: Additional arguments passed to builder.add_node.
+            *args, **kwargs: Additional arguments passed to builder.add_node (e.g., mesh).
 
         Returns:
             A NodeProxy object representing this SPMD.
         """
-        self._builder.add_node(name, spmd_class, description=description)
+        self._builder.add_node(name, spmd_class, description, *args, **kwargs)
         return NodeProxy(name, self)
 
     def reader(

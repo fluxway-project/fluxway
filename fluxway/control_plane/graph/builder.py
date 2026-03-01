@@ -12,6 +12,7 @@ Usage:
     graph = builder.build(name="my_graph")
 """
 
+import copy
 from typing import Any, Dict, List, Optional, Callable, Type, Tuple
 import logging
 
@@ -78,8 +79,8 @@ class Builder:
             )
 
         # Get resource and config from the decorated class
-        resource = spmd_class.get_resource()
-        spmd_config = spmd_class.get_spmd_config()
+        resource = copy.deepcopy(spmd_class.get_resource())
+        spmd_config = copy.deepcopy(spmd_class.get_spmd_config())
 
         if mesh is not None:
             spmd_config.mesh = mesh
@@ -319,11 +320,16 @@ class Builder:
         Refactored into discrete validation and linking phases.
         """
         ctx = f"edge {source_node}.{source_op} -> {target_node}.{target_op}"
-        tensor_map = self._build_tensor_map(source_output, target_input)
 
         # 1. Validation Phase (Strict checks on metadata, IO, and Sharding)
-        src_meta, dst_meta, effective_sharding = self._validate_edge_io(
-            source_node, source_op, target_node, target_op, tensor_map, ctx
+        src_meta, dst_meta, effective_sharding, tensor_map = self._validate_edge_io(
+            source_node,
+            source_op,
+            target_node,
+            target_op,
+            source_output,
+            target_input,
+            ctx,
         )
 
         # 2. Linking Phase (Update topology and sharding info in SPMDConfigs)
@@ -342,31 +348,19 @@ class Builder:
             tensor_map,
         )
 
-    def _build_tensor_map(
-        self, source_output: Optional[str], target_input: Optional[str]
-    ) -> Dict[str, str]:
-        """Build tensor name mapping between source and target."""
-        tensor_map = {}
-        if source_output and target_input:
-            tensor_map[source_output] = target_input
-        elif source_output:
-            tensor_map[source_output] = source_output
-        elif target_input:
-            tensor_map[target_input] = target_input
-        return tensor_map
-
     def _validate_edge_io(
         self,
         source_node: str,
         source_op: str,
         target_node: str,
         target_op: str,
-        tensor_map: Dict[str, str],
+        source_output: Optional[str],
+        target_input: Optional[str],
         ctx: str,
-    ) -> Tuple[OperatorMeta, OperatorMeta, Dict[str, Any]]:
+    ) -> Tuple[OperatorMeta, OperatorMeta, Dict[str, Any], Dict[str, str]]:
         """
         Unified validation for edge IO.
-        Returns (source_meta, target_meta, { 'src_specs': ..., 'dst_specs': ..., 'src_names': ..., 'dst_names': ... })
+        Returns (source_meta, target_meta, { 'src_specs': ..., 'dst_specs': ..., 'src_names': ..., 'dst_names': ... }, tensor_map)
         """
         src_cfg = self._nodes[source_node].spmd_config
         dst_cfg = self._nodes[target_node].spmd_config
@@ -388,10 +382,73 @@ class Builder:
             ctx=ctx,
         )
 
-        # 3. Validate and Extract Sharding Specs
         from fluxway.common.types.sharding import ShardingConfig
         from fluxway.common.types.configs import ArgumentType
 
+        # This implementation treats parameter names as placeholders and resolves
+        # the underlying flattened tensor fields automatically.
+        src_args = src_meta.get_arguments(is_output=True, arg_type=ArgumentType.TENSOR)
+        dst_args = dst_meta.get_arguments(is_output=False, arg_type=ArgumentType.TENSOR)
+
+        effective_src_names = src_args
+        effective_dst_names = dst_args
+
+        # If target_input refers to a logical @data_type parameter,
+        # map all its constituent fields instead of the name itself.
+        if target_input and target_input in (
+            getattr(dst_meta, "input_param_map", {}) or {}
+        ):
+            effective_dst_names = [
+                f for f in dst_meta.input_param_map[target_input] if f in dst_args
+            ]
+            target_input = None  # Consumed
+
+        # Similarly for source placeholders/operators
+        if source_output and source_output in (
+            getattr(src_meta, "output_param_map", {}) or {}
+        ):
+            effective_src_names = [
+                f for f in src_meta.output_param_map[source_output] if f in src_args
+            ]
+            source_output = None  # Consumed
+
+        # If positional source/target provided, use them directly
+        if not source_output and len(effective_src_names) == 1:
+            source_output = effective_src_names[0]
+        if not target_input and len(effective_dst_names) == 1:
+            target_input = effective_dst_names[0]
+
+        tensor_map = {}
+        if source_output and target_input:
+            tensor_map[source_output] = target_input
+        elif source_output:
+            tensor_map[source_output] = source_output
+        elif target_input:
+            tensor_map[target_input] = target_input
+        else:
+            # Intersection: Map fields with matching names
+            common = [n for n in effective_src_names if n in effective_dst_names]
+            for n in common:
+                tensor_map[n] = n
+
+        # 1-to-1 fallback for single-tensor streams if still no map
+        if (
+            not tensor_map
+            and len(effective_src_names) == 1
+            and len(effective_dst_names) == 1
+        ):
+            tensor_map[effective_src_names[0]] = effective_dst_names[0]
+
+        if not tensor_map:
+            raise ValueError(
+                f"\n[Fluxway Topology Error] In {ctx}:\n"
+                f"  Could not automatically map outputs from '{source_node}.{source_op}' to inputs of '{target_node}.{target_op}'.\n"
+                f"  Available outputs: {list(src_args)}\n"
+                f"  Available inputs: {list(dst_args)}\n"
+                f"  Fix: Explicitly specify target arguments using kwargs handling or ensure argument names intersect."
+            )
+
+        # 4. Validate and Extract Sharding Specs
         def to_spec(raw, mesh):
             if isinstance(raw, dict):
                 return ShardingConfig.model_validate(raw).to_spec(mesh)
@@ -406,18 +463,8 @@ class Builder:
             for k, v in (dst_meta.input_sharding or {}).items()
         }
 
-        if tensor_map:
-            src_names = list(tensor_map.keys())
-            dst_names = list(tensor_map.values())
-        else:
-            src_args = src_meta.get_arguments(
-                is_output=True, arg_type=ArgumentType.TENSOR
-            )
-            dst_args = dst_meta.get_arguments(
-                is_output=False, arg_type=ArgumentType.TENSOR
-            )
-            src_names = [n for n in src_args if n in dst_args]
-            dst_names = src_names
+        src_names = list(tensor_map.keys())
+        dst_names = list(tensor_map.values())
 
         for name in src_names:
             if name not in src_out_specs:
@@ -444,6 +491,7 @@ class Builder:
                 "src_names": src_names,
                 "dst_names": dst_names,
             },
+            tensor_map,
         )
 
     def _link_topology(

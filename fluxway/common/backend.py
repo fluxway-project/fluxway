@@ -199,7 +199,7 @@ class TensorBackend(ABC):
         pass
 
     @abstractmethod
-    def nonzero(self, x: Any) -> Any:
+    def nonzero(self, x: Any, *, size: Any = None, fill_value: Any = None) -> Any:
         pass
 
     @abstractmethod
@@ -406,13 +406,13 @@ class TorchBackend(TensorBackend):
     def cumsum(self, x: Any, dim: int = 0) -> Any:
         return self._torch.cumsum(x, dim=dim)
 
-    def nonzero(self, x: Any) -> Any:
+    def nonzero(self, x: Any, *, size: Any = None, fill_value: Any = None) -> Any:
         return self._torch.nonzero(x, as_tuple=False)
 
     def dynamic_slice(self, x: Any, start: Any, size: Any) -> Any:
         """Simulates dynamic slicing using index_select."""
         # Note: robust for dynamic start without CPU sync if we index manually
-        for i, (s, l) in enumerate(zip(start, size, strict=True)):
+        for i, (s, l) in enumerate(zip(start, size, strict=True)):  # type: ignore
             idx = self._torch.arange(l, device=x.device, dtype=self._torch.int64) + s
             x = self._torch.index_select(x, i, idx)
 
@@ -624,12 +624,23 @@ class JaxBackend(TensorBackend):
         return val, idx
 
     def gather(self, x: Any, dim: int, index: Any) -> Any:
+        # Avoid JAX gather error for zero-sized dimensions in JIT
+        if x.shape[dim] == 0:
+            return self._jnp.zeros(index.shape, dtype=x.dtype)
         return self._jnp.take_along_axis(x, index, axis=dim)
 
     def take(self, x: Any, indices: Any) -> Any:
+        # Avoid JAX gather error for zero-sized dimensions in JIT
+        if x.shape[0] == 0:
+            indices_shape = getattr(indices, "shape", ())
+            return self._jnp.zeros(indices_shape + x.shape[1:], dtype=x.dtype)
         return x[indices]
 
     def select(self, x: Any, dim: int, index: int) -> Any:
+        # JAX take/select will fail if dimension is 0
+        if x.shape[dim] == 0:
+            new_shape = x.shape[:dim] + x.shape[dim + 1 :]
+            return self._jnp.zeros(new_shape, dtype=x.dtype)
         return self._jnp.take(x, index, axis=dim)
 
     def diff(self, x: Any, dim: int = -1) -> Any:
@@ -663,6 +674,8 @@ class JaxBackend(TensorBackend):
     def unique(
         self, x: Any, return_inverse: bool = False, return_counts: bool = False
     ) -> Any:
+        # jnp.unique returns (uniques, [inverse], [counts])
+        # Torch returns (uniques, [inverse], [counts]) in the same order.
         return self._jnp.unique(
             x, return_inverse=return_inverse, return_counts=return_counts
         )
@@ -694,8 +707,8 @@ class JaxBackend(TensorBackend):
     def cumsum(self, x: Any, dim: int = 0) -> Any:
         return self._jnp.cumsum(x, axis=dim)
 
-    def nonzero(self, x: Any) -> Any:
-        return self._jnp.argwhere(x)
+    def nonzero(self, x: Any, *, size: Any = None, fill_value: Any = None) -> Any:
+        return self._jnp.nonzero(x, size=size, fill_value=fill_value)
 
     def dynamic_slice(self, x: Any, start: Any, size: Any) -> Any:
         # Ensure start/size are tuples for JAX compatibility

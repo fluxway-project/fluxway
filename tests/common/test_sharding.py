@@ -6,11 +6,11 @@ import jax.numpy as jnp
 from fluxway.common.backend import set_backend
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.types.sharding import ShardingSpec, P
-from fluxway.common.topology import (
-    TopologyMorphology,
-    RaggedTopology,
-    IndexedTopology,
-    CallableTopology,
+from fluxway.common.index_descriptor import (
+    IndexMorphology,
+    RaggedIndex,
+    ExplicitIndex,
+    FunctionalIndex,
 )
 
 
@@ -32,7 +32,7 @@ def test_chunk_layout_dense():
     assert layout.partitions[0] == ("x",)
     assert layout.num_workers == 2
     assert layout.is_static is True
-    assert layout.topology_morphology == TopologyMorphology.CONTINUOUS
+    assert layout.index_desc.morphology == IndexMorphology.CONTINUOUS
 
     indices0 = layout.get_shard_indices(0, 0)
     indices1 = layout.get_shard_indices(1, 0)
@@ -57,11 +57,11 @@ def test_chunk_layout_multidim():
 
 
 def test_chunk_layout_ragged():
-    """chunk on ragged tensor (topology = splits)."""
+    """chunk on ragged tensor (index_desc = splits)."""
     splits = [jnp.array([0, 3, 5], dtype=jnp.int32)]
     mesh = DeviceMesh(device_shape=(2,), axis_names=("x",))
     spec = ShardingSpec.chunk(mesh=mesh, partition=P("x"))
-    layout = spec._to_layout(data_shape=(2,), topology=RaggedTopology(splits=splits))
+    layout = spec._to_layout(data_shape=(2,), index_desc=RaggedIndex(splits=splits))
 
     indices0 = layout.get_shard_indices(0, 0)
     indices1 = layout.get_shard_indices(1, 0)
@@ -89,12 +89,12 @@ def test_cyclic_layout():
 # ---- hash ----
 
 
-def test_hash_layout_with_topology():
+def test_hash_layout_with_index_desc():
     """hash using ragged splits as hash seed."""
     splits = [jnp.array([0, 10, 20], dtype=jnp.int32)]
     mesh = DeviceMesh(device_shape=(3,), axis_names=("x",))
     spec = ShardingSpec.hash(mesh=mesh, partition=P("x"))
-    layout = spec._to_layout(data_shape=(2,), topology=RaggedTopology(splits=splits))
+    layout = spec._to_layout(data_shape=(2,), index_desc=RaggedIndex(splits=splits))
 
     indices0 = layout.get_shard_indices(0, 0)
     indices1 = layout.get_shard_indices(1, 0)
@@ -104,15 +104,15 @@ def test_hash_layout_with_topology():
     assert jnp.array_equal(indices1, jnp.array([1], dtype=jnp.int32))
     assert tuple(indices2.tolist()) == ()
     assert layout.is_static is False
-    assert layout.topology_morphology == TopologyMorphology.RAGGED
+    assert layout.index_desc_morphology == IndexMorphology.RAGGED
 
 
-def test_hash_layout_with_routing_indices():
-    """hash using external routing_indices indices."""
+def test_hash_layout_with_spatial_indices():
+    """hash using external spatial_indices indices."""
     dep = jnp.array([5, 3, 7, 2], dtype=jnp.int32)
     mesh = DeviceMesh(device_shape=(3,), axis_names=("x",))
     spec = ShardingSpec.hash(mesh=mesh, partition=P("x"))
-    layout = spec._to_layout(data_shape=(4,), topology=IndexedTopology(indices=dep))
+    layout = spec._to_layout(data_shape=(4,), index_desc=ExplicitIndex(indices=dep))
 
     indices0 = layout.get_shard_indices(0, 0)
     indices1 = layout.get_shard_indices(1, 0)
@@ -124,7 +124,7 @@ def test_hash_layout_with_routing_indices():
 
 
 def test_hash_layout_with_custom_function():
-    """hash using custom hash function via topology."""
+    """hash using custom hash function via index_desc."""
 
     def custom_hash(indices):
         return indices * 2
@@ -132,7 +132,7 @@ def test_hash_layout_with_custom_function():
     mesh = DeviceMesh(device_shape=(3,), axis_names=("x",))
     spec = ShardingSpec.hash(mesh=mesh, partition=P("x"))
     layout = spec._to_layout(
-        data_shape=(4,), topology=CallableTopology(hash_fn=custom_hash)
+        data_shape=(4,), index_desc=FunctionalIndex(hash_fn=custom_hash)
     )
 
     indices0 = layout.get_shard_indices(0, 0)
@@ -145,7 +145,7 @@ def test_hash_layout_with_custom_function():
 
 
 def test_hash_layout_default():
-    """hash with no topology or routing_indices - hash indices directly."""
+    """hash with no index_desc or spatial_indices - hash indices directly."""
     mesh = DeviceMesh(device_shape=(3,), axis_names=("x",))
     spec = ShardingSpec.hash(mesh=mesh, partition=P("x"))
     layout = spec._to_layout(data_shape=(6,))
@@ -167,7 +167,7 @@ def test_greedy_layout():
     splits = [jnp.array([0, 10, 30, 40], dtype=jnp.int32)]
     mesh = DeviceMesh(device_shape=(2,), axis_names=("x",))
     spec = ShardingSpec.greedy(mesh=mesh, partition=P("x"))
-    layout = spec._to_layout(data_shape=(3,), topology=RaggedTopology(splits=splits))
+    layout = spec._to_layout(data_shape=(3,), index_desc=RaggedIndex(splits=splits))
 
     indices0 = layout.get_shard_indices(0, 0)
     indices1 = layout.get_shard_indices(1, 0)
@@ -176,7 +176,7 @@ def test_greedy_layout():
     assert jnp.array_equal(indices1, jnp.array([1], dtype=jnp.int32))
 
 
-# ---- follow (routing_indices) ----
+# ---- follow (spatial_indices) ----
 
 
 def test_follow_layout():
@@ -185,7 +185,7 @@ def test_follow_layout():
     src_spec = ShardingSpec.hash(mesh=mesh, partition=P("x"))
     src_layout = src_spec._to_layout(
         data_shape=(4,),
-        topology=IndexedTopology(indices=jnp.array([0, 1, 0, 1], dtype=jnp.int32)),
+        index_desc=ExplicitIndex(indices=jnp.array([0, 1, 0, 1], dtype=jnp.int32)),
     )
 
     follow_spec = ShardingSpec.follow(src_layout, dim=0)
@@ -202,13 +202,13 @@ def test_follow_layout():
 
 
 def test_derive_from():
-    """derive_from: one-line key->value routing_indices."""
+    """derive_from: one-line key->value spatial_indices."""
     key_data = jnp.array([0, 1, 2, 3], dtype=jnp.int32)
     mesh = DeviceMesh(device_shape=(2,), axis_names=("x",))
     val_spec = ShardingSpec.derive_from(
         driver_spec=ShardingSpec.hash(mesh=mesh, partition=P("x")),
         driver_data_shape=(4,),
-        driver_topology=IndexedTopology(indices=key_data),
+        driver_index_desc=ExplicitIndex(indices=key_data),
         follow_dim=0,
     )
 

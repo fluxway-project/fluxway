@@ -465,7 +465,7 @@ def test_jit_plan_and_shard():
             send_counts,
             dest_devices,
             rep_factor,
-            global_indices,
+            spatial_indices,
             padded_routing,
             sort_indices,
         ) = distributor._plan_and_shard(

@@ -3,7 +3,7 @@ Standardized Reader implementation leveraging Google Grain.
 """
 
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from fluxway.common.decorators import spmd, operator
 from .base_reader import BaseReader
@@ -21,9 +21,7 @@ class GrainReader(BaseReader):
     """
     Standard Reader implementation using Google Grain.
 
-    This class acts as an orchestration engine for Grain's data pipelines.
-    It automatically handles distributed sharding based on the SPMD worker's
-    rank and world size.
+    Supports Elastic Sharding via Logical Shard Pools.
     """
 
     def __init__(self):
@@ -33,10 +31,19 @@ class GrainReader(BaseReader):
         self._output_type = None
 
     def _create_data_loader(
-        self, static_args: Dict[str, Any], rank: int, world_size: int
+        self,
+        static_args: Dict[str, Any],
+        rank: int,
+        world_size: int,
+        shard_index: Optional[int] = None,
+        shard_count: Optional[int] = None,
     ):
         """
         Constructs the Google Grain DataLoader pipeline.
+
+        Args:
+            shard_index: If provided, overrides rank for data sharding.
+            shard_count: If provided, overrides world_size for data sharding.
         """
         if grain is None:
             raise ImportError("google-grain not found. Install it to use GrainReader.")
@@ -45,11 +52,26 @@ class GrainReader(BaseReader):
         if data_source is None:
             raise ValueError("GrainReader requires 'data_source' in static_args.")
 
+        # 1. Base Dataset
         dataset = grain.MapDataset.source(data_source)
 
         transformations = static_args.get("transformations", [])
         for tx in transformations:
             dataset = dataset.map(tx)
+
+        # 2. logical sharding for elasticity
+        # If the user specifies num_logical_shards, we decouple rank from sharding.
+        num_logical_shards = static_args.get("num_logical_shards")
+
+        if shard_index is not None and shard_count is not None:
+            s_idx, s_cnt = shard_index, shard_count
+        elif num_logical_shards:
+            s_cnt = num_logical_shards
+            # Map physical rank to one or more logical shards
+            # For simplicity, we assume 1 worker -> 1 logical shard or range
+            s_idx = rank % num_logical_shards
+        else:
+            s_idx, s_cnt = rank, world_size
 
         sampler = static_args.get("sampler")
         if sampler is None:
@@ -57,8 +79,8 @@ class GrainReader(BaseReader):
             sampler = grain.IndexSampler(
                 num_records=num_records,
                 shard_options=grain.ShardOptions(
-                    shard_index=rank,
-                    shard_count=world_size,
+                    shard_index=s_idx,
+                    shard_count=s_cnt,
                     drop_remainder=static_args.get("drop_remainder", False),
                 ),
                 shuffle=static_args.get("shuffle", True),
@@ -68,6 +90,7 @@ class GrainReader(BaseReader):
 
         self._output_type = static_args.get("output_data_type")
 
+        # DataLoader creation
         self._dataloader = grain.DataLoader(
             data_source=dataset,
             sampler=sampler,
@@ -76,56 +99,42 @@ class GrainReader(BaseReader):
         self._iterator = iter(self._dataloader)
 
         logger.info(
-            f"[spmd_id={getattr(self, 'spmd_id', 'unknown')}] Grain pipeline initialized. "
-            f"Rank {rank}/{world_size} serving {len(sampler)} records."
+            f"[spmd_id={getattr(self, 'spmd_id', 'unknown')}] Rank {rank} mapped to Logical Shard {s_idx}/{s_cnt}. "
+            f"Serving {len(sampler)} records."
         )
 
     @operator("read", is_source=True)
     def read(self) -> Any:
-        """
-        Produces the next batch from the Grain iterator.
-        """
         return self.next_item()
 
     def next_item(self) -> Any:
-        """
-        Internal implementation to fetch the next item from Grain iterator.
-        This can be safely called by subclasses.
-        """
         rank = getattr(self, "rank", 0)
         world_size = getattr(self, "world_size", 1)
         static_args = getattr(self, "static_args", {})
 
-        # Check if rank or world_size changed (e.g. in multi-rank tests in same thread)
-        if self._iterator is not None:
-            if (
-                getattr(self, "_initialized_rank", None) != rank
-                or getattr(self, "_initialized_world_size", None) != world_size
-            ):
-                logger.info(
-                    f"Re-initializing GrainReader for new rank/world_size: {rank}/{world_size}"
-                )
-                self._iterator = None
-
         if self._iterator is None:
             self._create_data_loader(static_args, rank, world_size)
-            self._initialized_rank = rank
-            self._initialized_world_size = world_size
 
         try:
             batch = next(self._iterator)
-
-            # Cast to specialized data_type if requested
             if self._output_type and not isinstance(batch, self._output_type):
                 if isinstance(batch, dict):
                     return self._output_type(**batch)
                 return self._output_type(batch)
-
             return batch
-
         except StopIteration:
-            logger.debug("Reader reached end of data source.")
             return None
         except Exception as e:
             logger.error(f"GrainReader pipeline failure: {e}")
             raise
+
+    def get_state(self) -> Dict[str, Any]:
+        """Returns the current state of the iterator for checkpointing."""
+        if hasattr(self._iterator, "get_state"):
+            return self._iterator.get_state()
+        return {}
+
+    def set_state(self, state: Dict[str, Any]):
+        """Restores the iterator state from a checkpoint."""
+        if hasattr(self._iterator, "set_state"):
+            self._iterator.set_state(state)

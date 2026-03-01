@@ -325,6 +325,14 @@ class OperatorMeta(FluxwayBaseSchema):
     output_arguments: Optional[Dict[str, List[str]]] = None
     input_sharding: Dict[str, Any] = Field(default_factory=dict)
     output_sharding: Dict[str, Any] = Field(default_factory=dict)
+
+    # Implicit Mapping Support:
+    # Tracks logical placeholders (parameters in function signature) to their flattened fields.
+    # Key: Parameter name or "return" placeholder
+    # Value: List of flattened field names
+    input_param_map: Dict[str, List[str]] = Field(default_factory=dict)
+    output_param_map: Dict[str, List[str]] = Field(default_factory=dict)
+
     # Linking sharding specs (populated by Builder when constructing the graph)
     # For the current operator:
     # - input_pre_sharding: Records all "predecessor SPMD -> current SPMD" edges and their sharding,
@@ -592,7 +600,7 @@ class ControllerState(str, Enum):
 
     INITIALIZING = "initializing"  # Allocating resources, starting SPMDs
     PENDING = "pending"  # Waiting for all drivers to init (workers_ready)
-    TOPOLOGY_REGISTERING = "topology_registering"  # Topology registration in progress
+    TOPOLOGY_REGISTERING = "topology_registering"  # topology registration in progress
     RUNNING = "running"  # Normal execution
     BLOCKED = "blocked"  # Task blocked (handling exceptions)
     RECOVERING = "recovering"  # Recovering from errors

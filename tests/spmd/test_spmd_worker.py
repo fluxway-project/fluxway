@@ -414,11 +414,29 @@ async def test_mailbox_declare_step_and_on_ready():
 
     tensor = TransportTensor.from_tensor(np.zeros(4))
     await mb.deposit_shards(
-        "compute", "x", 0, rank=0, payloads=[tensor.flat_values], counts=[4]
+        "compute",
+        ["x"],
+        0,
+        "sender0",
+        rank=0,
+        payload_groups=[[tensor.flat_values]],
+        counts_groups=[[4]],
+        is_ragged=[False],
+        has_spatial_indices=[False],
+        has_origin_indices=[False],
     )
     assert not fired
     await mb.deposit_shards(
-        "compute", "x", 0, rank=1, payloads=[tensor.flat_values], counts=[4]
+        "compute",
+        ["x"],
+        0,
+        "sender1",
+        rank=1,
+        payload_groups=[[tensor.flat_values]],
+        counts_groups=[[4]],
+        is_ragged=[False],
+        has_spatial_indices=[False],
+        has_origin_indices=[False],
     )
     assert fired == [("compute", 0)]
 
@@ -435,7 +453,16 @@ async def test_mailbox_wait_step_ready():
         await asyncio.sleep(0)
         tensor = TransportTensor.from_tensor(np.ones(3))
         await mb.deposit_shards(
-            "compute", "a", 5, rank=0, payloads=[tensor.flat_values], counts=[3]
+            "compute",
+            ["a"],
+            5,
+            "sender0",
+            rank=0,
+            payload_groups=[[tensor.flat_values]],
+            counts_groups=[[3]],
+            is_ragged=[False],
+            has_spatial_indices=[False],
+            has_origin_indices=[False],
         )
         await asyncio.sleep(0)
         await mb.deposit_states("compute", 5, names=["cfg"], values=[{"lr": 0.1}])
@@ -493,12 +520,30 @@ async def test_mailbox_periodic_trigger():
     # Deposit first shard (sender says step 100)
     tensor = TransportTensor.from_tensor(np.array([1.0]))
     await mb.deposit_shards(
-        "periodic_op", "x", step=100, rank=0, payloads=[tensor.flat_values], counts=[1]
+        "periodic_op",
+        ["x"],
+        step=100,
+        sender_id="s0",
+        rank=0,
+        payload_groups=[[tensor.flat_values]],
+        counts_groups=[[1]],
+        is_ragged=[False],
+        has_spatial_indices=[False],
+        has_origin_indices=[False],
     )
 
     # Deposit second shard (sender says step 101)
     await mb.deposit_shards(
-        "periodic_op", "x", step=101, rank=1, payloads=[tensor.flat_values], counts=[1]
+        "periodic_op",
+        ["x"],
+        step=101,
+        sender_id="s1",
+        rank=1,
+        payload_groups=[[tensor.flat_values]],
+        counts_groups=[[1]],
+        is_ragged=[False],
+        has_spatial_indices=[False],
+        has_origin_indices=[False],
     )
 
     # Should have two ready events with sequential virtual steps 0 and 1
@@ -506,9 +551,9 @@ async def test_mailbox_periodic_trigger():
 
     # Verify data storage
     shards0 = await mb.get_tensor_shards("periodic_op", "x", 0)
-    assert 0 in shards0
+    assert ("s0", 0) in shards0
     shards1 = await mb.get_tensor_shards("periodic_op", "x", 1)
-    assert 1 in shards1
+    assert ("s1", 1) in shards1
 
 
 @pytest.mark.asyncio
@@ -584,11 +629,20 @@ async def test_mailbox_tensor_put_get():
     d = np.array([1.0, 2.0])
     tensor = TransportTensor.from_tensor(d)
     await mb.deposit_shards(
-        "compute", "x", 0, rank=0, payloads=[tensor.flat_values], counts=[2]
+        "compute",
+        ["x"],
+        0,
+        "sender0",
+        rank=0,
+        payload_groups=[[tensor.flat_values]],
+        counts_groups=[[2]],
+        is_ragged=[False],
+        has_spatial_indices=[False],
+        has_origin_indices=[False],
     )
     shards = await mb.get_tensor_shards("compute", "x", 0)
-    assert 0 in shards
-    np.testing.assert_array_equal(shards[0].flat_values, d)
+    assert ("sender0", 0) in shards
+    np.testing.assert_array_equal(shards[("sender0", 0)][0].flat_values, d)
 
 
 @pytest.mark.asyncio
@@ -596,11 +650,29 @@ async def test_mailbox_tensor_multi_rank():
     mb = WorkerMailbox()
     tensor_zeros = TransportTensor.from_tensor(np.zeros(4))
     await mb.deposit_shards(
-        "compute", "e", 1, rank=0, payloads=[tensor_zeros.flat_values], counts=[4]
+        "compute",
+        ["e"],
+        1,
+        "sender0",
+        rank=0,
+        payload_groups=[[tensor_zeros.flat_values]],
+        counts_groups=[[4]],
+        is_ragged=[False],
+        has_spatial_indices=[False],
+        has_origin_indices=[False],
     )
     tensor_ones = TransportTensor.from_tensor(np.ones(4))
     await mb.deposit_shards(
-        "compute", "e", 1, rank=1, payloads=[tensor_ones.flat_values], counts=[4]
+        "compute",
+        ["e"],
+        1,
+        "sender1",
+        rank=1,
+        payload_groups=[[tensor_ones.flat_values]],
+        counts_groups=[[4]],
+        is_ragged=[False],
+        has_spatial_indices=[False],
+        has_origin_indices=[False],
     )
     assert await mb.get_tensor_shard_count("compute", "e", 1) == 2
 
@@ -609,15 +681,33 @@ async def test_mailbox_tensor_multi_rank():
 async def test_mailbox_op_isolation():
     mb = WorkerMailbox()
     await mb.deposit_shards(
-        "compute", "g", 0, rank=0, payloads=[np.array([1.0])], counts=[1]
+        "compute",
+        ["g"],
+        0,
+        "sender0",
+        rank=0,
+        payload_groups=[[np.array([1.0])]],
+        counts_groups=[[1]],
+        is_ragged=[False],
+        has_spatial_indices=[False],
+        has_origin_indices=[False],
     )
     await mb.deposit_shards(
-        "optimize", "g", 0, rank=0, payloads=[np.array([2.0])], counts=[1]
+        "optimize",
+        ["g"],
+        0,
+        "sender0",
+        rank=0,
+        payload_groups=[[np.array([2.0])]],
+        counts_groups=[[1]],
+        is_ragged=[False],
+        has_spatial_indices=[False],
+        has_origin_indices=[False],
     )
     fwd = await mb.get_tensor_shards("compute", "g", 0)
     bwd = await mb.get_tensor_shards("optimize", "g", 0)
-    np.testing.assert_array_equal(fwd[0].flat_values, [1.0])
-    np.testing.assert_array_equal(bwd[0].flat_values, [2.0])
+    np.testing.assert_array_equal(fwd[("sender0", 0)][0].flat_values, [1.0])
+    np.testing.assert_array_equal(bwd[("sender0", 0)][0].flat_values, [2.0])
 
 
 # ===========================================================================
@@ -634,11 +724,15 @@ async def test_mailbox_zero_copy_writes_into_buffer():
     )
     await mb.deposit_shards(
         "compute",
-        "emb",
+        ["emb"],
         step=0,
+        sender_id="s0",
         rank=0,
-        payloads=[np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)],
-        counts=[2],
+        payload_groups=[[np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)]],
+        counts_groups=[[2]],
+        is_ragged=[False],
+        has_spatial_indices=[False],
+        has_origin_indices=[False],
     )
     buffers = await mb.get_zero_copy_buffers("compute", "emb", step=0)
     assert buffers is not None
@@ -657,7 +751,16 @@ async def test_mailbox_clear_step():
     await mb.deposit_states("compute", 2, names=["s"], values=["y"])
     tensor = TransportTensor.from_tensor(np.zeros(2))
     await mb.deposit_shards(
-        "compute", "t", 1, rank=0, payloads=[tensor.flat_values], counts=[2]
+        "compute",
+        ["t"],
+        1,
+        "sender0",
+        rank=0,
+        payload_groups=[[tensor.flat_values]],
+        counts_groups=[[2]],
+        is_ragged=[False],
+        has_spatial_indices=[False],
+        has_origin_indices=[False],
     )
     mb.declare_step("compute", 1, {}, [])
 
@@ -676,10 +779,28 @@ async def test_mailbox_get_size():
     await mb.deposit_states("compute", 0, names=["s"], values=[None])
     tensor = TransportTensor.from_tensor(np.zeros(2))
     await mb.deposit_shards(
-        "compute", "t", 0, rank=0, payloads=[tensor.flat_values], counts=[2]
+        "compute",
+        ["t"],
+        0,
+        "s0",
+        rank=0,
+        payload_groups=[[tensor.flat_values]],
+        counts_groups=[[2]],
+        is_ragged=[False],
+        has_spatial_indices=[False],
+        has_origin_indices=[False],
     )
     await mb.deposit_shards(
-        "compute", "t", 0, rank=1, payloads=[tensor.flat_values], counts=[2]
+        "compute",
+        ["t"],
+        0,
+        "s1",
+        rank=1,
+        payload_groups=[[tensor.flat_values]],
+        counts_groups=[[2]],
+        is_ragged=[False],
+        has_spatial_indices=[False],
+        has_origin_indices=[False],
     )
     assert await mb.get_size() == 3
 
@@ -738,16 +859,18 @@ async def test_receive_multi_tensor_data():
 
     await worker.receive_shards(
         "compute",
-        "multi",
+        ["multi"],
         step=1,
+        sender_id="s0",
         sender_rank=0,
-        payloads=[t1.flat_values, t2.flat_values],
-        counts=[2, 2],
-        is_ragged=False,
-        has_indices=False,
+        payload_groups=[[t1.flat_values, t2.flat_values]],
+        counts_groups=[[2, 2]],
+        is_ragged=[False],
+        has_spatial_indices=[False],
+        has_origin_indices=[False],
     )
     shards = await worker._mailbox.get_tensor_shards("compute", "multi", 1)
-    received = shards[0]
+    received = shards[("s0", 0)]
     assert isinstance(received, list)
     assert len(received) == 2
     np.testing.assert_array_equal(received[0].flat_values, [1, 2])
@@ -776,13 +899,15 @@ async def test_mailbox_zero_copy_ragged():
 
     await mb.deposit_shards(
         "compute",
-        "ragged",
+        ["ragged"],
         step=0,
+        sender_id="s0",
         rank=0,
-        payloads=[tt.flat_values, np.array([3, 2], dtype=np.int32)],
-        counts=[5, 2],
-        is_ragged=True,
-        has_indices=False,
+        payload_groups=[[tt.flat_values, np.array([3, 2], dtype=np.int32)]],
+        counts_groups=[[5, 2]],
+        is_ragged=[True],
+        has_spatial_indices=[False],
+        has_origin_indices=[False],
     )
 
     # Verify buffers from mailbox (handles JAX-style non-inplace updates)
@@ -851,6 +976,7 @@ async def test_send_output_none_mesh():
     succ_info.is_self_loop = False
     succ_info.target_op = "compute"
     succ_info.tensor_sharding = {"t1": None}  # Trigger default target_spec
+    succ_info.tensor_map = None
     succ_info.mesh = None
     worker._op_manager.get_successor_info.return_value = succ_info
 
@@ -916,7 +1042,7 @@ class _DummyWorker:
         self.config = types.SimpleNamespace(
             use_global_step_indexing=use_global_step_indexing
         )
-        self._total_rank = total_rank
+        self._world_size = total_rank
         self.rank = rank
 
 

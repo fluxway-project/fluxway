@@ -1,6 +1,13 @@
 from typing import List, Any, Optional, Tuple
+
+import numpy as np
+
 from fluxway.common.backend import get_backend
-from fluxway.common.topology import ContinuousTopology, Topology, IndexedTopology
+from fluxway.common.index_descriptor import (
+    ContinuousIndex,
+    IndexDescriptor,
+    ExplicitIndex,
+)
 
 # ============================================================
 # TransportTensor — Unified tensor wrapper
@@ -18,22 +25,20 @@ class TransportTensor:
     def __init__(
         self,
         flat_values: Any,
-        nested_splits: Optional[List[Any]] = None,
-        indices: Optional[Any] = None,
+        nested_splits: Optional[List[np.ndarray]] = None,
+        spatial_indices: Optional[Any] = None,
         global_shape: Optional[Tuple[int, ...]] = None,
-        origin_ranks: Optional[Any] = None,
         origin_indices: Optional[Any] = None,
     ):
         self._flat_values = flat_values
         self._nested_splits = nested_splits if nested_splits is not None else []
         self._global_shape = global_shape
-        self._origin_ranks = origin_ranks
         self._origin_indices = origin_indices
 
-        self._indices: Optional[Topology]
-        if isinstance(indices, ContinuousTopology):
-            self._indices = indices
-        elif isinstance(indices, slice):
+        self._spatial_indices: Optional[IndexDescriptor]
+        if isinstance(spatial_indices, ContinuousIndex):
+            self._spatial_indices = spatial_indices
+        elif isinstance(spatial_indices, slice):
             backend = get_backend()
             if not self._nested_splits:
                 if isinstance(self._flat_values, list):
@@ -46,13 +51,15 @@ class TransportTensor:
                 else:
                     count = int(backend.shape(self._nested_splits[0])[0]) - 1
 
-            start = indices.start if indices.start is not None else 0
-            stride = indices.step if indices.step is not None else 1
-            if indices.stop is not None:
+            start = spatial_indices.start if spatial_indices.start is not None else 0
+            stride = spatial_indices.step if spatial_indices.step is not None else 1
+            if spatial_indices.stop is not None:
                 expected_count = (
-                    max(0, (indices.stop - start + stride - 1) // stride)
+                    max(0, (spatial_indices.stop - start + stride - 1) // stride)
                     if stride > 0
-                    else max(0, (start - indices.stop - stride - 1) // (-stride))
+                    else max(
+                        0, (start - spatial_indices.stop - stride - 1) // (-stride)
+                    )
                 )
                 if expected_count != count:
                     raise ValueError(
@@ -60,36 +67,36 @@ class TransportTensor:
                     )
 
             if stride == 1:
-                self._indices = ContinuousTopology.chunk(start, count)
+                self._spatial_indices = ContinuousIndex.chunk(start, count)
             else:
-                self._indices = ContinuousTopology.cyclic(start, stride, count)
-        elif indices is not None:
-            if isinstance(indices, Topology):
-                self._indices = indices
+                self._spatial_indices = ContinuousIndex.cyclic(start, stride, count)
+        elif spatial_indices is not None:
+            if isinstance(spatial_indices, IndexDescriptor):
+                self._spatial_indices = spatial_indices
             else:
-                self._indices = IndexedTopology(indices)
+                self._spatial_indices = ExplicitIndex(spatial_indices)
         else:
-            self._indices = None
+            self._spatial_indices = None
 
     @classmethod
     def from_tensor(
         cls,
         tensor: Any,
-        indices: Optional[Any] = None,
+        spatial_indices: Optional[Any] = None,
         global_shape: Optional[Tuple[int, ...]] = None,
     ) -> "TransportTensor":
         """Creates a dense TransportTensor directly from a multi-dimensional tensor.
 
         Args:
             tensor: The dense data tensor.
-            indices: Global indices mapping. Can be a materialized tensor, an explicit
-                     ContinuousTopology, or a python `slice` object for O(1) regular patterns.
+            spatial_indices: Global indices mapping. Can be a materialized tensor, an explicit
+                     ContinuousIndex, or a python `slice` object for O(1) regular patterns.
             global_shape: Optional global shape of the full tensor.
         """
         return cls(
             flat_values=tensor,
             nested_splits=[],
-            indices=indices,
+            spatial_indices=spatial_indices,
             global_shape=global_shape,
         )
 
@@ -112,32 +119,25 @@ class TransportTensor:
         return len(self._nested_splits) > 0
 
     @property
-    def indices(self) -> Optional[Any]:
-        """Underlying topology indices object."""
-        return self._indices
+    def index_descriptor(self) -> Optional[IndexDescriptor]:
+        """The underlying IndexDescriptor (metadata) for spatial positioning."""
+        return self._spatial_indices
 
     @property
-    def index_descriptor(self) -> Optional[ContinuousTopology]:
-        """Compact index pattern descriptor, if available."""
-        if isinstance(self._indices, ContinuousTopology):
-            return self._indices
-        return None
-
-    @property
-    def global_indices(self) -> Optional[Any]:
+    def spatial_indices(self) -> Optional[Any]:
         """Global indices this local data corresponds to.
 
         Lazy-materializes from descriptor if no explicit tensor is set.
         Returns None if neither is available (implicit/zero-cost).
         """
-        from fluxway.common.topology import IndexedTopology, ContinuousTopology
+        from fluxway.common.index_descriptor import ExplicitIndex, ContinuousIndex
 
-        if self._indices is None:
+        if self._spatial_indices is None:
             return None
-        if isinstance(self._indices, IndexedTopology):
-            return self._indices.indices
-        if isinstance(self._indices, ContinuousTopology):
-            return self._indices.materialize()
+        if isinstance(self._spatial_indices, ExplicitIndex):
+            return self._spatial_indices.indices
+        if isinstance(self._spatial_indices, ContinuousIndex):
+            return self._spatial_indices.materialize()
         return None
 
     @property
@@ -159,46 +159,118 @@ class TransportTensor:
 
     @property
     def topology(self) -> Optional[List[Any]]:
-        """Topology metadata derived from nested_splits. None for dense."""
+        """IndexDescriptor metadata derived from nested_splits. None for dense."""
         return self._nested_splits if self._nested_splits else None
-
-    @property
-    def origin_ranks(self) -> Optional[Any]:
-        return self._origin_ranks
 
     @property
     def origin_indices(self) -> Optional[Any]:
         return self._origin_indices
 
-    def unique_with_routing(self) -> Tuple["TransportTensor", "TransportTensor"]:
+    # -------------------------------------------------------------------------
+    # Transparent Container / Duck-typing Overloads
+    # -------------------------------------------------------------------------
+
+    def __getitem__(self, key: Any) -> "TransportTensor":
+        """Support for slicing and gathering via []."""
+        backend = get_backend()
+        if isinstance(key, slice):
+            return self.slice(key.start or 0, key.stop, unsafe=False)
+
+        # If key is a tensor or TransportTensor, it's a gather
+        if isinstance(key, TransportTensor) or backend.is_tensor(key):
+            return self.gather(key)
+
+        # Fallback to backend indexing for simple scalars if no splits
+        if not self._nested_splits:
+            return TransportTensor(
+                self._flat_values[key], global_shape=self._global_shape
+            )
+
+        raise NotImplementedError(
+            f"Indexing with {type(key)} not supported for ragged tensors"
+        )
+
+    def __len__(self) -> int:
+        backend = get_backend()
+        return int(backend.shape(self._flat_values)[0])
+
+    def __iter__(self):
+        # Very high-cost, but sometimes needed for duck-typing
+        for i in range(len(self)):
+            yield self[i]
+
+    def __add__(self, other: Any) -> "TransportTensor":
+        return self._binary_op(other, "__add__")
+
+    def __sub__(self, other: Any) -> "TransportTensor":
+        return self._binary_op(other, "__sub__")
+
+    def __mul__(self, other: Any) -> "TransportTensor":
+        return self._binary_op(other, "__mul__")
+
+    def __truediv__(self, other: Any) -> "TransportTensor":
+        return self._binary_op(other, "__truediv__")
+
+    def _binary_op(self, other: Any, op_name: str) -> "TransportTensor":
+        other_val = other.flat_values if isinstance(other, TransportTensor) else other
+        op = getattr(self._flat_values, op_name)
+        res = op(other_val)
+        # Inherit metadata from self
+        return TransportTensor(
+            res,
+            nested_splits=self.nested_splits,
+            spatial_indices=self.spatial_indices,
+            global_shape=self._global_shape,
+            origin_indices=self.origin_indices,
+        )
+
+    def sum(self, dim: Any = None) -> Any:
+        backend = get_backend()
+        return backend.sum(self._flat_values, dim=dim)
+
+    def unique_with_routing(
+        self, offset: int = 0
+    ) -> Tuple["TransportTensor", "TransportTensor"]:
         """
         Performs unique on flat_values.
         Returns (compacted_tensor, inverse_indices_tensor).
         The compacted_tensor has origin_indices automatically set to allow O(1) restoration.
+        The inverse_indices_tensor is shifted by 'offset' to allow global alignment.
         """
         backend = get_backend()
         uniques, inverse = backend.unique(self.flat_values, return_inverse=True)
 
+        num_uniques = backend.shape(uniques)[0]
         origin_indices = backend.arange(
-            0, backend.shape(uniques)[0], dtype=backend.int32()
+            offset, offset + num_uniques, dtype=backend.int32()
         )
 
         compacted = TransportTensor(
             flat_values=uniques,
-            indices=uniques,  # Use values as global routing keys
+            spatial_indices=uniques,  # Use values as global routing keys
             origin_indices=origin_indices,
             nested_splits=[],
+            global_shape=self.global_shape,
         )
 
         # inverse_indices must retain the original nested_splits (ragged structure)
+        # Inherit spatial_indices from self to allow routing back to origin batch positions
         inverse_tt = TransportTensor(
-            flat_values=inverse, nested_splits=self.nested_splits
+            flat_values=inverse + offset,
+            nested_splits=self.nested_splits,
+            global_shape=self.global_shape,
+            spatial_indices=self.spatial_indices,
         )
 
         return compacted, inverse_tt
 
     @classmethod
-    def from_lists(cls, data: List[Any], dtype=None) -> "TransportTensor":
+    def from_lists(
+        cls,
+        data: List[Any],
+        dtype: Optional[Any] = None,
+        global_shape: Optional[Tuple[int, ...]] = None,
+    ) -> "TransportTensor":
         """Creates a TransportTensor from a nested list.
 
         This constructor automatically inspects the input structure. If the data is
@@ -279,7 +351,7 @@ class TransportTensor:
             dtype = backend.float32()
 
         flat_tensor = backend.tensor(current_level_lists, dtype=dtype)
-        return cls(flat_tensor, all_splits)
+        return cls(flat_tensor, all_splits, global_shape=global_shape)
 
     def to_lists(self) -> List[Any]:
         """Converts back to a nested list."""
@@ -313,15 +385,15 @@ class TransportTensor:
         return build_list(0, 0, num_splits - 1)
 
     def _propagate_indices_for_dense_slice(self, start: Any, size: Any) -> Any:
-        """Derive new index info for a dense slice. Returns new Topology or None."""
+        """Derive new index info for a dense slice. Returns new IndexDescriptor or None."""
         backend = get_backend()
-        from fluxway.common.topology import ContinuousTopology, IndexedTopology
+        from fluxway.common.index_descriptor import ContinuousIndex, ExplicitIndex
 
-        if self._indices is None:
+        if self._spatial_indices is None:
             return None
 
         # Prefer descriptor path (O(1))
-        if isinstance(self._indices, ContinuousTopology):
+        if isinstance(self._spatial_indices, ContinuousIndex):
             if backend.is_tensor(start):
                 s = int(backend.item(start))
             else:
@@ -330,12 +402,14 @@ class TransportTensor:
                 sz = int(backend.item(size))
             else:
                 sz = int(size)
-            return self._indices.slice(s, s + sz)
+            return self._spatial_indices.slice(s, s + sz)
 
         # Explicit tensor path
-        if isinstance(self._indices, IndexedTopology):
-            new_indices = backend.dynamic_slice(self._indices.indices, [start], [size])
-            return IndexedTopology(new_indices)
+        if isinstance(self._spatial_indices, ExplicitIndex):
+            new_indices = backend.dynamic_slice(
+                self._spatial_indices.indices, [start], [size]
+            )
+            return ExplicitIndex(new_indices)
 
         return None
 
@@ -357,7 +431,7 @@ class TransportTensor:
             sliced_data = backend.dynamic_slice(x, starts, sizes)
 
             new_indices = self._propagate_indices_for_dense_slice(start, size_tensor)
-            return TransportTensor(sliced_data, [], indices=new_indices)
+            return TransportTensor(sliced_data, [], spatial_indices=new_indices)
 
         else:
             # Ragged case: requires processing nested splits.
@@ -467,17 +541,20 @@ class TransportTensor:
 
             # Propagate indices
             new_indices = None
-            if self._indices is not None:
-                from fluxway.common.topology import ContinuousTopology, IndexedTopology
+            if self._spatial_indices is not None:
+                new_indices = self._spatial_indices.slice(s, e)
 
-                if isinstance(self._indices, ContinuousTopology):
-                    new_indices = self._indices.slice(s, e)
-                elif isinstance(self._indices, IndexedTopology):
-                    # Fast slice for indices
-                    sliced_idx = self._indices.indices[s:e]
-                    new_indices = IndexedTopology(sliced_idx)
+            # Propagate origin metadata
+            new_origin_indices = None
+            if self._origin_indices is not None:
+                new_origin_indices = self._origin_indices[s:e]
 
-            return TransportTensor(val_slice, new_nested_splits, indices=new_indices)
+            return TransportTensor(
+                val_slice,
+                new_nested_splits,
+                spatial_indices=new_indices,
+                origin_indices=new_origin_indices,
+            )
 
         # -------------------------------------------------------------------------
         # Standard / JIT-Safe Path
@@ -575,20 +652,22 @@ class TransportTensor:
             val_idx = backend.arange(curr_start, curr_end, dtype=backend.int32())
             val_slice = backend.take(self._flat_values, val_idx)
 
+        # Propagate origin metadata for ragged slice
+        new_origin_indices = None
+        if self._origin_indices is not None:
+            new_origin_indices = self._origin_indices[start:end]
+
         # Propagate indices for ragged slice
         new_indices = None
-        if self._indices is not None:
-            from fluxway.common.topology import ContinuousTopology, IndexedTopology
+        if self._spatial_indices is not None:
+            new_indices = self._spatial_indices.slice(start, end)
 
-            if isinstance(self._indices, ContinuousTopology):
-                new_indices = self._indices.slice(start, end)
-            elif isinstance(self._indices, IndexedTopology):
-                if static_shape is None:
-                    idx_range = backend.arange(start, end, dtype=backend.int32())
-                    idx_val = backend.take(self._indices.indices, idx_range)
-                    new_indices = IndexedTopology(idx_val)
-
-        return TransportTensor(val_slice, new_nested_splits, indices=new_indices)
+        return TransportTensor(
+            val_slice,
+            new_nested_splits,
+            spatial_indices=new_indices,
+            origin_indices=new_origin_indices,
+        )
 
     def as_dlpack_slice(self, cursor: Optional[Any] = None) -> Any:
         """Returns a zero-copy DLPack-compatible slice of the tensor.
@@ -632,7 +711,7 @@ class TransportTensor:
 
             new_values = backend.dynamic_slice(self._flat_values, starts, sizes)
             return TransportTensor(
-                new_values, self._nested_splits, indices=self._indices
+                new_values, self._nested_splits, spatial_indices=self._spatial_indices
             )
         return self
 
@@ -644,14 +723,14 @@ class TransportTensor:
             indices.flat_values if isinstance(indices, TransportTensor) else indices
         )
 
-        # Propagate global_indices through gather
-        new_global_indices = None
-        src_indices = self.global_indices  # Materializes descriptor if needed
+        # Propagate spatial_indices through gather
+        new_spatial_indices = None
+        src_indices = self.spatial_indices  # Materializes descriptor if needed
         if src_indices is not None:
-            from fluxway.common.topology import IndexedTopology
+            from fluxway.common.index_descriptor import ExplicitIndex
 
             gathered_indices = backend.take(src_indices, idx_flat)
-            new_global_indices = IndexedTopology(gathered_indices)
+            new_spatial_indices = ExplicitIndex(gathered_indices)
         # Descriptor cannot survive gather (order destroyed), so always explicit tensor
 
         if not self._nested_splits:
@@ -661,7 +740,9 @@ class TransportTensor:
             new_splits = (
                 indices.nested_splits if isinstance(indices, TransportTensor) else []
             )
-            return TransportTensor(gathered, new_splits, indices=new_global_indices)
+            return TransportTensor(
+                gathered, new_splits, spatial_indices=new_spatial_indices
+            )
 
         current_indices = idx_flat
         new_splits = []
@@ -722,7 +803,17 @@ class TransportTensor:
         # Finally gather flat values
         new_values = backend.take(self._flat_values, current_indices)
 
-        return TransportTensor(new_values, new_splits, indices=new_global_indices)
+        # Propagate origin metadata through gather
+        new_origin_indices = None
+        if self._origin_indices is not None:
+            new_origin_indices = backend.take(self._origin_indices, idx_flat)
+
+        return TransportTensor(
+            new_values,
+            new_splits,
+            spatial_indices=new_spatial_indices,
+            origin_indices=new_origin_indices,
+        )
 
     def __reduce__(self):
         """Serialization interface for pickle/Ray."""
@@ -731,32 +822,30 @@ class TransportTensor:
             (
                 self._flat_values,
                 self._nested_splits,
-                self._indices,
-                self._origin_ranks,
+                self._spatial_indices,
+                self._global_shape,
                 self._origin_indices,
             ),
         )
 
     def __repr__(self):
         parts = [f"flat_values={self._flat_values}", f"splits={self._nested_splits}"]
-        if self._indices is not None:
-            parts.append(f"indices={self._indices}")
-        if self._origin_ranks is not None:
-            parts.append(f"origin_ranks={self._origin_ranks}")
+        if self._spatial_indices is not None:
+            parts.append(f"spatial_indices={self._spatial_indices}")
         if self._origin_indices is not None:
             parts.append(f"origin_indices={self._origin_indices}")
         return f"TransportTensor({', '.join(parts)})"
 
 
 def _reconstruct_transport_tensor(
-    flat_values, nested_splits, indices, origin_ranks=None, origin_indices=None
+    flat_values, nested_splits, spatial_indices, global_shape=None, origin_indices=None
 ):
     """Pickle reconstruction helper (top-level function for pickling)."""
     return TransportTensor(
         flat_values,
         nested_splits,
-        indices=indices,
-        origin_ranks=origin_ranks,
+        spatial_indices=spatial_indices,
+        global_shape=global_shape,
         origin_indices=origin_indices,
     )
 
@@ -774,19 +863,21 @@ if _JAX_AVAILABLE:
         children = (
             v._flat_values,
             v._nested_splits,
-            v._indices,
-            v._origin_ranks,
+            v._spatial_indices,
+            v._global_shape,
             v._origin_indices,
         )
         return children, None
 
     def _tt_unflatten(aux_data, children):
-        flat_values, nested_splits, indices, origin_ranks, origin_indices = children
+        flat_values, nested_splits, spatial_indices, global_shape, origin_indices = (
+            children
+        )
         return TransportTensor(
             flat_values,
             nested_splits,
-            indices=indices,
-            origin_ranks=origin_ranks,
+            spatial_indices=spatial_indices,
+            global_shape=global_shape,
             origin_indices=origin_indices,
         )
 

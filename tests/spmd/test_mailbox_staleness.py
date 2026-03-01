@@ -12,12 +12,12 @@ async def test_mailbox_staleness_tensor_fallback():
 
     # Declare step 0 and provide data
     mb.declare_step("op", step=0, expected_tensors={"a": 1}, expected_states=[])
-    await mb.deposit_shards("op", "a", 0, 0, [np.array([1.0])], [1])
+    await mb.deposit_shards("op", ["a"], 0, "sender0", 0, [[np.array([1.0])]], [[1]])
     assert mb.is_step_ready("op", 0)
 
     # Declare step 1 and provide data
     mb.declare_step("op", step=1, expected_tensors={"a": 1}, expected_states=[])
-    await mb.deposit_shards("op", "a", 1, 0, [np.array([2.0])], [1])
+    await mb.deposit_shards("op", ["a"], 1, "sender0", 0, [[np.array([2.0])]], [[1]])
     assert mb.is_step_ready("op", 1)
 
     # Declare step 3 but it requires a tensor 'a'. Configure it with a staleness of 2.
@@ -37,7 +37,7 @@ async def test_mailbox_staleness_tensor_fallback():
     # Verify retrieved data uses the 'latest' policy (step 1 is latest valid)
     shards = await mb.get_tensor_shards("op", "a", 3)
     assert len(shards) == 1
-    np.testing.assert_array_equal(shards[0].flat_values, [2.0])
+    np.testing.assert_array_equal(shards[("sender0", 0)][0].flat_values, [2.0])
 
 
 @pytest.mark.asyncio
@@ -109,9 +109,9 @@ async def test_mailbox_future_resolution():
     assert not mb.is_step_ready("op", 2)
 
     # Deposit shards for step 1. This should trigger the check and satisfy step 2.
-    await mb.deposit_shards("op", "x", 1, 0, [np.array([10.0])], [1])
+    await mb.deposit_shards("op", ["x"], 1, "sender0", 0, [[np.array([10.0])]], [[1]])
 
     assert mb.is_step_ready("op", 2)
     shards = await mb.get_tensor_shards("op", "x", 2)
     assert len(shards) == 1
-    np.testing.assert_array_equal(shards[0].flat_values, [10.0])
+    np.testing.assert_array_equal(shards[("sender0", 0)][0].flat_values, [10.0])

@@ -3,89 +3,128 @@ from typing import Any, Dict, Optional
 from fluxway.common.decorators import spmd, operator
 from fluxway.common.types.tensor import TransportTensor
 from fluxway.reader import GrainReader
-from .data_types import RaggedInput
+from .data_types import UserBatch, ActiveFeatures, PassiveFeatures, LabelFeatures
 
 
 @spmd(mesh_axis_names=("worker",), mesh_axis_shapes=(1,))
 class RecommendationReader(GrainReader):
     """
-    Standard Reader SPMD for Recommendation Example.
-
-    This class demonstrates how to integrate Google Grain with Fluxway:
-    1. Inherit from GrainReader for distributed sharding and data loading.
-    2. Use TransportTensor to wrap ragged (variable-length) data.
-    3. Generate synthetic samples with different lengths to verify E2E training logic.
+    Refactored Reader SPMD for Recommendation Example.
+    Uses col-store (Active/Passive/Label) schema.
     """
 
     def _create_data_loader(
-        self, static_args: Dict[str, Any], rank: int, world_size: int
+        self,
+        static_args: Dict[str, Any],
+        rank: int,
+        world_size: int,
+        shard_index: Optional[int] = None,
+        shard_count: Optional[int] = None,
     ):
-        """
-        Initializes the data loading pipeline.
-        Provides synthetic ragged samples if no data_source is specified.
-        """
         if "data_source" not in static_args:
-            # Base samples with different lengths (Ragged structure)
-            base_samples = [
-                {"feature1": [10, 20, 10], "feature2": [30, 40]},
-                {"feature1": [20, 40], "feature2": [100, 110, 120, 100, 110]},
-            ]
-
-            # Create a dataset for training demonstration
-            data = [base_samples[i % 2].copy() for i in range(100)]
+            # Synthetic dataset following the Active/Passive/Label pattern
+            # Note: We use lists to represent ragged/variable length data
+            data = []
+            for i in range(100):
+                sample = {
+                    "user_id": [1000 + i],
+                    "user_age_level": [i % 5],
+                    "request_hour": [18],
+                    "hist_click_item_seq": [200, 201, 202] if i % 2 == 0 else [210],
+                    "hist_seq_length": 3 if i % 2 == 0 else 1,
+                    "target_item_id": [500 + i],
+                    "target_item_category": [i % 10],
+                    "target_item_stats": [0.05, 19.9],
+                    "is_click": [1 if i % 3 == 0 else 0],
+                }
+                data.append(sample)
             static_args["data_source"] = data
-
-            # Set default training configurations
+            static_args.setdefault("batch_size", 4)
             static_args.setdefault("num_epochs", 1)
             static_args.setdefault("shuffle", False)
 
-            print(
-                f"[RecommendationReader] Initialized synthetic dataset (Rank {rank})."
-            )
-
-        # Default batch size for the demo
-        static_args.setdefault("batch_size", 2)
-
-        # Build Grain DataLoader
-        super()._create_data_loader(static_args, rank, world_size)
+        super()._create_data_loader(
+            static_args, rank, world_size, shard_index, shard_count
+        )
 
     @operator(
         "read",
         output_sharding={
-            "feature1": {"type": "static", "axis": [0]},
-            "feature2": {"type": "static", "axis": [0]},
+            "active": {"type": "static", "axis": ["worker"]},
+            "passive": {"type": "static", "axis": ["worker"]},
+            "labels": {"type": "static", "axis": ["worker"]},
         },
     )
-    def read(self) -> Optional[RaggedInput]:
-        """
-        Produces a batch of RaggedInput for downstream operators.
-        """
+    def read(self) -> Optional[UserBatch]:
+        """Produces a batch of UserBatch."""
         static_args = getattr(self, "static_args", {})
-        batch_size = static_args.get("batch_size", 2)
+        batch_size = static_args.get("batch_size", 4)
         samples = []
 
-        # Accumulate samples from Grain iterator
-        for _ in range(batch_size):
-            try:
-                # Use next_item() from GrainReader to fetch the next record
-                item = self.next_item()
-                if item is None:
-                    break
-                samples.append(item)
-            except Exception as e:
-                print(f"[RecommendationReader] Error fetching item: {e}")
+        for i in range(batch_size):
+            item = self.next_item()
+            if item is None:
                 break
+            samples.append(item)
 
         if not samples:
             return None
 
-        # Wrap into TransportTensor with nested_splits for ragged data transport.
-        # TransportTensor.from_lists automatically detects variable lengths.
-        f1_list = [s["feature1"] for s in samples]
-        f2_list = [s["feature2"] for s in samples]
+        # Calculate global batch size
+        global_batch_size = batch_size * self.world_size
+        g_shape = (global_batch_size,)
 
-        t1 = TransportTensor.from_lists(f1_list, dtype=jnp.int32)
-        t2 = TransportTensor.from_lists(f2_list, dtype=jnp.int32)
+        # 1. Active Features
+        active = ActiveFeatures(
+            user_id=TransportTensor.from_lists(
+                [s["user_id"] for s in samples], dtype=jnp.int32, global_shape=g_shape
+            ),
+            user_age_level=TransportTensor.from_lists(
+                [s["user_age_level"] for s in samples],
+                dtype=jnp.int32,
+                global_shape=g_shape,
+            ),
+            request_hour=TransportTensor.from_lists(
+                [s["request_hour"] for s in samples],
+                dtype=jnp.int32,
+                global_shape=g_shape,
+            ),
+            hist_click_item_seq=TransportTensor.from_lists(
+                [s["hist_click_item_seq"] for s in samples],
+                dtype=jnp.int32,
+                global_shape=g_shape,
+            ),
+            hist_seq_length=TransportTensor.from_lists(
+                [[s["hist_seq_length"]] for s in samples],
+                dtype=jnp.int32,
+                global_shape=g_shape,
+            ),
+        )
 
-        print(f"[RecommendationReader] Produced Batch Shard (Size {len(samples)})")
-        return RaggedInput(feature1=t1, feature2=t2)
+        # 2. Passive Features
+        passive = PassiveFeatures(
+            target_item_id=TransportTensor.from_lists(
+                [s["target_item_id"] for s in samples],
+                dtype=jnp.int32,
+                global_shape=g_shape,
+            ),
+            target_item_category=TransportTensor.from_lists(
+                [s["target_item_category"] for s in samples],
+                dtype=jnp.int32,
+                global_shape=g_shape,
+            ),
+            target_item_stats=TransportTensor.from_lists(
+                [s["target_item_stats"] for s in samples],
+                dtype=jnp.float32,
+                global_shape=g_shape,
+            ),
+        )
+
+        # 3. Label Features
+        labels = LabelFeatures(
+            is_click=TransportTensor.from_lists(
+                [s["is_click"] for s in samples], dtype=jnp.int32, global_shape=g_shape
+            )
+        )
+
+        return UserBatch(active=active, passive=passive, labels=labels)

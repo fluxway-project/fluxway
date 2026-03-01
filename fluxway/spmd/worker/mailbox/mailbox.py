@@ -15,7 +15,7 @@ Zero-copy shard writing is supported via TransportReceiver delegation.
 from fluxway.common.types.configs import BarrierConfig
 import asyncio
 import logging
-from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from fluxway.common.sync import ArrivalBarrier
 from fluxway.transport.communication import TransportReceiver
@@ -64,6 +64,22 @@ class StepBarrier:
         if not periodic:
             self._check()  # fire immediately if both dicts are empty
 
+    @property
+    def arrived_tensors(self) -> List[str]:
+        return [
+            name for name, b in self._tensor_barriers.items() if b.count >= b.target
+        ]
+
+    @property
+    def expected_tensors(self) -> List[str]:
+        return list(self._tensor_barriers.keys())
+
+    @property
+    def tensor_progress(self) -> Dict[str, str]:
+        return {
+            name: f"{b.count}/{b.target}" for name, b in self._tensor_barriers.items()
+        }
+
     # ------------------------------------------------------------------
     # Arrival notification
     # ------------------------------------------------------------------
@@ -73,8 +89,9 @@ class StepBarrier:
         barrier = self._tensor_barriers.get(name)
         if barrier is not None:
             fired = barrier.arrive()
-            logger.debug(
-                f"[StepBarrier] TENSOR ARRIVED: name={name}, count={barrier.count}/{barrier.target}, fired={fired}"
+            print(
+                f"[StepBarrier] TENSOR ARRIVED: name={name}, count={barrier.count}/{barrier.target}, fired={fired}",
+                flush=True,
             )
             if self._periodic:
                 return fired
@@ -186,7 +203,7 @@ class WorkerMailbox:
 
         # Data plane (buffered path)
         self._tensor_slots: Dict[
-            str, Dict[str, Dict[int, Dict[int, "TransportTensor"]]]
+            str, Dict[str, Dict[int, Dict[Tuple[str, int], List["TransportTensor"]]]]
         ] = {}
 
         # Completion barriers: {op_name: {step: StepBarrier}}
@@ -271,6 +288,10 @@ class WorkerMailbox:
             self._staleness_config[op_name] = staleness_dict
             self._expected_tensor_counts[op_name] = expected_tensors
             self._expected_state_names[op_name] = expected_states
+            print(
+                f"[WorkerMailbox] declare_step({op_name}, {step}) expected_tensors: {expected_tensors}",
+                flush=True,
+            )
             # Currently apply one policy per operator for all its staleness configs
             self._retrieval_policy.setdefault(op_name, {})
             for name in staleness_dict:
@@ -302,6 +323,10 @@ class WorkerMailbox:
 
         barrier = StepBarrier(expected_tensors, expected_states)
         self._barriers.setdefault(op_name, {})[step] = barrier
+        print(
+            f"[WorkerMailbox] declare_step: op={op_name}, step={step}, expected_tensors={expected_tensors}, expected_states={expected_states}",
+            flush=True,
+        )
 
         # Check if we can satisfy any tolerant dependencies using cached older data
         for name, max_staleness in staleness_dict.items():
@@ -354,19 +379,23 @@ class WorkerMailbox:
             barrier = None
             if op_name in self._periodic_barriers:
                 actual_step = self._periodic_steps[op_name]
-                self._periodic_steps[op_name] += 1
                 barrier = self._periodic_barriers[op_name]
             else:
                 barrier = self._barriers.get(op_name, {}).get(step)
 
-            for name, data in zip(names, values, strict=True):
+            for name, data in zip(names, values, strict=True):  # type: ignore
                 self._state_data.setdefault(op_name, {}).setdefault(name, {})[
                     actual_step
                 ] = data
                 if barrier is not None:
                     fired = barrier.state_arrived(name)
-                    if fired and self._on_ready:
-                        self._on_ready(op_name, actual_step)
+                    if fired:
+                        if self._on_ready:
+                            self._on_ready(op_name, actual_step)
+                        # Periodic op consumes one virtual step for the entire bundle
+                        if op_name in self._periodic_barriers:
+                            self._periodic_steps[op_name] += 1
+                            actual_step = self._periodic_steps[op_name]
 
                 # Check if this state satisfies any FUTURE barriers that tolerate staleness
                 staleness = self._staleness_config.get(op_name, {}).get(name, 0)
@@ -431,7 +460,7 @@ class WorkerMailbox:
 
     def _buffered_slot(
         self, op_name: str, name: str, step: int
-    ) -> Dict[int, "TransportTensor"]:
+    ) -> Dict[Tuple[str, int], List["TransportTensor"]]:
         return (
             self._tensor_slots.setdefault(op_name, {})
             .setdefault(name, {})
@@ -441,102 +470,116 @@ class WorkerMailbox:
     async def deposit_shards(
         self,
         op_name: str,
-        name: str,
+        names: List[str],
         step: int,
+        sender_id: str,
         rank: int,
-        payloads: List[Any],
-        counts: List[int],
-        is_ragged: bool = False,
-        has_indices: bool = False,
+        payload_groups: List[List[Any]],
+        counts_groups: List[List[int]],
+        is_ragged: List[bool],
+        has_spatial_indices: List[bool],
+        has_origin_indices: List[bool],
     ) -> int:
         """
-        Cache a tensor shard and notify the step barrier.
-
-        If a zero-copy slot is registered for (op_type, name, step), writes
-        directly into the pre-allocated buffer instead.
+        Cache multiple tensor shards and notify the step barrier.
 
         Args:
             op_name: Operation type
-            name: Tensor name
+            names: List of tensor names
             step: Execution step
+            sender_id: ID of the sender
             rank: Sender rank
-            payloads: Raw data arrays (data, optional lengths, optional indices)
-            counts: Number of rows for each payload
-            is_ragged: Whether the payloads represent a ragged tensor (data + lengths)
-            has_indices: Whether the payloads include routing indices
+            payload_groups: List of lists of raw data arrays (data, optional lengths, optional spatial_indices, optional origin_indices)
+            counts_groups: List of lists of counts for each payload
+            is_ragged: List of bools indicating if ragged lengths are included for each tensor.
+            has_spatial_indices: List of bools indicating if routing indices are included for each tensor.
+            has_origin_indices: List of bools indicating if assembly indices are included for each tensor.
         """
         async with self._lock:
-            # Handle periodic ops: use virtual step
-            actual_step = step
-            barrier = None
+            # Determine actual step (periodic or standard)
             if op_name in self._periodic_barriers:
                 actual_step = self._periodic_steps[op_name]
-                self._periodic_steps[op_name] += 1
+                # self._periodic_steps[op_name] += 1 # This is moved to after the loop
                 barrier = self._periodic_barriers[op_name]
             else:
-                zc = self._zc_receivers.get(op_name, {}).get(name, {}).get(step)
-                if zc is not None:
-                    # Zero-copy delegates raw payloads directly to the receiver.
-                    zc.receive_slices(rank, payloads, counts)
-                    # Note: zero-copy periodic is not yet implemented in this simplified path
+                actual_step = step
                 barrier = self._barriers.get(op_name, {}).get(step)
 
-            if op_name not in self._periodic_barriers:
-                # Standard buffered path (only if not handled by ZC)
-                zc = self._zc_receivers.get(op_name, {}).get(name, {}).get(step)
-                if zc is None:
-                    self._deposit_buffered_shards(
-                        op_name,
-                        name,
-                        actual_step,
-                        rank,
-                        payloads,
-                        counts,
-                        is_ragged,
-                        has_indices,
-                    )
-            else:
-                # Periodic always uses buffered path for now
-                self._deposit_buffered_shards(
-                    op_name,
-                    name,
-                    actual_step,
-                    rank,
-                    payloads,
-                    counts,
-                    is_ragged,
-                    has_indices,
+            for i, name in enumerate(names):
+                print(
+                    f"[WorkerMailbox] deposit_shards: op={op_name}, name={name}, step={step}, sender={sender_id}:{rank}",
+                    flush=True,
                 )
+                payloads = payload_groups[i]
+                counts = counts_groups[i]
+                ragged = is_ragged[i]
+                has_idx = has_spatial_indices[i]
+                has_asmb = has_origin_indices[i]
 
-            if barrier is not None:
-                fired = barrier.tensor_arrived(name)
-                if fired and self._on_ready:
-                    self._on_ready(op_name, actual_step)
-
-            # Check if this completion satisfies any FUTURE barriers that tolerate staleness
-            staleness = self._staleness_config.get(op_name, {}).get(name, 0)
-            if staleness > 0:
-                expected = self._expected_tensor_counts.get(op_name, {}).get(name, 0)
-                cached_shards = (
+                # Strict Duplicate Validation
+                slot = (
                     self._tensor_slots.get(op_name, {})
                     .get(name, {})
                     .get(actual_step, {})
                 )
-                if expected > 0 and len(cached_shards) >= expected:
-                    for s in range(actual_step + 1, actual_step + staleness + 1):
-                        future_barrier = self._barriers.get(op_name, {}).get(s)
-                        if future_barrier is not None:
-                            fired_future = future_barrier.satisfy_tensor(name)
-                            if fired_future and self._on_ready:
-                                self._on_ready(op_name, s)
+                key = (sender_id, rank)
+                if key in slot:
+                    msg = (
+                        f"[WorkerMailbox Error] DUPLICATE SHARD RECEIVED: op={op_name} name={name} step={actual_step} sender={sender_id} rank={rank}. "
+                        "This indicates that the same worker is receiving the same shard from the same sender twice. "
+                        f"Current slot content: {slot[key]}"
+                    )
+                    raise ValueError(msg)
 
-        logger.debug(
-            "Mailbox deposit_shards: op=%s name=%s step=%d rank=%d",
-            op_name,
-            name,
-            step,
-            rank,
-        )
+                # Route to Zero-Copy or Buffered path
+                zc = self._zc_receivers.get(op_name, {}).get(name, {}).get(actual_step)
+                if zc is not None:
+                    # Note: Zero-copy bundling is not yet implemented; use first payload/count
+                    zc.receive_slices(rank, payloads, counts)
+                else:
+                    self._deposit_buffered_shards(
+                        op_name,
+                        name,
+                        actual_step,
+                        sender_id,
+                        rank,
+                        payloads,
+                        counts,
+                        is_ragged=ragged,
+                        has_spatial_indices=has_idx,
+                        has_origin_indices=has_asmb,
+                    )
+
+                # Notify barrier ONCE per sender for this tensor in the bundle
+                if barrier is not None:
+                    if barrier.tensor_arrived(name):
+                        if self._on_ready:
+                            self._on_ready(op_name, actual_step)
+
+                        # Periodic op consumes one virtual step for the entire bundle
+                        if op_name in self._periodic_barriers:
+                            self._periodic_steps[op_name] += 1
+                            actual_step = self._periodic_steps[op_name]
+
+                # Check if this tensor satisfies any FUTURE barriers that tolerate staleness
+                staleness = self._staleness_config.get(op_name, {}).get(name, 0)
+                if staleness > 0:
+                    expected = self._expected_tensor_counts.get(op_name, {}).get(
+                        name, 0
+                    )
+                    current_slot = (
+                        self._tensor_slots.get(op_name, {})
+                        .get(name, {})
+                        .get(actual_step, {})
+                    )
+                    if expected > 0 and len(current_slot) >= expected:
+                        for s in range(actual_step + 1, actual_step + staleness + 1):
+                            future_barrier = self._barriers.get(op_name, {}).get(s)
+                            if future_barrier is not None:
+                                fired_future = future_barrier.satisfy_tensor(name)
+                                if fired_future and self._on_ready:
+                                    self._on_ready(op_name, s)
+
         return await self.get_size()
 
     def _deposit_buffered_shards(
@@ -544,12 +587,14 @@ class WorkerMailbox:
         op_name: str,
         name: str,
         step: int,
+        sender_id: str,
         rank: int,
         payloads: List[Any],
         counts: List[int],
-        is_ragged: bool,
-        has_indices: bool,
-    ) -> None:
+        is_ragged: bool = False,
+        has_spatial_indices: bool = False,
+        has_origin_indices: bool = False,
+    ) -> int:
         """Internal helper for buffered shard storage."""
         from fluxway.common.types.tensor import TransportTensor
         from fluxway.common.backend import get_backend
@@ -560,7 +605,14 @@ class WorkerMailbox:
 
         while cursor < len(payloads):
             count = counts[cursor] if cursor < len(counts) else 0
-            data_payload = payloads[cursor][:count] if count > 0 else payloads[cursor]
+            data_payload = payloads[cursor]
+            if count > 0:
+                # Use count for slicing only if the tensor has a non-empty shape (is not a scalar)
+                data_payload = (
+                    data_payload[:count]
+                    if backend.shape(data_payload)
+                    else data_payload
+                )
             cursor += 1
 
             lengths_payload = None
@@ -574,11 +626,21 @@ class WorkerMailbox:
                 cursor += 1
 
             indices_payload = None
-            if has_indices and cursor < len(payloads):
+            if has_spatial_indices and cursor < len(payloads):
                 index_count = counts[cursor] if cursor < len(counts) else 0
                 indices_payload = (
                     payloads[cursor][:index_count]
                     if index_count > 0
+                    else payloads[cursor]
+                )
+                cursor += 1
+
+            assembly_payload = None
+            if has_origin_indices and cursor < len(payloads):
+                asmb_count = counts[cursor] if cursor < len(counts) else 0
+                assembly_payload = (
+                    payloads[cursor][:asmb_count]
+                    if asmb_count > 0
                     else payloads[cursor]
                 )
                 cursor += 1
@@ -592,29 +654,63 @@ class WorkerMailbox:
 
             tensors.append(
                 TransportTensor(
-                    data_payload, nested_splits=nested_splits, indices=indices_payload
+                    data_payload,
+                    nested_splits=nested_splits,
+                    spatial_indices=indices_payload,
+                    origin_indices=assembly_payload,
                 )
             )
 
-        if len(tensors) == 1:
-            self._buffered_slot(op_name, name, step)[rank] = tensors[0]
-        else:
-            self._buffered_slot(op_name, name, step)[rank] = tensors
+        key = (sender_id, rank)
+        self._buffered_slot(op_name, name, step)[key] = tensors
+
+        # Debug Trace for barrier status
+        barrier = self._barriers.get(op_name, {}).get(step)
+        if barrier and logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"[WorkerMailbox] Shard stored: op={op_name} name={name} step={step} rank={rank}"
+            )
+        return int(counts[0]) if counts else 0
+
+    async def get_all_tensor_shards(
+        self, op_name: str, step: int
+    ) -> Dict[str, Dict[Tuple[str, int], List["TransportTensor"]]]:
+        """Get all received shards for a step."""
+        async with self._lock:
+            result = {}
+            for name, step_dict in self._tensor_slots.get(op_name, {}).items():
+                if step in step_dict:
+                    result[name] = dict(step_dict[step])
+            return result
+
+    def _get_barrier(self, op_name: str, step: int) -> Optional[StepBarrier]:
+        """Internal helper to get barrier."""
+        if op_name in self._periodic_barriers:
+            return self._periodic_barriers[op_name]
+        return self._barriers.get(op_name, {}).get(step)
 
     async def get_tensor_shard(
-        self, op_name: str, name: str, step: int, rank: int
-    ) -> Optional["TransportTensor"]:
+        self,
+        op_name: str,
+        name: str,
+        step: int,
+        rank: int,
+        sender_id: Optional[str] = None,
+    ) -> Optional[List["TransportTensor"]]:
         async with self._lock:
-            return (
-                self._tensor_slots.get(op_name, {})
-                .get(name, {})
-                .get(step, {})
-                .get(rank)
-            )
+            slot = self._tensor_slots.get(op_name, {}).get(name, {}).get(step, {})
+            if sender_id is not None:
+                return slot.get((sender_id, rank))
+
+            # Search for the first key that matches the rank
+            for (sid, r), tensors in slot.items():
+                if r == rank:
+                    return tensors
+            return None
 
     async def get_tensor_shards(
         self, op_name: str, name: str, step: int
-    ) -> Dict[int, "TransportTensor"]:
+    ) -> Dict[Tuple[str, int], List["TransportTensor"]]:
         async with self._lock:
             staleness = self._staleness_config.get(op_name, {}).get(name, 0)
             if staleness > 0:
@@ -635,34 +731,25 @@ class WorkerMailbox:
 
             return dict(self._tensor_slots.get(op_name, {}).get(name, {}).get(step, {}))
 
-    async def get_all_tensor_shards(
-        self, op_name: str, step: int
-    ) -> Dict[str, Dict[int, "TransportTensor"]]:
+    async def get_all_states_shards(self, op_name: str, step: int) -> Dict[str, Any]:
         async with self._lock:
             result = {}
             for name, step_dict in self._tensor_slots.get(op_name, {}).items():
                 staleness = self._staleness_config.get(op_name, {}).get(name, 0)
-                if staleness > 0:
-                    expected = self._expected_tensor_counts.get(op_name, {}).get(
-                        name, 0
-                    )
-                    if expected > 0:
-                        policy = self._retrieval_policy.get(op_name, {}).get(
-                            name, "latest"
+                expected = self._expected_tensor_counts.get(op_name, {}).get(name, 0)
+                if staleness > 0 and expected > 0:
+                    policy = self._retrieval_policy.get(op_name, {}).get(name, "latest")
+                    valid_steps = [
+                        k
+                        for k in range(max(0, step - staleness), step + 1)
+                        if len(step_dict.get(k, {})) >= expected
+                    ]
+                    if valid_steps:
+                        best_k = (
+                            valid_steps[0] if policy == "oldest" else valid_steps[-1]
                         )
-                        valid_steps = [
-                            k
-                            for k in range(max(0, step - staleness), step + 1)
-                            if len(step_dict.get(k, {})) >= expected
-                        ]
-                        if valid_steps:
-                            best_k = (
-                                valid_steps[0]
-                                if policy == "oldest"
-                                else valid_steps[-1]
-                            )
-                            result[name] = dict(step_dict[best_k])
-                            continue
+                        result[name] = dict(step_dict[best_k])
+                        continue
 
                 if step in step_dict:
                     result[name] = dict(step_dict[step])
@@ -686,12 +773,14 @@ class WorkerMailbox:
 
         Raises RuntimeError if declare_step() was never called for this step.
         """
-        barrier = self._barriers.get(op_name, {}).get(step)
-        if barrier is None:
+        barrier = self._get_barrier(op_name, step)
+        if barrier is not None:
+            await barrier.wait()
+        else:
             raise RuntimeError(
-                f"declare_step() was not called for op={op_name} step={step}"
+                f"No barrier declared for op={op_name} step={step}. "
+                f"Call declare_step() first."
             )
-        await barrier.wait()
 
     # ------------------------------------------------------------------
     # Zero-copy registration

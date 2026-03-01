@@ -36,10 +36,6 @@ def ensure_logging_configured(
     (unless force=True). This avoids clobbering the application's logging setup.
     """
 
-    # Resolve log level with the following precedence (highest → lowest):
-    # 1. Explicit `level` argument
-    # 2. Environment variable FLUXWAY_LOG_LEVEL
-    # 3. INFO as the conservative default
     root_logger = logging.getLogger()
 
     env_level = _parse_log_level(os.getenv(ENV_LOG_LEVEL))
@@ -48,10 +44,6 @@ def ensure_logging_configured(
     else:
         resolved_level = env_level
 
-    # Resolve "force" behaviour:
-    # 1. Explicit `force` argument (if provided)
-    # 2. FLUXWAY_LOG_FORCE env var
-    # 3. Default to True so Fluxway logs are visible in Ray workers and examples.
     env_force = _parse_bool(os.getenv(ENV_LOG_FORCE))
     if force is not None:
         resolved_force = force
@@ -60,30 +52,22 @@ def ensure_logging_configured(
     else:
         resolved_force = True
 
-    # Make logs visible even in Ray worker processes.
-    # If force=True, this overrides any existing handlers in the process.
     logging.basicConfig(
         level=resolved_level, format=log_format, datefmt=datefmt, force=resolved_force
     )
 
-    # Ensure the root logger and all existing handlers honour the resolved level.
     root_logger.setLevel(resolved_level)
     for handler in root_logger.handlers:
         handler.setLevel(resolved_level)
 
-    # Emit a verification log so we can confirm this ran in each process.
-    try:
-        _logger.info(
-            "ensure_logging_configured applied in PID=%s: level=%s, force=%s, env_level=%r, env_force=%r",
-            os.getpid(),
-            logging.getLevelName(resolved_level),
-            resolved_force,
-            os.getenv(ENV_LOG_LEVEL),
-            os.getenv(ENV_LOG_FORCE),
-        )
-    except Exception:
-        # Logging itself should never break application logic.
-        pass
+    _logger.debug(
+        "Logging configured in PID=%s: level=%s, force=%s, env_level=%r, env_force=%r",
+        os.getpid(),
+        logging.getLevelName(resolved_level),
+        resolved_force,
+        os.getenv(ENV_LOG_LEVEL),
+        os.getenv(ENV_LOG_FORCE),
+    )
 
 
 def ensure_logger_info_visible(

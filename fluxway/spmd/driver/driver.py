@@ -297,7 +297,7 @@ if RAY_AVAILABLE:
                 logger.debug(f"[spmd_id={self.spmd_id}] Registered successor {spmd_id}")
 
             logger.debug(
-                f"[spmd_id={self.spmd_id}] SPMD {self.spmd_id}: Topology registration completed"
+                f"[spmd_id={self.spmd_id}] SPMD {self.spmd_id}: topology registration completed"
             )
 
         def _restore_from_checkpoint(self, checkpoint_id: str) -> None:

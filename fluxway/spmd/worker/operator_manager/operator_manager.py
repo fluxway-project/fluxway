@@ -165,7 +165,6 @@ class OperatorManager:
             if meta is None:
                 continue
 
-            # 1. Per-operator input/output sharding
             if meta.input_sharding:
                 self._input_sharding[op_name] = self._parse_sharding_specs(
                     meta.input_sharding
@@ -186,7 +185,6 @@ class OperatorManager:
                 list(meta.output_post_sharding.keys()),
             )
 
-            # 2. Expected parameter names
             self._expected_state_names[op_name] = list(
                 meta.get_arguments(is_output=False, arg_type=ArgumentType.STATE) or []
             )
@@ -194,7 +192,7 @@ class OperatorManager:
                 meta.get_arguments(is_output=False, arg_type=ArgumentType.TENSOR) or []
             )
 
-            # 3. Parse predecessor topology from input_pre_sharding
+            # Parse predecessor topology from input_pre_sharding
             # Structure: {spmd_id: List[EdgeShardingInfo]}
             for pre_spmd_id, edge_info_list in meta.input_pre_sharding.items():
                 merged_sharding: Dict[str, ShardingSpec] = {}
@@ -234,7 +232,7 @@ class OperatorManager:
                     is_self_loop=(pre_spmd_id == self._spmd_id),
                 )
 
-            # 4. Parse successor topology from output_post_sharding
+            # Parse successor topology from output_post_sharding
             # Structure: {spmd_id: List[EdgeShardingInfo]}
             for post_spmd_id, edge_info_list in meta.output_post_sharding.items():
                 merged_sharding: Dict[str, ShardingSpec] = {}
@@ -272,7 +270,7 @@ class OperatorManager:
                     is_self_loop=(post_spmd_id == self._spmd_id),
                 )
 
-            # 5. Build output-to-input tensor name mapping (positional correspondence)
+            # Build output-to-input tensor name mapping (positional correspondence)
             input_tensor_names = list(
                 meta.get_arguments(is_output=False, arg_type=ArgumentType.TENSOR) or []
             )
@@ -417,18 +415,24 @@ class OperatorManager:
                 sig = inspect.signature(operator)
                 params = list(sig.parameters.values())
 
-                if not params:
-                    logger.warning(f"Operator {op_name} has no parameters")
-                    continue
-
-                # Get the first parameter (excluding self)
+                is_source = self.is_source_operator(op_name)
+                has_self = params and params[0].name == "self"
                 param = (
-                    params[0]
-                    if params[0].name != "self"
-                    else (params[1] if len(params) > 1 else None)
+                    params[1]
+                    if has_self and len(params) > 1
+                    else (params[0] if not has_self and params else None)
                 )
+
                 if param is None:
-                    logger.warning(f"Operator {op_name} has no valid parameters")
+                    if is_source:
+                        logger.debug(
+                            f"Operator {op_name} is a source, skipping parameter type pre-computation."
+                        )
+                    else:
+                        logger.warning(
+                            f"Operator {op_name} has no valid parameters to receive data, "
+                            f"but it is not marked as a source operator."
+                        )
                     continue
 
                 param_type = param.annotation

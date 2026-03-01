@@ -188,8 +188,9 @@ def _create_operator_wrapper(
     sig = inspect.signature(func)
 
     # --- 1. Automated Inference from Type Annotations ---
-    all_data_fields = set()
-    all_control_fields = set()
+    all_data_fields = []
+    all_control_fields = []
+    input_param_map = {}
 
     # Check arguments (for Input streams)
     for param_name, param in sig.parameters.items():
@@ -213,35 +214,115 @@ def _create_operator_wrapper(
             continue
 
         data_fields, control_fields = _get_fluxway_streams(tp)
-        all_data_fields.update(data_fields)
-        all_control_fields.update(control_fields)
+        input_param_map[param_name] = data_fields + control_fields
+        for df in data_fields:
+            if df not in all_data_fields:
+                all_data_fields.append(df)
+        for cf in control_fields:
+            if cf not in all_control_fields:
+                all_control_fields.append(cf)
 
     # Merge explicit overrides
-    final_tensors = list(
-        set(data_argument) if data_argument is not None else all_data_fields
-    )
-    final_states = list(
-        set(control_argument) if control_argument is not None else all_control_fields
-    )
-    final_statics = list(set(static_argument) if static_argument is not None else set())
+    def _dedup_preserve_order(lst):
+        res = []
+        for x in lst:
+            if x not in res:
+                res.append(x)
+        return res
 
-    # --- 2. Deep Validation with Clear Messages ---
-    # Sharding vs Streams consistency
+    final_tensors = _dedup_preserve_order(
+        data_argument if data_argument is not None else all_data_fields
+    )
+    final_states = _dedup_preserve_order(
+        control_argument if control_argument is not None else all_control_fields
+    )
+    final_statics = _dedup_preserve_order(
+        static_argument if static_argument is not None else []
+    )
+
+    # Supports uniform/nested sharding for @data_type parameters (Pytree-like)
+    resolved_input_sharding = {}
     if input_sharding:
-        illegal_shards = set(input_sharding.keys()) & set(final_states)
-        if illegal_shards:
-            raise ValueError(
-                f"Fluxway Operator Error: Field(s) {illegal_shards} in operator '{name}' are marked as Control (ControlStream), "
-                f"but have sharding configured. Control fields are broadcast via Driver and do not support sharding.\n"
-                f"Fix: Remove input_sharding for these fields OR change them to Data (DataStream) in @data_type definition."
-            )
+        # Map parameter names to their fields
+        param_to_fields = {}
+        for p_name, p in sig.parameters.items():
+            if p_name in ("self", "cls"):
+                continue
+            if _is_fluxway_data_type(p.annotation):
+                param_to_fields[p_name] = _get_fluxway_streams(p.annotation)
 
-        unknown_shards = set(input_sharding.keys()) - set(final_tensors)
-        if unknown_shards:
-            raise ValueError(
-                f"Fluxway Operator Error: input_sharding contains unknown keys {unknown_shards} for operator '{name}'.\n"
-                f"Fix: Ensure sharding keys match Data fields defined in the input @data_type class."
-            )
+        for k, v in input_sharding.items():
+            if k in param_to_fields:
+                d_fields, c_fields = param_to_fields[k]
+                # If v is a dict and its keys overlap with fields, it's a nested mapping: {"param": {"field": spec}}
+                if isinstance(v, dict) and any(
+                    sk in d_fields or sk in c_fields for sk in v.keys()
+                ):
+                    for sk, sv in v.items():
+                        if sk in c_fields:
+                            raise ValueError(
+                                f"Fluxway Operator Error: Field '{sk}' in parameter '{k}' is marked as Control (ControlStream), "
+                                f"sharding is not supported.\nFix: Remove sharding for this field."
+                            )
+                        if sk in d_fields:
+                            resolved_input_sharding[sk] = sv
+                        else:
+                            raise ValueError(
+                                f"Fluxway Operator Error: Unknown field '{sk}' in @data_type parameter '{k}' for operator '{name}'.\n"
+                                f"Available Data fields: {d_fields}"
+                            )
+                else:
+                    # Apply v to all data fields (Uniform Sharding): {"param": spec}
+                    for df in d_fields:
+                        resolved_input_sharding[df] = v
+            elif k in final_tensors:
+                # Direct field sharding (Backward compatibility/Flattened): {"field": spec}
+                resolved_input_sharding[k] = v
+            elif k in final_states:
+                raise ValueError(
+                    f"Fluxway Operator Error: Field '{k}' is marked as Control (ControlStream) and does not support sharding.\n"
+                    f"Fix: Remove '{k}' from input_sharding."
+                )
+            else:
+                raise ValueError(
+                    f"Fluxway Operator Error: input_sharding contains unknown key '{k}' for operator '{name}'.\n"
+                    f"Fix: Use one of the parameter names {list(param_to_fields.keys())} or Data fields {final_tensors}."
+                )
+    input_sharding = resolved_input_sharding
+
+    # Recursive Output Sharding Resolution
+    resolved_output_sharding = {}
+    return_tp = sig.return_annotation
+    out_data_fields = []
+    out_control_fields = []
+    output_param_map = {}
+
+    if return_tp is not None and return_tp is not inspect.Signature.empty:
+        if _is_fluxway_data_type(return_tp):
+            out_data_fields, out_control_fields = _get_fluxway_streams(return_tp)
+            output_param_map["return"] = out_data_fields + out_control_fields
+        elif output_sharding:
+            # Fallback for simple return types if sharding is provided
+            out_data_fields = list(output_sharding.keys())
+            output_param_map["return"] = out_data_fields
+
+    if output_sharding:
+        for k, v in output_sharding.items():
+            if k in out_data_fields:
+                resolved_output_sharding[k] = v
+            elif k in out_control_fields:
+                raise ValueError(
+                    f"Fluxway Operator Error: Output field '{k}' is marked as Control, sharding not supported."
+                )
+            elif _is_fluxway_data_type(return_tp):
+                # Placeholder/Uniform mapping: apply v to all data fields if k is not a field but matches return type
+                # This implements the "placeholder" requirement.
+                for df in out_data_fields:
+                    resolved_output_sharding[df] = v
+            else:
+                resolved_output_sharding[k] = v
+
+    output_sharding = resolved_output_sharding
 
     # Periodic barrier constraints
     if periodic_barrier is not None:
@@ -256,12 +337,22 @@ def _create_operator_wrapper(
     input_sharding_processed = {}
     if input_sharding:
         for k, v in input_sharding.items():
-            input_sharding_processed[k] = v if isinstance(v, dict) else v.__dict__
+            if isinstance(v, dict):
+                input_sharding_processed[k] = v
+            elif hasattr(v, "as_dict"):
+                input_sharding_processed[k] = v.as_dict()
+            else:
+                input_sharding_processed[k] = v.__dict__
 
     output_sharding_processed = {}
     if output_sharding:
         for k, v in output_sharding.items():
-            output_sharding_processed[k] = v if isinstance(v, dict) else v.__dict__
+            if isinstance(v, dict):
+                output_sharding_processed[k] = v
+            elif hasattr(v, "as_dict"):
+                output_sharding_processed[k] = v.as_dict()
+            else:
+                output_sharding_processed[k] = v.__dict__
 
     # Auto-infer output arguments from return type
     output_args = None
@@ -297,12 +388,12 @@ def _create_operator_wrapper(
         output_arguments=output_args,
         input_sharding=input_sharding_processed,
         output_sharding=output_sharding_processed,
+        input_param_map=input_param_map,
+        output_param_map=output_param_map,
         barrier_config=barrier_config,
     )
 
     # --- 4. Wrapper Generation ---
-    func._flux_operator_meta = meta
-
     import threading
 
     _local = threading.local()
@@ -337,8 +428,10 @@ def _create_operator_wrapper(
     def set_spmd_class(cls):
         wrapper._flux_spmd_class = cls
 
-    wrapper._flux_set_spmd_class = set_spmd_class
-    wrapper._flux_operator_meta = meta
+    # Attach metadata to both original and wrapper
+    for target in (func, wrapper):
+        target._flux_operator_meta = meta
+        target._flux_set_spmd_class = set_spmd_class
 
     return staticmethod(wrapper)
 

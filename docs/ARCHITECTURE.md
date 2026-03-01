@@ -830,17 +830,17 @@ RPCPayload 结构：
 class RPCPayload:
     batch_id: str           # 唯一批次标识
     data: Array             # 数据分片 (Tensor)
-    global_indices: Array   # 原始全局索引 (Tensor, 用于 Sparse->Dense 还原顺序)
+    spatial_indices: Array   # 原始全局索引 (Tensor, 用于 Sparse->Dense 还原顺序)
     # 无需包含 sender_id 或 complex metadata
 ```
 设计原则：
 最小化元数据，减少传输开销
-global_indices 用于支持 Sparse 数据的顺序还原
+spatial_indices 用于支持 Sparse 数据的顺序还原
 不包含发送方 ID，实现接收端的去中心化
 4.7 性能优化 Checklist
 关键优化点：
  Zero-Copy：发送端使用 View/Slice 而非 Copy；接收端仅在 Barrier 触发时进行一次 Concat
- Static Topology：LayoutSpec 和 DependencySpec 应在训练前一次性生成，运行时只读
+ Static IndexDescriptor：LayoutSpec 和 DependencySpec 应在训练前一次性生成，运行时只读
  Vectorized Implementation：确保路由计算使用 jnp.argsort、jnp.take、torch.gather 等原语
  Keep-Alive：严格执行"空包保活"策略，确保 Barrier 计数器永远能达到 limit
 

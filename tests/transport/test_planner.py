@@ -8,7 +8,7 @@ from fluxway.common.mesh import DeviceMesh
 from fluxway.transport.planner import TransportPlanner
 from fluxway.common.types.sharding import ShardingSpec, P
 from fluxway.common.types.tensor import TransportTensor
-from fluxway.common.topology import RaggedTopology, IndexedTopology
+from fluxway.common.index_descriptor import RaggedIndex, ExplicitIndex
 
 
 @pytest.fixture(autouse=True)
@@ -62,7 +62,7 @@ def test_static_to_static_rank1():
 
 
 def test_static_to_dynamic_hash():
-    """Source: chunk(1). Target: hash(2) via topology."""
+    """Source: chunk(1). Target: hash(2) via index_desc."""
     splits = [jnp.array([0, 1, 2, 3, 4], dtype=jnp.int32)]
 
     src_mesh = DeviceMesh(device_shape=(1,), axis_names=("x",))
@@ -75,7 +75,7 @@ def test_static_to_dynamic_hash():
         dst_spec=dst_spec,
         data_shape=(4,),
         local_rank=0,
-        topology=RaggedTopology(splits=splits),
+        index_desc=RaggedIndex(splits=splits),
     )
 
     counts = plan.send_counts.tolist()
@@ -97,7 +97,7 @@ def test_dynamic_to_static():
         dst_spec=dst_spec,
         data_shape=(6,),
         local_rank=0,
-        topology=IndexedTopology(indices=dep),
+        index_desc=ExplicitIndex(indices=dep),
     )
 
     counts = plan.send_counts.tolist()
@@ -120,7 +120,7 @@ def test_dynamic_to_dynamic():
         dst_spec=dst_spec,
         data_shape=(3,),
         local_rank=0,
-        topology=RaggedTopology(splits=splits),
+        index_desc=RaggedIndex(splits=splits),
     )
 
     counts = plan.send_counts.tolist()
@@ -128,10 +128,10 @@ def test_dynamic_to_dynamic():
     assert counts[1] == 0
 
 
-# ---- Scenario 5: routing_indices (key -> value dual-tensor) ----
+# ---- Scenario 5: spatial_indices (key -> value dual-tensor) ----
 
 
-def test_routing_indices_dual_tensor():
+def test_spatial_indices_dual_tensor():
     """Key-value dispatch: key determines device, value follows."""
     key_data = jnp.array([0, 1, 2, 3], dtype=jnp.int32)
     mesh = DeviceMesh(device_shape=(2,), axis_names=("x",))
@@ -139,7 +139,7 @@ def test_routing_indices_dual_tensor():
     val_spec = ShardingSpec.derive_from(
         driver_spec=ShardingSpec.hash(mesh=mesh, partition=P("x")),
         driver_data_shape=(4,),
-        driver_topology=IndexedTopology(indices=key_data),
+        driver_index_desc=ExplicitIndex(indices=key_data),
         follow_dim=0,
     )
 

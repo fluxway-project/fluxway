@@ -322,15 +322,15 @@ def test_ragged_dynamic_slice_interface():
 
 
 # ============================================================
-# ContinuousTopology tests
+# ContinuousIndex tests
 # ============================================================
 
 
 def test_index_descriptor_chunk_materialize():
     """Chunk descriptor materializes to contiguous range."""
-    from fluxway.common.types.tensor import ContinuousTopology
+    from fluxway.common.types.tensor import ContinuousIndex
 
-    desc = ContinuousTopology.chunk(start=10, count=5)
+    desc = ContinuousIndex.chunk(start=10, count=5)
     indices = desc.materialize()
 
     backend = get_backend()
@@ -340,9 +340,9 @@ def test_index_descriptor_chunk_materialize():
 
 def test_index_descriptor_cyclic_materialize():
     """Cyclic descriptor materializes to strided range."""
-    from fluxway.common.types.tensor import ContinuousTopology
+    from fluxway.common.types.tensor import ContinuousIndex
 
-    desc = ContinuousTopology.cyclic(start=1, step=4, count=3)
+    desc = ContinuousIndex.cyclic(start=1, step=4, count=3)
     indices = desc.materialize()
 
     backend = get_backend()
@@ -352,12 +352,12 @@ def test_index_descriptor_cyclic_materialize():
 
 def test_index_descriptor_chunk_slice():
     """Chunk descriptor slice is O(1) — returns a new descriptor, not a tensor."""
-    from fluxway.common.topology import ContinuousTopology
+    from fluxway.common.index_descriptor import ContinuousIndex
 
-    desc = ContinuousTopology.chunk(start=100, count=10)
+    desc = ContinuousIndex.chunk(start=100, count=10)
     sub = desc.slice(2, 5)  # indices [102, 103, 104]
 
-    assert isinstance(sub, ContinuousTopology)
+    assert isinstance(sub, ContinuousIndex)
     assert sub.pattern.name == "CONTIGUOUS"
     assert sub.start == 102
     assert sub.count == 3
@@ -369,13 +369,13 @@ def test_index_descriptor_chunk_slice():
 
 def test_index_descriptor_cyclic_slice():
     """Cyclic descriptor slice is O(1)."""
-    from fluxway.common.topology import ContinuousTopology
+    from fluxway.common.index_descriptor import ContinuousIndex
 
-    desc = ContinuousTopology.cyclic(start=0, step=4, count=8)
+    desc = ContinuousIndex.cyclic(start=0, step=4, count=8)
     # Original: [0, 4, 8, 12, 16, 20, 24, 28]
     sub = desc.slice(2, 5)  # elements at positions 2,3,4 → [8, 12, 16]
 
-    assert isinstance(sub, ContinuousTopology)
+    assert isinstance(sub, ContinuousIndex)
     assert sub.pattern.name == "STRIDED"
     assert sub.start == 8
     assert sub.step == 4
@@ -391,52 +391,51 @@ def test_index_descriptor_cyclic_slice():
 # ============================================================
 
 
-def test_slice_propagates_explicit_global_indices():
-    """Slicing a tensor with explicit global_indices propagates sub-indices."""
+def test_slice_propagates_explicit_spatial_indices():
+    """Slicing a tensor with explicit spatial_indices propagates sub-indices."""
     backend = get_backend()
     data = backend.tensor([10.0, 20.0, 30.0, 40.0, 50.0])
     indices = backend.tensor([100, 101, 102, 103, 104], dtype=backend.int32())
 
-    tensor = TransportTensor(data, indices=indices)
+    tensor = TransportTensor(data, spatial_indices=indices)
     sliced = tensor.slice(1, 4)
 
     assert backend.equal(
-        sliced.global_indices, backend.tensor([101, 102, 103], dtype=backend.int32())
+        sliced.spatial_indices, backend.tensor([101, 102, 103], dtype=backend.int32())
     )
     assert backend.equal(sliced.flat_values, backend.tensor([20.0, 30.0, 40.0]))
 
 
 def test_slice_propagates_descriptor():
-    """Slicing a tensor with ContinuousTopology derives O(1) sub-descriptor."""
-    from fluxway.common.types.tensor import ContinuousTopology
+    """Slicing a tensor with ContinuousIndex derives O(1) sub-descriptor."""
+    from fluxway.common.types.tensor import ContinuousIndex
 
     backend = get_backend()
     data = backend.tensor([10.0, 20.0, 30.0, 40.0, 50.0])
-    desc = ContinuousTopology.chunk(start=50, count=5)
+    desc = ContinuousIndex.chunk(start=50, count=5)
 
-    tensor = TransportTensor(data, indices=desc)
+    tensor = TransportTensor(data, spatial_indices=desc)
     sliced = tensor.slice(1, 4)
 
     # Should have a derived descriptor, not a materialized tensor
     assert sliced.index_descriptor is not None
     assert sliced.index_descriptor.start == 51
     assert sliced.index_descriptor.count == 3
-    assert sliced._global_indices is None  # Not materialized
 
-    # global_indices property should lazy-materialize
+    # spatial_indices property should lazy-materialize
     expected = backend.tensor([51, 52, 53], dtype=backend.int32())
-    assert backend.equal(sliced.global_indices, expected)
+    assert backend.equal(sliced.spatial_indices, expected)
 
 
 def test_dynamic_slice_propagates_descriptor():
     """dynamic_slice with tensor args also propagates descriptor."""
-    from fluxway.common.types.tensor import ContinuousTopology
+    from fluxway.common.types.tensor import ContinuousIndex
 
     backend = get_backend()
     data = backend.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
-    desc = ContinuousTopology.chunk(start=0, count=6)
+    desc = ContinuousIndex.chunk(start=0, count=6)
 
-    tensor = TransportTensor(data, indices=desc)
+    tensor = TransportTensor(data, spatial_indices=desc)
     start = backend.tensor(2, dtype=backend.int32())
     size = backend.tensor(3, dtype=backend.int32())
     sliced = tensor.dynamic_slice(start, size)
@@ -446,62 +445,62 @@ def test_dynamic_slice_propagates_descriptor():
     assert sliced.index_descriptor.count == 3
 
 
-def test_gather_propagates_global_indices():
-    """Gather reorders global_indices correctly, destroys descriptor."""
-    from fluxway.common.types.tensor import ContinuousTopology
+def test_gather_propagates_spatial_indices():
+    """Gather reorders spatial_indices correctly, destroys descriptor."""
+    from fluxway.common.types.tensor import ContinuousIndex
 
     backend = get_backend()
     data = backend.tensor([10.0, 20.0, 30.0, 40.0])
-    desc = ContinuousTopology.chunk(start=100, count=4)
+    desc = ContinuousIndex.chunk(start=100, count=4)
 
-    tensor = TransportTensor(data, indices=desc)
+    tensor = TransportTensor(data, spatial_indices=desc)
     perm = backend.tensor([3, 1, 0, 2], dtype=backend.int32())
     gathered = tensor.gather(perm)
 
     # Descriptor is destroyed (order broken), explicit tensor stored
-    assert gathered.index_descriptor is None
+    assert not isinstance(gathered.index_descriptor, ContinuousIndex)
     expected = backend.tensor([103, 101, 100, 102], dtype=backend.int32())
-    assert backend.equal(gathered.global_indices, expected)
+    assert backend.equal(gathered.spatial_indices, expected)
 
 
 def test_gather_propagates_explicit_indices():
-    """Gather with explicit global_indices reorders correctly."""
+    """Gather with explicit spatial_indices reorders correctly."""
     backend = get_backend()
     data = backend.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
     indices = backend.tensor([10, 20, 30], dtype=backend.int32())
 
-    tensor = TransportTensor(data, indices=indices)
+    tensor = TransportTensor(data, spatial_indices=indices)
     perm = backend.tensor([2, 0], dtype=backend.int32())
     gathered = tensor.gather(perm)
 
     expected_indices = backend.tensor([30, 10], dtype=backend.int32())
-    assert backend.equal(gathered.global_indices, expected_indices)
+    assert backend.equal(gathered.spatial_indices, expected_indices)
     assert backend.equal(gathered.flat_values, backend.tensor([[5.0, 6.0], [1.0, 2.0]]))
 
 
 def test_no_indices_stays_none():
-    """Operations on tensor without indices keep global_indices as None."""
+    """Operations on tensor without indices keep spatial_indices as None."""
     backend = get_backend()
     data = backend.tensor([1.0, 2.0, 3.0])
     tensor = TransportTensor(data)
 
     sliced = tensor.slice(0, 2)
-    assert sliced.global_indices is None
+    assert sliced.spatial_indices is None
     assert sliced.index_descriptor is None
 
     gathered = tensor.gather(backend.tensor([1, 0], dtype=backend.int32()))
-    assert gathered.global_indices is None
+    assert gathered.spatial_indices is None
 
 
 def test_descriptor_serialization():
-    """ContinuousTopology survives pickle round-trip."""
-    from fluxway.common.topology import ContinuousTopology
+    """ContinuousIndex survives pickle round-trip."""
+    from fluxway.common.index_descriptor import ContinuousIndex
 
     backend = get_backend()
     data = backend.tensor([1.0, 2.0, 3.0])
-    desc = ContinuousTopology.chunk(start=42, count=3)
+    desc = ContinuousIndex.chunk(start=42, count=3)
 
-    tensor = TransportTensor(data, indices=desc)
+    tensor = TransportTensor(data, spatial_indices=desc)
 
     serialized = pickle.dumps(tensor)
     restored = pickle.loads(serialized)
@@ -512,18 +511,18 @@ def test_descriptor_serialization():
     assert restored.index_descriptor.count == 3
 
     expected = backend.tensor([42, 43, 44], dtype=backend.int32())
-    assert backend.equal(restored.global_indices, expected)
+    assert backend.equal(restored.spatial_indices, expected)
 
 
 def test_slice_then_gather_chain():
     """Chain: slice (preserves descriptor) → gather (materializes)."""
-    from fluxway.common.types.tensor import ContinuousTopology
+    from fluxway.common.types.tensor import ContinuousIndex
 
     backend = get_backend()
     data = backend.tensor([10.0, 20.0, 30.0, 40.0, 50.0, 60.0])
-    desc = ContinuousTopology.chunk(start=0, count=6)
+    desc = ContinuousIndex.chunk(start=0, count=6)
 
-    tensor = TransportTensor(data, indices=desc)
+    tensor = TransportTensor(data, spatial_indices=desc)
 
     # slice [1:5] → descriptor (start=1, count=4)
     sliced = tensor.slice(1, 5)
@@ -535,9 +534,9 @@ def test_slice_then_gather_chain():
     perm = backend.tensor([2, 0], dtype=backend.int32())
     gathered = sliced.gather(perm)
 
-    assert gathered.index_descriptor is None
+    assert not isinstance(gathered.index_descriptor, ContinuousIndex)
     expected = backend.tensor([3, 1], dtype=backend.int32())
-    assert backend.equal(gathered.global_indices, expected)
+    assert backend.equal(gathered.spatial_indices, expected)
 
 
 def test_from_tensor_and_slice():
@@ -546,7 +545,7 @@ def test_from_tensor_and_slice():
     data = backend.tensor([10.0, 20.0, 30.0, 40.0])
 
     # Using slice for chunk descriptor
-    tensor = TransportTensor.from_tensor(data, indices=slice(100, 104))
+    tensor = TransportTensor.from_tensor(data, spatial_indices=slice(100, 104))
 
     assert tensor.index_descriptor is not None
     assert tensor.index_descriptor.start == 100
@@ -555,10 +554,12 @@ def test_from_tensor_and_slice():
 
     # The materialized global indices should match
     expected = backend.tensor([100, 101, 102, 103], dtype=backend.int32())
-    assert backend.equal(tensor.global_indices, expected)
+    assert backend.equal(tensor.spatial_indices, expected)
 
     # Using slice for cyclic descriptor
-    tensor_strided = TransportTensor.from_tensor(data, indices=slice(10, None, 2))
+    tensor_strided = TransportTensor.from_tensor(
+        data, spatial_indices=slice(10, None, 2)
+    )
     assert tensor_strided.index_descriptor is not None
     assert tensor_strided.index_descriptor.start == 10
     assert tensor_strided.index_descriptor.step == 2

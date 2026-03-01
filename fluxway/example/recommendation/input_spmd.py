@@ -1,14 +1,14 @@
 import jax.numpy as jnp
 from fluxway.common.decorators import spmd, operator
-from .data_types import RaggedInput, InputNodeOutput
+from .data_types import UserBatch, InputNodeOutput, DPFeatures
 
 
 def hash_routing(tensor, mesh):
     """Modulo-based routing for P2P."""
     from fluxway.common.types.tensor import TransportTensor
 
-    if isinstance(tensor, TransportTensor) and tensor.global_indices is not None:
-        val = tensor.global_indices
+    if isinstance(tensor, TransportTensor) and tensor.spatial_indices is not None:
+        val = tensor.spatial_indices
     else:
         val = tensor.flat_values if isinstance(tensor, TransportTensor) else tensor
     return jnp.mod(val, mesh.size)
@@ -22,25 +22,39 @@ class InputSPMD:
 
     @operator(
         name="process",
-        data_argument=["feature1", "feature2"],
-        input_sharding={
-            "feature1": {"type": "static", "axis": [0]},
-            "feature2": {"type": "static", "axis": [0]},
-        },
+        input_sharding={"data": {"type": "static", "axis": ["dp"]}},
         output_sharding={
-            "unique_ids1": {"type": "dynamic", "axis": [0], "fn": "hash_routing"},
-            "unique_ids2": {"type": "dynamic", "axis": [0], "fn": "hash_routing"},
-            "inv1": {"type": "static", "axis": ["dp"]},
-            "inv2": {"type": "static", "axis": ["dp"]},
+            "unique_user_ids": {
+                "type": "dynamic",
+                "axis": ["dp"],
+                "fn": "hash_routing",
+            },
+            "unique_item_ids": {
+                "type": "dynamic",
+                "axis": ["dp"],
+                "fn": "hash_routing",
+            },
+            "user_inv": {"type": "dynamic", "axis": ["dp"]},
+            "item_inv": {"type": "dynamic", "axis": ["dp"]},
+            "dp_data": {"type": "static", "axis": ["dp"]},
         },
     )
-    def process(self, data: RaggedInput) -> InputNodeOutput:
-        u1, inv1 = data.feature1.unique_with_routing()
-        u2, inv2 = data.feature2.unique_with_routing()
+    def process(self, data: UserBatch) -> InputNodeOutput:
+        # 1. Handle User ID (Routing to Table 1)
+        u_user, inv_user = data.active.user_id.unique_with_routing()
 
-        print(f"[InputSPMD] F1 Unique IDs: {u1.flat_values}")
-        print(f"[InputSPMD] F1 Inv Map: {inv1.flat_values}")
-        print(f"[InputSPMD] F2 Unique IDs: {u2.flat_values}")
-        print(f"[InputSPMD] F2 Inv Map: {inv2.flat_values}")
+        # 2. Handle Item ID (Routing to Table 2)
+        u_item, inv_item = data.passive.target_item_id.unique_with_routing()
 
-        return InputNodeOutput(unique_ids1=u1, inv1=inv1, unique_ids2=u2, inv2=inv2)
+        # 3. Features to pass through as-is (DP aligned)
+        dp_data = DPFeatures(
+            labels=data.labels, dense_stats=data.passive.target_item_stats
+        )
+
+        return InputNodeOutput(
+            unique_user_ids=u_user,
+            user_inv=inv_user,
+            unique_item_ids=u_item,
+            item_inv=inv_item,
+            dp_data=dp_data,
+        )

@@ -69,12 +69,16 @@ class BaseDataDistributor:
         src_shape_arg = (
             None
             if (isinstance(source, ShardingSpec) and source.is_content_addressable)
-            else local_shape
+            else (
+                primary.global_shape
+                if primary.global_shape is not None
+                else local_shape
+            )
         )
         src_layout = self._ensure_layout(source, src_shape_arg)
 
         # Routing indices or implicit inference.
-        src_indices = primary.global_indices
+        src_indices = primary.spatial_indices
         if src_indices is None and not src_layout.is_content_addressable:
             source_routing_dim = (
                 src_layout.routing_dim if src_layout.routing_dim is not None else 0
@@ -92,17 +96,30 @@ class BaseDataDistributor:
             start = effective_rank * dim_size
             src_indices = backend.arange(start, start + dim_size, dtype=backend.int32())
 
-        # For dst layout, prefer explicit global_shape, then src_layout.data_shape.
+        # For dst layout, prefer explicit global_shape, then tensor's global_shape, then src_layout.data_shape.
         dst_shape_arg = (
-            global_shape if global_shape is not None else src_layout.data_shape
+            global_shape
+            if global_shape is not None
+            else (
+                primary.global_shape
+                if primary.global_shape is not None
+                else src_layout.data_shape
+            )
         )
         if isinstance(target, ShardingSpec) and target.is_content_addressable:
             dst_shape_arg = None
 
         if isinstance(target, ShardingSpec):
-            dst_layout = target._to_layout(dst_shape_arg, topology=None)
+            dst_layout = target._to_layout(dst_shape_arg, index_desc=None)
         else:
             dst_layout = target
+
+        print(
+            f"[Distributor] Planning: src_mesh={src_layout.mesh.size if src_layout.mesh else 1}, "
+            f"dst_mesh={dst_layout.mesh.size if dst_layout.mesh else 1}, "
+            f"local_rank={self.local_rank}, src_indices={src_indices}",
+            flush=True,
+        )
 
         routing_dim = dst_layout.routing_dim
         if routing_dim is None:
@@ -128,13 +145,28 @@ class BaseDataDistributor:
         # Prepare payload tuples for JIT
         # format: tuple of (flat_values, None or lengths_tensor)
         payloads = []
+        is_ragged_list = []
+        has_origin_indices_list = []
+        has_spatial_indices_list = [
+            tt.spatial_indices is not None for tt in tensors_to_pack
+        ]
         for tt in tensors_to_pack:
             lengths = None
+            is_ragged = False
             if tt.is_ragged:
                 # Calculate lengths from splits (splits[1:] - splits[:-1])
                 splits = tt.nested_splits[0]
                 lengths = splits[1:] - splits[:-1]
+                is_ragged = True
             payloads.append((tt.flat_values, lengths))
+            is_ragged_list.append(is_ragged)
+
+            # Check for origin_indices (logical offsets)
+            if tt.origin_indices is not None:
+                payloads.append((tt.origin_indices, None))
+                has_origin_indices_list.append(True)
+            else:
+                has_origin_indices_list.append(False)
 
         payloads_tuple = tuple(payloads)
 
@@ -149,9 +181,9 @@ class BaseDataDistributor:
         # Prepare static shapes for JIT padding
         # static_shapes: (item_cap, payload0_flat_cap, payload1_flat_cap, ...)
         static_shapes = [capacity]
-        for tt in tensors_to_pack:
-            if tt.is_ragged:
-                static_shapes.append(int(backend.shape(tt.flat_values)[0]))
+        for p_data, p_len in payloads:
+            if p_len is not None:
+                static_shapes.append(int(backend.shape(p_data)[0]))
             else:
                 static_shapes.append(capacity)
         static_shapes_tuple = tuple(static_shapes)
@@ -162,16 +194,17 @@ class BaseDataDistributor:
         )
         (
             padded_buffers_lists,  # List of (padded_data, padded_lengths)
-            valid_counts,
+            counts_per_payload,  # List of count tensors [item_count or flat_count]
+            send_counts,  # item_counts (dim0 row counts)
             dest_devices,
             replication_factor,
-            plan_global_indices,
-            extra_routing_indices,
+            plan_spatial_indices,
+            extra_spatial_indices,
             sort_indices,
         ) = _jit_plan_and_pack(
             payloads_tuple,
             src_indices,
-            dst_layout.topology,
+            dst_layout.index_desc,
             routing_dim,
             dst_layout.data_shape,
             dst_layout.strategy,
@@ -185,7 +218,7 @@ class BaseDataDistributor:
 
         is_dynamic = source.is_content_addressable or target.is_content_addressable
 
-        counts_host = backend.to_numpy(valid_counts).flatten()
+        counts_host = backend.to_numpy(send_counts).flatten()
         is_replicated = replication_factor > 1
 
         if is_replicated:
@@ -206,13 +239,26 @@ class BaseDataDistributor:
                     if p_len is not None:
                         payload_tensors.append(p_len[device_id])
 
-                if extra_routing_indices is not None:
-                    payload_tensors.append(extra_routing_indices[device_id])
-                    includes_indices = True
-                else:
-                    includes_indices = False
+                # Multi-tensor count assembly
+                payload_counts = []
+                for c_list in counts_per_payload:
+                    payload_counts.append(int(c_list[device_id]))
 
-                yield targets, payload_tensors, [count], sort_indices, includes_indices
+                if extra_spatial_indices is not None:
+                    payload_tensors.append(extra_spatial_indices[device_id])
+                    payload_counts.append(count)  # item_count
+                else:
+                    pass
+
+                yield (
+                    targets,
+                    payload_tensors,
+                    payload_counts,
+                    sort_indices,
+                    has_spatial_indices_list,
+                    is_ragged_list,
+                    has_origin_indices_list,
+                )
         else:
             # Scatter-send
             for device_id, count in enumerate(counts_host):
@@ -220,25 +266,38 @@ class BaseDataDistributor:
                 if count == 0 and not is_dynamic:
                     continue
 
-                # Dynamic Payload Assembly (filter out None)
+                targets = [device_id]
+
+                # Dynamic Payload Assembly
                 payload_tensors = []
                 for p_data, p_len in padded_buffers_lists:
                     payload_tensors.append(p_data[device_id])
                     if p_len is not None:
                         payload_tensors.append(p_len[device_id])
 
-                if extra_routing_indices is not None:
-                    payload_tensors.append(extra_routing_indices[device_id])
-                    includes_indices = True
-                else:
-                    includes_indices = False
+                # Multi-tensor count assembly
+                payload_counts = []
+                for c_list in counts_per_payload:
+                    payload_counts.append(int(c_list[device_id]))
 
+                if extra_spatial_indices is not None:
+                    payload_tensors.append(extra_spatial_indices[device_id])
+                    payload_counts.append(count)  # item_count
+                else:
+                    pass
+
+                print(
+                    f"[Distributor] Yielding shard for targets={targets}, counts={payload_counts}",
+                    flush=True,
+                )
                 yield (
-                    [device_id],
+                    targets,
                     payload_tensors,
-                    [count],
+                    payload_counts,
                     sort_indices,
-                    includes_indices,
+                    has_spatial_indices_list,
+                    is_ragged_list,
+                    has_origin_indices_list,
                 )
 
 
@@ -250,7 +309,9 @@ class SyncDataDistributor(BaseDataDistributor):
         local_data: Union[TransportTensor, List[TransportTensor]],
         source: Union[ShardingSpec, Layout],
         target: Union[ShardingSpec, Layout],
-        send_fn: Callable[[int, List[Any], List[int], bool], Any],
+        send_fn: Callable[
+            [int, List[Any], List[int], List[bool], List[bool], List[bool]], Any
+        ],
         global_shape: Any = None,
         capacity: Optional[Union[int, List[int]]] = None,
     ) -> Tuple[List[Any], Any]:
@@ -262,12 +323,21 @@ class SyncDataDistributor(BaseDataDistributor):
             tensors,
             counts,
             sort_idx,
-            includes_indices,
+            has_spatial_indices_list,
+            is_ragged_list,
+            has_origin_indices_list,
         ) in self._plan_and_shard(local_data, source, target, global_shape, capacity):
             if meta_sort_indices is None:
                 meta_sort_indices = sort_idx
             for target_id in targets:
-                res = send_fn(target_id, tensors, counts, includes_indices)
+                res = send_fn(
+                    target_id,
+                    tensors,
+                    counts,
+                    has_spatial_indices_list,
+                    is_ragged_list,
+                    has_origin_indices_list,
+                )
                 results.append(res)
         return results, meta_sort_indices
 
@@ -280,27 +350,67 @@ class AsyncDataDistributor(BaseDataDistributor):
         local_data: Union[TransportTensor, List[TransportTensor]],
         source: Union[ShardingSpec, Layout],
         target: Union[ShardingSpec, Layout],
-        send_fn: Callable[[int, List[Any], List[int], bool], Coroutine[Any, Any, Any]],
+        send_fn: Callable[
+            [int, List[Any], List[int], List[bool], List[bool], List[bool]],
+            Coroutine[Any, Any, Any],
+        ],
         global_shape: Any = None,
         capacity: Optional[Union[int, List[int]]] = None,
     ) -> Tuple[List[Any], Any]:
         """Performs asynchronous distribution."""
-        tasks = []
+        # Aggregate all shards per destination rank to avoid multiple RPC collisions
+        dest_agg = {}  # target_id -> (merged_tensors, merged_counts)
         meta_sort_indices = None
+        # We assume flags are consistent for the batch
+        batch_has_spatial_indices_list = []
+        batch_ragged_list = []
+        batch_has_origin_indices_list = []
+
         for (
             targets,
             tensors,
             counts,
             sort_idx,
-            includes_indices,
+            has_spatial_indices_list,
+            is_ragged_list,
+            has_origin_indices_list,
         ) in self._plan_and_shard(local_data, source, target, global_shape, capacity):
             if meta_sort_indices is None:
                 meta_sort_indices = sort_idx
-            for target_id in targets:
-                tasks.append(send_fn(target_id, tensors, counts, includes_indices))
 
-        if not tasks:
+            batch_has_spatial_indices_list = has_spatial_indices_list
+            batch_ragged_list = is_ragged_list
+            batch_has_origin_indices_list = has_origin_indices_list
+
+            for target_id in targets:
+                # This assumes that for a given target_id, all calls to _plan_and_shard
+                # will yield the same tensors and counts, or that only the last one matters.
+                # If aggregation is truly needed, this logic would need to be more complex
+                # (e.g., dest_agg[target_id][0].extend(tensors)).
+                dest_agg[target_id] = (tensors, counts)
+
+        print(
+            f"[AsyncDistributor Rank {self.local_rank}] distribute targets: {list(dest_agg.keys())}",
+            flush=True,
+        )
+
+        if not dest_agg:
             return [], meta_sort_indices
+
+        tasks = []
+        # Sort target_ids for deterministic execution
+        for target_id in sorted(dest_agg.keys()):
+            m_tensors, m_counts = dest_agg[target_id]
+            tasks.append(
+                send_fn(
+                    target_id,
+                    m_tensors,
+                    m_counts,
+                    batch_has_spatial_indices_list,
+                    batch_ragged_list,
+                    batch_has_origin_indices_list,
+                )
+            )
 
         res = await asyncio.gather(*tasks)
         return res, meta_sort_indices
@@ -470,7 +580,12 @@ class TransportReceiver:
                     if tensor is None or i >= len(sender_bufs):
                         written.append(0)
                         continue
-                    count = int(counts[i] if i < len(counts) else counts[0])
+                    if i < len(counts):
+                        count = int(counts[i])
+                    else:
+                        raise RuntimeError(
+                            f"Missing shard count for bundle element {i} from rank {source_rank}"
+                        )
                     if backend.name() == "torch":
                         sender_bufs[i][:count] = tensor[:count]
                     elif backend.name() == "jax" and backend.is_tensor(tensor):
@@ -577,13 +692,13 @@ class TransportReceiver:
 def _jit_plan_and_pack(
     payloads_tuple: Tuple[Tuple[Any, Optional[Any]], ...],
     src_indices: Any,
-    dst_topology: Any,
+    dst_index_desc: Any,
     dst_routing_dim: Optional[Union[int, Tuple[int, ...]]],
     dst_data_shape: Tuple[int, ...],
     dst_strategy: Callable,
     dst_mesh: Any,
     dst_partitions: Any,
-    src_layout_local_indices_fn: Callable,
+    src_shard_resolver: Callable,
     local_rank: int,
     dst_routing_values: Any,
     static_shapes: Tuple[int, ...],
@@ -600,19 +715,19 @@ def _jit_plan_and_pack(
         sort_indices,
         dest_devices,
         send_counts,
-        global_indices,
+        spatial_indices,
         target_num_workers,
         replica_size,
     ) = TransportPlanner._compute_plan_internal(
         src_indices=src_indices,
         data_values=dst_routing_values,
-        dst_topology=dst_topology,
+        dst_index_desc=dst_index_desc,
         dst_routing_dim=dst_routing_dim,
         dst_data_shape=dst_data_shape,
         dst_strategy=dst_strategy,
         dst_mesh=dst_mesh,
         dst_partitions=dict(dst_partitions) if dst_partitions else None,
-        src_layout_local_indices_fn=src_layout_local_indices_fn,
+        src_shard_resolver=src_shard_resolver,
         local_rank=local_rank,
     )
 
@@ -623,6 +738,7 @@ def _jit_plan_and_pack(
 
     # 2. Flatten and Gather Masked Sequences for each payload
     padded_buffers_lists = []
+    counts_per_payload = []
 
     for i in range(len(payloads_tuple)):
         data, lengths = payloads_tuple[i]
@@ -652,6 +768,8 @@ def _jit_plan_and_pack(
 
             padded_data = backend.vmap(pack_data_for_rank)(send_offsets, send_counts)
             padded_lengths = None
+
+            counts_per_payload.append(send_counts)
 
         else:
             # --- Ragged Path ---
@@ -724,12 +842,22 @@ def _jit_plan_and_pack(
 
             padded_lengths = backend.vmap(pack_len_for_rank)(send_offsets)
 
+            # Flat counts for ragged values
+            reordered_flat_lengths = reordered_item_lengths
+            flat_cs = backend.cat([zero, backend.cumsum(reordered_flat_lengths)], dim=0)
+            send_flat_counts = backend.take(
+                flat_cs, send_offsets + send_counts
+            ) - backend.take(flat_cs, send_offsets)
+
+            counts_per_payload.append(send_flat_counts)
+            counts_per_payload.append(send_counts)  # for lengths
+
         padded_buffers_lists.append((padded_data, padded_lengths))
 
     # Pack routing indices
     padded_indices_payload = None
-    if global_indices is not None:
-        sorted_globals = backend.take(global_indices, sort_indices)
+    if spatial_indices is not None:
+        sorted_globals = backend.take(spatial_indices, sort_indices)
         dtype_route = backend.dtype(sorted_globals)
         pad_shape_route = (item_cap,) + backend.shape(sorted_globals)[1:]
         padded_sorted_globals = backend.cat(
@@ -743,10 +871,11 @@ def _jit_plan_and_pack(
 
     return (
         padded_buffers_lists,
+        counts_per_payload,
         send_counts,
         dest_devices,
         replica_size,
-        global_indices,
+        spatial_indices,
         padded_indices_payload,
         sort_indices,
     )
