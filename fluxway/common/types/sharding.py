@@ -439,6 +439,10 @@ class ShardingSpec(FluxwayBaseSchema):
             **kwargs,
         )
 
+    def with_mesh(self, mesh: DeviceMesh) -> "ShardingSpec":
+        """Returns a new ShardingSpec with the provided mesh."""
+        return self.model_copy(update={"mesh": mesh})
+
     @property
     def is_dynamic(self) -> bool:
         """Alias for is_content_addressable for GSPMD-style intuition."""

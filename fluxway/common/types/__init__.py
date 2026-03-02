@@ -52,8 +52,8 @@ from .configs import (
     # Transport markers
     Data,
     Control,
-    DataStream,
-    ControlStream,
+    DataFlow,
+    ControlFlow,
 )
 
 # Sharding types: algebraic layer
@@ -114,8 +114,8 @@ __all__ = [
     "OpLockState",
     "Data",
     "Control",
-    "DataStream",
-    "ControlStream",
+    "DataFlow",
+    "ControlFlow",
     "PartitionSpec",
     "P",
     "PartitionStrategy",

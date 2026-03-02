@@ -92,7 +92,7 @@ class OperatorManager:
         self._successor_topology: Dict[str, Dict[str, SPMDTopologyInfo]] = {}
         self._expected_tensor_shards_cache: Dict[str, Dict[str, int]] = {}
         self._periodic_trigger_cache: Dict[str, bool] = {}
-        self._operator_input_types: Dict[str, Optional[Type]] = {}
+        self._operator_input_types: Dict[str, Dict[str, Type]] = {}
         self._output_to_input_tensor_mapping: Dict[str, Dict[str, str]] = {}
 
         for op_name in self._operators:
@@ -102,7 +102,7 @@ class OperatorManager:
             self._expected_tensor_names[op_name] = []
             self._predecessor_topology[op_name] = {}
             self._successor_topology[op_name] = {}
-            self._operator_input_types[op_name] = None
+            self._operator_input_types[op_name] = {}
             self._output_to_input_tensor_mapping[op_name] = {}
 
         # Static arguments from config
@@ -322,7 +322,7 @@ class OperatorManager:
         operator = self._operators.get(op_name)
         if operator is None:
             return None
-        return getattr(operator, "_flux_operator_meta", None)
+        return getattr(operator, "_fluxway_operator_meta", None)
 
     def _infer_world_size_from_sharding(self, sharding_map: Dict[str, Any]) -> int:
         """Infer total rank from sharding specs."""
@@ -404,8 +404,8 @@ class OperatorManager:
         """
         Pre-compute operator input types from function signatures.
 
-        Extracts the first parameter type (excluding self) from each operator function
-        and caches it for use in _assemble_input.
+        Extracts all parameter types (excluding self) from each operator function
+        and caches them for use in _assemble_input.
         """
         for op_name, operator in self._operators.items():
             if operator is None:
@@ -413,17 +413,21 @@ class OperatorManager:
 
             try:
                 sig = inspect.signature(operator)
-                params = list(sig.parameters.values())
-
                 is_source = self.is_source_operator(op_name)
-                has_self = params and params[0].name == "self"
-                param = (
-                    params[1]
-                    if has_self and len(params) > 1
-                    else (params[0] if not has_self and params else None)
-                )
 
-                if param is None:
+                params_dict = {}
+                for p_name, param in sig.parameters.items():
+                    if p_name in ("self", "cls"):
+                        continue
+                    param_type = param.annotation
+                    if param_type == inspect.Parameter.empty:
+                        logger.warning(
+                            f"Operator {op_name} parameter '{p_name}' has no type annotation"
+                        )
+                        continue
+                    params_dict[p_name] = param_type
+
+                if not params_dict:
                     if is_source:
                         logger.debug(
                             f"Operator {op_name} is a source, skipping parameter type pre-computation."
@@ -433,17 +437,9 @@ class OperatorManager:
                             f"Operator {op_name} has no valid parameters to receive data, "
                             f"but it is not marked as a source operator."
                         )
-                    continue
 
-                param_type = param.annotation
-                if param_type == inspect.Parameter.empty:
-                    logger.warning(
-                        f"Operator {op_name} parameter '{param.name}' has no type annotation"
-                    )
-                    continue
-
-                self._operator_input_types[op_name] = param_type
-                logger.debug(f"Precomputed input type for {op_name}: {param_type}")
+                self._operator_input_types[op_name] = params_dict
+                logger.debug(f"Precomputed input types for {op_name}: {params_dict}")
 
             except Exception as e:
                 logger.warning(f"Failed to extract input type for {op_name}: {e}")
@@ -578,14 +574,14 @@ class OperatorManager:
         """
         return dict(self._expected_tensor_shards_cache.get(op_name, {}))
 
-    def get_operator_input_type(self, op_name: str) -> Optional[Type]:
+    def get_operator_input_types(self, op_name: str) -> Dict[str, Type]:
         """
-        Get the input type (data_type class) expected by an operator.
+        Get the input parameter types expected by an operator.
 
         Returns:
-            The Type of the data_type class, or None if not available
+            A dictionary mapping parameter names to their Types
         """
-        return self._operator_input_types.get(op_name)
+        return self._operator_input_types.get(op_name, {})
 
     def get_output_to_input_tensor_mapping(self, op_name: str) -> Dict[str, str]:
         """

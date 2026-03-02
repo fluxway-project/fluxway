@@ -4,13 +4,15 @@ from .data_types import UserBatch, InputNodeOutput, DPFeatures
 
 
 def hash_routing(tensor, mesh):
-    """Modulo-based routing for P2P."""
     from fluxway.common.types.tensor import TransportTensor
 
-    if isinstance(tensor, TransportTensor) and tensor.spatial_indices is not None:
-        val = tensor.spatial_indices
-    else:
-        val = tensor.flat_values if isinstance(tensor, TransportTensor) else tensor
+    # Feature IDs are stored in flat_values for input sharding
+    val = tensor.flat_values if isinstance(tensor, TransportTensor) else tensor
+
+    # If it's a 2D matrix (like ID batch or gradients), we hash based on the first column (the IDs)
+    if len(val.shape) > 1:
+        val = val[:, 0]
+
     return jnp.mod(val, mesh.size)
 
 
@@ -34,8 +36,8 @@ class InputSPMD:
                 "axis": ["dp"],
                 "fn": "hash_routing",
             },
-            "user_inv": {"type": "dynamic", "axis": ["dp"]},
-            "item_inv": {"type": "dynamic", "axis": ["dp"]},
+            "user_inv": {"type": "static", "axis": ["dp"]},
+            "item_inv": {"type": "static", "axis": ["dp"]},
             "dp_data": {"type": "static", "axis": ["dp"]},
         },
     )

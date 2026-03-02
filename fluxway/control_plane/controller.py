@@ -299,20 +299,33 @@ if RAY_AVAILABLE:
 
         async def _check_and_enforce_step_limits(self) -> None:
             """Check step differences and apply lock/unlock actions."""
-            # 1. Check for completion if max_steps is set
             if self._async_step_manager.is_all_completed():
                 logger.debug("All operators reached max_steps, triggering completion")
-                self._state_machine.transit(ControllerEvent.ALL_DRIVERS_COMPLETED)
+                await self._state_machine.trigger_event(
+                    ControllerEvent.ALL_DRIVERS_COMPLETED
+                )
                 return
 
-            # 2. Enforce step difference limits
-            actions = self._async_step_manager.check_and_enforce_limits()
+            # Enforce step difference limits via global watermarks
+            for (
+                spmd_id,
+                op_name,
+                allowed_step,
+            ) in self._async_step_manager.check_and_enforce_limits():
+                await self._set_spmd_allowed_step(spmd_id, op_name, allowed_step)
 
-            for spmd_id, op_name, is_lock in actions:
-                if is_lock:
-                    await self._lock_spmd_op(spmd_id, op_name)
-                else:
-                    await self._unlock_spmd_op(spmd_id, op_name)
+        async def _set_spmd_allowed_step(
+            self, spmd_id: str, op_name: str, allowed_step: int
+        ) -> None:
+            """Propagate global watermark to an SPMD Driver."""
+            driver = self._spmd_manager.get_driver_handle(spmd_id)
+            if driver is not None:
+                try:
+                    await driver.set_allowed_step.remote(op_name, allowed_step)
+                except Exception as e:
+                    logger.error(
+                        f"Failed to set allowed_step {allowed_step} for {spmd_id}.{op_name}: {e}"
+                    )
 
         async def _lock_spmd_op(self, spmd_id: str, op_name: str) -> None:
             """Lock an SPMD's operation."""
@@ -320,7 +333,7 @@ if RAY_AVAILABLE:
             if driver is not None:
                 try:
                     await driver.block_op.remote(op_name)
-                    logger.debug(f"Locked {spmd_id} {op_name}")
+                    # logger.debug(f"Locked {spmd_id} {op_name}")
                 except Exception as e:
                     logger.error(f"Failed to lock {spmd_id} {op_name}: {e}")
 
@@ -330,7 +343,7 @@ if RAY_AVAILABLE:
             if driver is not None:
                 try:
                     await driver.unblock_op.remote(op_name)
-                    logger.debug(f"Unlocked {spmd_id} {op_name}")
+                    # logger.debug(f"Unlocked {spmd_id} {op_name}")
                 except Exception as e:
                     logger.error(f"Failed to unlock {spmd_id} {op_name}: {e}")
 
@@ -652,7 +665,7 @@ if RAY_AVAILABLE:
                     results = await asyncio.gather(
                         *[asyncio.wrap_future(t.future()) for t in fetch_tasks]
                     )
-                    for spmd_id, worker_map in zip(
+                    for spmd_id, worker_map in zip(  # type: ignore
                         spmd_ids_to_fetch, results, strict=True
                     ):
                         all_worker_handles[spmd_id] = worker_map

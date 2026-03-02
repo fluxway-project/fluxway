@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Tuple, Union
+import logging
 
 from fluxway.common.backend import get_backend
 from fluxway.common.types.sharding import ShardingSpec, Layout
 
+logger = logging.getLogger(__name__)
 
 # ============================================================
 # TransportPlan — Result of Diff(L_src, L_dst)
@@ -46,8 +48,7 @@ class TransportPlan:
         offset = 0
         for device_id in range(self.target_num_workers):
             count = int(backend.item(self.send_counts[device_id]))
-            if count > 0:
-                yield device_id, offset, count
+            yield device_id, offset, count
             offset += count
 
 
@@ -131,9 +132,8 @@ class TransportPlanner:
         backend = get_backend()
 
         dst_num_workers = dst_mesh.size if dst_mesh else 1
-        print(
-            f"[Planner] Compute plan: local_rank={local_rank}, src_indices={src_indices}, dst_num_workers={dst_num_workers}, dst_data_shape={dst_data_shape}",
-            flush=True,
+        logger.debug(
+            f"[Planner] Compute plan: local_rank={local_rank}, src_indices={src_indices}, dst_num_workers={dst_num_workers}, dst_data_shape={dst_data_shape}"
         )
 
         dst_is_content_addressable = (

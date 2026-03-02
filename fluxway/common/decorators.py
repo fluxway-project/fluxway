@@ -65,12 +65,12 @@ def _is_fluxway_data_type(tp: Any) -> bool:
     return getattr(tp, "is_fluxway_data", lambda: False)()
 
 
-def _get_fluxway_streams(tp: Any) -> Tuple[List[str], List[str]]:
+def _get_fluxway_streams(tp: Any, prefix: str = "") -> Tuple[List[str], List[str]]:
     """
-    Extract Data (Worker-to-Worker) and Control (Driver-to-Driver) fields from a @data_type.
-    Returns: (data_fields, control_fields)
+    Recursively extract Data (Worker-to-Worker) and Control (Driver-to-Driver) fields from a @data_type.
+    Returns: (data_fields, control_fields) as flattened paths (e.g. 'active.user_id').
     """
-    from fluxway.common.types.configs import ControlStream
+    from fluxway.common.types.configs import ControlFlow
 
     if not _is_fluxway_data_type(tp):
         return [], []
@@ -98,21 +98,85 @@ def _get_fluxway_streams(tp: Any) -> Tuple[List[str], List[str]]:
         if name.startswith("_"):
             continue
 
+        full_name = f"{prefix}.{name}" if prefix else name
+
         # Check for Annotated markers
         is_control = False
         if hasattr(hint, "__metadata__"):
             for meta in hint.__metadata__:
-                if meta is ControlStream:
+                if meta is ControlFlow:
                     is_control = True
                     break
 
-        if is_control:
-            control_fields.append(name)
+        if _is_fluxway_data_type(hint):
+            # Recurse for nested @data_type
+            d, c = _get_fluxway_streams(hint, prefix=full_name)
+            data_fields.extend(d)
+            control_fields.extend(c)
+        elif is_control:
+            control_fields.append(full_name)
         else:
-            # Default to Data plane for all other public fields
-            data_fields.append(name)
+            # Default to Data plane for all other public fields (assumed Tensors or primitives)
+            data_fields.append(full_name)
 
     return data_fields, control_fields
+
+
+def _build_hierarchical_map(
+    tp: Any, prefix: str = "", include_root: bool = False
+) -> Dict[str, List[str]]:
+    """
+    Recursively builds a map from every valid field path prefix to the list of
+    flattened physical stream names it contains.
+    Example: 'dp_data' -> ['dp_data.labels.is_click', 'dp_data.dense_stats']
+    """
+    from fluxway.common.types.configs import ControlFlow
+
+    if not _is_fluxway_data_type(tp):
+        return {}
+
+    mapping = {}
+    try:
+        cls = tp
+        origin = getattr(tp, "__origin__", None)
+        if origin is Union:
+            args = getattr(tp, "__args__", [])
+            for arg in args:
+                if arg is not type(None) and _is_fluxway_data_type(arg):
+                    cls = arg
+                    break
+        hints = get_type_hints(cls, include_extras=True)
+    except Exception:
+        return {}
+
+    all_primitive_fields = []
+
+    for name, hint in hints.items():
+        if name.startswith("_"):
+            continue
+
+        full_name = f"{prefix}.{name}" if prefix else name
+
+        is_control = False
+        if hasattr(hint, "__metadata__"):
+            for meta in hint.__metadata__:
+                if meta is ControlFlow:
+                    is_control = True
+                    break
+
+        if _is_fluxway_data_type(hint):
+            sub_map = _build_hierarchical_map(hint, prefix=full_name, include_root=True)
+            mapping.update(sub_map)
+            all_primitive_fields.extend(sub_map.get(full_name, []))
+        else:
+            if not is_control:
+                mapping[full_name] = [full_name]
+                all_primitive_fields.append(full_name)
+
+    if include_root and prefix:
+        mapping[prefix] = all_primitive_fields
+
+    return mapping
 
 
 def operator(
@@ -192,33 +256,69 @@ def _create_operator_wrapper(
     all_control_fields = []
     input_param_map = {}
 
-    # Check arguments (for Input streams)
-    for param_name, param in sig.parameters.items():
-        if param_name in ("self", "cls"):
+    # Identify data-plane parameters to determine prefixing mode
+    data_params = []
+    primitive_tensors = []
+    for p_name, p in sig.parameters.items():
+        if p_name in ("self", "cls"):
             continue
 
-        tp = param.annotation
-
+        tp = p.annotation
         if tp is inspect.Parameter.empty:
-            if param.kind in (
+            if p.kind in (
                 inspect.Parameter.VAR_POSITIONAL,
                 inspect.Parameter.VAR_KEYWORD,
             ):
                 continue
             raise TypeError(
-                f"Fluxway Operator Error: Argument '{param_name}' in '{func.__qualname__}' missing type annotation.\n"
+                f"Fluxway Operator Error: Argument '{p_name}' in '{func.__qualname__}' missing type annotation.\n"
                 f"Fix: Add a type hint, e.g., 'def {func.__name__}(self, batch: MyDataType):'"
             )
 
-        if not _is_fluxway_data_type(tp):
+        if _is_fluxway_data_type(tp):
+            data_params.append(p_name)
+        else:
+            primitive_tensors.append(p_name)
+
+    # Use prefixing if there are multiple @data_type parameters
+    use_prefix = len(data_params) > 1
+
+    # Check arguments (for Input streams)
+    for p_name, p in sig.parameters.items():
+        if p_name in ("self", "cls"):
             continue
 
-        data_fields, control_fields = _get_fluxway_streams(tp)
-        input_param_map[param_name] = data_fields + control_fields
-        for df in data_fields:
+        tp = p.annotation
+        if _is_fluxway_data_type(tp):
+            data_fields, control_fields = _get_fluxway_streams(tp)
+
+            # Apply prefix if needed for the global argument list
+            if use_prefix:
+                d_f_final = [f"{p_name}.{df}" for df in data_fields]
+                c_f_final = [f"{p_name}.{cf}" for cf in control_fields]
+            else:
+                d_f_final = data_fields
+                c_f_final = control_fields
+
+            # Also build the hierarchical mapping for this parameter
+            param_hierarchical_map = _build_hierarchical_map(
+                tp, prefix=p_name if use_prefix else ""
+            )
+
+            # Always alias the python parameter name to all its resolved streams
+            param_hierarchical_map[p_name] = d_f_final + c_f_final
+
+            input_param_map.update(param_hierarchical_map)
+        else:
+            d_f_final = [p_name]
+            c_f_final = []
+            # primitive tensors map to themselves
+            input_param_map[p_name] = [p_name]
+
+        for df in d_f_final:
             if df not in all_data_fields:
                 all_data_fields.append(df)
-        for cf in control_fields:
+        for cf in c_f_final:
             if cf not in all_control_fields:
                 all_control_fields.append(cf)
 
@@ -240,87 +340,120 @@ def _create_operator_wrapper(
         static_argument if static_argument is not None else []
     )
 
-    # Supports uniform/nested sharding for @data_type parameters (Pytree-like)
+    # --- 2. Sharding Resolution (Pytree-like recursive mapping) ---
+    def _resolve_recursive_sharding(
+        sharding_val, data_fields, control_fields, prefix=""
+    ):
+        resolved = {}
+        if isinstance(sharding_val, dict):
+            # If it's a sharding spec (not nested mapping), apply uniformly to all data fields in this branch
+            if "type" in sharding_val and "axis" in sharding_val:
+                for df in data_fields:
+                    resolved[df] = sharding_val
+            else:
+                # Nested mapping: {"subfield": spec}
+                for k, v in sharding_val.items():
+                    full_k = f"{prefix}.{k}" if prefix else k
+                    # Sub-fields belonging to this branch
+                    sub_data = [
+                        f
+                        for f in data_fields
+                        if f == full_k or f.startswith(full_k + ".")
+                    ]
+                    sub_control = [
+                        f
+                        for f in control_fields
+                        if f == full_k or f.startswith(full_k + ".")
+                    ]
+
+                    if not sub_data and not sub_control:
+                        # Fallback for flat field names provided directly
+                        if k in data_fields:
+                            resolved[k] = v
+                            continue
+                        raise ValueError(
+                            f"Fluxway Operator Error: Unknown field '{k}' at path '{prefix}' for operator '{name}'.\n"
+                            f"Available Data fields here: {[f[len(prefix) + 1 :] if prefix else f for f in data_fields]}\n"
+                            f"Fix: Check for typos in your sharding dictionary or ensure the field is part of the @data_type."
+                        )
+
+                    if sub_control and not sub_data:
+                        raise ValueError(
+                            f"Fluxway Operator Error: Control field '{full_k}' does not support sharding.\n"
+                            f"Fix: Control fields (marked with ControlFlow) are broadcasted; remove them from your sharding configuration."
+                        )
+
+                    resolved.update(
+                        _resolve_recursive_sharding(
+                            v, sub_data, sub_control, prefix=full_k
+                        )
+                    )
+        else:
+            # Uniform sharding: Apply this object/spec to all data fields in this branch
+            for df in data_fields:
+                resolved[df] = sharding_val
+        return resolved
+
     resolved_input_sharding = {}
     if input_sharding:
-        # Map parameter names to their fields
         param_to_fields = {}
-        for p_name, p in sig.parameters.items():
-            if p_name in ("self", "cls"):
-                continue
-            if _is_fluxway_data_type(p.annotation):
-                param_to_fields[p_name] = _get_fluxway_streams(p.annotation)
+        for p_name in data_params:
+            tp = sig.parameters[p_name].annotation
+            d_f, c_f = _get_fluxway_streams(tp)
+            if use_prefix:
+                d_f = [f"{p_name}.{f}" for f in d_f]
+                c_f = [f"{p_name}.{f}" for f in c_f]
+            param_to_fields[p_name] = (d_f, c_f)
 
         for k, v in input_sharding.items():
             if k in param_to_fields:
-                d_fields, c_fields = param_to_fields[k]
-                # If v is a dict and its keys overlap with fields, it's a nested mapping: {"param": {"field": spec}}
-                if isinstance(v, dict) and any(
-                    sk in d_fields or sk in c_fields for sk in v.keys()
-                ):
-                    for sk, sv in v.items():
-                        if sk in c_fields:
-                            raise ValueError(
-                                f"Fluxway Operator Error: Field '{sk}' in parameter '{k}' is marked as Control (ControlStream), "
-                                f"sharding is not supported.\nFix: Remove sharding for this field."
-                            )
-                        if sk in d_fields:
-                            resolved_input_sharding[sk] = sv
-                        else:
-                            raise ValueError(
-                                f"Fluxway Operator Error: Unknown field '{sk}' in @data_type parameter '{k}' for operator '{name}'.\n"
-                                f"Available Data fields: {d_fields}"
-                            )
-                else:
-                    # Apply v to all data fields (Uniform Sharding): {"param": spec}
-                    for df in d_fields:
-                        resolved_input_sharding[df] = v
+                d_f, c_f = param_to_fields[k]
+                resolved_input_sharding.update(
+                    _resolve_recursive_sharding(
+                        v, d_f, c_f, prefix=k if use_prefix else ""
+                    )
+                )
             elif k in final_tensors:
-                # Direct field sharding (Backward compatibility/Flattened): {"field": spec}
                 resolved_input_sharding[k] = v
             elif k in final_states:
                 raise ValueError(
-                    f"Fluxway Operator Error: Field '{k}' is marked as Control (ControlStream) and does not support sharding.\n"
-                    f"Fix: Remove '{k}' from input_sharding."
+                    f"Fluxway Operator Error: Control field '{k}' does not support sharding."
                 )
             else:
                 raise ValueError(
-                    f"Fluxway Operator Error: input_sharding contains unknown key '{k}' for operator '{name}'.\n"
-                    f"Fix: Use one of the parameter names {list(param_to_fields.keys())} or Data fields {final_tensors}."
+                    f"Fluxway Operator Error: Unknown sharding key '{k}' for operator '{name}'."
                 )
     input_sharding = resolved_input_sharding
 
-    # Recursive Output Sharding Resolution
     resolved_output_sharding = {}
     return_tp = sig.return_annotation
-    out_data_fields = []
-    out_control_fields = []
+    out_data_fields, out_control_fields = [], []
     output_param_map = {}
 
     if return_tp is not None and return_tp is not inspect.Signature.empty:
         if _is_fluxway_data_type(return_tp):
             out_data_fields, out_control_fields = _get_fluxway_streams(return_tp)
+            # Add hierarchical mappings
+            output_param_map = _build_hierarchical_map(return_tp, include_root=False)
             output_param_map["return"] = out_data_fields + out_control_fields
         elif output_sharding:
-            # Fallback for simple return types if sharding is provided
             out_data_fields = list(output_sharding.keys())
             output_param_map["return"] = out_data_fields
 
     if output_sharding:
-        for k, v in output_sharding.items():
-            if k in out_data_fields:
-                resolved_output_sharding[k] = v
-            elif k in out_control_fields:
-                raise ValueError(
-                    f"Fluxway Operator Error: Output field '{k}' is marked as Control, sharding not supported."
-                )
-            elif _is_fluxway_data_type(return_tp):
-                # Placeholder/Uniform mapping: apply v to all data fields if k is not a field but matches return type
-                # This implements the "placeholder" requirement.
+        if _is_fluxway_data_type(return_tp):
+            # If output_sharding IS a single spec, apply to all data fields
+            if "type" in output_sharding and "axis" in output_sharding:
                 for df in out_data_fields:
-                    resolved_output_sharding[df] = v
+                    resolved_output_sharding[df] = output_sharding
             else:
-                resolved_output_sharding[k] = v
+                resolved_output_sharding = _resolve_recursive_sharding(
+                    output_sharding, out_data_fields, out_control_fields
+                )
+        else:
+            # Simple return types (Dict[str, Tensor] or single Tensor)
+            resolved_output_sharding = output_sharding
+    output_sharding = resolved_output_sharding
 
     output_sharding = resolved_output_sharding
 
@@ -430,10 +563,13 @@ def _create_operator_wrapper(
 
     # Attach metadata to both original and wrapper
     for target in (func, wrapper):
-        target._flux_operator_meta = meta
+        target._fluxway_operator_meta = meta
         target._flux_set_spmd_class = set_spmd_class
 
-    return staticmethod(wrapper)
+    # Only wrap in staticmethod if it's actually inside a class
+    if "." in func.__qualname__:
+        return staticmethod(wrapper)
+    return wrapper
 
 
 def data_type():
@@ -529,12 +665,14 @@ def spmd(
 
             operators, metas = {}, {}
 
+            import copy
+
             for name in dir(c):
                 attr = getattr(c, name, None)
-                meta = getattr(attr, "_flux_operator_meta", None)
+                meta = getattr(attr, "_fluxway_operator_meta", None)
                 if isinstance(meta, OperatorMeta):
                     operators[meta.name] = attr
-                    metas[meta.name] = meta
+                    metas[meta.name] = copy.deepcopy(meta)
 
             return SPMDConfig(
                 mesh=c._mesh,

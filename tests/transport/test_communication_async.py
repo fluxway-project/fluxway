@@ -42,9 +42,6 @@ class TestDataDistributor(unittest.TestCase):
 
             # Should have called send_fn
             self.assertTrue(send_fn.called)
-            # send_fn calls depend on plan. With chunks matching, maybe no communication?
-            # Or self-send?
-            print(f"Sync distribute called send_fn {send_fn.call_count} times.")
 
         except ImportError:
             print("Skipping due to missing backend")
@@ -76,7 +73,6 @@ class TestDataDistributor(unittest.TestCase):
         try:
             results = asyncio.run(run_test())
             self.assertTrue(len(results) > 0)
-            print(f"Async distribute returned {len(results)} results.")
             for r in results:
                 self.assertTrue(r.startswith("ok_"))
 
@@ -137,7 +133,6 @@ class TestDataDistributor(unittest.TestCase):
 
         try:
             asyncio.run(run_test())
-            print("Complex batch async distribute test passed!")
         except ImportError:
             print("Skipping complex batch test due to missing backend")
 
@@ -169,7 +164,6 @@ class TestDataDistributor(unittest.TestCase):
             await dist.distribute(batch, self.src_spec, self.dst_spec, async_send_fn)
 
         asyncio.run(run_test())
-        print("All-with-indices batch test passed!")
 
     def test_async_distributor_multiple_mixed(self):
         """Test a mixed batch: [dense, ragged+indices, dense+indices]."""
@@ -203,7 +197,6 @@ class TestDataDistributor(unittest.TestCase):
             await dist.distribute(batch, self.src_spec, self.dst_spec, async_send_fn)
 
         asyncio.run(run_test())
-        print("Multiple mixed batch test passed!")
 
 
 if __name__ == "__main__":

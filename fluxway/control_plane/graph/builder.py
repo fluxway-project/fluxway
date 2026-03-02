@@ -83,7 +83,51 @@ class Builder:
         spmd_config = copy.deepcopy(spmd_class.get_spmd_config())
 
         if mesh is not None:
+            # Structural Check: Ensure new mesh provides all axes required by operators.
+            # (Note: operator_metas currently stores raw dicts, so we'll check axis names)
+            for op_name, meta in spmd_config.operator_metas.items():
+                for kind, sharding in [
+                    ("input", meta.input_sharding),
+                    ("output", meta.output_sharding),
+                ]:
+                    if not sharding:
+                        continue
+                    for k, v in sharding.items():
+                        # Extract axis names from raw dict or ShardingSpec
+                        required_axes = []
+                        if isinstance(v, dict):
+                            required_axes = v.get("axis", [])
+                            if isinstance(required_axes, str):
+                                required_axes = [required_axes]
+                        elif hasattr(v, "partition"):
+                            # It's a ShardingSpec-like object
+                            required_axes = [
+                                ax
+                                for sub in v.partition.partitions.values()
+                                for ax in sub
+                            ]
+
+                        for ax in required_axes:
+                            if ax not in mesh.axis_names:
+                                raise ValueError(
+                                    f"\n[Fluxway Configuration Error] Node '{name}' (class '{spmd_class.__name__}') "
+                                    f"uses axis '{ax}' for {kind} sharding of tensor '{k}'.\n"
+                                    f"  However, the provided DeviceMesh for this node does NOT have an axis named '{ax}'.\n"
+                                    f"  Current Mesh Axis Names: {mesh.axis_names}\n"
+                                    f"  Fix: Ensure your DeviceMesh has matching axis names, or adjust the @operator sharding."
+                                )
+
+            # Re-bind the mesh at the config and spec level
             spmd_config.mesh = mesh
+            from fluxway.common.types.sharding import ShardingSpec
+
+            for meta in spmd_config.operator_metas.values():
+                for sharding_dict in [meta.input_sharding, meta.output_sharding]:
+                    if not sharding_dict:
+                        continue
+                    for k, v in sharding_dict.items():
+                        if isinstance(v, ShardingSpec):
+                            sharding_dict[k] = v.with_mesh(mesh)
 
         if not isinstance(spmd_config.mesh, DeviceMesh):
             raise ValueError(
@@ -270,7 +314,7 @@ class Builder:
             for attr_name in dir(spmd_class):
                 # Use getattr on the class to avoid triggering property descriptors if any
                 attr = getattr(spmd_class, attr_name, None)
-                m = getattr(attr, "_flux_operator_meta", None)
+                m = getattr(attr, "_fluxway_operator_meta", None)
                 if m is not None:
                     op_name_by_fn[attr_name] = m.name
 
@@ -395,6 +439,7 @@ class Builder:
 
         # If target_input refers to a logical @data_type parameter,
         # map all its constituent fields instead of the name itself.
+        explicit_target = False
         if target_input and target_input in (
             getattr(dst_meta, "input_param_map", {}) or {}
         ):
@@ -402,8 +447,10 @@ class Builder:
                 f for f in dst_meta.input_param_map[target_input] if f in dst_args
             ]
             target_input = None  # Consumed
+            explicit_target = True
 
         # Similarly for source placeholders/operators
+        explicit_source = False
         if source_output and source_output in (
             getattr(src_meta, "output_param_map", {}) or {}
         ):
@@ -411,22 +458,44 @@ class Builder:
                 f for f in src_meta.output_param_map[source_output] if f in src_args
             ]
             source_output = None  # Consumed
+            explicit_source = True
 
         # If positional source/target provided, use them directly
         if not source_output and len(effective_src_names) == 1:
             source_output = effective_src_names[0]
+            explicit_source = True
         if not target_input and len(effective_dst_names) == 1:
             target_input = effective_dst_names[0]
+            explicit_target = True
 
         tensor_map = {}
-        if source_output and target_input:
+
+        # Positional mapping if both endpoints were explicitly specified and their structures match
+        if (
+            (source_output is None and target_input is None)
+            and explicit_source
+            and explicit_target
+        ):
+            if len(effective_src_names) == len(effective_dst_names):
+                for s, d in zip(effective_src_names, effective_dst_names, strict=True):  # type: ignore
+                    tensor_map[s] = d
+            else:
+                raise ValueError(
+                    f"\n[Fluxway Topology Error] In {ctx}:\n"
+                    f"  Cannot perform structural mapping because lengths differ.\n"
+                    f"  Source has {len(effective_src_names)} fields: {effective_src_names}\n"
+                    f"  Target has {len(effective_dst_names)} fields: {effective_dst_names}\n"
+                    f"  Fix: Ensure the data structures are identical or extract specific fields."
+                )
+        # Simple 1-to-1 explicit mapping of primitive names
+        elif source_output and target_input:
             tensor_map[source_output] = target_input
         elif source_output:
             tensor_map[source_output] = source_output
         elif target_input:
             tensor_map[target_input] = target_input
         else:
-            # Intersection: Map fields with matching names
+            # Fallback: Intersection (Map fields with matching names)
             common = [n for n in effective_src_names if n in effective_dst_names]
             for n in common:
                 tensor_map[n] = n
@@ -451,7 +520,15 @@ class Builder:
         # 4. Validate and Extract Sharding Specs
         def to_spec(raw, mesh):
             if isinstance(raw, dict):
-                return ShardingConfig.model_validate(raw).to_spec(mesh)
+                try:
+                    return ShardingConfig.model_validate(raw).to_spec(mesh)
+                except Exception as e:
+                    raise ValueError(
+                        f"\n[Fluxway Sharding Error] In {ctx}:\n"
+                        f"  Invalid sharding configuration: {raw}\n"
+                        f"  Validation Error: {str(e)}\n"
+                        f"  Fix: Ensure the dictionary contains 'type' (e.g. 'static') and 'axis'. Refer to ShardingConfig documentation."
+                    ) from e
             return raw
 
         src_out_specs = {

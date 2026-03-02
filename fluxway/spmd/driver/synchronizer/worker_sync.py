@@ -53,6 +53,10 @@ class WorkerSynchronizer:
             rank: {} for rank in range(num_workers)
         }
 
+        # Global flow control: op_name -> max allowed step (watermark from Controller)
+        # Initialize with a very large value to avoid blocking before first sync
+        self._allowed_steps: Dict[str, int] = {}
+
         # Lock for thread safety
         self._lock = threading.Lock()
 
@@ -129,46 +133,52 @@ class WorkerSynchronizer:
 
     def _check_worker_step_diff_internal(self, op_name: str) -> None:
         """
-        Check worker step difference and enforce limits.
-
+        Check worker step difference and enforce limits (both local skew and global watermark).
         Must hold lock when calling.
         """
         steps = [self._worker_steps[r].get(op_name, 0) for r in range(self.num_workers)]
         max_step = max(steps)
         min_step = min(steps)
-        diff = max_step - min_step
 
-        if diff > self.max_worker_step_skew:
-            # Block workers that are too far ahead
-            for rank in range(self.num_workers):
-                worker_step = self._worker_steps[rank].get(op_name, 0)
-                if worker_step >= max_step and not self._worker_op_locked[rank].get(
-                    op_name, False
-                ):
+        skew_diff = max_step - min_step
+
+        allowed_step = self._allowed_steps.get(op_name)
+
+        for rank in range(self.num_workers):
+            worker_step = self._worker_steps[rank].get(op_name, 0)
+
+            # Reasons to block:
+            # A) Too far ahead of local peers (skew)
+            # B) Exceeds global watermark allowed by Controller
+            should_block_skew = (
+                skew_diff > self.max_worker_step_skew and worker_step >= max_step
+            )
+            should_block_global = (
+                allowed_step is not None and worker_step > allowed_step
+            )
+
+            if (should_block_skew or should_block_global) or self._op_locked.get(
+                op_name, False
+            ):
+                if not self._worker_op_locked[rank].get(op_name, False):
                     self._worker_op_locked[rank][op_name] = True
+                    reason = (
+                        "skew"
+                        if should_block_skew
+                        else ("global" if should_block_global else "controller")
+                    )
                     logger.debug(
-                        f"Blocking worker {rank} {op_name} in SPMD {self.spmd_id} "
-                        f"(step {worker_step}, min={min_step})"
+                        f"Blocking rank {rank} {op_name} (step {worker_step}, reason={reason})"
                     )
                     if self._block_worker_op:
-                        try:
-                            self._block_worker_op(rank, op_name)
-                        except Exception as e:
-                            logger.error(f"Error blocking worker {rank}: {e}")
-
-        elif diff <= self.max_worker_step_skew // 2:
-            # Unblock workers when difference is small enough
-            for rank in range(self.num_workers):
+                        self._block_worker_op(rank, op_name)
+            else:
+                # Unblock only if NO reason to block remains
                 if self._worker_op_locked[rank].get(op_name, False):
                     self._worker_op_locked[rank][op_name] = False
-                    logger.debug(
-                        f"Unblocking worker {rank} {op_name} in SPMD {self.spmd_id}"
-                    )
+                    logger.debug(f"Unblocking rank {rank} {op_name}")
                     if self._unblock_worker_op:
-                        try:
-                            self._unblock_worker_op(rank, op_name)
-                        except Exception as e:
-                            logger.error(f"Error unblocking worker {rank}: {e}")
+                        self._unblock_worker_op(rank, op_name)
 
     def _all_workers_completed_step_internal(self, op_name: str, step: int) -> bool:
         """Check if all workers completed the given step. Must hold lock."""
@@ -192,7 +202,7 @@ class WorkerSynchronizer:
         """
         with self._lock:
             self._op_locked[op_name] = True
-            logger.debug(f"SPMD {self.spmd_id} {op_name} blocked by controller")
+            # logger.debug(f"SPMD {self.spmd_id} {op_name} blocked by controller")
 
         # Block all workers
         if self._block_worker_op:
@@ -214,7 +224,7 @@ class WorkerSynchronizer:
         """
         with self._lock:
             self._op_locked[op_name] = False
-            logger.debug(f"SPMD {self.spmd_id} {op_name} unblocked by controller")
+            # logger.debug(f"SPMD {self.spmd_id} {op_name} unblocked by controller")
 
             # Unblock workers (unless they're blocked by step diff)
             workers_to_unblock = [
@@ -248,6 +258,21 @@ class WorkerSynchronizer:
         """Check if an op is locked by controller."""
         with self._lock:
             return self._op_locked.get(op_name, False)
+
+    def update_allowed_step(self, op_name: str, step: int) -> None:
+        """
+        Update the global allowed step for an operation.
+        """
+        with self._lock:
+            # Only update if the new step is more permissive
+            old_step = self._allowed_steps.get(op_name, -1)
+            if step > old_step:
+                self._allowed_steps[op_name] = step
+                logger.debug(
+                    f"SPMD {self.spmd_id} {op_name} allowed_step updated: {old_step} -> {step}"
+                )
+                # Trigger re-evaluation of all worker locks for this op
+                self._check_worker_step_diff_internal(op_name)
 
     # =========================================================================
     # Step Query

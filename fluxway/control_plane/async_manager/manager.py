@@ -55,132 +55,69 @@ class AsyncStepManager:
 
     def report_op_completed(self, spmd_id: str, op_name: str, step: int) -> None:
         """
-        Report that an SPMD completed an op step.
-
-        Args:
-            spmd_id: SPMD identifier
-            op_name: Operation name
-            step: Completed step number
+        Report SPMD-level min-step completion.
         """
         with self._lock:
             if spmd_id not in self._spmd_steps:
-                logger.warning(f"Unknown SPMD {spmd_id} reported op completion")
-                return
+                self._spmd_steps[spmd_id] = SPMDOpStep(spmd_id=spmd_id)
 
             spmd_step = self._spmd_steps[spmd_id]
             spmd_step.op_steps[op_name] = max(spmd_step.op_steps.get(op_name, 0), step)
 
-            logger.debug(
-                f"SPMD {spmd_id} completed {op_name} step {step}, "
-                f"current steps: {spmd_step.op_steps}"
-            )
-
     def report_op_steps(self, spmd_id: str, op_steps: Dict[str, int]) -> None:
         """
         Report all op steps for an SPMD (from heartbeat).
-
-        Args:
-            spmd_id: SPMD identifier
-            op_steps: Dict mapping op_name to step number
         """
         with self._lock:
             if spmd_id not in self._spmd_steps:
-                logger.warning(f"Unknown SPMD {spmd_id} reported op steps")
-                return
+                self._spmd_steps[spmd_id] = SPMDOpStep(spmd_id=spmd_id)
 
             spmd_step = self._spmd_steps[spmd_id]
-
             for op_name, step in op_steps.items():
                 spmd_step.op_steps[op_name] = max(
                     spmd_step.op_steps.get(op_name, 0), step
                 )
 
-    def check_and_enforce_limits(self) -> List[Tuple[str, str, bool]]:
+    def check_and_enforce_limits(self) -> List[Tuple[str, str, int]]:
         """
-        Check step differences and determine lock/unlock actions.
+        Calculate the allowed step for each operator based on topology and limits.
 
         Returns:
-            List of (spmd_id, op_name, is_lock) tuples indicating required actions.
-            is_lock=True means lock the op, is_lock=False means unlock.
+            List of (spmd_id, op_name, allowed_step)
         """
-        actions: List[Tuple[str, str, bool]] = []
-        current_time = time.time()
-
+        updates = []
         with self._lock:
-            # 1. Check global step limit (max_steps)
-            if self._config.max_steps is not None:
-                for spmd_id, spmd_step in self._spmd_steps.items():
-                    for op_name, step in spmd_step.op_steps.items():
-                        if step >= self._config.max_steps:
-                            if not self._is_locked(spmd_id, op_name):
-                                actions.append((spmd_id, op_name, True))
-                                self._set_locked(
-                                    spmd_id,
-                                    op_name,
-                                    current_time,
-                                    f"Step {step} >= max_steps {self._config.max_steps}",
-                                )
-
-            # 2. Check step differences for edges
             for edge in self._graph.edges:
                 if not edge.source_op or not edge.target_op:
                     continue
 
-                source = edge.source_node
-                target = edge.target_node
+                source_id = edge.source_node
+                target_id = edge.target_node
                 source_op = edge.source_op
                 target_op = edge.target_op
 
-                if source not in self._spmd_steps or target not in self._spmd_steps:
-                    continue
+                # Get trailing progress of target
+                target_data = self._spmd_steps.get(target_id)
+                target_min_step = (
+                    target_data.op_steps.get(target_op, 0) if target_data else 0
+                )
 
-                source_step = self._spmd_steps[source].op_steps.get(source_op, 0)
-                target_step = self._spmd_steps[target].op_steps.get(target_op, 0)
-
-                # Skip if already reached max_steps (handled above)
-                if (
-                    self._config.max_steps is not None
-                    and source_step >= self._config.max_steps
-                ):
-                    continue
-
-                # Get allowed step difference from target operator
                 limit = self._config.default_max_inflight_steps
-                target_node_obj = self._graph.nodes.get(target)
-                if target_node_obj:
-                    target_meta = target_node_obj.spmd_config.operator_metas.get(
-                        target_op
-                    )
-                    if target_meta is not None:
-                        limit = getattr(target_meta, "max_inflight_steps", limit)
+                target_node = self._graph.nodes.get(target_id)
+                if target_node:
+                    meta = target_node.spmd_config.operator_metas.get(target_op)
+                    if meta:
+                        limit = getattr(meta, "max_inflight_steps", limit)
 
-                diff = source_step - target_step
+                # Watermark logic: allowed_step = target_progress + limit
+                allowed_step = target_min_step + limit
 
-                # Check if need to lock source's op
-                if diff > limit:
-                    if not self._is_locked(source, source_op):
-                        actions.append((source, source_op, True))
-                        self._set_locked(
-                            source,
-                            source_op,
-                            current_time,
-                            f"Step diff {diff} > {limit} "
-                            f"(edge: {source}.{source_op} -> {target}.{target_op})",
-                        )
+                if self._config.max_steps is not None:
+                    allowed_step = min(allowed_step, self._config.max_steps)
 
-                # Check if can unlock (diff within half of max)
-                elif diff <= max(1, limit // 2):
-                    if self._is_locked(source, source_op):
-                        # ONLY unlock if NOT reached max_steps
-                        if (
-                            self._config.max_steps is None
-                            or source_step < self._config.max_steps
-                        ):
-                            if self._can_unlock(source, source_op, current_time):
-                                actions.append((source, source_op, False))
-                                self._clear_locked(source, source_op)
+                updates.append((source_id, source_op, allowed_step))
 
-        return actions
+        return updates
 
     def is_all_completed(self) -> bool:
         """Check if all operators in all SPMDs have reached max_steps."""
@@ -190,12 +127,7 @@ class AsyncStepManager:
         with self._lock:
             for spmd_id, node in self._graph.nodes.items():
                 spmd_step = self._spmd_steps.get(spmd_id)
-                if not spmd_step:
-                    return False
-
-                # All operators of this SPMD must reach max_steps
-                # (Note: only checking operators that have reported at least once)
-                if not spmd_step.op_steps:
+                if not spmd_step or not spmd_step.op_steps:
                     return False
 
                 for op_name, step in spmd_step.op_steps.items():
@@ -216,13 +148,13 @@ class AsyncStepManager:
         self._lock_states[key] = OpLockState(
             spmd_id=spmd_id, op_name=op_name, locked_at=timestamp, reason=reason
         )
-        logger.debug(f"Locked {spmd_id} {op_name}: {reason}")
+        # logger.debug(f"Locked {spmd_id} {op_name}: {reason}")
 
     def _clear_locked(self, spmd_id: str, op_name: str) -> None:
         """Clear op lock (must hold lock)."""
         key = (spmd_id, op_name)
         self._lock_states.pop(key, None)
-        logger.debug(f"Unlocked {spmd_id} {op_name}")
+        # logger.debug(f"Unlocked {spmd_id} {op_name}")
 
     def _can_unlock(self, spmd_id: str, op_name: str, current_time: float) -> bool:
         """Check if an op can be unlocked (must hold lock)."""

@@ -90,8 +90,6 @@ def test_embedding_lookup_flow():
 
     inputs = {0: TransportTensor(rank0_keys), 1: TransportTensor(rank1_keys)}
 
-    print("\n--- Phase 1: Dispatch (SPMD0 -> SPMD1) ---")
-
     # Rank 0 sends
     dist0 = cluster[0].distributor
 
@@ -124,8 +122,6 @@ def test_embedding_lookup_flow():
     )
 
     # --- 4. Forward Phase 2: Embedding Lookup (SPMD1) ---
-
-    print("\n--- Phase 2: Lookup (SPMD1) ---")
 
     spmd1_results = {}
 
@@ -214,9 +210,6 @@ def test_embedding_lookup_flow():
     buffer1 = bk.zeros((rank1_total_count, emb_dim), dtype=bk.float32())
     cluster[1].receiver.register_zero_copy_buffers([buffer1], rank1_offsets)
 
-    print("\n--- Phase 3: Combine (SPMD1 -> SPMD2) [Zero-Copy Mode] ---")
-    print(f"Rank 0 expects {rank0_total_count}, Rank 1 expects {rank1_total_count}")
-
     # output_shards no longer needed for Zero-Copy flow
     # but we can keep it empty or refactor verify?
     # We will verify `buffer0` and `buffer1` directly.
@@ -251,8 +244,6 @@ def test_embedding_lookup_flow():
 
     # --- 6. Verify Forward Output ---
 
-    print("\n--- Verification: Forward ---")
-
     # Verify Rank 0 (indices 0..5)
     # Zero-Copy: check the buffer directly
     rank0_data = cluster[0].receiver.target_buffers[0]
@@ -286,14 +277,9 @@ def test_embedding_lookup_flow():
     assert bk.equal(flat_emb_ordered_0, expected_ordered_0), (
         "Rank 0 Reconstructed Tensor Mismatch"
     )
-    print(
-        "Successfully reconstructed Ragged Tensor Embedding for Rank 0 using related meta!"
-    )
 
     # --- 7. Backward Pass: Gradients (SPMD2 -> SPMD1) ---
     # "Dispatch Gradients"
-
-    print("\n--- Phase 4: Backward Dispatch (SPMD2 -> SPMD1) ---")
 
     # Mock Gradients (Index based)
     _tmp_casted = global_keys.astype(bk.float32())
@@ -349,8 +335,6 @@ def test_embedding_lookup_flow():
     )
 
     # --- 8. Verify Backward Update (SPMD1) ---
-
-    print("\n--- Verification: Backward ---")
 
     for r in range(4):
         shards = grad_acc[r]
@@ -447,7 +431,6 @@ def test_jit_shielding_flow():
     import numpy as np
 
     assert np.allclose(side_effects[0], [2, 4, 6])
-    print("\nShielding test passed: Side effect captured from JIT.")
 
 
 def test_jit_plan_and_shard():
@@ -504,8 +487,6 @@ def test_unified_compile():
     traced_fn(t1)
     assert len(side_effects) == 1, "Should not re-trace"
 
-    print("\nUnified compile test passed.")
-
 
 def test_colocation_dispatch():
     """Verify that distribute can take a List of TransportTensors and share the same plan."""
@@ -553,8 +534,6 @@ def test_colocation_dispatch():
 
     assert bk.equal(buffer_keys, bk.tensor([10, 20], dtype=bk.int32()))
     assert bk.equal(buffer_vals, bk.tensor([0.1, 0.2], dtype=bk.float32()))
-
-    print("\nCo-location test passed.")
 
 
 def test_reconstruct_splits_from_lengths():
@@ -629,8 +608,4 @@ def test_reconstruct_splits_from_lengths():
 
     assert jnp.allclose(segment_sums, expected_sums), (
         f"Segment sum mismatch. Got {segment_sums}"
-    )
-
-    print(
-        "\nSuccessfully demonstrated nested_splits, segment_ids, and JAX segment_sum reconstruction from lengths!"
     )

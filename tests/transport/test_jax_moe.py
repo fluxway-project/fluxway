@@ -1,5 +1,4 @@
 import pytest
-import time
 from typing import List, Dict, Any
 
 from fluxway.common.types.tensor import TransportTensor
@@ -76,8 +75,6 @@ def test_large_scale_sparse_moe():
     # We set content addressable target to route based on `routing` array
     spec_target = ShardingSpec.hash(mesh, P("x"))
 
-    t0 = time.time()
-
     # Using DataDistributor with capacity buckets
     _res, _ = cluster[0].distributor.distribute(
         local_data=tt,
@@ -86,8 +83,6 @@ def test_large_scale_sparse_moe():
         send_fn=send_wrapper_moe_0,
         capacity=capacity_buckets,
     )
-    t1 = time.time()
-    print(f"\nDistribute time: {(t1 - t0) * 1000:.2f} ms")
 
     # Check experts received their shards
     total_received = 0
@@ -101,4 +96,3 @@ def test_large_scale_sparse_moe():
     assert total_received == total_tokens, (
         f"Expected {total_tokens} tokens, got {total_received}."
     )
-    print(f"\nMoE AllToAll routing test passed. Total tokens routed: {total_received}")

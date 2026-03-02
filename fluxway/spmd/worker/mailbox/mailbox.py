@@ -89,9 +89,8 @@ class StepBarrier:
         barrier = self._tensor_barriers.get(name)
         if barrier is not None:
             fired = barrier.arrive()
-            print(
-                f"[StepBarrier] TENSOR ARRIVED: name={name}, count={barrier.count}/{barrier.target}, fired={fired}",
-                flush=True,
+            logger.debug(
+                f"[StepBarrier] TENSOR ARRIVED: name={name}, count={barrier.count}/{barrier.target}, fired={fired}"
             )
             if self._periodic:
                 return fired
@@ -288,10 +287,7 @@ class WorkerMailbox:
             self._staleness_config[op_name] = staleness_dict
             self._expected_tensor_counts[op_name] = expected_tensors
             self._expected_state_names[op_name] = expected_states
-            print(
-                f"[WorkerMailbox] declare_step({op_name}, {step}) expected_tensors: {expected_tensors}",
-                flush=True,
-            )
+
             # Currently apply one policy per operator for all its staleness configs
             self._retrieval_policy.setdefault(op_name, {})
             for name in staleness_dict:
@@ -323,9 +319,8 @@ class WorkerMailbox:
 
         barrier = StepBarrier(expected_tensors, expected_states)
         self._barriers.setdefault(op_name, {})[step] = barrier
-        print(
-            f"[WorkerMailbox] declare_step: op={op_name}, step={step}, expected_tensors={expected_tensors}, expected_states={expected_states}",
-            flush=True,
+        logger.debug(
+            f"[WorkerMailbox] declare_step: op={op_name}, step={step}, expected_tensors={expected_tensors}, expected_states={expected_states}"
         )
 
         # Check if we can satisfy any tolerant dependencies using cached older data
@@ -506,9 +501,8 @@ class WorkerMailbox:
                 barrier = self._barriers.get(op_name, {}).get(step)
 
             for i, name in enumerate(names):
-                print(
-                    f"[WorkerMailbox] deposit_shards: op={op_name}, name={name}, step={step}, sender={sender_id}:{rank}",
-                    flush=True,
+                logger.debug(
+                    f"[WorkerMailbox] deposit_shards: op={op_name}, name={name}, step={step}, sender={sender_id}:{rank}"
                 )
                 payloads = payload_groups[i]
                 counts = counts_groups[i]

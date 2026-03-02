@@ -140,7 +140,7 @@ class HeartbeatManager:
             was_in_error = spmd_id in self._error_drivers
             if was_in_error and heartbeat.status == DriverStatus.HEALTHY:
                 self._error_drivers.discard(spmd_id)
-                logger.debug(f"Driver {spmd_id} recovered from error")
+                logger.info(f"Driver {spmd_id} recovered from error")
                 # Will call callback outside lock
 
             # Check if driver reported error
@@ -159,7 +159,7 @@ class HeartbeatManager:
                 if self._check_all_ready_internal():
                     self._all_ready_triggered = True
                     should_trigger_ready = True
-                    logger.debug("All drivers are ready (workers_ready=True)")
+                    # logger.debug("All drivers are ready (workers_ready=True)")
 
             # Check if all workers are running (first time) — Phase 2
             should_trigger_running = False
@@ -167,7 +167,7 @@ class HeartbeatManager:
                 if self._check_all_workers_running_internal():
                     self._all_workers_running_triggered = True
                     should_trigger_running = True
-                    logger.debug("All workers are running (workers_running=True)")
+                    # logger.debug("All workers are running (workers_running=True)")
 
         # Call callbacks outside lock to prevent deadlock
         if was_in_error and heartbeat.status == DriverStatus.HEALTHY:
@@ -183,12 +183,12 @@ class HeartbeatManager:
         if should_trigger_running:
             await self._call_workers_running_callback()
 
-        logger.debug(
-            f"Received heartbeat from {spmd_id}: status={heartbeat.status.name}, "
-            f"state={heartbeat.state.name}, timestamp={heartbeat.timestamp:.3f}, "
-            f"healthy_workers={heartbeat.healthy_num_workers}/{heartbeat.num_workers}, "
-            f"op_steps={heartbeat.op_steps}, workers_ready={heartbeat.workers_ready}"
-        )
+        # logger.debug(
+        #     f"Received heartbeat from {spmd_id}: status={heartbeat.status.name}, "
+        #     f"state={heartbeat.state.name}, timestamp={heartbeat.timestamp:.3f}, "
+        #     f"healthy_workers={heartbeat.healthy_num_workers}/{heartbeat.num_workers}, "
+        #     f"op_steps={heartbeat.op_steps}, workers_ready={heartbeat.workers_ready}"
+        # )
 
     async def _call_ready_callback(self) -> None:
         """Call the on_all_ready callback (handles sync and async)."""
@@ -429,9 +429,10 @@ class HeartbeatManager:
                         self._missed_counts.get(spmd_id, 0) + 1
                     )
                     missed = self._missed_counts[spmd_id]
-                    logger.debug(
+                    logger.log(
+                        5,  # HEARTBEAT
                         f"Heartbeat check: {spmd_id} never received heartbeat, "
-                        f"missed_count={missed}/{self._config.max_missed_heartbeats}"
+                        f"missed_count={missed}/{self._config.max_missed_heartbeats}",
                     )
                 elif (
                     current_time - heartbeat.timestamp > self._config.heartbeat_timeout
@@ -442,17 +443,19 @@ class HeartbeatManager:
                     )
                     missed = self._missed_counts[spmd_id]
                     age = current_time - heartbeat.timestamp
-                    logger.debug(
+                    logger.log(
+                        5,  # HEARTBEAT
                         f"Heartbeat check: {spmd_id} timeout (age={age:.2f}s > "
                         f"timeout={self._config.heartbeat_timeout}s), "
-                        f"missed_count={missed}/{self._config.max_missed_heartbeats}"
+                        f"missed_count={missed}/{self._config.max_missed_heartbeats}",
                     )
                 else:
                     # Heartbeat is healthy
                     age = current_time - heartbeat.timestamp
-                    logger.debug(
+                    logger.log(
+                        5,  # HEARTBEAT
                         f"Heartbeat check: {spmd_id} healthy (age={age:.2f}s < "
-                        f"timeout={self._config.heartbeat_timeout}s)"
+                        f"timeout={self._config.heartbeat_timeout}s)",
                     )
                     continue
 

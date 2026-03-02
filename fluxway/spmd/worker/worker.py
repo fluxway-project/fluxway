@@ -36,7 +36,7 @@ from fluxway.common.index_descriptor import IndexDescriptor
 from fluxway.common.types.tensor import TransportTensor
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.types.sharding import ShardingSpec, PartitionSpec
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Type, Union, get_type_hints
 from fluxway.common.backend import get_backend
 from fluxway.common.types.configs import MailboxStatus
 from fluxway.common.utils import ensure_logging_configured
@@ -324,11 +324,10 @@ class SPMDWorker:
             len(self._successor_handlers) >= self._expected_successor_count
         )
 
-        print(
+        logger.debug(
             f"[{self.spmd_id} Rank {self.rank}] _check_and_auto_start: "
             f"pred={len(self._predecessor_handlers)}/{self._expected_predecessor_count} "
-            f"succ={len(self._successor_handlers)}/{self._expected_successor_count}",
-            flush=True,
+            f"succ={len(self._successor_handlers)}/{self._expected_successor_count}"
         )
 
         if pred_registered and succ_registered:
@@ -342,9 +341,8 @@ class SPMDWorker:
 
     def _auto_start(self) -> None:
         """Internal auto-start method."""
-        print(
-            f"[{self.spmd_id} Rank {self.rank}] _auto_start CALLED. _running={self._running}",
-            flush=True,
+        logger.debug(
+            f"[{self.spmd_id} Rank {self.rank}] _auto_start CALLED. _running={self._running}"
         )
         if self._running:
             return
@@ -352,10 +350,6 @@ class SPMDWorker:
         self._running = True
         self._start_event.set()
         logger.debug(f"[spmd_id={self.spmd_id}] Worker {self.rank} auto-started")
-        print(
-            f"[{self.spmd_id} Rank {self.rank}] Worker auto-started successfully.",
-            flush=True,
-        )
 
         # Trigger source operators (operators with 0 input tensors)
         asyncio.create_task(self._trigger_source_operators())
@@ -365,17 +359,9 @@ class SPMDWorker:
         Trigger initial steps for source operators (those with 0 input tensors).
         """
         source_ops = self._op_manager.get_source_operators()
-        print(
-            f"[{self.spmd_id} Rank {self.rank}] _trigger_source_operators CALLED. source_ops={source_ops}",
-            flush=True,
-        )
         for op_name in source_ops:
             logger.debug(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] Triggering source operator: {op_name}"
-            )
-            print(
-                f"[{self.spmd_id} Rank {self.rank}] Enqueuing source op: {op_name}",
-                flush=True,
+                f"[{self.spmd_id} Rank {self.rank}] Enqueuing source op: {op_name}"
             )
             await self._enqueue(op_name, 0)
 
@@ -391,7 +377,7 @@ class SPMDWorker:
         instead of being executed. Other ops continue normally.
         """
         self._op_runnable[op_name].clear()
-        logger.debug(f"[spmd_id={self.spmd_id}] Worker {self.rank}: {op_name} blocked")
+        # logger.debug(f"[spmd_id={self.spmd_id}] Worker {self.rank}: {op_name} blocked")
 
     async def unblock_op(self, op_name: str) -> None:
         """
@@ -405,9 +391,9 @@ class SPMDWorker:
                 await self._enqueue(op_name, step)
             self._pending_blocked[op_name].clear()
 
-        logger.debug(
-            f"[spmd_id={self.spmd_id}] Worker {self.rank}: {op_name} unblocked"
-        )
+        # logger.debug(
+        #     f"[spmd_id={self.spmd_id}] Worker {self.rank}: {op_name} unblocked"
+        # )
 
     def is_op_blocked(self, op_name: str) -> bool:
         """Check if an operator is blocked."""
@@ -571,10 +557,6 @@ class SPMDWorker:
         Schedules _enqueue as an asyncio task so the lock in deposit_shards/
         deposit_states can return immediately without blocking on queue insertion.
         """
-        print(
-            f"[Worker {self.spmd_id} Rank {self.rank}] _on_step_ready: op={op_name}, step={step}",
-            flush=True,
-        )
         logger.debug(
             f"[spmd_id={self.spmd_id} rank={self.rank}] Step ready: op={op_name}, step={step}"
         )
@@ -584,9 +566,8 @@ class SPMDWorker:
         """Enqueue a task for execution."""
         from fluxway.common.types.configs import OperatorMeta
 
-        print(
-            f"[Worker {self.spmd_id} Rank {self.rank}] _enqueue CALLED: op={op_name}, step={step}",
-            flush=True,
+        logger.debug(
+            f"[Worker {self.spmd_id} Rank {self.rank}] _enqueue CALLED: op={op_name}, step={step}"
         )
         meta = self._op_manager._get_operator_metadata(op_name)
         priority = meta.priority if isinstance(meta, OperatorMeta) else 0
@@ -633,14 +614,12 @@ class SPMDWorker:
         while self._running:
             try:
                 # Blocking wait for next task (async)
-                print(
-                    f"[Worker {self.spmd_id} Rank {self.rank}] Execution loop waiting for task in _execution_queue...",
-                    flush=True,
+                logger.debug(
+                    f"[spmd_id={self.spmd_id} rank={self.rank}] Execution loop waiting for task in _execution_queue..."
                 )
                 priority, step, op_name = await self._execution_queue.get()
-                print(
-                    f"[Worker {self.spmd_id} Rank {self.rank}] Execution loop picked up task: {op_name} step={step} priority={priority}",
-                    flush=True,
+                logger.debug(
+                    f"[spmd_id={self.spmd_id} rank={self.rank}] Execution loop picked up task: {op_name} step={step} priority={priority}"
                 )
 
                 # Check if we should stop
@@ -654,17 +633,12 @@ class SPMDWorker:
                     async with self._pending_lock:
                         self._pending_blocked[op_name].append(step)
                     logger.debug(
-                        f"[spmd_id={self.spmd_id}] Task held (op blocked): op={op_name}, step={step}"
-                    )
-                    print(
-                        f"[{self.spmd_id}] OP BLOCKED in queue: op={op_name} step={step}",
-                        flush=True,
+                        f"[spmd_id={self.spmd_id}] OP BLOCKED in queue: op={op_name}, step={step}"
                     )
                     continue
 
-                print(
-                    f"[{self.spmd_id}] Task processing: op={op_name} step={step}",
-                    flush=True,
+                logger.debug(
+                    f"[{self.spmd_id}] Task processing: op={op_name} step={step}"
                 )
                 # Check if this op is in periodic_trigger mode
                 is_periodic = (
@@ -833,15 +807,7 @@ class SPMDWorker:
 
             # Assemble input data
             try:
-                print(
-                    f"[Worker {self.spmd_id} Rank {self.rank}] start assembling input for {op_name} step={step}",
-                    flush=True,
-                )
                 input_data = await self._assemble_input(op_name, step)
-                print(
-                    f"[Worker {self.spmd_id} Rank {self.rank}] input assembled for {op_name} step={step}. Keys: {list(input_data.keys()) if isinstance(input_data, dict) else 'non-dict'}",
-                    flush=True,
-                )
             except Exception as e:
                 logger.error(
                     f"[spmd_id={self.spmd_id} rank={self.rank}] Failed to assemble input data for "
@@ -850,10 +816,6 @@ class SPMDWorker:
                 raise e
 
             # Execute operator in a thread to avoid blocking the worker event loop
-            print(
-                f"[Worker {self.spmd_id} Rank {self.rank}] Calling _op_manager.execute: op={op_name}, step={step}",
-                flush=True,
-            )
             if isinstance(input_data, dict):
                 result = await asyncio.to_thread(
                     self._op_manager.execute, op_name, **input_data
@@ -862,19 +824,15 @@ class SPMDWorker:
                 result = await asyncio.to_thread(
                     self._op_manager.execute, op_name, input_data
                 )
-            print(
-                f"[Worker {self.spmd_id} Rank {self.rank}] Execution finished: op={op_name}, step={step}",
-                flush=True,
-            )
             logger.debug(
                 f"[spmd_id={self.spmd_id} rank={self.rank}] Execution finished: op={op_name}, step={step}"
             )
 
             if result is None:
-                logger.warning(
-                    f"[spmd_id={self.spmd_id} rank={self.rank}] Operator {op_name} returned None, skipping output send"
+                logger.debug(
+                    f"[spmd_id={self.spmd_id} rank={self.rank}] Operator {op_name} returned None. "
+                    f"Continuing to advance step."
                 )
-                return
 
             # Determine output step
             is_periodic = (
@@ -908,9 +866,8 @@ class SPMDWorker:
         except Exception as e:
             import traceback
 
-            traceback.print_exc()
             logger.error(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] Operator {op_name} execution failed: {e}"
+                f"[spmd_id={self.spmd_id} rank={self.rank}] Operator {op_name} execution failed: {e}, traceback: {traceback.format_exc()}"
             )
             raise
 
@@ -976,55 +933,46 @@ class SPMDWorker:
         # Cache assembled tensors (they carry their own indices/meta)
         self._last_assembled_tensors[op_name] = tensor_args
 
-        # Task 5: Construct final data_type object
-        input_type = self._op_manager.get_operator_input_type(op_name)
-        if input_type is None:
-            if self._op_manager.is_source_operator(op_name):
-                return None
+        # Task 5: Construct final keyword arguments
+        input_types = self._op_manager.get_operator_input_types(op_name)
+        if not input_types and not self._op_manager.is_source_operator(op_name):
             raise ValueError(
-                f"Cannot determine input type for operator {op_name}. "
+                f"Cannot determine input types for operator {op_name}. "
                 f"Make sure the operator function has type annotations."
             )
 
-        # Combine all arguments
-        kwargs = {}
-        kwargs.update(static_args)
-        logger.debug(
-            f"[spmd_id={self.spmd_id} rank={self.rank}] Update to kwargs: static arguments: {static_args}"
-        )
-        kwargs.update(state_args)
-        logger.debug(
-            f"[spmd_id={self.spmd_id} rank={self.rank}] Update to kwargs: state arguments: {state_args}"
-        )
-        kwargs.update(tensor_args)
-        _tensor_log_str = f"[spmd_id={self.spmd_id} rank={self.rank}] Update to kwargs: tensor arguments: {tensor_args}"
-        logger.debug(
-            _tensor_log_str[:100] + "..."
-            if len(_tensor_log_str) > 100
-            else _tensor_log_str
-        )
+        # Combine all arguments (including flattened tensor paths)
+        all_args = {}
+        all_args.update(static_args)
+        all_args.update(state_args)
+        all_args.update(tensor_args)
 
-        # Construct the data_type object if the first parameter is a @data_type
-        # Otherwise, the operator expects direct kwargs, so we return the dict.
-        if input_type and getattr(input_type, "is_fluxway_data", False):
-            try:
-                input_obj = input_type(**kwargs)
-            except Exception as e:
-                logger.error(
-                    f"[spmd_id={self.spmd_id} rank={self.rank}] Failed to construct input object for "
-                    f"op={op_name}, step={step}: {e}"
-                )
-                raise e
+        input_kwargs = {}
 
-            _input_log_str = f"[spmd_id={self.spmd_id} rank={self.rank}] Constructed input object: {input_obj}"
-            logger.debug(
-                _input_log_str[:1000] + "..."
-                if len(_input_log_str) > 1000
-                else _input_log_str
-            )
-            return input_obj
+        from fluxway.common.decorators import _is_fluxway_data_type
 
-        return kwargs
+        data_type_count = sum(
+            1 for tp in input_types.values() if _is_fluxway_data_type(tp)
+        )
+        use_prefix = data_type_count > 1
+
+        for p_name, p_type in input_types.items():
+            if _is_fluxway_data_type(p_type):
+                try:
+                    prefix = p_name if use_prefix else ""
+                    input_kwargs[p_name] = self._reconstruct_data_type(
+                        p_type, all_args, prefix=prefix
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[spmd_id={self.spmd_id} rank={self.rank}] Failed to reconstruct "
+                        f"parameter {p_name} for op={op_name}: {e}"
+                    )
+            else:
+                if p_name in all_args:
+                    input_kwargs[p_name] = all_args[p_name]
+
+        return input_kwargs
 
     def _get_values(self, obj: Any) -> Any:
         """Helper to get raw values from either TransportTensor or raw array."""
@@ -1280,9 +1228,8 @@ class SPMDWorker:
         old_step = self._current_steps[op_name]
         self._current_steps[op_name] += 1
         new_step = self._current_steps[op_name]
-        print(
-            f"[Worker {self.spmd_id} Rank {self.rank}] _advance_step: op={op_name}, {old_step} -> {new_step}",
-            flush=True,
+        logger.debug(
+            f"[spmd_id={self.spmd_id} rank={self.rank}] _advance_step: op={op_name}, {old_step} -> {new_step}"
         )
 
         # If it's a source operator, automatically trigger the next step
@@ -1292,7 +1239,7 @@ class SPMDWorker:
             if max_steps is not None and new_step >= max_steps:
                 logger.debug(
                     f"[spmd_id={self.spmd_id} rank={self.rank}] Source operator '{op_name}' "
-                    f"reached max_steps ({max_steps}). Self-terminating."
+                    f"reached max_steps ({max_steps}). Try to be terminated by driver."
                 )
                 # Do NOT enqueue new_step + 1, effectively stopping the pulse
             elif result is not None:
@@ -1301,14 +1248,14 @@ class SPMDWorker:
                     await self._source_pause_events[op_name].wait()
 
                 asyncio.create_task(
-                    self._enqueue(op_name, new_step + 1)
-                )  # Use new_step + 1 for next step
+                    self._enqueue(op_name, new_step)
+                )  # Use new_step for next step
             else:
                 logger.debug(
                     f"[spmd_id={self.spmd_id} rank={self.rank}] Source operator {op_name} finished (returned None)"
                 )
 
-        # Report op completion to driver
+        # Report op completion to driver (here new_step means water level)
         self._report_op_completed(op_name, new_step)
 
         # Check if this op is in periodic_trigger mode
@@ -1386,11 +1333,6 @@ class SPMDWorker:
         successor_ids = sorted(set(self._op_manager.get_successor_ids(op_name)))
         input_tensors = self._last_assembled_tensors.get(op_name, {})
 
-        print(
-            f"[Worker {self.spmd_id} Rank {self.rank}] _send_output: op={op_name}, step={step}, out_tensors={list(tensors_to_send.keys())}, successors={successor_ids}",
-            flush=True,
-        )
-
         for spmd_id in successor_ids:
             succ_info = self._op_manager.get_successor_info(op_name, spmd_id)
             if succ_info is None:
@@ -1465,17 +1407,55 @@ class SPMDWorker:
                             device_shape=(1,), axis_names=("data",)
                         )
                     source_spec = ShardingSpec.chunk(source_mesh, PartitionSpec())
+                else:
+                    # Infer global shape for static specs to avoid geometry collapse in the transport layer
+                    if (
+                        transport_tensor.global_shape is None
+                        and not source_spec.is_content_addressable
+                    ):
+                        from fluxway.common.backend import get_backend
 
+                        backend = get_backend()
+                        if transport_tensor.is_ragged:
+                            dim0 = (
+                                backend.shape(transport_tensor.nested_splits[0])[0] - 1
+                            )
+                            inferred_shape = [int(dim0)]
+                        else:
+                            inferred_shape = list(
+                                backend.shape(transport_tensor.flat_values)
+                            )
+
+                        for dim, axes in source_spec.partitions.items():
+                            if dim < len(inferred_shape):
+                                dim_multiplier = 1
+                                for ax in axes:
+                                    src_mesh = source_spec.mesh
+                                    if src_mesh is None:
+                                        raise ValueError(
+                                            f"Mesh of {source_spec.name} is None. Please provide a mesh for {source_spec.name} with the @spmd decorator."
+                                        )
+                                    ax_idx = src_mesh.axis_names.index(ax)
+                                    dim_multiplier *= src_mesh.shape[ax_idx]
+                                inferred_shape[dim] = int(
+                                    inferred_shape[dim] * dim_multiplier
+                                )
+
+                        transport_tensor = TransportTensor(
+                            transport_tensor.flat_values,
+                            nested_splits=transport_tensor.nested_splits,
+                            spatial_indices=transport_tensor.spatial_indices,
+                            global_shape=tuple(inferred_shape),
+                            origin_indices=transport_tensor.origin_indices,
+                        )
+                # Use local tensor name for successor spec lookup (as mapped by Builder)
                 target_spec = succ_info.tensor_sharding.get(tensor_name)
                 if target_spec is None:
-                    target_mesh = (
-                        succ_info.mesh if succ_info.mesh is not None else self._mesh
+                    raise KeyError(
+                        f"Sharding spec for local tensor '{tensor_name}' (target '{target_tensor_name}') "
+                        f"not found in successor '{spmd_id}' topology info. "
+                        f"Available tensors: {list(succ_info.tensor_sharding.keys())}"
                     )
-                    if target_mesh is None:
-                        target_mesh = DeviceMesh(
-                            device_shape=(1,), axis_names=("data",)
-                        )
-                    target_spec = ShardingSpec.chunk(target_mesh, PartitionSpec())
 
                 # 7. Collect into batches for efficient bulk distribution
                 batches[(source_spec, target_spec)].append(
@@ -1532,6 +1512,8 @@ class SPMDWorker:
 
                     count = int(counts[0]) if counts else 0
                     if count == 0:
+                        from fluxway.common.backend import get_backend
+
                         backend = get_backend()
                         # Use actual batch_tensors metadata to create correctly typed empty shards
                         empty_shards = [
@@ -1669,6 +1651,11 @@ class SPMDWorker:
                     asyncio.create_task(_wait_and_release())
                     return True
 
+                logger.debug(
+                    f"[spmd_id={self.spmd_id} rank={self.rank}] Distributing batch for target SPMD {spmd_id}: "
+                    f"tensor_names={batch_tensor_names}, target_names={batch_target_names}, "
+                    f"source_spec={source_spec}, target_spec={target_spec}"
+                )
                 await distributor.distribute(
                     batch_transport_tensors,
                     source=source_spec,
@@ -1725,31 +1712,40 @@ class SPMDWorker:
                             )
 
     def _extract_tensors(
-        self, data: Any, output_sharding: Dict[str, ShardingSpec]
+        self, data: Any, output_sharding: Dict[str, Any]
     ) -> Dict[str, Any]:
         """
         Extract named tensors from output data using generic attribute access.
-        Prioritizes getattr() for speed and library-agnostic field access.
+        Supports recursive traversal for nested @data_type objects.
         """
         tensors: Dict[str, Any] = {}
 
-        # 1. Try getattr protocol (works for dataclass, pydantic, custom classes)
         for name in output_sharding.keys():
-            val = getattr(data, name, None)
+            # 'name' can be a flattened path like 'active.user_id'
+            parts = name.split(".")
+            val = data
+            for part in parts:
+                if val is None:
+                    break
+                # Try attribute first (dataclass / @data_type)
+                if hasattr(val, part):
+                    val = getattr(val, part)
+                elif isinstance(val, dict) and part in val:
+                    # Fallback to dict access
+                    val = val[part]
+                else:
+                    val = None
+                    break
+
             if val is not None:
                 tensors[name] = val
 
-        # 2. Fallback to dict access if attributes didn't yield all expected keys
-        if len(tensors) < len(output_sharding) and isinstance(data, dict):
-            for name in output_sharding.keys():
-                if name not in tensors and name in data:
-                    tensors[name] = data[name]
-
-        # 3. If still no specific tensors found, treat entire data as single tensor (legacy fallback)
-        if not tensors and output_sharding:
+        # Handle legacy or direct return case (entire result is a single tensor)
+        if not tensors and output_sharding and not isinstance(data, (dict, list)):
             first_name = next(iter(output_sharding.keys()))
             tensors[first_name] = data
 
+        # Ensure all extracted values are TransportTensors
         for name in list(tensors.keys()):
             val = tensors[name]
             if not isinstance(val, TransportTensor):
@@ -1760,8 +1756,64 @@ class SPMDWorker:
             f"[spmd_id={self.spmd_id} rank={self.rank}] _extract_tensors: "
             f"extracted={list(tensors.keys())}, data_type={type(data).__name__}"
         )
-
         return tensors
+
+    def _reconstruct_data_type(
+        self, cls: Type, flat_data: Dict[str, Any], prefix: str = ""
+    ) -> Any:
+        """
+        Recursively reconstruct a @data_type object from flattened fields.
+
+        Args:
+            cls: The @data_type class to reconstruct
+            flat_data: Mapping of full paths to TransportTensors/States
+            prefix: Current path prefix
+        """
+        from fluxway.common.decorators import _is_fluxway_data_type
+
+        # Use library-agnostic reconstruction if possible
+        if not _is_fluxway_data_type(cls):
+            return flat_data.get(prefix)
+
+        # Get fields and their type hints
+        try:
+            hints = get_type_hints(cls, include_extras=True)
+        except Exception:
+            # Fallback if hints can't be resolved
+            return None
+
+        kwargs = {}
+        for name, hint in hints.items():
+            if name.startswith("_"):
+                continue
+
+            full_name = f"{prefix}.{name}" if prefix else name
+
+            # If hint is another @data_type, recurse
+            if _is_fluxway_data_type(hint):
+                # Resolve nested type (handle Optional/Union)
+                actual_cls = hint
+                origin = getattr(hint, "__origin__", None)
+                if origin is Union:
+                    args = getattr(hint, "__args__", [])
+                    for arg in args:
+                        if arg is not type(None) and _is_fluxway_data_type(arg):
+                            actual_cls = arg
+                            break
+                kwargs[name] = self._reconstruct_data_type(
+                    actual_cls, flat_data, prefix=full_name
+                )
+            else:
+                # Direct field (Tensor or State)
+                if full_name in flat_data:
+                    kwargs[name] = flat_data[full_name]
+
+        # Instantiate the @data_type object (usually a dataclass)
+        try:
+            return cls(**kwargs)
+        except Exception as e:
+            logger.error(f"Failed to reconstruct {cls.__name__} at {prefix}: {e}")
+            return None
 
     # =========================================================================
     # Backward Reverse Routing (using forward shard origins)
@@ -1991,10 +2043,10 @@ class SPMDWorker:
 
         try:
             self._driver_handle.receive_worker_heartbeat.remote(self.rank, heartbeat)
-            logger.debug(
-                f"[spmd_id={self.spmd_id}] Worker {self.rank} sent heartbeat: status={status.name}, "
-                f"op_steps={heartbeat.op_steps}, mailbox_full={mailbox_status.is_full}"
-            )
+            # logger.log(5,  # HEARTBEAT
+            #     f"[spmd_id={self.spmd_id}] Worker {self.rank} sent heartbeat: status={status.name}, "
+            #     f"op_steps={heartbeat.op_steps}, mailbox_full={mailbox_status.is_full}"
+            # )
         except Exception as e:
             logger.error(
                 f"[spmd_id={self.spmd_id} rank={self.rank}] Failed to send heartbeat: {e}"

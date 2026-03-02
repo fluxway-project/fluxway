@@ -15,13 +15,13 @@ T = TypeVar("T")
 
 
 # Transport stream markers for fields within a @data_type
-class DataStream:
+class DataFlow:
     """Marker for Worker-to-Worker (Data Plane) transport. Supports sharding."""
 
     pass
 
 
-class ControlStream:
+class ControlFlow:
     """Marker for Driver-to-Driver (Control Plane) transport. Broadcast to all workers."""
 
     pass
@@ -29,8 +29,8 @@ class ControlStream:
 
 # User-facing type aliases
 # Usage: field_name: Data[jnp.ndarray] or field_name: Control[float]
-Data = Annotated[T, DataStream]
-Control = Annotated[T, ControlStream]
+Data = Annotated[T, DataFlow]
+Control = Annotated[T, ControlFlow]
 
 
 class NodeType(str, Enum):

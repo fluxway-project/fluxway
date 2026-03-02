@@ -352,11 +352,11 @@ if RAY_AVAILABLE:
             """
             self._worker_heartbeats[rank] = heartbeat
             self._worker_heartbeat_times[rank] = time.time()
-            logger.debug(
-                f"[spmd_id={self.spmd_id}] Driver {self.spmd_id} received worker {rank} heartbeat: "
-                f"status={heartbeat.status.name}, op_steps={heartbeat.op_steps}, "
-                f"mailbox_full={heartbeat.mailbox_status.is_full if heartbeat.mailbox_status else False}"
-            )
+            # logger.debug(
+            #     f"[spmd_id={self.spmd_id}] Driver {self.spmd_id} received worker {rank} heartbeat: "
+            #     f"status={heartbeat.status.name}, op_steps={heartbeat.op_steps}, "
+            #     f"mailbox_full={heartbeat.mailbox_status.is_full if heartbeat.mailbox_status else False}"
+            # )
 
             # Check for worker error
             if heartbeat.error_message:
@@ -372,17 +372,17 @@ if RAY_AVAILABLE:
             if not self._workers_ready:
                 if len(self._worker_heartbeat_times) >= self.config.num_workers:
                     self._workers_ready = True
-                    logger.debug(
-                        f"[spmd_id={self.spmd_id}] All {self.config.num_workers} workers are ready for SPMD {self.spmd_id}"
-                    )
+                    # logger.debug(
+                    #     f"[spmd_id={self.spmd_id}] All {self.config.num_workers} workers are ready for SPMD {self.spmd_id}"
+                    # )
 
                     # Event-driven: trigger INIT_COMPLETE now that all workers are alive
                     if self.state_machine.state == DriverState.INITIALIZING:
                         self.state_machine.trigger(DriverEvent.INIT_COMPLETE)
-                        logger.debug(
-                            f"[spmd_id={self.spmd_id}] INIT_COMPLETE triggered by worker heartbeats "
-                            f"for SPMD {self.spmd_id}"
-                        )
+                        # logger.debug(
+                        #     f"[spmd_id={self.spmd_id}] INIT_COMPLETE triggered by worker heartbeats "
+                        #     f"for SPMD {self.spmd_id}"
+                        # )
 
             # Check if all workers are running (workers_running)
             if not self._workers_running and self._workers_ready:
@@ -397,17 +397,17 @@ if RAY_AVAILABLE:
                     and len(self._worker_heartbeats) >= self.config.num_workers
                 ):
                     self._workers_running = True
-                    logger.debug(
-                        f"[spmd_id={self.spmd_id}] All workers are running for SPMD {self.spmd_id} "
-                        f"(topology registration complete)"
-                    )
+                    # logger.debug(
+                    #     f"[spmd_id={self.spmd_id}] All workers are running for SPMD {self.spmd_id} "
+                    #     f"(topology registration complete)"
+                    # )
                     # Trigger READY → RUNNING transition
                     if self.state_machine.state == DriverState.READY:
                         self.state_machine.trigger(DriverEvent.START)
-                        logger.debug(
-                            f"[spmd_id={self.spmd_id}] START triggered, "
-                            f"driver state: READY → RUNNING"
-                        )
+                        # logger.debug(
+                        #     f"[spmd_id={self.spmd_id}] START triggered, "
+                        #     f"driver state: READY → RUNNING"
+                        # )
 
         def _handle_worker_error(self, rank: int, error: str) -> None:
             """Handle worker error."""
@@ -472,6 +472,10 @@ if RAY_AVAILABLE:
         def unblock_op(self, op_name: str) -> None:
             """Unblock an op for all workers (called by Controller)."""
             self.worker_synchronizer.unblock_spmd_op(op_name)
+
+        def set_allowed_step(self, op_name: str, step: int) -> None:
+            """Set global watermark for an op (called by Controller)."""
+            self.worker_synchronizer.update_allowed_step(op_name, step)
 
         def block_all_ops(self) -> None:
             """Block all ops for all workers."""
@@ -684,11 +688,11 @@ if RAY_AVAILABLE:
 
             try:
                 self.controller_handle.receive_driver_heartbeat.remote(heartbeat)
-                logger.debug(
-                    f"[spmd_id={self.spmd_id}] Driver {self.spmd_id} sent heartbeat: status={status.name}, "
-                    f"state={heartbeat.state.name}, healthy_workers={healthy_count}/{self.config.num_workers}, "
-                    f"op_steps={heartbeat.op_steps}, busy_ratio={self._busy_worker_ratio:.2f}"
-                )
+                # logger.log(5,  # HEARTBEAT
+                #     f"[spmd_id={self.spmd_id}] Driver {self.spmd_id} sent heartbeat: status={status.name}, "
+                #     f"state={heartbeat.state.name}, healthy_workers={healthy_count}/{self.config.num_workers}, "
+                #     f"op_steps={heartbeat.op_steps}, busy_ratio={self._busy_worker_ratio:.2f}"
+                # )
             except Exception as e:
                 logger.error(f"[spmd_id={self.spmd_id}] Failed to send heartbeat: {e}")
 

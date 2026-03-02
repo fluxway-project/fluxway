@@ -12,15 +12,14 @@ class DenseSPMD:
 
     @operator(
         name="forward",
-        data_argument=["emb1", "inv1", "emb2", "inv2", "dp_data"],
         input_sharding={
             "emb1": {"type": "dynamic", "axis": ["dp"]},
-            "inv1": {"type": "dynamic", "axis": ["dp"]},
+            "inv1": {"type": "static", "axis": ["dp"]},
             "emb2": {"type": "dynamic", "axis": ["dp"]},
-            "inv2": {"type": "dynamic", "axis": ["dp"]},
+            "inv2": {"type": "static", "axis": ["dp"]},
             "dp_data": {"type": "static", "axis": ["dp"]},
         },
-        output_sharding={"dense_output": {"type": "static", "axis": ["dp"]}},
+        output_sharding={"type": "static", "axis": ["dp"]},
     )
     def forward(
         self,
@@ -75,12 +74,12 @@ class DenseSPMD:
 
         g1_unique = (
             jnp.zeros((num_uniques1, f1_shape[1]))
-            .at[context.user_inv.flat_values]
+            .at[context.user_inv.flat_values.reshape(-1)]
             .add(g1_gathered)
         )
         g2_unique = (
             jnp.zeros((num_uniques2, f2_shape[1]))
-            .at[context.item_inv.flat_values]
+            .at[context.item_inv.flat_values.reshape(-1)]
             .add(g2_gathered)
         )
 
@@ -96,5 +95,13 @@ class DenseSPMD:
 
 
 def hash_routing(tensor, mesh):
+    from fluxway.common.types.tensor import TransportTensor
+
+    # For gradients, if they are uniquely keyed by ID, IDs must be in flat_values
     val = tensor.flat_values if isinstance(tensor, TransportTensor) else tensor
+
+    # Ensure we use 1D sequence for routing, typically the first column for feature IDs
+    if len(val.shape) > 1:
+        val = val[:, 0]
+
     return jnp.mod(val, mesh.size)

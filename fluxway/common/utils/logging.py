@@ -38,6 +38,10 @@ def ensure_logging_configured(
 
     root_logger = logging.getLogger()
 
+    HEARTBEAT = 5  # DEBUG=10, INFO=20, WARNING=30
+    logging.addLevelName(HEARTBEAT, "HEARTBEAT")
+    _logger.heartbeat = lambda msg: _logger.log(HEARTBEAT, msg)
+
     env_level = _parse_log_level(os.getenv(ENV_LOG_LEVEL))
     if level is not None:
         resolved_level = level

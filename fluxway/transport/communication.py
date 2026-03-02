@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any, Callable, Coroutine, List, Tuple
+import logging
 
 from fluxway.common.backend import get_backend
 from fluxway.transport.planner import TransportPlanner
@@ -15,6 +16,8 @@ import asyncio
 from typing import Union, Optional
 
 from fluxway.common.types.sharding import Layout
+
+logger = logging.getLogger(__name__)
 
 
 class BaseDataDistributor:
@@ -114,11 +117,10 @@ class BaseDataDistributor:
         else:
             dst_layout = target
 
-        print(
+        logger.debug(
             f"[Distributor] Planning: src_mesh={src_layout.mesh.size if src_layout.mesh else 1}, "
             f"dst_mesh={dst_layout.mesh.size if dst_layout.mesh else 1}, "
-            f"local_rank={self.local_rank}, src_indices={src_indices}",
-            flush=True,
+            f"local_rank={self.local_rank}, src_indices={src_indices}"
         )
 
         routing_dim = dst_layout.routing_dim
@@ -217,17 +219,22 @@ class BaseDataDistributor:
         )
 
         is_dynamic = source.is_content_addressable or target.is_content_addressable
-
         counts_host = backend.to_numpy(send_counts).flatten()
         is_replicated = replication_factor > 1
+
+        logger.debug(
+            f"[Distributor Rank {self.local_rank}] Plan complete: is_dynamic={is_dynamic}, "
+            f"counts_host={counts_host.tolist()}, replication_factor={replication_factor}"
+        )
 
         if is_replicated:
             # Fan-out
             sorted_dest_host = backend.to_numpy(dest_devices)
             for device_id, count in enumerate(counts_host):
                 count = int(count)
-                if count == 0 and not is_dynamic:
-                    continue
+                # Yield even if count is 0 to ensure completion signal (prevents deadlock)
+                # TODO(He Jia): Optimize performance. When static to static, an empty packet should not be sent
+                pass
 
                 # Fetch target group (from host memory)
                 targets = sorted_dest_host[device_id].flatten().tolist()
@@ -263,8 +270,9 @@ class BaseDataDistributor:
             # Scatter-send
             for device_id, count in enumerate(counts_host):
                 count = int(count)
-                if count == 0 and not is_dynamic:
-                    continue
+                # Yield even if count is 0 to ensure completion signal (prevents deadlock)
+                # TODO(He Jia): Optimize performance. When static to static, an empty packet should not be sent
+                pass
 
                 targets = [device_id]
 
@@ -286,9 +294,8 @@ class BaseDataDistributor:
                 else:
                     pass
 
-                print(
-                    f"[Distributor] Yielding shard for targets={targets}, counts={payload_counts}",
-                    flush=True,
+                logger.debug(
+                    f"[Distributor] Yielding shard for targets={targets}, counts={payload_counts}"
                 )
                 yield (
                     targets,
@@ -389,13 +396,20 @@ class AsyncDataDistributor(BaseDataDistributor):
                 # (e.g., dest_agg[target_id][0].extend(tensors)).
                 dest_agg[target_id] = (tensors, counts)
 
-        print(
-            f"[AsyncDistributor Rank {self.local_rank}] distribute targets: {list(dest_agg.keys())}",
-            flush=True,
+        logger.debug(
+            f"[AsyncDistributor Rank {self.local_rank}] distribute targets: {list(dest_agg.keys())}"
         )
 
         if not dest_agg:
-            return [], meta_sort_indices
+            # Even if we have no data, we MUST send empty shards to all target ranks to satisfy their StepBarriers.
+            target_mesh = (
+                target.mesh if isinstance(target, ShardingSpec) else target.mesh
+            )
+            if target_mesh:
+                for target_id in range(target_mesh.size):
+                    dest_agg[target_id] = ([], [])
+            else:
+                return [], meta_sort_indices
 
         tasks = []
         # Sort target_ids for deterministic execution
