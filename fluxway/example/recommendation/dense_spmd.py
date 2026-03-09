@@ -19,7 +19,14 @@ class DenseSPMD:
             "inv2": {"type": "static", "axis": ["dp"]},
             "dp_data": {"type": "static", "axis": ["dp"]},
         },
-        output_sharding={"type": "static", "axis": ["dp"]},
+        output_sharding={
+            "prediction": {"type": "static", "axis": []},  # Scalar is replicated
+            "user_inv": {"type": "static", "axis": ["dp"]},
+            "item_inv": {"type": "static", "axis": ["dp"]},
+            "user_emb_unique": {"type": "static", "axis": ["dp"]},
+            "item_emb_unique": {"type": "static", "axis": ["dp"]},
+            "dp_data": {"type": "static", "axis": ["dp"]},
+        },
     )
     def forward(
         self,
@@ -38,7 +45,13 @@ class DenseSPMD:
         # Simple summation + dense stats
         prediction = f1_rec.sum() + f2_rec.sum() + dp_data.dense_stats.sum()
 
-        print(f"[DenseSPMD] Worker {rank} Forward complete. Samples: {len(inv1)}")
+        print(
+            f"[DenseSPMD] forward input rank={rank}, inv1={inv1.flat_values}, inv2={inv2.flat_values}"
+        )
+
+        print(
+            f"[DenseSPMD]forward output rank={rank}, emb1:user_emb_unique={emb1.flat_values}, emb1.global_shape={emb1.global_shape}, emb2:item_emb_unique={emb2.flat_values}, emb2.global_shape={emb2.global_shape}"
+        )
 
         return DenseOutput(
             prediction=prediction,
@@ -53,15 +66,16 @@ class DenseSPMD:
         name="backward",
         input_sharding={"context": {"type": "static", "axis": ["dp"]}},
         output_sharding={
-            "grad1": {"type": "dynamic", "axis": ["dp"], "fn": "hash_routing"},
-            "grad2": {"type": "dynamic", "axis": ["dp"], "fn": "hash_routing"},
+            "grad1": {"type": "mirror", "source": "forward.emb1"},
+            "grad2": {"type": "mirror", "source": "forward.emb2"},
         },
     )
     def backward(self, context: DenseOutput) -> dict:
         rank = self.rank  # type: ignore
-        print(f"[DenseSPMD] Worker {rank} Backward starting.")
-
         # 1. Produce gradients for the "gathered" embeddings (per-sample)
+        print(
+            f"[DenseSPMD] backward rank={rank}, context.user_inv={context.user_inv.flat_values}, context.user_emb_unique.flat_values={context.user_emb_unique.flat_values}"
+        )
         f1_shape = (len(context.user_inv), context.user_emb_unique.flat_values.shape[1])
         f2_shape = (len(context.item_inv), context.item_emb_unique.flat_values.shape[1])
 
@@ -83,25 +97,14 @@ class DenseSPMD:
             .add(g2_gathered)
         )
 
-        # 3. Create TransportTensors with proper global IDs for routing
+        # 3. Create TransportTensors.
+        # We don't even need to manually set routing_indices if the receiver
+        # can infer them from provenance, but keeping them doesn't hurt.
         grad1 = TransportTensor(
-            g1_unique, spatial_indices=context.user_emb_unique.spatial_indices
+            g1_unique, global_shape=context.user_emb_unique.global_shape
         )
         grad2 = TransportTensor(
-            g2_unique, spatial_indices=context.item_emb_unique.spatial_indices
+            g2_unique, global_shape=context.item_emb_unique.global_shape
         )
 
         return {"grad1": grad1, "grad2": grad2}
-
-
-def hash_routing(tensor, mesh):
-    from fluxway.common.types.tensor import TransportTensor
-
-    # For gradients, if they are uniquely keyed by ID, IDs must be in flat_values
-    val = tensor.flat_values if isinstance(tensor, TransportTensor) else tensor
-
-    # Ensure we use 1D sequence for routing, typically the first column for feature IDs
-    if len(val.shape) > 1:
-        val = val[:, 0]
-
-    return jnp.mod(val, mesh.size)

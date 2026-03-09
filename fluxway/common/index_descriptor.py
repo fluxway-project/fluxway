@@ -64,6 +64,43 @@ class IndexDescriptor:
         concatenated = backend.cat(materialized, dim=0)
         return ExplicitIndex(concatenated)
 
+    # --- Arithmetic Magic Methods ---
+    def __floordiv__(self, other):
+        return self.materialize() // other
+
+    def __mod__(self, other):
+        return self.materialize() % other
+
+    def __divmod__(self, other):
+        return divmod(self.materialize(), other)
+
+    def __truediv__(self, other):
+        return self.materialize() / other
+
+    def __mul__(self, other):
+        return self.materialize() * other
+
+    def __add__(self, other):
+        return self.materialize() + other
+
+    def __sub__(self, other):
+        return self.materialize() - other
+
+    def __radd__(self, other):
+        return other + self.materialize()
+
+    def __rsub__(self, other):
+        return other - self.materialize()
+
+    def __rmul__(self, other):
+        return other * self.materialize()
+
+    def __rfloordiv__(self, other):
+        return other // self.materialize()
+
+    def __rmod__(self, other):
+        return other % self.materialize()
+
 
 class IndexPattern(enum.Enum):
     CONTIGUOUS = enum.auto()
@@ -83,6 +120,25 @@ class ContinuousIndex(IndexDescriptor):
     start: int = 0
     step: int = 1
     count: int = 0
+
+    def to_compact_params(self) -> List[int]:
+        """Calculate sharded parameters for compact transport."""
+        return [
+            int(self.start),
+            int(self.step),
+            int(self.count),
+            int(self.pattern.value),
+        ]
+
+    @staticmethod
+    def from_compact_params(p: List[int]) -> "ContinuousIndex":
+        """Reconstruct from parameters."""
+        return ContinuousIndex(
+            pattern=IndexPattern(int(p[3])),
+            start=int(p[0]),
+            step=int(p[1]),
+            count=int(p[2]),
+        )
 
     @property
     def morphology(self) -> IndexMorphology:
@@ -198,7 +254,7 @@ class RaggedIndex(IndexDescriptor):
 
 @dataclass(frozen=True)
 class ExplicitIndex(IndexDescriptor):
-    """IndexDescriptor describing an explicit tensor of routing mapping (formerly spatial_indices/lookup table)."""
+    """IndexDescriptor describing an explicit tensor of routing mapping (formerly routing_indices/lookup table)."""
 
     indices: Any
 
@@ -254,15 +310,12 @@ except ImportError:
 if _JAX_AVAILABLE:
     jax.tree_util.register_pytree_node(
         ContinuousIndex,
-        lambda x: (
-            (),
-            {"pattern": x.pattern, "start": x.start, "step": x.step, "count": x.count},
-        ),
-        lambda static, aux: ContinuousIndex(
-            pattern=static["pattern"],
-            start=static["start"],
-            step=static["step"],
-            count=static["count"],
+        lambda x: ((x.start, x.step, x.count), {"pattern": x.pattern}),
+        lambda aux, children: ContinuousIndex(
+            pattern=aux["pattern"],
+            start=children[0],
+            step=children[1],
+            count=children[2],
         ),
     )
     jax.tree_util.register_pytree_node(

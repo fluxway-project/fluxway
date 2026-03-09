@@ -65,7 +65,6 @@ from .sharding import (
     CyclicPartition,
     IndexedPartition,
     GreedyPartition,
-    Layout,
     ShardingSpec,
 )
 
@@ -123,7 +122,6 @@ __all__ = [
     "CyclicPartition",
     "IndexedPartition",
     "GreedyPartition",
-    "Layout",
     "ShardingSpec",
     "TransportTensor",
 ]

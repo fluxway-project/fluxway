@@ -74,9 +74,8 @@ def test_worker_sync_skew_limit():
 
     # 4. Worker 2 catches up to step 1
     sync.report_worker_op_completed(2, op, 1)
-    # diff is 3 - 1 = 2, which is <= max_diff.
-    # But unblock only happens when diff <= max_diff // 2 (i.e. 1)
-    assert 0 in blocked_workers
+    # diff is 3 - 1 = 2, which is <= max_diff. Unblocked!
+    assert 0 not in blocked_workers
 
     # 5. Worker 2 catches up to step 2
     sync.report_worker_op_completed(2, op, 2)
@@ -131,37 +130,33 @@ def test_async_manager_edge_limit():
     # 1. Both at step 0
     manager.report_op_completed("A", op_a, 0)
     manager.report_op_completed("B", op_b, 0)
-    actions = manager.check_and_enforce_limits()
-    assert not actions
+    updates = manager.check_and_enforce_limits()
+    # allowed_step = target_min_step (0) + limit (2) = 2
+    assert ("A", op_a, 2) in updates
 
     # 2. A moves to step 2
     manager.report_op_completed("A", op_a, 2)
-    actions = manager.check_and_enforce_limits()
-    # diff = 2 - 0 = 2, which is NOT > limit (2)
-    assert not actions
+    updates = manager.check_and_enforce_limits()
+    # A is at 2, B is at 0. diff=2. allowed_step = B(0) + limit(2) = 2.
+    assert ("A", op_a, 2) in updates
 
     # 3. A moves to step 3
     manager.report_op_completed("A", op_a, 3)
-    actions = manager.check_and_enforce_limits()
-    # diff = 3 - 0 = 3, which IS > limit (2)
-    # Should lock A.produce
-    assert ("A", op_a, True) in actions
-    assert manager.is_op_locked("A", op_a)
+    updates = manager.check_and_enforce_limits()
+    # Still allowed_step = 2.
+    assert ("A", op_a, 2) in updates
 
     # 4. B moves to step 1
     manager.report_op_completed("B", op_b, 1)
-    actions = manager.check_and_enforce_limits()
-    # diff = 3 - 1 = 2. Still > limit // 2 (1). Stay locked.
-    assert not actions
-    assert manager.is_op_locked("A", op_a)
+    updates = manager.check_and_enforce_limits()
+    # target B.consume is at 1, limit is 2. allowed_step = 1 + 2 = 3
+    assert ("A", op_a, 3) in updates
 
     # 5. B moves to step 2
     manager.report_op_completed("B", op_b, 2)
-    # diff = 3 - 2 = 1. <= limit // 2 (1). Unlock!
-    manager._config.min_lock_duration = 0
-    actions = manager.check_and_enforce_limits()
-    assert ("A", op_a, False) in actions
-    assert not manager.is_op_locked("A", op_a)
+    # target B.consume is at 2, limit 2. allowed_step = 2 + 2 = 4
+    updates = manager.check_and_enforce_limits()
+    assert ("A", op_a, 4) in updates
 
 
 def test_async_manager_global_limit():
@@ -174,11 +169,14 @@ def test_async_manager_global_limit():
     manager = AsyncStepManager(graph=graph, config=config)
 
     manager.report_op_completed("N", "run", 4)
-    actions = manager.check_and_enforce_limits()
-    assert not actions
+    updates = manager.check_and_enforce_limits()
+    # allowed_step should be 5 because max_steps=5 and global_step is 4
+    # Wait, Global Limit code:
+    # `allowed_step = min(allowed_step, self._config.max_steps)`
+    # actually it should allow step 5 if we just completed 4.
+    assert ("N", "run", 5) in [u for u in updates if u[0] == "N"]
 
     manager.report_op_completed("N", "run", 5)
-    actions = manager.check_and_enforce_limits()
-    assert ("N", "run", True) in actions
-    assert manager.is_op_locked("N", "run")
+    updates = manager.check_and_enforce_limits()
+    assert ("N", "run", 5) in [u for u in updates if u[0] == "N"]
     assert manager.is_all_completed()

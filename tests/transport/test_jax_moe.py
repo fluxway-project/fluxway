@@ -41,7 +41,7 @@ def test_large_scale_sparse_moe():
 
     # 4 Experts
     num_workers = 4
-    mesh = DeviceMesh((num_workers,), ("x",), list(range(num_workers)))
+    mesh = DeviceMesh(("x",), (num_workers,), list(range(num_workers)))
     spec = ShardingSpec.chunk(mesh, P("x"))
 
     cluster = {i: VirtualRank(i, mesh) for i in range(num_workers)}
@@ -61,10 +61,10 @@ def test_large_scale_sparse_moe():
     routing_np = np.random.randint(0, num_workers, size=total_tokens).astype(np.int32)
     routing = bk.tensor(routing_np)
 
-    tt = TransportTensor(tokens, indices=routing)
+    tt = TransportTensor(tokens, routing_indices=routing)
 
     # Mock send wrapper
-    def send_wrapper_moe_0(target, tensors, counts, includes_indices=False):
+    def send_wrapper_moe_0(target, tensors, counts, *args, **kwargs):
         count = counts[0]
         if count > 0:
             cluster[target].receiver.receive_slices(0, tensors, counts)

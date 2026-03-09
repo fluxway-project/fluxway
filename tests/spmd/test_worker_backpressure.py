@@ -33,7 +33,7 @@ def _make_config(mesh, *op_names):
 @pytest.mark.asyncio
 async def test_spmd_worker_backpressure_throttles_sender():
     """Verify that a sender delays sending if the downstream receiver returns a high watermark."""
-    mesh = DeviceMesh((2,), axis_names=("data",))
+    mesh = DeviceMesh(axis_names=("data",), device_shape=(2,))
     config = _make_config(mesh, "compute")
 
     # Instantiate class depending on whether it's wrapped by Ray or not

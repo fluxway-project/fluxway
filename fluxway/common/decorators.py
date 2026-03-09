@@ -23,46 +23,55 @@ from contextlib import contextmanager
 import threading
 import logging
 
+from fluxway.common.utils.tree import tree_flatten_type, _is_fluxway_data_type
+
 logger = logging.getLogger(__name__)
 
-# Thread-local storage for operator context
-_operator_context = threading.local()
+
+class PicklableThreadLocal(threading.local):
+    """A threading.local that can be pickled (state is lost)."""
+
+    def __getstate__(self):
+        return {}
+
+    def __setstate__(self, state):
+        pass
+
+
+# Thread-local storage for operator context and instances
+_operator_context = PicklableThreadLocal()
+_instance_storage = PicklableThreadLocal()
 
 
 @contextmanager
-def operator_context(static_args: Dict[str, Any], rank: int, world_size: int):
+def operator_context(
+    static_args: Dict[str, Any],
+    rank: int,
+    world_size: int,
+    operator_ctx: Optional[Any] = None,
+):
     """Context manager to inject operator runtime context into current thread."""
     prev_static = getattr(_operator_context, "static_args", {})
     prev_rank = getattr(_operator_context, "rank", 0)
     prev_world = getattr(_operator_context, "world_size", 1)
+    prev_operator_ctx = getattr(_operator_context, "operator_ctx", None)
 
     _operator_context.static_args = static_args
     _operator_context.rank = rank
     _operator_context.world_size = world_size
+    _operator_context.operator_ctx = operator_ctx
     try:
         yield _operator_context
     finally:
         _operator_context.static_args = prev_static
         _operator_context.rank = prev_rank
         _operator_context.world_size = prev_world
+        _operator_context.operator_ctx = prev_operator_ctx
 
 
 def get_current_context():
     """Access current operator thread context."""
     return _operator_context
-
-
-def _is_fluxway_data_type(tp: Any) -> bool:
-    """Check if a type is marked with @data_type."""
-    if tp is None:
-        return False
-    # Handle Optional[T] or Union
-    origin = getattr(tp, "__origin__", None)
-    if origin is Union:
-        args = getattr(tp, "__args__", [])
-        return any(_is_fluxway_data_type(arg) for arg in args if arg is not type(None))
-
-    return getattr(tp, "is_fluxway_data", lambda: False)()
 
 
 def _get_fluxway_streams(tp: Any, prefix: str = "") -> Tuple[List[str], List[str]]:
@@ -251,10 +260,11 @@ def _create_operator_wrapper(
 
     sig = inspect.signature(func)
 
-    # --- 1. Automated Inference from Type Annotations ---
+    # --- Automated Inference from Type Annotations ---
     all_data_fields = []
     all_control_fields = []
     input_param_map = {}
+    input_treedefs = {}
 
     # Identify data-plane parameters to determine prefixing mode
     data_params = []
@@ -314,6 +324,10 @@ def _create_operator_wrapper(
             c_f_final = []
             # primitive tensors map to themselves
             input_param_map[p_name] = [p_name]
+            input_treedefs[p_name] = None  # Primitive is None or scalar treedef
+
+        if _is_fluxway_data_type(tp):
+            input_treedefs[p_name] = tree_flatten_type(tp)
 
         for df in d_f_final:
             if df not in all_data_fields:
@@ -340,7 +354,9 @@ def _create_operator_wrapper(
         static_argument if static_argument is not None else []
     )
 
-    # --- 2. Sharding Resolution (Pytree-like recursive mapping) ---
+    # --- Sharding Resolution (Pytree-like recursive mapping) ---
+    meta_output_treedef = None
+
     def _resolve_recursive_sharding(
         sharding_val, data_fields, control_fields, prefix=""
     ):
@@ -442,17 +458,47 @@ def _create_operator_wrapper(
 
     if output_sharding:
         if _is_fluxway_data_type(return_tp):
-            # If output_sharding IS a single spec, apply to all data fields
+            # Handle single spec applied to all fields
             if "type" in output_sharding and "axis" in output_sharding:
                 for df in out_data_fields:
                     resolved_output_sharding[df] = output_sharding
             else:
-                resolved_output_sharding = _resolve_recursive_sharding(
-                    output_sharding, out_data_fields, out_control_fields
-                )
+                # Canonicalize aliased keys ("return" or class name)
+                return_type_name = return_tp.__name__.lower()
+                remaining_sharding = {}
+
+                for k, v in output_sharding.items():
+                    if k.lower() in ("return", return_type_name):
+                        # Root alias: apply its value recursively to the entire return object
+                        resolved_output_sharding.update(
+                            _resolve_recursive_sharding(
+                                v, out_data_fields, out_control_fields
+                            )
+                        )
+                    else:
+                        remaining_sharding[k] = v
+
+                # 3. Resolve remaining explicit field mappings
+                if remaining_sharding:
+                    resolved_output_sharding.update(
+                        _resolve_recursive_sharding(
+                            remaining_sharding, out_data_fields, out_control_fields
+                        )
+                    )
         else:
-            # Simple return types (Dict[str, Tensor] or single Tensor)
+            # For non-data_type returns (Dict or single Tensor), the output_sharding
+            # serves as the ground-truth contract for TUUID ordering.
             resolved_output_sharding = output_sharding
+
+            if isinstance(output_sharding, dict):
+                # If a sharding map is provided, the return value MUST be a dictionary
+                # matching these keys. We generate a template to enforce this order.
+                sharding_keys = list(output_sharding)
+                meta_output_treedef = (
+                    "dict",
+                    sharding_keys,
+                    [None] * len(sharding_keys),
+                )
     output_sharding = resolved_output_sharding
 
     output_sharding = resolved_output_sharding
@@ -466,7 +512,7 @@ def _create_operator_wrapper(
                 f"Fix: Use a @data_type with exactly one field for streaming/periodic processing."
             )
 
-    # --- 3. Build Metadata ---
+    # --- Build Metadata ---
     input_sharding_processed = {}
     if input_sharding:
         for k, v in input_sharding.items():
@@ -497,11 +543,11 @@ def _create_operator_wrapper(
     ):
         out_data, out_control = _get_fluxway_streams(return_tp)
         output_args = {
-            ArgumentType.TENSOR.value: out_data,
-            ArgumentType.STATE.value: out_control,
+            ArgumentType.DATA.value: out_data,
+            ArgumentType.CONTROL.value: out_control,
         }
     elif output_sharding:
-        output_args = {ArgumentType.TENSOR.value: list(output_sharding.keys())}
+        output_args = {ArgumentType.DATA.value: list(output_sharding.keys())}
 
     barrier_config = (
         PeriodicBarrierConfig(n=periodic_barrier)
@@ -514,8 +560,8 @@ def _create_operator_wrapper(
         is_source=is_source,
         max_inflight_steps=max_inflight_steps,
         input_arguments={
-            ArgumentType.STATE.value: final_states,
-            ArgumentType.TENSOR.value: final_tensors,
+            ArgumentType.CONTROL.value: final_states,
+            ArgumentType.DATA.value: final_tensors,
             ArgumentType.STATIC.value: list(final_statics),
         },
         output_arguments=output_args,
@@ -523,40 +569,49 @@ def _create_operator_wrapper(
         output_sharding=output_sharding_processed,
         input_param_map=input_param_map,
         output_param_map=output_param_map,
+        input_treedefs=input_treedefs,
+        output_treedef=meta_output_treedef
+        if meta_output_treedef
+        else (
+            tree_flatten_type(return_tp) if _is_fluxway_data_type(return_tp) else None
+        ),
         barrier_config=barrier_config,
     )
-
-    # --- 4. Wrapper Generation ---
-    import threading
-
-    _local = threading.local()
 
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         # Get or create thread-local instance
-        if not hasattr(_local, "instance"):
-            # We need the class to instantiate it
-            cls = getattr(wrapper, "_flux_spmd_class", None)
-            if not cls:
-                # Fallback: try to find it from qualname
-                qualname_parts = func.__qualname__.split(".")
-                if len(qualname_parts) >= 2:
-                    module = inspect.getmodule(func)
-                    cls = getattr(module, qualname_parts[-2], None)
+        if not hasattr(_instance_storage, "instances"):
+            _instance_storage.instances = {}
 
-            if not cls:
-                raise RuntimeError(
-                    f"Fluxway Execution Error: Cannot instantiate class for operator '{name}'."
-                )
-            _local.instance = cls()
+        # We need the class to instantiate it
+        cls = getattr(wrapper, "_flux_spmd_class", None)
+        if not cls:
+            # Fallback: try to find it from qualname
+            qualname_parts = func.__qualname__.split(".")
+            if len(qualname_parts) >= 2:
+                module = inspect.getmodule(func)
+                cls = getattr(module, qualname_parts[-2], None)
+
+        if not cls:
+            raise RuntimeError(
+                f"Fluxway Execution Error: Cannot instantiate class for operator '{name}'."
+            )
+
+        instance_key = (id(cls), name)
+        if instance_key not in _instance_storage.instances:
+            _instance_storage.instances[instance_key] = cls()
+
+        instance = _instance_storage.instances[instance_key]
 
         # Inject runtime context into the class instance
         ctx = get_current_context()
-        _local.instance.static_args = ctx.static_args
-        _local.instance.rank = ctx.rank
-        _local.instance.world_size = ctx.world_size
+        instance.static_args = getattr(ctx, "static_args", {})
+        instance.rank = getattr(ctx, "rank", 0)
+        instance.world_size = getattr(ctx, "world_size", 1)
+        instance.ctx = getattr(ctx, "operator_ctx", None)
 
-        return func(_local.instance, *args, **kwargs)
+        return func(instance, *args, **kwargs)
 
     def set_spmd_class(cls):
         wrapper._flux_spmd_class = cls
@@ -622,7 +677,6 @@ def spmd(
     resource: Optional[Dict[str, Any]] = None,
     mesh_axis_names: Optional[Tuple[str, ...]] = None,
     mesh_axis_shapes: Optional[Tuple[int, ...]] = None,
-    use_global_step_indexing: bool = False,
 ):
     """
     Configure a class for SPMD distributed execution.
@@ -647,7 +701,6 @@ def spmd(
     def decorator(cls: Type[T]) -> Type[T]:
         cls._resource = res_spec
         cls._mesh = mesh
-        cls._use_global_step_indexing = use_global_step_indexing
 
         # Link operators
         for attr_name in dir(cls):
@@ -674,14 +727,48 @@ def spmd(
                     operators[meta.name] = attr
                     metas[meta.name] = copy.deepcopy(meta)
 
-            return SPMDConfig(
-                mesh=c._mesh,
-                use_global_step_indexing=c._use_global_step_indexing,
-                operators=operators,
-                operator_metas=metas,
-            )
+            return SPMDConfig(mesh=c._mesh, operators=operators, operator_metas=metas)
 
         cls.get_spmd_config = classmethod(get_spmd_config)
+        return cls
+
+    return decorator
+
+
+def spmd_source(
+    resource: Optional[Dict[str, Any]] = None,
+    mesh_axis_names: Optional[Tuple[str, ...]] = None,
+    mesh_axis_shapes: Optional[Tuple[int, ...]] = None,
+    interleaved: bool = False,
+    interleave_unit_size: int = 1,
+):
+    """
+    Configure a class as an SPMD source.
+    Operators defined within will automatically inherit source and interleaving traits.
+    """
+    # Reuse the core logic of @spmd
+    base_decorator = spmd(
+        resource=resource,
+        mesh_axis_names=mesh_axis_names,
+        mesh_axis_shapes=mesh_axis_shapes,
+    )
+
+    def decorator(cls):
+        # Apply the base @spmd to setup mesh and resource
+        cls = base_decorator(cls)
+
+        # Override the get_spmd_config to stamp Source properties
+        orig_get_config = cls.get_spmd_config
+
+        def new_get_config(c):
+            config = orig_get_config()
+            for meta in config.operator_metas.values():
+                meta.is_source = True
+                meta.is_interleaved = interleaved
+                meta.interleave_unit_size = interleave_unit_size
+            return config
+
+        cls.get_spmd_config = classmethod(new_get_config)
         return cls
 
     return decorator

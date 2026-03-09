@@ -76,7 +76,7 @@ class SPMDHandle:
         if self._driver_handle is None:
             raise RuntimeError(f"Driver handle not set for SPMD {self.spmd_id}")
 
-        method_fn = getattr(self._driver_handle, method, None)
+        method_fn: Any = getattr(self._driver_handle, method, None)
         if method_fn is None:
             raise AttributeError(f"Driver does not have method: {method}")
 
@@ -166,6 +166,9 @@ class SPMDManager:
             # Import driver here to avoid circular imports
             from ...spmd.driver import SPMDDriver
 
+            # Case to Any to satisfy static type checkers for Ray-specific calls (.remote, .options)
+            spmd_driver_cls: Any = SPMDDriver
+
             # Build graph topology for this SPMD (self-loops are already filtered)
             graph_topology = {
                 "predecessors": self.get_predecessors(spmd_id),
@@ -176,7 +179,7 @@ class SPMDManager:
             driver_name = f"spmd_driver_{spmd_id}"
 
             if placement_group is not None:
-                driver = SPMDDriver.options(
+                driver = spmd_driver_cls.options(
                     placement_group=placement_group,
                     placement_group_bundle_index=driver_bundle_index,
                     name=driver_name,
@@ -191,7 +194,7 @@ class SPMDManager:
                 )
             else:
                 # No placement group - for testing or mock scenarios
-                driver = SPMDDriver.remote(
+                driver = spmd_driver_cls.remote(
                     spmd_id=spmd_id,
                     config=config,
                     placement_group=None,
@@ -275,7 +278,7 @@ class SPMDManager:
         """Get all registered SPMD IDs."""
         return list(self._spmd_handles.keys())
 
-    def evict_spmd(self, spmd_id: str) -> Optional[str]:
+    async def evict_spmd(self, spmd_id: str) -> Optional[str]:
         """
         Evict an SPMD and return checkpoint ID.
 
@@ -288,10 +291,10 @@ class SPMDManager:
         TODO: Implement checkpoint saving
         """
         logger.warning(f"evict_spmd called for {spmd_id} - checkpoint not implemented")
-        self.stop_spmd(spmd_id, save_checkpoint=True)
+        await self.stop_spmd(spmd_id, save_checkpoint=True)
         return None
 
-    def restore_spmd(
+    async def restore_spmd(
         self,
         spmd_id: str,
         config: SPMDConfig,
@@ -319,7 +322,7 @@ class SPMDManager:
         logger.warning(
             f"restore_spmd called for {spmd_id} - checkpoint not implemented"
         )
-        return self.start_spmd(
+        return await self.start_spmd(
             spmd_id=spmd_id,
             config=config,
             placement_group=placement_group,
@@ -334,19 +337,13 @@ class SPMDManager:
         Args:
             topology: Mapping of SPMD ID to downstream SPMD IDs
         """
-        # Filter out self-loops when building topology
-        self._topology = {}
-        for source, targets in topology.items():
-            # Filter out self-loops (where target == source)
-            self._topology[source] = [target for target in targets if target != source]
+        # Establish topology connections
+        self._topology = {source: list(targets) for source, targets in topology.items()}
 
-        # Build reverse topology (also filtering self-loops)
+        # Build reverse topology
         self._reverse_topology = {spmd_id: [] for spmd_id in topology}
         for source, targets in topology.items():
             for target in targets:
-                # Skip self-loops
-                if target == source:
-                    continue
                 if target not in self._reverse_topology:
                     self._reverse_topology[target] = []
                 if source not in self._reverse_topology[target]:
@@ -369,22 +366,14 @@ class SPMDManager:
     def get_predecessors(self, spmd_id: str) -> List[str]:
         """
         Get predecessor SPMD IDs.
-
-        Returns list excluding self-loops (where predecessor == spmd_id).
         """
-        predecessors = self._reverse_topology.get(spmd_id, [])
-        # Filter out self-loops as a safety measure
-        return [p for p in predecessors if p != spmd_id]
+        return self._reverse_topology.get(spmd_id, [])
 
     def get_successors(self, spmd_id: str) -> List[str]:
         """
         Get successor SPMD IDs.
-
-        Returns list excluding self-loops (where successor == spmd_id).
         """
-        successors = self._topology.get(spmd_id, [])
-        # Filter out self-loops as a safety measure
-        return [s for s in successors if s != spmd_id]
+        return self._topology.get(spmd_id, [])
 
     async def broadcast_to_all_drivers(
         self, method: str, *args, **kwargs
@@ -415,7 +404,7 @@ class SPMDManager:
             spmd_ids = list(refs.keys())
             obj_refs = [refs[s] for s in spmd_ids]
             gathered = await asyncio.gather(*obj_refs, return_exceptions=True)
-            for spmd_id, result in zip(spmd_ids, gathered, strict=False):
+            for spmd_id, result in zip(spmd_ids, gathered, strict=True):  # type: ignore
                 results[spmd_id] = result
 
         return results

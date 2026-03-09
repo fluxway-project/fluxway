@@ -12,9 +12,7 @@ Covers:
 import sys
 import os
 import asyncio
-import ast
-import types
-from pathlib import Path
+from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
@@ -28,6 +26,7 @@ from fluxway.common.types.configs import SPMDConfig, OperatorMeta, ArgumentType
 from fluxway.common.types.tensor import TransportTensor
 from fluxway.common.mesh import DeviceMesh
 from fluxway.transport.communication import TransportReceiver
+from fluxway.common.types.sharding import ShardingSpec, PartitionSpec
 
 
 # ---------------------------------------------------------------------------
@@ -332,7 +331,9 @@ def test_transport_receiver_zero_copy_per_sender():
 
 def test_step_barrier_fires_on_completion():
     """Fires when all tensor shards AND all states have arrived."""
-    b = StepBarrier(expected_tensors={"emb": 2, "attn": 1}, expected_states=["lr"])
+    b = StepBarrier(
+        "test", 0, expected_tensors={"emb": 2, "attn": 1}, expected_states=["lr"]
+    )
     assert not b.is_ready()
     b.tensor_arrived("emb")
     b.tensor_arrived("emb")
@@ -344,7 +345,7 @@ def test_step_barrier_fires_on_completion():
 
 def test_step_barrier_partial_not_ready():
     """Partial arrivals do not fire the barrier."""
-    b = StepBarrier(expected_tensors={"x": 3}, expected_states=[])
+    b = StepBarrier("test", 0, expected_tensors={"x": 3}, expected_states=[])
     b.tensor_arrived("x")
     b.tensor_arrived("x")
     assert not b.is_ready()
@@ -352,13 +353,13 @@ def test_step_barrier_partial_not_ready():
 
 def test_step_barrier_no_expectations_fires_immediately():
     """Empty expectations → already ready."""
-    b = StepBarrier(expected_tensors={}, expected_states=[])
+    b = StepBarrier("test", 0, expected_tensors={}, expected_states=[])
     assert b.is_ready()
 
 
 def test_step_barrier_unknown_name_ignored():
     """Arrivals for unexpected names are silently ignored."""
-    b = StepBarrier(expected_tensors={"x": 1}, expected_states=[])
+    b = StepBarrier("test", 0, expected_tensors={"x": 1}, expected_states=[])
     assert b.tensor_arrived("unknown_tensor") is False
     assert not b.is_ready()
     b.tensor_arrived("x")
@@ -369,7 +370,9 @@ def test_step_barrier_unknown_name_ignored():
 async def test_step_barrier_periodic():
     """Verify StepBarrier in periodic mode fires for every arrival."""
     # Eager op expects 1 shard for 'x'
-    b = StepBarrier(expected_tensors={"x": 1}, expected_states=[], periodic=True)
+    b = StepBarrier(
+        "test", 0, expected_tensors={"x": 1}, expected_states=[], periodic=True
+    )
 
     # First arrival
     fired = b.tensor_arrived("x")
@@ -382,7 +385,7 @@ async def test_step_barrier_periodic():
 
 @pytest.mark.asyncio
 async def test_step_barrier_async_wait():
-    b = StepBarrier(expected_tensors={"x": 1}, expected_states=["s"])
+    b = StepBarrier("test", 0, expected_tensors={"x": 1}, expected_states=["s"])
 
     async def arrive():
         await asyncio.sleep(0)
@@ -410,33 +413,31 @@ async def test_mailbox_declare_step_and_on_ready():
         fired.append((op, step))
 
     mb.set_ready_callback(cb)
-    mb.declare_step("compute", step=0, expected_tensors={"x": 2}, expected_states=[])
+    mb.declare_step("compute", step=0, expected_tensors={101: 2}, expected_states=[])
 
     tensor = TransportTensor.from_tensor(np.zeros(4))
     await mb.deposit_shards(
         "compute",
-        ["x"],
+        [101],
         0,
         "sender0",
         rank=0,
+        sender_world_size=4,
         payload_groups=[[tensor.flat_values]],
         counts_groups=[[4]],
-        is_ragged=[False],
-        has_spatial_indices=[False],
-        has_origin_indices=[False],
+        meta_tensor_state_list=[0],
     )
     assert not fired
     await mb.deposit_shards(
         "compute",
-        ["x"],
+        [101],
         0,
         "sender1",
         rank=1,
+        sender_world_size=4,
         payload_groups=[[tensor.flat_values]],
         counts_groups=[[4]],
-        is_ragged=[False],
-        has_spatial_indices=[False],
-        has_origin_indices=[False],
+        meta_tensor_state_list=[0],
     )
     assert fired == [("compute", 0)]
 
@@ -446,7 +447,7 @@ async def test_mailbox_wait_step_ready():
     """wait_step_ready() coroutine resolves when the step is done."""
     mb = WorkerMailbox()
     mb.declare_step(
-        "compute", step=5, expected_tensors={"a": 1}, expected_states=["cfg"]
+        "compute", step=5, expected_tensors={201: 1}, expected_states=["cfg"]
     )
 
     async def feed():
@@ -454,15 +455,14 @@ async def test_mailbox_wait_step_ready():
         tensor = TransportTensor.from_tensor(np.ones(3))
         await mb.deposit_shards(
             "compute",
-            ["a"],
+            [201],
             5,
             "sender0",
             rank=0,
+            sender_world_size=4,
             payload_groups=[[tensor.flat_values]],
             counts_groups=[[3]],
-            is_ragged=[False],
-            has_spatial_indices=[False],
-            has_origin_indices=[False],
+            meta_tensor_state_list=[0],
         )
         await asyncio.sleep(0)
         await mb.deposit_states("compute", 5, names=["cfg"], values=[{"lr": 0.1}])
@@ -512,7 +512,7 @@ async def test_mailbox_periodic_trigger():
     mb.declare_step(
         "periodic_op",
         step=0,
-        expected_tensors={"x": 1},
+        expected_tensors={301: 1},
         expected_states=[],
         barrier_config=PeriodicBarrierConfig(n=1),
     )
@@ -521,38 +521,36 @@ async def test_mailbox_periodic_trigger():
     tensor = TransportTensor.from_tensor(np.array([1.0]))
     await mb.deposit_shards(
         "periodic_op",
-        ["x"],
+        [301],
         step=100,
         sender_id="s0",
         rank=0,
+        sender_world_size=4,
         payload_groups=[[tensor.flat_values]],
         counts_groups=[[1]],
-        is_ragged=[False],
-        has_spatial_indices=[False],
-        has_origin_indices=[False],
+        meta_tensor_state_list=[0],
     )
 
     # Deposit second shard (sender says step 101)
     await mb.deposit_shards(
         "periodic_op",
-        ["x"],
+        [301],
         step=101,
         sender_id="s1",
         rank=1,
+        sender_world_size=4,
         payload_groups=[[tensor.flat_values]],
         counts_groups=[[1]],
-        is_ragged=[False],
-        has_spatial_indices=[False],
-        has_origin_indices=[False],
+        meta_tensor_state_list=[0],
     )
 
     # Should have two ready events with sequential virtual steps 0 and 1
     assert ready_steps == [("periodic_op", 0), ("periodic_op", 1)]
 
     # Verify data storage
-    shards0 = await mb.get_tensor_shards("periodic_op", "x", 0)
+    shards0 = await mb.get_tensor_shards("periodic_op", 301, 0)
     assert ("s0", 0) in shards0
-    shards1 = await mb.get_tensor_shards("periodic_op", "x", 1)
+    shards1 = await mb.get_tensor_shards("periodic_op", 301, 1)
     assert ("s1", 1) in shards1
 
 
@@ -630,17 +628,16 @@ async def test_mailbox_tensor_put_get():
     tensor = TransportTensor.from_tensor(d)
     await mb.deposit_shards(
         "compute",
-        ["x"],
+        [401],
         0,
         "sender0",
         rank=0,
+        sender_world_size=4,
         payload_groups=[[tensor.flat_values]],
         counts_groups=[[2]],
-        is_ragged=[False],
-        has_spatial_indices=[False],
-        has_origin_indices=[False],
+        meta_tensor_state_list=[0],
     )
-    shards = await mb.get_tensor_shards("compute", "x", 0)
+    shards = await mb.get_tensor_shards("compute", 401, 0)
     assert ("sender0", 0) in shards
     np.testing.assert_array_equal(shards[("sender0", 0)][0].flat_values, d)
 
@@ -651,30 +648,28 @@ async def test_mailbox_tensor_multi_rank():
     tensor_zeros = TransportTensor.from_tensor(np.zeros(4))
     await mb.deposit_shards(
         "compute",
-        ["e"],
+        [501],
         1,
         "sender0",
         rank=0,
+        sender_world_size=4,
         payload_groups=[[tensor_zeros.flat_values]],
         counts_groups=[[4]],
-        is_ragged=[False],
-        has_spatial_indices=[False],
-        has_origin_indices=[False],
+        meta_tensor_state_list=[0],
     )
     tensor_ones = TransportTensor.from_tensor(np.ones(4))
     await mb.deposit_shards(
         "compute",
-        ["e"],
+        [501],
         1,
         "sender1",
         rank=1,
+        sender_world_size=4,
         payload_groups=[[tensor_ones.flat_values]],
         counts_groups=[[4]],
-        is_ragged=[False],
-        has_spatial_indices=[False],
-        has_origin_indices=[False],
+        meta_tensor_state_list=[0],
     )
-    assert await mb.get_tensor_shard_count("compute", "e", 1) == 2
+    assert await mb.get_tensor_shard_count("compute", 501, 1) == 2
 
 
 @pytest.mark.asyncio
@@ -682,30 +677,28 @@ async def test_mailbox_op_isolation():
     mb = WorkerMailbox()
     await mb.deposit_shards(
         "compute",
-        ["g"],
+        [601],
         0,
         "sender0",
         rank=0,
+        sender_world_size=4,
         payload_groups=[[np.array([1.0])]],
         counts_groups=[[1]],
-        is_ragged=[False],
-        has_spatial_indices=[False],
-        has_origin_indices=[False],
+        meta_tensor_state_list=[0],
     )
     await mb.deposit_shards(
         "optimize",
-        ["g"],
+        [601],
         0,
         "sender0",
         rank=0,
+        sender_world_size=4,
         payload_groups=[[np.array([2.0])]],
         counts_groups=[[1]],
-        is_ragged=[False],
-        has_spatial_indices=[False],
-        has_origin_indices=[False],
+        meta_tensor_state_list=[0],
     )
-    fwd = await mb.get_tensor_shards("compute", "g", 0)
-    bwd = await mb.get_tensor_shards("optimize", "g", 0)
+    fwd = await mb.get_tensor_shards("compute", 601, 0)
+    bwd = await mb.get_tensor_shards("optimize", 601, 0)
     np.testing.assert_array_equal(fwd[("sender0", 0)][0].flat_values, [1.0])
     np.testing.assert_array_equal(bwd[("sender0", 0)][0].flat_values, [2.0])
 
@@ -720,21 +713,20 @@ async def test_mailbox_zero_copy_writes_into_buffer():
     mb = WorkerMailbox()
     buf = np.zeros((4, 2), dtype=np.float32)
     await mb.register_zero_copy_slot(
-        "compute", "emb", step=0, target_buffers=[buf], expect_offsets={0: 0}
+        "compute", 701, step=0, target_buffers=[buf], expect_offsets={0: 0}
     )
     await mb.deposit_shards(
         "compute",
-        ["emb"],
+        [701],
         step=0,
         sender_id="s0",
         rank=0,
+        sender_world_size=4,
         payload_groups=[[np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)]],
         counts_groups=[[2]],
-        is_ragged=[False],
-        has_spatial_indices=[False],
-        has_origin_indices=[False],
+        meta_tensor_state_list=[0],
     )
-    buffers = await mb.get_zero_copy_buffers("compute", "emb", step=0)
+    buffers = await mb.get_zero_copy_buffers("compute", 701, step=0)
     assert buffers is not None
     np.testing.assert_array_equal(buffers[0][:2], [[1.0, 2.0], [3.0, 4.0]])
 
@@ -752,15 +744,14 @@ async def test_mailbox_clear_step():
     tensor = TransportTensor.from_tensor(np.zeros(2))
     await mb.deposit_shards(
         "compute",
-        ["t"],
+        [801],
         1,
         "sender0",
-        rank=0,
+        0,
+        4,
         payload_groups=[[tensor.flat_values]],
         counts_groups=[[2]],
-        is_ragged=[False],
-        has_spatial_indices=[False],
-        has_origin_indices=[False],
+        meta_tensor_state_list=[0],
     )
     mb.declare_step("compute", 1, {}, [])
 
@@ -768,7 +759,7 @@ async def test_mailbox_clear_step():
 
     assert not await mb.has_state("compute", "s", 1)
     assert await mb.has_state("compute", "s", 2)
-    assert await mb.get_tensor_shard_count("compute", "t", 1) == 0
+    assert await mb.get_tensor_shard_count("compute", 801, 1) == 0
     assert not mb.is_step_ready("compute", 1)  # barrier also cleared
 
 
@@ -780,27 +771,25 @@ async def test_mailbox_get_size():
     tensor = TransportTensor.from_tensor(np.zeros(2))
     await mb.deposit_shards(
         "compute",
-        ["t"],
+        [901],
         0,
         "s0",
-        rank=0,
+        0,
+        1,
         payload_groups=[[tensor.flat_values]],
         counts_groups=[[2]],
-        is_ragged=[False],
-        has_spatial_indices=[False],
-        has_origin_indices=[False],
+        meta_tensor_state_list=[0],
     )
     await mb.deposit_shards(
         "compute",
-        ["t"],
+        [901],
         0,
         "s1",
-        rank=1,
+        1,
+        1,
         payload_groups=[[tensor.flat_values]],
         counts_groups=[[2]],
-        is_ragged=[False],
-        has_spatial_indices=[False],
-        has_origin_indices=[False],
+        meta_tensor_state_list=[0],
     )
     assert await mb.get_size() == 3
 
@@ -811,7 +800,7 @@ async def test_mailbox_get_size():
 
 
 def test_layout_mesh():
-    mesh = DeviceMesh((4, 2), axis_names=("data", "model"))
+    mesh = DeviceMesh(axis_names=("data", "model"), device_shape=(4, 2))
     assert mesh.size == 8
     assert mesh.get_coordinate(5) == (2, 1)
     assert mesh.get_rank((2, 1)) == 5
@@ -819,20 +808,20 @@ def test_layout_mesh():
 
 @pytest.mark.asyncio
 async def test_spmd_config_with_mesh():
-    mesh = DeviceMesh((4, 2), axis_names=("data", "model"))
+    mesh = DeviceMesh(axis_names=("data", "model"), device_shape=(4, 2))
     config = _make_config(mesh, "compute")
-    assert config.has_mesh and config.get_mesh_size() == 8
+    assert config.num_workers == 8
 
 
 def test_operator_manager_mesh():
-    mesh = DeviceMesh((2,), axis_names=("data",))
+    mesh = DeviceMesh(axis_names=("data",), device_shape=(2,))
     config = _make_config(mesh, "compute", "optimize", "apply")
     assert OperatorManager(config, rank=0)._mesh is mesh
 
 
 @pytest.mark.asyncio
 async def test_spmd_worker_init():
-    mesh = DeviceMesh((2,), axis_names=("data",))
+    mesh = DeviceMesh(axis_names=("data",), device_shape=(2,))
     config = _make_config(mesh, "compute", "optimize", "apply")
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
     cls = cls.modified_class if cls else SPMDWorker
@@ -843,7 +832,7 @@ async def test_spmd_worker_init():
 
 @pytest.mark.asyncio
 async def test_receive_multi_tensor_data():
-    mesh = DeviceMesh((2,), axis_names=("data",))
+    mesh = DeviceMesh(axis_names=("data",), device_shape=(2,))
     config = _make_config(mesh, "compute")
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
     cls = cls.modified_class if cls else SPMDWorker
@@ -851,25 +840,25 @@ async def test_receive_multi_tensor_data():
 
     # Declare the step first (workers normally do this via _start_step)
     worker._mailbox.declare_step(
-        "compute", step=1, expected_tensors={"multi": 1}, expected_states=[]
+        "compute", step=1, expected_tensors={999: 1}, expected_states=[]
     )
+    # Inject TUUID dispatch
+    worker._op_manager.get_operators_for_tuuid = MagicMock(return_value=["compute"])
+    worker._op_manager.get_sender_world_size = MagicMock(return_value=2)
 
     t1 = TransportTensor.from_tensor(np.array([1, 2]))
     t2 = TransportTensor.from_tensor(np.array([3, 4]))
 
     await worker.receive_shards(
-        "compute",
-        ["multi"],
+        tuuids=[999],
         step=1,
         sender_id="s0",
         sender_rank=0,
         payload_groups=[[t1.flat_values, t2.flat_values]],
         counts_groups=[[2, 2]],
-        is_ragged=[False],
-        has_spatial_indices=[False],
-        has_origin_indices=[False],
+        meta_tensor_state_list=[0],
     )
-    shards = await worker._mailbox.get_tensor_shards("compute", "multi", 1)
+    shards = await worker._mailbox.get_tensor_shards("compute", 999, 1)
     received = shards[("s0", 0)]
     assert isinstance(received, list)
     assert len(received) == 2
@@ -886,7 +875,7 @@ async def test_mailbox_zero_copy_ragged():
 
     await mb.register_zero_copy_slot(
         "compute",
-        "ragged",
+        1001,
         step=0,
         target_buffers=[data_buf, len_buf],
         expect_offsets={0: [0, 0]},
@@ -899,19 +888,18 @@ async def test_mailbox_zero_copy_ragged():
 
     await mb.deposit_shards(
         "compute",
-        ["ragged"],
-        step=0,
-        sender_id="s0",
-        rank=0,
+        [1001],
+        0,
+        "s0",
+        0,
+        1,
         payload_groups=[[tt.flat_values, np.array([3, 2], dtype=np.int32)]],
         counts_groups=[[5, 2]],
-        is_ragged=[True],
-        has_spatial_indices=[False],
-        has_origin_indices=[False],
+        meta_tensor_state_list=[1],  # meta_state 1 for ragged
     )
 
     # Verify buffers from mailbox (handles JAX-style non-inplace updates)
-    buffers = await mb.get_zero_copy_buffers("compute", "ragged", step=0)
+    buffers = await mb.get_zero_copy_buffers("compute", 1001, step=0)
     assert buffers is not None
     # Verify data buffer
     np.testing.assert_array_equal(buffers[0][:5], flat_values)
@@ -922,11 +910,11 @@ async def test_mailbox_zero_copy_ragged():
 def test_replicate_operator_manager():
     from fluxway.common.types.configs import OperatorMeta
 
-    mesh = DeviceMesh((2, 2), axis_names=("x", "y"))
+    mesh = DeviceMesh(axis_names=("x", "y"), device_shape=(2, 2))
 
     meta = OperatorMeta(
         name="test_op",
-        input_arguments={ArgumentType.TENSOR.value: ["a"]},
+        input_arguments={ArgumentType.DATA.value: ["a"]},
         output_arguments={},
         input_sharding={"a": {"type": "replicated"}},
         output_sharding={},
@@ -937,6 +925,8 @@ def test_replicate_operator_manager():
 
     dummy_op._flux_operator_meta = meta
 
+    from fluxway.common.types.configs import SPMDTopology, SPMDTopologyInfo
+
     # Register with the operator name matching the meta name: "test_op"
     config = SPMDConfig(
         spmd_id="test",
@@ -944,21 +934,33 @@ def test_replicate_operator_manager():
         mesh=mesh,
         operators={"test_op": dummy_op},
         operator_metas={"test_op": meta},
+        topology={
+            "test_op": SPMDTopology(
+                predecessors={
+                    "test": SPMDTopologyInfo(
+                        spmd_id="test",
+                        tuuid_sharding={1001: {"type": "replicated"}},
+                        tuuid_map={"a": 1001},
+                    )
+                }
+            )
+        },
     )
 
     manager = OperatorManager(config, rank=0)
 
     # Query by the registered op name
     spec = manager.get_input_sharding("test_op")
-    assert "a" in spec
-    assert spec["a"].replica_size == 4
+    assert 1001 in spec
+    assert spec[1001].replica_size == 4
 
 
 @pytest.mark.asyncio
 async def test_send_output_none_mesh():
     # Test fallback to default mesh when config.mesh is None
     # This specifically verifies the fix for ShardingSpec.chunk(None, ...)
-    config = _make_config(None, "compute")  # mesh=None
+    # Use a dummy mesh for config to satisfy OperatorManager initialization
+    config = _make_config(DeviceMesh(axis_names=("dp",), device_shape=(1,)), "compute")
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
     cls = cls.modified_class if cls else SPMDWorker
     worker = cls(config, rank=0)
@@ -967,18 +969,27 @@ async def test_send_output_none_mesh():
     from unittest.mock import MagicMock
 
     worker._op_manager = MagicMock()
-    # Mock sharding for a tensor named 't1'
+    test_mesh = DeviceMesh(axis_names=("data",), device_shape=(1,))
+    def_spec = ShardingSpec.chunk(test_mesh, PartitionSpec())
+
+    # Mock sharding for a tensor with TUUID 123
     # We leave it empty to trigger the default source_spec chunk call
-    worker._op_manager.get_output_sharding.return_value = {"t1": None}
+    worker._op_manager.get_output_sharding.return_value = {123: def_spec}
+    worker._op_manager.get_output_tuuids.return_value = [123]
     worker._op_manager.get_successor_ids.return_value = ["succ"]
 
     succ_info = MagicMock()
     succ_info.is_self_loop = False
-    succ_info.target_op = "compute"
-    succ_info.tensor_sharding = {"t1": None}  # Trigger default target_spec
-    succ_info.tensor_map = None
-    succ_info.mesh = None
+    succ_info.tuuid_sharding = {123: def_spec}
+    succ_info.tuuid_map = None
+    succ_info.mesh = test_mesh
+    succ_info.is_interleaved = False
     worker._op_manager.get_successor_info.return_value = succ_info
+
+    # Mock operator metadata for TUUID lookup
+    op_meta = MagicMock()
+    op_meta.output_uuids = [123]
+    worker._op_manager.get_operator_meta.return_value = op_meta
 
     # Mock successor handlers
     handler = MagicMock()
@@ -987,106 +998,9 @@ async def test_send_output_none_mesh():
     worker._successor_handlers = {"succ": {0: DataPlaneCallable(handler)}}
 
     # Call _send_output
-    data = {"t1": np.array([1, 2, 3])}
-    # This should not raise "Argument Any | None is not assignable to parameter mesh"
-    # because we now provide a fallback DeviceMesh.
-    await worker._send_output("compute", 0, data)
+    data = [np.array([1, 2, 3])]  # Flattened results
+    # This should not raise Errors
+    await worker._send_output("compute", data, exec_step=0)
 
     # Verify distributor.distribute was called (indirectly by checking handler)
     assert handler.receive_shards.remote.called
-
-
-# ===========================================================================
-# Step Regeneration / Remapping Logic
-# ===========================================================================
-
-
-def _load_compute_output_step():
-    """
-    Load compute_output_step without importing `fluxway` (importing it triggers runtime deps like Ray).
-    We parse `worker.py` and exec only the function definition.
-    """
-    repo_root = Path(__file__).resolve().parents[2]
-    worker_path = repo_root / "fluxway" / "spmd" / "worker" / "worker.py"
-    source = worker_path.read_text(encoding="utf-8")
-    tree = ast.parse(source, filename=str(worker_path))
-
-    method_node = None
-    for node in tree.body:
-        if isinstance(node, ast.ClassDef) and node.name == "SPMDWorker":
-            for item in node.body:
-                if (
-                    isinstance(item, ast.FunctionDef)
-                    and item.name == "_resolve_output_step"
-                ):
-                    method_node = item
-                    break
-    assert method_node is not None, (
-        "SPMDWorker._resolve_output_step not found in worker.py"
-    )
-
-    module = types.ModuleType("fluxway_worker_step_extract")
-    # Compile the method as a standalone function (first arg is `self`).
-    compiled = compile(
-        ast.Module(body=[method_node], type_ignores=[]), str(worker_path), "exec"
-    )
-    exec(compiled, module.__dict__)
-    return module._resolve_output_step
-
-
-_resolve_output_step = _load_compute_output_step()
-
-
-class _DummyWorker:
-    def __init__(self, *, use_global_step_indexing: bool, total_rank: int, rank: int):
-        self.config = types.SimpleNamespace(
-            use_global_step_indexing=use_global_step_indexing
-        )
-        self._world_size = total_rank
-        self.rank = rank
-
-
-def test_compute_output_step_keep_input_step() -> None:
-    assert (
-        _resolve_output_step(
-            _DummyWorker(use_global_step_indexing=False, total_rank=8, rank=3),
-            is_periodic=False,
-            current_step=100,
-            input_step=7,
-        )
-        == 7
-    )
-    assert (
-        _resolve_output_step(
-            _DummyWorker(use_global_step_indexing=False, total_rank=8, rank=3),
-            is_periodic=True,
-            current_step=100,
-            input_step=7,
-        )
-        == 7
-    )
-
-
-def test_compute_output_step_remap_non_periodic() -> None:
-    assert (
-        _resolve_output_step(
-            _DummyWorker(use_global_step_indexing=True, total_rank=8, rank=3),
-            is_periodic=False,
-            current_step=12,
-            input_step=7,
-        )
-        == 12
-    )
-
-
-def test_compute_output_step_remap_periodic() -> None:
-    # output_step = total_rank * current_step + local_rank
-    assert (
-        _resolve_output_step(
-            _DummyWorker(use_global_step_indexing=True, total_rank=8, rank=3),
-            is_periodic=True,
-            current_step=12,
-            input_step=7,
-        )
-        == 8 * 12 + 3
-    )

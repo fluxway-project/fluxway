@@ -1,4 +1,5 @@
 import pytest
+from typing import Optional
 import jax.numpy as jnp
 import numpy as np
 
@@ -25,8 +26,12 @@ def use_torch_backend():
 def test_distributor_receiver_integration():
     local_rank = 0
 
-    src_mesh = DeviceMesh((1,), ("x",), jnp.array([0]))
-    dst_mesh = DeviceMesh((2,), ("x",), jnp.array([0, 1]))
+    src_mesh = DeviceMesh(
+        axis_names=("x",), device_shape=(1,), device_ids=np.array([0])
+    )
+    dst_mesh = DeviceMesh(
+        axis_names=("x",), device_shape=(2,), device_ids=np.array([0, 1])
+    )
 
     source_spec = ShardingSpec.chunk(mesh=src_mesh, partition=P("x"))
     target_spec = ShardingSpec.chunk(mesh=dst_mesh, partition=P("x"))
@@ -34,15 +39,21 @@ def test_distributor_receiver_integration():
     # Use Dense Data for distribution test
     # 2 rows, 50 elements each
     values = jnp.array(np.random.randn(2, 50))
-    data = TransportTensor(values)
+    data = TransportTensor(values, global_shape=(2, 50))
 
     # Mock receivers
     receiver0 = TransportReceiver(wait_for_n_slices=0)
     receiver1 = TransportReceiver(wait_for_n_slices=0)
     receivers = [receiver0, receiver1]
 
-    def mock_send(target_rank, tensors, counts, includes_indices=False):
-        rec = receivers[target_rank]
+    def mock_send(
+        target: int,
+        tensors: list,
+        counts: list,
+        global_shapes_list: Optional[list] = None,
+        meta_tensor_state_list: Optional[list] = None,
+    ):
+        rec = receivers[target]
         rec.receive_slices(local_rank, tensors, counts)
         return True
 

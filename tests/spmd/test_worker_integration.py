@@ -29,7 +29,7 @@ def _make_test_config(mesh: DeviceMesh, spmd_id: str = "") -> SPMDConfig:
 
 @pytest.fixture
 def mock_mesh():
-    return DeviceMesh((1,), axis_names=("data",))
+    return DeviceMesh(axis_names=("data",), device_shape=(1,))
 
 
 @pytest.fixture
@@ -42,28 +42,36 @@ async def test_worker_self_receive_data(worker_config):
     """Verify that _self_receive_data correctly calls receive_shards with unpacked payloads."""
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
     cls = cls.modified_class if cls else SPMDWorker
-    worker = cls(worker_config, rank=0)
+    worker = cls(worker_config, rank=0, spmd_id="test_spmd")
 
-    # Mock receive_shards
-    worker.receive_shards = AsyncMock()
+    # Mock mailbox deposit_shards (self-receive now goes directly to mailbox)
+    worker._mailbox.deposit_shards = AsyncMock()
+    # Mock operator manager for TUUID lookup
+    op2_meta = OperatorMeta(name="op2")
+    worker.config.operator_metas["op2"] = op2_meta
+    worker.config.operators["op2"] = lambda: None
+
+    from unittest.mock import MagicMock
+
+    worker._op_manager.get_operators_for_tuuid = MagicMock(return_value=["op2"])
 
     test_tensor = TransportTensor.from_tensor(np.array([1.0, 2.0]))
 
-    await worker._self_receive_data(
-        target_op="op2", name="grad", step=5, tensor=test_tensor
-    )
+    await worker._self_receive_data(u=123, step=5, tensor=test_tensor)
 
-    # Verify call signature matches the NEW receive_shards signature
-    worker.receive_shards.assert_called_once()
-    args, kwargs = worker.receive_shards.call_args
+    # Verify mailbox deposit
+    worker._mailbox.deposit_shards.assert_called_once()
+    args, kwargs = worker._mailbox.deposit_shards.call_args
     assert args[0] == "op2"
-    assert args[1] == "grad"
+    assert args[1] == [123]
     assert args[2] == 5
-    assert args[3] == 0  # self.rank
-    assert isinstance(args[4], list)  # payloads
-    assert isinstance(args[5], list)  # counts
-    np.testing.assert_array_equal(args[4][0], test_tensor.flat_values)
-    assert args[5][0] == 2  # count
+    assert args[3] == "test_spmd"
+    assert args[4] == 0  # self.rank
+    assert isinstance(args[5], int)  # sender_world_size
+    assert isinstance(args[6], list)  # payload_groups
+    assert isinstance(args[7], list)  # counts_groups
+    np.testing.assert_array_equal(args[6][0][0], test_tensor.flat_values)
+    assert args[7][0][0] == 2  # count
 
 
 @pytest.mark.asyncio
@@ -71,12 +79,12 @@ async def test_worker_self_receive_state(worker_config):
     """Verify that _self_receive_state correctly calls receive_control with wrapped arguments."""
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
     cls = cls.modified_class if cls else SPMDWorker
-    worker = cls(worker_config, rank=0)
+    worker = cls(worker_config, rank=0, spmd_id="test_spmd")
 
     # Mock receive_control
     worker.receive_control = AsyncMock()
 
-    await worker._self_receive_state(target_op="update", name="lr", step=10, data=0.01)
+    await worker._self_receive_state(op_name="update", name="lr", step=10, data=0.01)
 
     # Verify call signature matches the NEW receive_control signature
     worker.receive_control.assert_called_once()

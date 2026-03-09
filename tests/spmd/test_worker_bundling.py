@@ -72,7 +72,9 @@ class TestWorkerBundling(unittest.IsolatedAsyncioTestCase):
         Verify that worker.py correctly groups tensors into batches
         based on (source_spec, target_spec).
         """
-        mesh = DeviceMesh((2,), ("x",), jnp.array([0, 1]))
+        mesh = DeviceMesh(
+            axis_names=("x",), device_shape=(2,), device_ids=np.array([0, 1])
+        )
         spec1 = ShardingSpec.chunk(mesh, P("x"))
         spec2 = ShardingSpec.chunk(mesh, P())  # replicated
 
@@ -126,14 +128,14 @@ class TestWorkerBundling(unittest.IsolatedAsyncioTestCase):
 
         async def mock_self_receive(tt):
             group = [tt.flat_values]
-            if tt.spatial_indices is not None:
-                group.append(tt.spatial_indices)
+            if tt.routing_indices is not None:
+                group.append(tt.routing_indices)
             if tt.origin_indices is not None:
                 group.append(tt.origin_indices)
             return group
 
         # Case 1: Spatial only
-        tt1 = TransportTensor(jnp.zeros(2), spatial_indices=jnp.arange(2))
+        tt1 = TransportTensor(jnp.zeros(2), routing_indices=jnp.arange(2))
         g1 = await mock_self_receive(tt1)
         self.assertEqual(len(g1), 2)
 
@@ -144,7 +146,7 @@ class TestWorkerBundling(unittest.IsolatedAsyncioTestCase):
 
         # Case 3: Both
         tt3 = TransportTensor(
-            jnp.zeros(2), spatial_indices=jnp.arange(2), origin_indices=jnp.arange(2)
+            jnp.zeros(2), routing_indices=jnp.arange(2), origin_indices=jnp.arange(2)
         )
         g3 = await mock_self_receive(tt3)
         self.assertEqual(len(g3), 3)
@@ -181,9 +183,7 @@ class TestWorkerBundling(unittest.IsolatedAsyncioTestCase):
             0,
             payload_groups=[[data1], [data2]],
             counts_groups=[[10], [10]],
-            is_ragged=[False, False],
-            has_spatial_indices=[False, False],
-            has_origin_indices=[False, False],
+            meta_tensor_state_list=[0, 0],
         )
 
         # Verify buffers updated (check via mb.get_zero_copy_buffers since JAX reassigns)
@@ -200,7 +200,9 @@ class TestWorkerBundling(unittest.IsolatedAsyncioTestCase):
         Verify that a flattened @data_type is split or bundled correctly
         based on sharding.
         """
-        mesh = DeviceMesh((2,), ("x",), jnp.array([0, 1]))
+        mesh = DeviceMesh(
+            axis_names=("x",), device_shape=(2,), device_ids=np.array([0, 1])
+        )
         spec1 = ShardingSpec.chunk(mesh, P("x"))
         spec2 = ShardingSpec.chunk(mesh, P())
 

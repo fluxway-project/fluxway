@@ -830,12 +830,12 @@ RPCPayload 结构：
 class RPCPayload:
     batch_id: str           # 唯一批次标识
     data: Array             # 数据分片 (Tensor)
-    spatial_indices: Array   # 原始全局索引 (Tensor, 用于 Sparse->Dense 还原顺序)
+    routing_indices: Array   # 原始全局索引 (Tensor, 用于 Sparse->Dense 还原顺序)
     # 无需包含 sender_id 或 complex metadata
 ```
 设计原则：
 最小化元数据，减少传输开销
-spatial_indices 用于支持 Sparse 数据的顺序还原
+routing_indices 用于支持 Sparse 数据的顺序还原
 不包含发送方 ID，实现接收端的去中心化
 4.7 性能优化 Checklist
 关键优化点：

@@ -6,10 +6,8 @@ from __future__ import annotations
 
 import numpy as np
 from typing import Any, List, Optional, Tuple
-from dataclasses import dataclass
 
 
-@dataclass
 class DeviceMesh:
     """
     DeviceMesh represents the topology of devices for distributed computation.
@@ -24,22 +22,21 @@ class DeviceMesh:
 
     def __init__(
         self,
+        axis_names: Tuple[str, ...],
         device_shape: Optional[Tuple[int, ...]] = None,
-        axis_names: Tuple[str, ...] = None,
         device_ids: Optional[Any] = None,
     ):
         """
         Initialize a DeviceMesh.
 
         Args:
-            device_shape: Optional tuple defining the dimensions of the mesh.
             axis_names: Tuple of names for each axis.
+            device_shape: Optional tuple defining the dimensions of the mesh.
             device_ids: Optional physical device IDs.
                         If provided as a multi-dimensional array, device_shape will be inferred.
                         If provided as a 1D array and device_shape is given, it will be reshaped.
         """
-        if axis_names is None:
-            raise ValueError("axis_names must be provided.")
+        self._axis_names = tuple(axis_names)
 
         # Determine device_ids and shape
         if device_ids is not None:
@@ -48,27 +45,32 @@ class DeviceMesh:
                 # Infer shape from device_ids
                 if self.device_ids.ndim == 1:
                     # Default to 1D if it's a flat list and no shape provided
-                    # But we usually want it to match axis_names
-                    if len(axis_names) == 1:
-                        self.shape = self.device_ids.shape
+                    if len(self._axis_names) == 1:
+                        self._shape = self.device_ids.shape
                     else:
                         raise ValueError(
-                            f"Cannot infer multi-dimensional shape from 1D device_ids without device_shape. axis_names: {axis_names}"
+                            f"Cannot infer multi-dimensional shape from 1D device_ids without device_shape. axis_names: {self._axis_names}"
                         )
                 else:
-                    self.shape = self.device_ids.shape
+                    self._shape = tuple(int(s) for s in self.device_ids.shape)
             else:
                 # Shape provided, validate and reshape if needed
-                self.shape = tuple(device_shape)
-                if self.device_ids.size != np.prod(self.shape):
+                self._shape = tuple(int(s) for s in device_shape)
+                expected_size = 1
+                for s in self._shape:
+                    expected_size *= s
+                if self.device_ids.size != expected_size:
                     raise ValueError(
-                        f"device_ids size {self.device_ids.size} does not match device_shape {self.shape}"
+                        f"device_ids size {self.device_ids.size} does not match device_shape {self._shape}"
                     )
-                self.device_ids = self.device_ids.reshape(self.shape)
+                self.device_ids = self.device_ids.reshape(self._shape)
         elif device_shape is not None:
             # Only shape provided, generate default IDs
-            self.shape = tuple(device_shape)
-            self.device_ids = np.arange(np.prod(self.shape)).reshape(self.shape)
+            self._shape = tuple(int(s) for s in device_shape)
+            expected_size = 1
+            for s in self._shape:
+                expected_size *= s
+            self.device_ids = np.arange(expected_size).reshape(self._shape)
         else:
             raise ValueError("Either device_shape or device_ids must be provided.")
 
@@ -77,7 +79,7 @@ class DeviceMesh:
                 f"Shape {self.shape} and axis_names {axis_names} must have same length."
             )
 
-        self.axis_names = tuple(axis_names)
+        self._axis_names = tuple(axis_names)
         self.axis_map = dict(
             zip(self.axis_names, range(len(self.axis_names)), strict=False)
         )
@@ -92,11 +94,19 @@ class DeviceMesh:
 
     @property
     def ndim(self) -> int:
-        return len(self.shape)
+        return len(self._shape)
 
     @property
     def size(self) -> int:
         return self.device_ids.size
+
+    @property
+    def axis_names(self) -> Tuple[str, ...]:
+        return self._axis_names
+
+    @property
+    def shape(self) -> Tuple[int, ...]:
+        return self._shape
 
     def get_axis_size(self, axis_name: str) -> int:
         """Get the size (number of devices) of the specified axis."""
@@ -120,8 +130,15 @@ class DeviceMesh:
 
     def coordinate_to_device(self, coords: Tuple[Any, ...]) -> Any:
         """Vectorized get_rank. coords elements can be tensors or numpy arrays."""
-        # Ensure we use JAX-compatible indexing if device_ids is a Tracer
-        # backend.take or simple indexing should work.
+        from fluxway.common.backend import get_backend
+
+        backend = get_backend()
+
+        # If we are in JAX, we must ensure device_ids is a JAX array to support tracer indexing.
+        # jnp.asarray(numpy_array)[tracer] works correctly.
+        if backend.name() == "jax":
+            return backend.as_tensor(self.device_ids)[coords]
+
         return self.device_ids[coords]
 
     def unravel_index(self, ranks: Any) -> Tuple[Any, ...]:
@@ -176,7 +193,7 @@ try:
     def _dm_unflatten(aux_data, children):
         # Reconstruct without invoking __init__ (avoids numpy conversion of Tracers)
         obj = object.__new__(DeviceMesh)
-        obj.shape, obj.axis_names = aux_data
+        obj._shape, obj._axis_names = aux_data
         obj.device_ids = children[0]
 
         # Restore derived maps (static)

@@ -85,8 +85,14 @@ class AsyncStepManager:
         Returns:
             List of (spmd_id, op_name, allowed_step)
         """
+        # TODO(He Jia): Optimize self._graph.edges and self._graph.nodes traversing.
+        # No need to call every op with driver.set_allowed_step.remote(...)
+        # TODO(He Jia): Maintain a self._last_allowed_steps cache inside AsyncStepManager. Only when the newly calculated allowed_step is greater than the value issued last time will it be placed in the updates list and returned to the Controller.
         updates = []
         with self._lock:
+            # Topological limits from edges
+            op_topo_limits = {}  # (source_id, source_op) -> min_allowed_step
+
             for edge in self._graph.edges:
                 if not edge.source_op or not edge.target_op:
                     continue
@@ -109,13 +115,29 @@ class AsyncStepManager:
                     if meta:
                         limit = getattr(meta, "max_inflight_steps", limit)
 
-                # Watermark logic: allowed_step = target_progress + limit
                 allowed_step = target_min_step + limit
+                key = (source_id, source_op)
+                if key not in op_topo_limits or allowed_step < op_topo_limits[key]:
+                    op_topo_limits[key] = allowed_step
 
-                if self._config.max_steps is not None:
-                    allowed_step = min(allowed_step, self._config.max_steps)
+            for node_id, node in self._graph.nodes.items():
+                if node.spmd_config is None:
+                    continue
+                # Use both to ensure we find all defined ops even in mock/partial configs
+                all_ops = set(node.spmd_config.operators.keys()) | set(
+                    node.spmd_config.operator_metas.keys()
+                )
+                for op_name in all_ops:
+                    # Start with topological limit if any
+                    allowed_step = op_topo_limits.get(
+                        (node_id, op_name), 999999999
+                    )  # Default "infinity"
 
-                updates.append((source_id, source_op, allowed_step))
+                    # Global limit
+                    if self._config.max_steps is not None:
+                        allowed_step = min(allowed_step, self._config.max_steps)
+
+                    updates.append((node_id, op_name, allowed_step))
 
         return updates
 

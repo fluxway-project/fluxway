@@ -45,7 +45,6 @@ from fluxway.common.types import (
     Edge,
     ResourceSpec,
     # Sharding types
-    Layout,
     ShardingSpec,
     PartitionSpec,
     ChunkPartition,
@@ -65,14 +64,13 @@ __all__ = [
     "spmd",
     "operator",
     # Types
-    "PartitionType",
+    "PartitionSpec",
     "SPMDConfig",
     "Graph",
     "Node",
     "Edge",
     "ResourceSpec",
     # Sharding
-    "Layout",
     "ShardingSpec",
     "PartitionSpec",
     "ChunkPartition",

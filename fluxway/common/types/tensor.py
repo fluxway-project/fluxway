@@ -14,6 +14,68 @@ from fluxway.common.index_descriptor import (
 # ============================================================
 
 
+class SymmetryReceipt:
+    """Stores the origin of each row in a TransportTensor.
+
+    This acts as a 'Mirror Sharding' receipt for symmetric routing in the backward pass,
+    allowing the framework to route data back to its source without re-calculating hashes.
+    """
+
+    def __init__(self, world_size: int, sender_rank_tags: Any):
+        """
+        Args:
+            world_size: Total number of ranks in the source mesh.
+            sender_rank_tags: Tensor containing target worker ranks (same shape as flat_values).
+        """
+        self._world_size = world_size
+        self._sender_rank_tags = sender_rank_tags
+
+    @property
+    def world_size(self) -> int:
+        return self._world_size
+
+    @property
+    def sender_rank_tags(self) -> Any:
+        return self._sender_rank_tags
+
+    def __getitem__(self, key: Any) -> "SymmetryReceipt":
+        """Slice or gather symmetry metadata."""
+        # Simple slicing/indexing on backend arrays
+        return SymmetryReceipt(self._world_size, self._sender_rank_tags[key])
+
+    @classmethod
+    def concatenate(
+        cls, receipts: List[Optional["SymmetryReceipt"]]
+    ) -> Optional["SymmetryReceipt"]:
+        """Concatenate multiple receipts into one."""
+        if not receipts or all(r is None for r in receipts):
+            return None
+
+        if any(r is None for r in receipts):
+            raise ValueError(
+                "Inconsistent provenance: Some shards have receipts while others don't."
+            )
+
+        world_size = receipts[0].world_size
+        assert all(r.world_size == world_size for r in receipts)
+
+        valid_receipts: List["SymmetryReceipt"] = receipts  # type: ignore
+        ranks = np.concatenate([r.sender_rank_tags for r in valid_receipts], axis=0)
+        return cls(world_size, ranks)
+
+
+class Scalar:
+    """Lightweight wrapper for 0-dim scalars to provide a compatible __len__ for transport."""
+
+    __slots__ = ("tensor",)
+
+    def __init__(self, tensor):
+        self.tensor = tensor
+
+    def __len__(self):
+        return 1
+
+
 class TransportTensor:
     """Unified tensor wrapper for distributed data transport operations.
 
@@ -25,20 +87,33 @@ class TransportTensor:
     def __init__(
         self,
         flat_values: Any,
-        nested_splits: Optional[List[np.ndarray]] = None,
-        spatial_indices: Optional[Any] = None,
+        nested_splits: Optional[List[np.ndarray]] = None,  # type: ignore
+        origin_indices: Optional[IndexDescriptor] = None,
+        routing_indices: Optional[IndexDescriptor] = None,
         global_shape: Optional[Tuple[int, ...]] = None,
-        origin_indices: Optional[Any] = None,
+        receipt: Optional[SymmetryReceipt] = None,
     ):
         self._flat_values = flat_values
         self._nested_splits = nested_splits if nested_splits is not None else []
         self._global_shape = global_shape
-        self._origin_indices = origin_indices
 
-        self._spatial_indices: Optional[IndexDescriptor]
-        if isinstance(spatial_indices, ContinuousIndex):
-            self._spatial_indices = spatial_indices
-        elif isinstance(spatial_indices, slice):
+        self._origin_indices: Optional[IndexDescriptor]
+        if origin_indices is not None:
+            if isinstance(origin_indices, IndexDescriptor):
+                self._origin_indices = origin_indices
+            else:
+                self._origin_indices = ExplicitIndex(origin_indices)
+        else:
+            self._origin_indices = None
+
+        self._receipt = receipt
+        self._routing_indices_materialize_cache = None
+        self._origin_indices_materialize_cache = None
+
+        self._routing_indices: Optional[IndexDescriptor]
+        if isinstance(routing_indices, ContinuousIndex):
+            self._routing_indices = routing_indices
+        elif isinstance(routing_indices, slice):
             backend = get_backend()
             if not self._nested_splits:
                 if isinstance(self._flat_values, list):
@@ -51,14 +126,14 @@ class TransportTensor:
                 else:
                     count = int(backend.shape(self._nested_splits[0])[0]) - 1
 
-            start = spatial_indices.start if spatial_indices.start is not None else 0
-            stride = spatial_indices.step if spatial_indices.step is not None else 1
-            if spatial_indices.stop is not None:
+            start = routing_indices.start if routing_indices.start is not None else 0
+            stride = routing_indices.step if routing_indices.step is not None else 1
+            if routing_indices.stop is not None:
                 expected_count = (
-                    max(0, (spatial_indices.stop - start + stride - 1) // stride)
+                    max(0, (routing_indices.stop - start + stride - 1) // stride)
                     if stride > 0
                     else max(
-                        0, (start - spatial_indices.stop - stride - 1) // (-stride)
+                        0, (start - routing_indices.stop - stride - 1) // (-stride)
                     )
                 )
                 if expected_count != count:
@@ -67,202 +142,49 @@ class TransportTensor:
                     )
 
             if stride == 1:
-                self._spatial_indices = ContinuousIndex.chunk(start, count)
+                self._routing_indices = ContinuousIndex.chunk(start, count)
             else:
-                self._spatial_indices = ContinuousIndex.cyclic(start, stride, count)
-        elif spatial_indices is not None:
-            if isinstance(spatial_indices, IndexDescriptor):
-                self._spatial_indices = spatial_indices
+                self._routing_indices = ContinuousIndex.cyclic(start, stride, count)
+        elif routing_indices is not None:
+            if isinstance(routing_indices, IndexDescriptor):
+                self._routing_indices = routing_indices
             else:
-                self._spatial_indices = ExplicitIndex(spatial_indices)
+                self._routing_indices = ExplicitIndex(routing_indices)
         else:
-            self._spatial_indices = None
+            self._routing_indices = None
 
     @classmethod
     def from_tensor(
         cls,
         tensor: Any,
-        spatial_indices: Optional[Any] = None,
         global_shape: Optional[Tuple[int, ...]] = None,
+        origin_indices: Optional[Any] = None,
+        routing_indices: Optional[Any] = None,
     ) -> "TransportTensor":
         """Creates a dense TransportTensor directly from a multi-dimensional tensor.
 
         Args:
             tensor: The dense data tensor.
-            spatial_indices: Global indices mapping. Can be a materialized tensor, an explicit
+            origin_indices: Global indices mapping. Can be a materialized tensor, an explicit
+                     ContinuousIndex, or a python `slice` object for O(1) regular patterns.
+            routing_indices: Global indices mapping. Can be a materialized tensor, an explicit
                      ContinuousIndex, or a python `slice` object for O(1) regular patterns.
             global_shape: Optional global shape of the full tensor.
         """
+        if global_shape and origin_indices is None:
+            from functools import reduce
+
+            origin_indices = ContinuousIndex.chunk(
+                0, reduce(lambda x, y: x * y, global_shape)
+            )
+
         return cls(
             flat_values=tensor,
             nested_splits=[],
-            spatial_indices=spatial_indices,
+            origin_indices=origin_indices,
+            routing_indices=routing_indices,
             global_shape=global_shape,
         )
-
-    @property
-    def flat_values(self) -> Any:
-        return self._flat_values
-
-    @property
-    def nested_splits(self) -> List[Any]:
-        return self._nested_splits
-
-    @property
-    def is_dense(self) -> bool:
-        """Returns True if this tensor is dense (no ragged dimensions)."""
-        return len(self._nested_splits) == 0
-
-    @property
-    def is_ragged(self) -> bool:
-        """Returns True if this tensor has ragged dimensions."""
-        return len(self._nested_splits) > 0
-
-    @property
-    def index_descriptor(self) -> Optional[IndexDescriptor]:
-        """The underlying IndexDescriptor (metadata) for spatial positioning."""
-        return self._spatial_indices
-
-    @property
-    def spatial_indices(self) -> Optional[Any]:
-        """Global indices this local data corresponds to.
-
-        Lazy-materializes from descriptor if no explicit tensor is set.
-        Returns None if neither is available (implicit/zero-cost).
-        """
-        from fluxway.common.index_descriptor import ExplicitIndex, ContinuousIndex
-
-        if self._spatial_indices is None:
-            return None
-        if isinstance(self._spatial_indices, ExplicitIndex):
-            return self._spatial_indices.indices
-        if isinstance(self._spatial_indices, ContinuousIndex):
-            return self._spatial_indices.materialize()
-        return None
-
-    @property
-    def global_shape(self) -> Optional[Tuple[int, ...]]:
-        """Global shape of the full tensor across all ranks."""
-        return self._global_shape
-
-    @property
-    def shape(self) -> Tuple[int, ...]:
-        """Local shape of the data shard."""
-        backend = get_backend()
-        return backend.shape(self._flat_values)
-
-    @property
-    def dtype(self) -> Any:
-        """Data type of the tensor."""
-        backend = get_backend()
-        return backend.dtype(self._flat_values)
-
-    @property
-    def topology(self) -> Optional[List[Any]]:
-        """IndexDescriptor metadata derived from nested_splits. None for dense."""
-        return self._nested_splits if self._nested_splits else None
-
-    @property
-    def origin_indices(self) -> Optional[Any]:
-        return self._origin_indices
-
-    # -------------------------------------------------------------------------
-    # Transparent Container / Duck-typing Overloads
-    # -------------------------------------------------------------------------
-
-    def __getitem__(self, key: Any) -> "TransportTensor":
-        """Support for slicing and gathering via []."""
-        backend = get_backend()
-        if isinstance(key, slice):
-            return self.slice(key.start or 0, key.stop, unsafe=False)
-
-        # If key is a tensor or TransportTensor, it's a gather
-        if isinstance(key, TransportTensor) or backend.is_tensor(key):
-            return self.gather(key)
-
-        # Fallback to backend indexing for simple scalars if no splits
-        if not self._nested_splits:
-            return TransportTensor(
-                self._flat_values[key], global_shape=self._global_shape
-            )
-
-        raise NotImplementedError(
-            f"Indexing with {type(key)} not supported for ragged tensors"
-        )
-
-    def __len__(self) -> int:
-        backend = get_backend()
-        return int(backend.shape(self._flat_values)[0])
-
-    def __iter__(self):
-        # Very high-cost, but sometimes needed for duck-typing
-        for i in range(len(self)):
-            yield self[i]
-
-    def __add__(self, other: Any) -> "TransportTensor":
-        return self._binary_op(other, "__add__")
-
-    def __sub__(self, other: Any) -> "TransportTensor":
-        return self._binary_op(other, "__sub__")
-
-    def __mul__(self, other: Any) -> "TransportTensor":
-        return self._binary_op(other, "__mul__")
-
-    def __truediv__(self, other: Any) -> "TransportTensor":
-        return self._binary_op(other, "__truediv__")
-
-    def _binary_op(self, other: Any, op_name: str) -> "TransportTensor":
-        other_val = other.flat_values if isinstance(other, TransportTensor) else other
-        op = getattr(self._flat_values, op_name)
-        res = op(other_val)
-        # Inherit metadata from self
-        return TransportTensor(
-            res,
-            nested_splits=self.nested_splits,
-            spatial_indices=self.spatial_indices,
-            global_shape=self._global_shape,
-            origin_indices=self.origin_indices,
-        )
-
-    def sum(self, dim: Any = None) -> Any:
-        backend = get_backend()
-        return backend.sum(self._flat_values, dim=dim)
-
-    def unique_with_routing(
-        self, offset: int = 0
-    ) -> Tuple["TransportTensor", "TransportTensor"]:
-        """
-        Performs unique on flat_values.
-        Returns (compacted_tensor, inverse_indices_tensor).
-        The compacted_tensor has origin_indices automatically set to allow O(1) restoration.
-        The inverse_indices_tensor is shifted by 'offset' to allow global alignment.
-        """
-        backend = get_backend()
-        uniques, inverse = backend.unique(self.flat_values, return_inverse=True)
-
-        num_uniques = backend.shape(uniques)[0]
-        origin_indices = backend.arange(
-            offset, offset + num_uniques, dtype=backend.int32()
-        )
-
-        compacted = TransportTensor(
-            flat_values=uniques,
-            spatial_indices=uniques,  # Use values as global routing keys
-            origin_indices=origin_indices,
-            nested_splits=[],
-            global_shape=self.global_shape,
-        )
-
-        # inverse_indices must retain the original nested_splits (ragged structure)
-        # Inherit spatial_indices from self to allow routing back to origin batch positions
-        inverse_tt = TransportTensor(
-            flat_values=inverse + offset,
-            nested_splits=self.nested_splits,
-            global_shape=self.global_shape,
-            spatial_indices=self.spatial_indices,
-        )
-
-        return compacted, inverse_tt
 
     @classmethod
     def from_lists(
@@ -270,6 +192,8 @@ class TransportTensor:
         data: List[Any],
         dtype: Optional[Any] = None,
         global_shape: Optional[Tuple[int, ...]] = None,
+        origin_indices: Optional[Any] = None,
+        routing_indices: Optional[Any] = None,
     ) -> "TransportTensor":
         """Creates a TransportTensor from a nested list.
 
@@ -307,7 +231,12 @@ class TransportTensor:
             if dtype is None:
                 dtype = backend.float32()
             dense_tensor = backend.tensor(data, dtype=dtype)
-            return cls(dense_tensor, [])
+            return cls(
+                dense_tensor,
+                [],
+                global_shape=global_shape,
+                origin_indices=origin_indices,
+            )
 
         # Ragged tensor: use iterative flattening
         current_level_lists = data
@@ -351,7 +280,13 @@ class TransportTensor:
             dtype = backend.float32()
 
         flat_tensor = backend.tensor(current_level_lists, dtype=dtype)
-        return cls(flat_tensor, all_splits, global_shape=global_shape)
+        return cls(
+            flat_tensor,
+            all_splits,
+            global_shape=global_shape,
+            origin_indices=origin_indices,
+            routing_indices=routing_indices,
+        )
 
     def to_lists(self) -> List[Any]:
         """Converts back to a nested list."""
@@ -384,16 +319,236 @@ class TransportTensor:
 
         return build_list(0, 0, num_splits - 1)
 
+    @property
+    def flat_values(self) -> Any:
+        return self._flat_values
+
+    @property
+    def nested_splits(self) -> List[Any]:
+        return self._nested_splits
+
+    @property
+    def is_dense(self) -> bool:
+        """Returns True if this tensor is dense (no ragged dimensions)."""
+        return len(self._nested_splits) == 0
+
+    @property
+    def is_ragged(self) -> bool:
+        """Returns True if this tensor has ragged dimensions."""
+        return len(self._nested_splits) > 0
+
+    @property
+    def origin_indices(self) -> Optional[IndexDescriptor]:
+        """The underlying IndexDescriptor (metadata) for origin tracking."""
+        return self._origin_indices
+
+    @property
+    def origin_indices_materialized(self) -> Optional[Any]:
+        """Global indices marking the original sequence/batch row.
+
+        Lazy-materializes from descriptor if no explicit tensor is set.
+        """
+        if self._origin_indices is None:
+            return None
+        if self._origin_indices_materialize_cache is not None:
+            return self._origin_indices_materialize_cache
+
+        if isinstance(self._origin_indices, ExplicitIndex):
+            self._origin_indices_materialize_cache = self._origin_indices.indices
+        elif isinstance(self._origin_indices, ContinuousIndex):
+            self._origin_indices_materialize_cache = self._origin_indices.materialize()
+        else:
+            self._origin_indices_materialize_cache = self._origin_indices
+        return self._origin_indices_materialize_cache
+
+    @property
+    def routing_indices(self) -> Optional[IndexDescriptor]:
+        """The underlying IndexDescriptor (metadata) for spatial positioning."""
+        return self._routing_indices
+
+    @property
+    def routing_indices_materialized(self) -> Optional[Any]:
+        """Routing indices to remote workers this local data corresponds to.
+
+        Lazy-materializes from descriptor if no explicit tensor is set.
+        Returns None if neither is available (implicit/zero-cost).
+        """
+        if self._routing_indices is None:
+            return None
+        if self._routing_indices_materialize_cache is not None:
+            return self._routing_indices_materialize_cache
+
+        if isinstance(self._routing_indices, ExplicitIndex):
+            self._routing_indices_materialize_cache = self._routing_indices.indices
+        elif isinstance(self._routing_indices, ContinuousIndex):
+            self._routing_indices_materialize_cache = (
+                self._routing_indices.materialize()
+            )
+        else:
+            self._routing_indices_materialize_cache = self._routing_indices
+        return self._routing_indices_materialize_cache
+
+    @property
+    def global_shape(self) -> Optional[Tuple[int, ...]]:
+        """Global shape of the full tensor across all ranks."""
+        return self._global_shape
+
+    @property
+    def shape(self) -> Tuple[int, ...]:
+        """Local shape of the data shard."""
+        backend = get_backend()
+        return backend.shape(self._flat_values)
+
+    @property
+    def dtype(self) -> Any:
+        """Data type of the tensor."""
+        backend = get_backend()
+        return backend.dtype(self._flat_values)
+
+    @property
+    def topology(self) -> Optional[List[Any]]:
+        """IndexDescriptor metadata derived from nested_splits. None for dense."""
+        return self._nested_splits if self._nested_splits else None
+
+    @property
+    def receipt(self) -> Optional[SymmetryReceipt]:
+        return self._receipt
+
+    @property
+    def meta_state(self) -> int:
+        """
+        Computed bitmask/int representing the state of the tensor metadata.
+        Used for efficient reconstruction in the mailbox.
+        0: Dense
+        1: Ragged
+        2: Has Origin Indices (Materialized in payload)
+        4: Has Compact Index (in slice_compact_desc_params)
+        (Combine via BITWISE OR)
+        """
+        state = 0
+        if self.is_ragged:
+            state |= 1
+        if self.origin_indices is not None:
+            if isinstance(self.origin_indices, ContinuousIndex):
+                state |= 4
+            else:
+                state |= 2
+        return state
+
+    # -------------------------------------------------------------------------
+    # Transparent Container / Duck-typing Overloads
+    # -------------------------------------------------------------------------
+
+    def __getitem__(self, key: Any) -> "TransportTensor":
+        """Support for slicing and gathering via []."""
+        backend = get_backend()
+        if isinstance(key, slice):
+            return self.slice(key.start or 0, key.stop, unsafe=False)
+
+        # If key is a tensor or TransportTensor, it's a gather
+        if isinstance(key, TransportTensor) or backend.is_tensor(key):
+            return self.gather(key)
+
+        # Fallback to backend indexing for simple scalars if no splits
+        if not self._nested_splits:
+            return TransportTensor(
+                self._flat_values[key],
+                global_shape=self._global_shape,
+                receipt=self._receipt[key] if self._receipt else None,
+            )
+
+        raise NotImplementedError(
+            f"Indexing with {type(key)} not supported for ragged tensors"
+        )
+
+    def __len__(self) -> int:
+        backend = get_backend()
+        if backend.is_scalar(self._flat_values):
+            return 1
+        return int(backend.shape(self._flat_values)[0])
+
+    def __iter__(self):
+        # Very high-cost, but sometimes needed for duck-typing
+        for i in range(len(self)):
+            yield self[i]
+
+    def __add__(self, other: Any) -> "TransportTensor":
+        return self._binary_op(other, "__add__")
+
+    def __sub__(self, other: Any) -> "TransportTensor":
+        return self._binary_op(other, "__sub__")
+
+    def __mul__(self, other: Any) -> "TransportTensor":
+        return self._binary_op(other, "__mul__")
+
+    def __truediv__(self, other: Any) -> "TransportTensor":
+        return self._binary_op(other, "__truediv__")
+
+    def _binary_op(self, other: Any, op_name: str) -> "TransportTensor":
+        other_val = other.flat_values if isinstance(other, TransportTensor) else other
+        op = getattr(self._flat_values, op_name)
+        res = op(other_val)
+        # Inherit metadata from self
+        return TransportTensor(
+            res,
+            nested_splits=self.nested_splits,
+            routing_indices=self.routing_indices,
+            global_shape=self._global_shape,
+            origin_indices=self.origin_indices,
+            receipt=self.receipt,
+        )
+
+    def sum(self, dim: Any = None) -> Any:
+        backend = get_backend()
+        return backend.sum(self._flat_values, dim=dim)
+
+    def unique_with_routing(self) -> Tuple["TransportTensor", "TransportTensor"]:
+        """
+        Finds the unique elements and creates a compact TransportTensor.
+        Returns (compacted_tensor, inverse_indices_tensor).
+        """
+        backend = get_backend()
+        uniques, first_indices, inverse = backend.unique(
+            self.flat_values, return_index=True, return_inverse=True
+        )
+
+        # Inherit origin_indices directly from the parent tensor if they exist
+        if self.origin_indices is not None:
+            origin_indices = backend.take(
+                self.origin_indices_materialized, first_indices
+            )
+        else:
+            origin_indices = first_indices
+
+        # Reshape inverse back to match original flat_values geometry
+        inv_flat = backend.reshape(inverse, backend.shape(self.flat_values))
+        inverse_tt = TransportTensor(
+            flat_values=inv_flat,
+            nested_splits=self.nested_splits,
+            origin_indices=self.origin_indices,
+            routing_indices=self.routing_indices,
+            global_shape=self.global_shape,
+        )
+
+        compacted = TransportTensor(
+            flat_values=uniques,
+            routing_indices=uniques,
+            origin_indices=origin_indices,
+            global_shape=None,
+        )
+
+        return compacted, inverse_tt
+
     def _propagate_indices_for_dense_slice(self, start: Any, size: Any) -> Any:
         """Derive new index info for a dense slice. Returns new IndexDescriptor or None."""
         backend = get_backend()
         from fluxway.common.index_descriptor import ContinuousIndex, ExplicitIndex
 
-        if self._spatial_indices is None:
+        if self._routing_indices is None:
             return None
 
         # Prefer descriptor path (O(1))
-        if isinstance(self._spatial_indices, ContinuousIndex):
+        if isinstance(self._routing_indices, ContinuousIndex):
             if backend.is_tensor(start):
                 s = int(backend.item(start))
             else:
@@ -402,12 +557,38 @@ class TransportTensor:
                 sz = int(backend.item(size))
             else:
                 sz = int(size)
-            return self._spatial_indices.slice(s, s + sz)
+            return self._routing_indices.slice(s, s + sz)
 
         # Explicit tensor path
-        if isinstance(self._spatial_indices, ExplicitIndex):
+        if isinstance(self._routing_indices, ExplicitIndex):
             new_indices = backend.dynamic_slice(
-                self._spatial_indices.indices, [start], [size]
+                self._routing_indices.indices, [start], [size]
+            )
+            return ExplicitIndex(new_indices)
+
+        return None
+
+    def _propagate_origin_indices_for_dense_slice(self, start: Any, size: Any) -> Any:
+        """Derive new origin index info for a dense slice. Returns new IndexDescriptor or None."""
+        backend = get_backend()
+
+        if self._origin_indices is None:
+            return None
+
+        if isinstance(self._origin_indices, ContinuousIndex):
+            if backend.is_tensor(start):
+                s = int(backend.item(start))
+            else:
+                s = int(start)
+            if backend.is_tensor(size):
+                sz = int(backend.item(size))
+            else:
+                sz = int(size)
+            return self._origin_indices.slice(s, s + sz)
+
+        if isinstance(self._origin_indices, ExplicitIndex):
+            new_indices = backend.dynamic_slice(
+                self._origin_indices.indices, [start], [size]
             )
             return ExplicitIndex(new_indices)
 
@@ -431,7 +612,18 @@ class TransportTensor:
             sliced_data = backend.dynamic_slice(x, starts, sizes)
 
             new_indices = self._propagate_indices_for_dense_slice(start, size_tensor)
-            return TransportTensor(sliced_data, [], spatial_indices=new_indices)
+            new_origin_indices = self._propagate_origin_indices_for_dense_slice(
+                start, size_tensor
+            )
+            return TransportTensor(
+                sliced_data,
+                [],
+                routing_indices=new_indices,
+                origin_indices=new_origin_indices,
+                receipt=self._receipt[start : start + size_tensor]
+                if self._receipt
+                else None,
+            )
 
         else:
             # Ragged case: requires processing nested splits.
@@ -541,19 +733,20 @@ class TransportTensor:
 
             # Propagate indices
             new_indices = None
-            if self._spatial_indices is not None:
-                new_indices = self._spatial_indices.slice(s, e)
+            if self._routing_indices is not None:
+                new_indices = self._routing_indices.slice(s, e)
 
             # Propagate origin metadata
             new_origin_indices = None
             if self._origin_indices is not None:
-                new_origin_indices = self._origin_indices[s:e]
+                new_origin_indices = self._origin_indices.slice(s, e)
 
             return TransportTensor(
                 val_slice,
                 new_nested_splits,
-                spatial_indices=new_indices,
+                routing_indices=new_indices,
                 origin_indices=new_origin_indices,
+                receipt=self._receipt[s:e] if self._receipt else None,
             )
 
         # -------------------------------------------------------------------------
@@ -655,18 +848,19 @@ class TransportTensor:
         # Propagate origin metadata for ragged slice
         new_origin_indices = None
         if self._origin_indices is not None:
-            new_origin_indices = self._origin_indices[start:end]
+            new_origin_indices = self._origin_indices.slice(start, end)
 
         # Propagate indices for ragged slice
         new_indices = None
-        if self._spatial_indices is not None:
-            new_indices = self._spatial_indices.slice(start, end)
+        if self._routing_indices is not None:
+            new_indices = self._routing_indices.slice(start, end)
 
         return TransportTensor(
             val_slice,
             new_nested_splits,
-            spatial_indices=new_indices,
+            routing_indices=new_indices,
             origin_indices=new_origin_indices,
+            receipt=self._receipt[start:end] if self._receipt else None,
         )
 
     def as_dlpack_slice(self, cursor: Optional[Any] = None) -> Any:
@@ -711,7 +905,7 @@ class TransportTensor:
 
             new_values = backend.dynamic_slice(self._flat_values, starts, sizes)
             return TransportTensor(
-                new_values, self._nested_splits, spatial_indices=self._spatial_indices
+                new_values, self._nested_splits, routing_indices=self._routing_indices
             )
         return self
 
@@ -723,15 +917,21 @@ class TransportTensor:
             indices.flat_values if isinstance(indices, TransportTensor) else indices
         )
 
-        # Propagate spatial_indices through gather
-        new_spatial_indices = None
-        src_indices = self.spatial_indices  # Materializes descriptor if needed
+        # Propagate routing_indices through gather
+        new_routing_indices = None
+        src_indices = self.routing_indices  # Materializes descriptor if needed
         if src_indices is not None:
-            from fluxway.common.index_descriptor import ExplicitIndex
-
             gathered_indices = backend.take(src_indices, idx_flat)
-            new_spatial_indices = ExplicitIndex(gathered_indices)
-        # Descriptor cannot survive gather (order destroyed), so always explicit tensor
+            new_routing_indices = ExplicitIndex(gathered_indices)
+
+        # Propagate origin metadata through gather
+        new_origin_indices = None
+        src_origin = (
+            self.origin_indices_materialized
+        )  # Materializes descriptor if needed
+        if src_origin is not None:
+            gathered_origin = backend.take(src_origin, idx_flat)
+            new_origin_indices = ExplicitIndex(gathered_origin)
 
         if not self._nested_splits:
             # Dense case (can be multi-dimensional)
@@ -741,7 +941,11 @@ class TransportTensor:
                 indices.nested_splits if isinstance(indices, TransportTensor) else []
             )
             return TransportTensor(
-                gathered, new_splits, spatial_indices=new_spatial_indices
+                gathered,
+                new_splits,
+                routing_indices=new_routing_indices,
+                origin_indices=new_origin_indices,
+                receipt=self._receipt[idx_flat] if self._receipt else None,
             )
 
         current_indices = idx_flat
@@ -749,30 +953,24 @@ class TransportTensor:
 
         for level in range(len(self._nested_splits)):
             splits = self._nested_splits[level]
-            # Rely on python slicing which usually delegates to __getitem__
             lengths = splits[1:] - splits[:-1]
 
             # Gather lengths based on current level permutation
             gathered_lengths = backend.take(lengths, current_indices)
 
             # New splits: [0, cumsum(gathered_lengths)]
-            # 1. cumsum
             cs = backend.cumsum(gathered_lengths, dim=0)
-            # 2. prepend 0. Need generic zero tensor + concatenation
             zero = backend.zeros((1,), dtype=backend.int32())
 
             new_level_split = backend.cat([zero, cs], dim=0)
             new_splits.append(new_level_split)
 
             # Compute next level indices
-            # We need to generate the range of indices for the next level.
+            # generate the range of indices for the next level.
             # starts = splits[:-1][current_indices]
             starts = backend.take(splits[:-1], current_indices)
 
-            # We need to generate: [starts[0]...starts[0]+len[0], starts[1]...starts[1]+len[1], ...]
-            # Vectorized "repeat and increment"
-
-            # counts = gathered_lengths
+            # generate: [starts[0]...starts[0]+len[0], starts[1]...starts[1]+len[1], ...]
             total_elements = backend.sum(gathered_lengths)
 
             # If total is 0, handle empty case
@@ -803,15 +1001,10 @@ class TransportTensor:
         # Finally gather flat values
         new_values = backend.take(self._flat_values, current_indices)
 
-        # Propagate origin metadata through gather
-        new_origin_indices = None
-        if self._origin_indices is not None:
-            new_origin_indices = backend.take(self._origin_indices, idx_flat)
-
         return TransportTensor(
             new_values,
             new_splits,
-            spatial_indices=new_spatial_indices,
+            routing_indices=new_routing_indices,
             origin_indices=new_origin_indices,
         )
 
@@ -822,7 +1015,7 @@ class TransportTensor:
             (
                 self._flat_values,
                 self._nested_splits,
-                self._spatial_indices,
+                self._routing_indices,
                 self._global_shape,
                 self._origin_indices,
             ),
@@ -830,21 +1023,21 @@ class TransportTensor:
 
     def __repr__(self):
         parts = [f"flat_values={self._flat_values}", f"splits={self._nested_splits}"]
-        if self._spatial_indices is not None:
-            parts.append(f"spatial_indices={self._spatial_indices}")
+        if self._routing_indices is not None:
+            parts.append(f"routing_indices={self._routing_indices}")
         if self._origin_indices is not None:
             parts.append(f"origin_indices={self._origin_indices}")
         return f"TransportTensor({', '.join(parts)})"
 
 
 def _reconstruct_transport_tensor(
-    flat_values, nested_splits, spatial_indices, global_shape=None, origin_indices=None
+    flat_values, nested_splits, routing_indices, global_shape=None, origin_indices=None
 ):
     """Pickle reconstruction helper (top-level function for pickling)."""
     return TransportTensor(
         flat_values,
         nested_splits,
-        spatial_indices=spatial_indices,
+        routing_indices=routing_indices,
         global_shape=global_shape,
         origin_indices=origin_indices,
     )
@@ -863,20 +1056,20 @@ if _JAX_AVAILABLE:
         children = (
             v._flat_values,
             v._nested_splits,
-            v._spatial_indices,
+            v._routing_indices,
             v._global_shape,
             v._origin_indices,
         )
         return children, None
 
     def _tt_unflatten(aux_data, children):
-        flat_values, nested_splits, spatial_indices, global_shape, origin_indices = (
+        flat_values, nested_splits, routing_indices, global_shape, origin_indices = (
             children
         )
         return TransportTensor(
             flat_values,
             nested_splits,
-            spatial_indices=spatial_indices,
+            routing_indices=routing_indices,
             global_shape=global_shape,
             origin_indices=origin_indices,
         )

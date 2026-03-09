@@ -11,7 +11,7 @@ def test_device_mesh_initialization():
     """Test basic initialization with default device IDs."""
     shape = (2, 4)
     axis_names = ("data", "model")
-    mesh = DeviceMesh(shape, axis_names)
+    mesh = DeviceMesh(axis_names, shape)
 
     assert mesh.shape == shape
     assert mesh.axis_names == axis_names
@@ -45,7 +45,7 @@ def test_device_mesh_1d_inference():
 
 def test_device_mesh_required_args():
     """Test that at least one of shape or ids is required."""
-    with pytest.raises(ValueError, match="axis_names must be provided"):
+    with pytest.raises(TypeError):
         DeviceMesh(device_shape=(2,))
 
     with pytest.raises(
@@ -58,7 +58,7 @@ def test_coordinate_mapping():
     """Test rank <-> coordinate mapping."""
     shape = (2, 2, 2)
     axis_names = ("a", "b", "c")
-    mesh = DeviceMesh(shape, axis_names)
+    mesh = DeviceMesh(axis_names, shape)
 
     # Check a few specific points
     # (0, 0, 0) -> 0
@@ -78,16 +78,16 @@ def test_invalid_initialization():
     """Test error handling during initialization."""
     # Mismatch shape/names length
     with pytest.raises(ValueError, match="must have same length"):
-        DeviceMesh((2, 2), ("x",))
+        DeviceMesh(("x",), (2, 2))
 
     # Mismatch device_ids size
     with pytest.raises(ValueError, match="does not match device_shape"):
-        DeviceMesh((2, 2), ("x", "y"), device_ids=[0, 1, 2])
+        DeviceMesh(("x", "y"), (2, 2), device_ids=[0, 1, 2])
 
 
 def test_invalid_access():
     """Test error handling for invalid access."""
-    mesh = DeviceMesh((2, 2), ("x", "y"))
+    mesh = DeviceMesh(("x", "y"), (2, 2))
 
     with pytest.raises(ValueError, match="Axis z not found"):
         mesh.get_axis_size("z")

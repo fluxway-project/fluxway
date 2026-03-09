@@ -165,7 +165,7 @@ class TestOperatorMetaSerialization:
         """
         # Create and modify meta
         meta = OperatorMeta(name="test_op", input_arguments=None, output_arguments=None)
-        edge_info = EdgeShardingInfo(tensor_sharding={"tensor": "some_spec"})
+        edge_info = EdgeShardingInfo(tuuid_sharding={123: "some_spec"})
         meta.input_pre_sharding["Preprocessing"] = [edge_info]
 
         # Pickle and unpickle
@@ -174,8 +174,8 @@ class TestOperatorMetaSerialization:
 
         # Modifications ARE preserved for Pydantic models
         assert list(restored.input_pre_sharding.keys()) == ["Preprocessing"]
-        assert restored.input_pre_sharding["Preprocessing"][0].tensor_sharding == {
-            "tensor": "some_spec"
+        assert restored.input_pre_sharding["Preprocessing"][0].tuuid_sharding == {
+            123: "some_spec"
         }
 
     def test_real_spmd_config_preserves_modifications(self):
@@ -197,7 +197,7 @@ class TestOperatorMetaSerialization:
         )
 
         # Modify meta after config creation (simulating Builder linking)
-        edge_info = EdgeShardingInfo(tensor_sharding={"input": "sharded_spec"})
+        edge_info = EdgeShardingInfo(tuuid_sharding={123: "sharded_spec"})
         meta.input_pre_sharding["SourceSPMD"] = [edge_info]
 
         # Pickle and unpickle (simulating Ray serialization)
@@ -211,7 +211,7 @@ class TestOperatorMetaSerialization:
         ]
         assert restored.operator_metas["test_op"].input_pre_sharding["SourceSPMD"][
             0
-        ].tensor_sharding == {"input": "sharded_spec"}
+        ].tuuid_sharding == {123: "sharded_spec"}
 
 
 if __name__ == "__main__":

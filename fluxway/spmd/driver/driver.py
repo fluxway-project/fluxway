@@ -41,9 +41,6 @@ from .synchronizer import SPMDSynchronizer
 from .synchronizer.worker_sync import WorkerSynchronizer
 from .stateful_executor import StatefulExecutor
 from .monitor import SPMDMonitor
-from .worker_registrar import WorkerRegistrar
-from .function_signatures import FunctionSignatures
-from .partition_manager import PartitionManager
 
 logger = logging.getLogger(__name__)
 
@@ -105,9 +102,6 @@ if RAY_AVAILABLE:
             self.synchronizer = SPMDSynchronizer(spmd_id)
             self.executor = StatefulExecutor(spmd_id)
             self.monitor = SPMDMonitor(spmd_id)
-            self.registrar = WorkerRegistrar(spmd_id)
-            self.function_signatures = FunctionSignatures()
-            self.partition_manager = PartitionManager()
 
             # Worker handles
             self._worker_handles: Dict[int, Any] = {}
@@ -898,6 +892,16 @@ else:
             logger.warning(
                 f"[spmd_id={spmd_id}] Created mock SPMDDriver for {spmd_id} (Ray not available)"
             )
+
+        @classmethod
+        def options(cls, **kwargs) -> Any:
+            """Mock Ray options."""
+            return cls
+
+        @classmethod
+        def remote(cls, *args, **kwargs) -> Any:
+            """Mock Ray remote call."""
+            return cls(*args, **kwargs)
 
         def initialize(self, checkpoint_id: Optional[str] = None) -> bool:
             return True

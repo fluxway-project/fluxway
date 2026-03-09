@@ -16,16 +16,24 @@ class OpHandle:
         node_id: str,
         op_name: str,
         graph: "FunctionalGraph",
+        tuuids: Dict[str, int],
         output_name: Optional[str] = None,
     ):
         self.node_id = node_id
         self.op_name = op_name
         self._graph = graph
+        self.tuuids = tuuids
         self.output_name = output_name
 
     def __getattr__(self, name: str) -> "OpHandle":
         """Allows selecting a specific output field, e.g. h_proc.unique_ids1"""
-        return OpHandle(self.node_id, self.op_name, self._graph, output_name=name)
+        return OpHandle(
+            self.node_id,
+            self.op_name,
+            self._graph,
+            tuuids=self.tuuids,
+            output_name=name,
+        )
 
     def __repr__(self):
         res = f"OpHandle({self.node_id}.{self.op_name})"
@@ -64,13 +72,13 @@ class NodeProxy:
                 if target_meta:
                     from fluxway.common.types.configs import ArgumentType
 
-                    tensor_args = target_meta.get_arguments(
-                        is_output=False, arg_type=ArgumentType.TENSOR
+                    data_args = target_meta.get_arguments(
+                        is_output=False, arg_type=ArgumentType.DATA
                     )
-                    state_args = target_meta.get_arguments(
-                        is_output=False, arg_type=ArgumentType.STATE
+                    control_args = target_meta.get_arguments(
+                        is_output=False, arg_type=ArgumentType.CONTROL
                     )
-                    all_target_args = tensor_args + state_args
+                    all_target_args = data_args + control_args
 
             # Register edges for positional arguments
             for i, in_handle in enumerate(args):
@@ -91,8 +99,16 @@ class NodeProxy:
                         from fluxway.common.types.configs import ArgumentType
 
                         src_output_names = src_meta.get_arguments(
-                            is_output=True, arg_type=ArgumentType.TENSOR
+                            is_output=True, arg_type=ArgumentType.DATA
                         )
+
+                # Check if the handle already has UUIDs.
+                # In the new TUUID-driven architecture, this is mandatory.
+                if not in_handle.tuuids:
+                    raise RuntimeError(
+                        f"OpHandle from {in_handle.node_id}.{in_handle.op_name} "
+                        f"is missing mandatory UUIDs. This should not happen."
+                    )
 
                 # If specific output field is not selected, and source has exactly one tensor output, infer it.
                 inferred_source_output = in_handle.output_name
@@ -139,7 +155,7 @@ class NodeProxy:
                         from fluxway.common.types.configs import ArgumentType
 
                         src_output_names = src_meta.get_arguments(
-                            is_output=True, arg_type=ArgumentType.TENSOR
+                            is_output=True, arg_type=ArgumentType.DATA
                         )
 
                 # If specific output field is not selected, and source has exactly one tensor output, infer it.
@@ -157,7 +173,29 @@ class NodeProxy:
                     target_input=target_arg,
                 )
 
-            return OpHandle(self.node_id, op_name, self._graph)
+            # 3. Handle Outputs: Retrieve pre-assigned UUIDs from the Builder
+            # These were assigned during add_node() and are the canonical IDs.
+            output_uuids = {}
+            if target_node:
+                target_meta = target_node.spmd_config.operator_metas.get(op_name)
+                if target_meta:
+                    from fluxway.common.types.configs import ArgumentType
+
+                    out_args = target_meta.get_arguments(
+                        is_output=True, arg_type=ArgumentType.DATA
+                    )
+                    for out_name in out_args:
+                        u_key = (self.node_id, op_name, out_name)
+                        if u_key not in self._graph._builder._output_uuids:
+                            # Safety check: ensure builder assigned it
+                            raise RuntimeError(
+                                f"TUUID for {u_key} not found in Builder registry."
+                            )
+                        output_uuids[out_name] = self._graph._builder._output_uuids[
+                            u_key
+                        ]
+
+            return OpHandle(self.node_id, op_name, self._graph, tuuids=output_uuids)
 
         return _call_op
 

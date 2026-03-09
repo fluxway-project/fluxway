@@ -6,7 +6,6 @@ from ..common.utils.logging import ensure_logging_configured
 
 from fluxway.common.types import TransportTensor
 from fluxway.common.types.sharding import (
-    Layout,
     ShardingSpec,
     PartitionStrategy,
     ChunkPartition,
@@ -19,7 +18,6 @@ from .communication import DataDistributor, TransportReceiver
 
 __all__ = [
     "TransportTensor",
-    "Layout",
     "ShardingSpec",
     "PartitionStrategy",
     "ChunkPartition",

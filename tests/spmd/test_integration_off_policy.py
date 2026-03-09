@@ -27,8 +27,12 @@ async def test_off_policy_staleness_integration():
         expected_states=[],
         barrier_config=config,
     )
-    await mb.deposit_shards("compute", "sparse_embedding", 1, 0, [np.array([0.1])], [1])
-    await mb.deposit_shards("compute", "batch_data", 1, 0, [np.array([10])], [1])
+    await mb.deposit_shards(
+        "compute", ["sparse_embedding"], 1, "A", 0, [[np.array([0.1])]], [[1]]
+    )
+    await mb.deposit_shards(
+        "compute", ["batch_data"], 1, "A", 0, [[np.array([10])]], [[1]]
+    )
     assert mb.is_step_ready("compute", 1), "Step 1 should be ready"
 
     # 2. Step 2 arrives normally
@@ -39,8 +43,12 @@ async def test_off_policy_staleness_integration():
         expected_states=[],
         barrier_config=config,
     )
-    await mb.deposit_shards("compute", "sparse_embedding", 2, 0, [np.array([0.2])], [1])
-    await mb.deposit_shards("compute", "batch_data", 2, 0, [np.array([20])], [1])
+    await mb.deposit_shards(
+        "compute", ["sparse_embedding"], 2, "A", 0, [[np.array([0.2])]], [[1]]
+    )
+    await mb.deposit_shards(
+        "compute", ["batch_data"], 2, "A", 0, [[np.array([20])]], [[1]]
+    )
     assert mb.is_step_ready("compute", 2), "Step 2 should be ready"
 
     # 3. Simulate step 3, where sparse embedding is delayed.
@@ -53,7 +61,9 @@ async def test_off_policy_staleness_integration():
     )
 
     # We only deposit batch data for step 3
-    await mb.deposit_shards("compute", "batch_data", 3, 0, [np.array([30])], [1])
+    await mb.deposit_shards(
+        "compute", ["batch_data"], 3, "A", 0, [[np.array([30])]], [[1]]
+    )
 
     # Step 3 should spring ready instantly! Because sparse_embedding from step 2 is 1 step stale, <= 2.
     assert mb.is_step_ready("compute", 3), (
@@ -61,10 +71,13 @@ async def test_off_policy_staleness_integration():
     )
 
     # Verify retrieved data for step 3
-    shards_emb = await mb.get_tensor_shards("compute", "sparse_embedding", 3)
+    shards_emb_dict = await mb.get_tensor_shards("compute", "sparse_embedding", 3)
+    # Convert dict of (sender_id, rank) -> List[shards] to a flat list of shards
+    shards_emb = [s for shards in shards_emb_dict.values() for s in shards]
     np.testing.assert_array_equal(shards_emb[0].flat_values, [0.2])
 
-    shards_batch = await mb.get_tensor_shards("compute", "batch_data", 3)
+    shards_batch_dict = await mb.get_tensor_shards("compute", "batch_data", 3)
+    shards_batch = [s for shards in shards_batch_dict.values() for s in shards]
     np.testing.assert_array_equal(shards_batch[0].flat_values, [30.0])
 
     # 4. Simulate step 4, where sparse embedding is delayed again.
@@ -75,14 +88,17 @@ async def test_off_policy_staleness_integration():
         expected_states=[],
         barrier_config=config,
     )
-    await mb.deposit_shards("compute", "batch_data", 4, 0, [np.array([40])], [1])
+    await mb.deposit_shards(
+        "compute", ["batch_data"], 4, "A", 0, [[np.array([40])]], [[1]]
+    )
 
     # Step 4 should also spring ready! Because sparse_embedding from step 2 is 2 steps stale, <= 2.
     assert mb.is_step_ready("compute", 4), (
         "Step 4 should be ready via stale data fallback"
     )
 
-    shards_emb_4 = await mb.get_tensor_shards("compute", "sparse_embedding", 4)
+    shards_emb_4_dict = await mb.get_tensor_shards("compute", "sparse_embedding", 4)
+    shards_emb_4 = [s for shards in shards_emb_4_dict.values() for s in shards]
     np.testing.assert_array_equal(shards_emb_4[0].flat_values, [0.2])
 
     # 5. Simulate step 5, where sparse embedding is delayed YET again.
@@ -93,7 +109,9 @@ async def test_off_policy_staleness_integration():
         expected_states=[],
         barrier_config=config,
     )
-    await mb.deposit_shards("compute", "batch_data", 5, 0, [np.array([50])], [1])
+    await mb.deposit_shards(
+        "compute", ["batch_data"], 5, "A", 0, [[np.array([50])]], [[1]]
+    )
 
     # Step 5 should NOT be ready! Because sparse_embedding from step 2 is 3 steps stale, which > 2.
     assert not mb.is_step_ready("compute", 5), (
@@ -101,7 +119,9 @@ async def test_off_policy_staleness_integration():
     )
 
     # Once we deposit step 3's embedding, it becomes ready
-    await mb.deposit_shards("compute", "sparse_embedding", 3, 0, [np.array([0.3])], [1])
+    await mb.deposit_shards(
+        "compute", ["sparse_embedding"], 3, "A", 0, [[np.array([0.3])]], [[1]]
+    )
     assert mb.is_step_ready("compute", 5), (
         "Step 5 should be ready after depositing new embedding data"
     )

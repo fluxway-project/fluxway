@@ -4,27 +4,13 @@ from fluxway.common.types.tensor import TransportTensor
 from .data_types import LookupOutput
 
 
-def route_to_dense(tensor, mesh):
-    """Calculates destination rank based on origin_indices."""
-    if tensor.origin_indices is None:
-        return 0
-
-    # Assume uniform chunk sharding on the target (Dense)
-    # We use global_shape to determine the logical batch size
-    global_rows = tensor.global_shape[0] if tensor.global_shape else 100
-    rows_per_rank = (global_rows + mesh.size - 1) // mesh.size
-
-    target_ranks = tensor.origin_indices // rows_per_rank
-    return jnp.clip(target_ranks, 0, mesh.size - 1)
-
-
 @spmd(mesh_axis_names=("shard",), mesh_axis_shapes=(4,))
 class SparseEmbeddingSPMD:
     """
     Generic lookup table.
     """
 
-    def __init__(self, vocab_size: int = 1000, embed_dim: int = 64):
+    def __init__(self, vocab_size: int = 1000, embed_dim: int = 3):
         self.embed_dim = embed_dim
         self.vocab_size = vocab_size
         # Simple parameter initialization
@@ -37,36 +23,34 @@ class SparseEmbeddingSPMD:
         input_sharding={
             "unique_ids": {"type": "dynamic", "axis": ["shard"], "fn": "hash_routing"}
         },
-        output_sharding={
-            "sparse_features": {
-                "type": "dynamic",
-                "axis": ["shard"],
-                "fn": "route_to_dense",
-            }
-        },
+        output_sharding={"sparse_features": {"type": "dynamic", "axis": ["shard"]}},
     )
     def lookup(self, unique_ids: TransportTensor) -> LookupOutput:
         """
         Receives 'unique_ids' directly.
         """
         rank = self.rank  # type: ignore rank and world_size has been injected by the decorator
+        world_size = self.world_size  # type: ignore
 
         ids = unique_ids.flat_values
         # Use modulo to stay within vocab_size for demo
         local_ids = jnp.mod(ids, self.vocab_size)
-        embeddings = self.params[local_ids]
+        embeddings = self.params[local_ids] * rank * world_size
 
-        print(
-            f"[SparseSPMD] Worker {rank}: Looked up {len(ids)} IDs. First few: {ids[:3] if len(ids) > 0 else []}"
-        )
-        print(
-            f"[SparseSPMD] Worker {rank}: Looked up embeddings sum {jnp.sum(embeddings)}"
-        )
+        # Determine global shape for downstream routing.
+        # Embeddings are (num_uniques, embed_dim), so global shape corresponds to (global_batch, embed_dim).
+        g_shape = None
+        if unique_ids.global_shape and len(unique_ids.global_shape) >= 1:
+            g_shape = (unique_ids.global_shape[0], self.embed_dim)
 
         output = TransportTensor(
             embeddings,
-            spatial_indices=unique_ids.spatial_indices,  # Propagate global IDs for backward routing
             origin_indices=unique_ids.origin_indices,
+            routing_indices=unique_ids.origin_indices,
+            global_shape=g_shape,
+        )
+        print(
+            f"[SparseSPMD] lookup rank={rank}, unique ids={unique_ids.flat_values}, global_shape={g_shape}, output embeddings={output.flat_values}"
         )
         return LookupOutput(sparse_features=output)
 
@@ -78,10 +62,10 @@ class SparseEmbeddingSPMD:
         },
     )
     def update(self, grads: TransportTensor) -> None:
-        ids = grads.spatial_indices
+        ids = grads.routing_indices
         if ids is None:
             print(
-                f"[SparseSPMD] Worker {self.rank} Update Error: Gradients missing spatial_indices"
+                f"[SparseSPMD] Worker {self.rank} Update Error: Gradients missing routing_indices"
             )
             return
 
@@ -103,8 +87,8 @@ class SparseEmbeddingSPMD:
 
 
 def hash_routing(tensor, mesh):
-    if isinstance(tensor, TransportTensor) and tensor.spatial_indices is not None:
-        val = tensor.spatial_indices
+    if isinstance(tensor, TransportTensor) and tensor.routing_indices is not None:
+        val = tensor.routing_indices
     else:
         val = tensor.flat_values if isinstance(tensor, TransportTensor) else tensor
     return jnp.mod(val, mesh.size)

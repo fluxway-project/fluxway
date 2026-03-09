@@ -45,8 +45,16 @@ class InputSPMD:
         # 1. Handle User ID (Routing to Table 1)
         u_user, inv_user = data.active.user_id.unique_with_routing()
 
+        print(
+            f"[InputSPMD] process rank={self.rank}, u_user={u_user.flat_values}, inv_user={inv_user.flat_values}"
+        )
+
         # 2. Handle Item ID (Routing to Table 2)
         u_item, inv_item = data.passive.target_item_id.unique_with_routing()
+
+        print(
+            f"[InputSPMD] process rank={self.rank}, u_item={u_item.flat_values}, inv_item={inv_item.flat_values}"
+        )
 
         # 3. Features to pass through as-is (DP aligned)
         dp_data = DPFeatures(

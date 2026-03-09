@@ -28,7 +28,7 @@ def test_static_to_static():
     dst_spec = ShardingSpec.chunk(mesh=dst_mesh, partition=P("x"))
 
     plan = TransportPlanner.plan(
-        src_spec=src_spec, dst_spec=dst_spec, data_shape=(100,), local_rank=0
+        src_local_rank=0, src_spec=src_spec, dst_spec=dst_spec, src_data_shape=(100,)
     )
 
     assert plan.target_num_workers == 4
@@ -48,7 +48,7 @@ def test_static_to_static_rank1():
     dst_spec = ShardingSpec.chunk(mesh=dst_mesh, partition=P("x"))
 
     plan = TransportPlanner.plan(
-        src_spec=src_spec, dst_spec=dst_spec, data_shape=(100,), local_rank=1
+        src_local_rank=1, src_spec=src_spec, dst_spec=dst_spec, src_data_shape=(100,)
     )
 
     counts = plan.send_counts.tolist()
@@ -71,11 +71,11 @@ def test_static_to_dynamic_hash():
     dst_spec = ShardingSpec.hash(mesh=dst_mesh, partition=P("x"))
 
     plan = TransportPlanner.plan(
+        src_local_rank=0,
         src_spec=src_spec,
         dst_spec=dst_spec,
-        data_shape=(4,),
-        local_rank=0,
-        index_desc=RaggedIndex(splits=splits),
+        src_data_shape=(4,),
+        dst_index_desc=RaggedIndex(splits=splits),
     )
 
     counts = plan.send_counts.tolist()
@@ -86,18 +86,32 @@ def test_static_to_dynamic_hash():
 
 
 def test_dynamic_to_static():
-    """Source: hash(2), local_rank=0 owns some rows. Target: chunk(2)."""
+    """Source: hash(2), local_rank=0 owns some rows. Target: chunk(2).
+    Routing logic for src_local_rank=0 (Source: Hash -> Target: Chunk)
+    Total rows: 6.
+    Hash splits: [0, 1, 0, 1, 0, 1]. Chunk splits: [0, 0, 0, 1, 1, 1].
+
+    Row 0: owns by Rank 0 -> target Rank 0 => send to Rank 0
+    Row 1: owns by Rank 1                  => (skip, not owned)
+    Row 2: owns by Rank 0 -> target Rank 0 => send to Rank 0
+    Row 3: owns by Rank 1                  => (skip, not owned)
+    Row 4: owns by Rank 0 -> target Rank 1 => send to Rank 1
+    Row 5: owns by Rank 1                  => (skip, not owned)
+
+    Final counts for Rank 0: 2 items to Rank 0, 1 item to Rank 1.
+    assert counts == [2, 1]
+    """
     dep = jnp.array([0, 1, 0, 1, 0, 1], dtype=jnp.int32)
     mesh = DeviceMesh(device_shape=(2,), axis_names=("x",))
     src_spec = ShardingSpec.hash(mesh=mesh, partition=P("x"))
     dst_spec = ShardingSpec.chunk(mesh=mesh, partition=P("x"))
 
     plan = TransportPlanner.plan(
+        src_local_rank=0,
         src_spec=src_spec,
         dst_spec=dst_spec,
-        data_shape=(6,),
-        local_rank=0,
-        index_desc=ExplicitIndex(indices=dep),
+        src_data_shape=(6,),
+        src_index_desc=ExplicitIndex(indices=dep),
     )
 
     counts = plan.send_counts.tolist()
@@ -116,22 +130,22 @@ def test_dynamic_to_dynamic():
     dst_spec = ShardingSpec.hash(mesh=mesh, partition=P("x"))
 
     plan = TransportPlanner.plan(
+        src_local_rank=0,
         src_spec=src_spec,
         dst_spec=dst_spec,
-        data_shape=(3,),
-        local_rank=0,
-        index_desc=RaggedIndex(splits=splits),
+        src_data_shape=(3,),
+        src_index_desc=RaggedIndex(splits=splits),
+        dst_index_desc=RaggedIndex(splits=splits),
     )
 
     counts = plan.send_counts.tolist()
-    assert counts[0] == 2
-    assert counts[1] == 0
+    assert counts == [2, 0]
 
 
-# ---- Scenario 5: spatial_indices (key -> value dual-tensor) ----
+# ---- Scenario 5: routing_indices (key -> value dual-tensor) ----
 
 
-def test_spatial_indices_dual_tensor():
+def test_routing_indices_dual_tensor():
     """Key-value dispatch: key determines device, value follows."""
     key_data = jnp.array([0, 1, 2, 3], dtype=jnp.int32)
     mesh = DeviceMesh(device_shape=(2,), axis_names=("x",))
@@ -147,7 +161,7 @@ def test_spatial_indices_dual_tensor():
     src_spec = ShardingSpec.chunk(mesh=src_mesh, partition=P("x"))
 
     plan = TransportPlanner.plan(
-        src_spec=src_spec, dst_spec=val_spec, data_shape=(4,), local_rank=0
+        src_local_rank=0, src_spec=src_spec, dst_spec=val_spec, src_data_shape=(4,)
     )
 
     counts = plan.send_counts.tolist()
@@ -166,7 +180,7 @@ def test_replicate_fanout():
     dst_spec = ShardingSpec.chunk(mesh=dst_mesh, partition=P("x"))
 
     plan = TransportPlanner.plan(
-        src_spec=src_spec, dst_spec=dst_spec, data_shape=(10,), local_rank=0
+        src_local_rank=0, src_spec=src_spec, dst_spec=dst_spec, src_data_shape=(10,)
     )
 
     assert plan.replication_factor == 2
@@ -193,7 +207,7 @@ def test_ragged_data_reorder():
     dst_spec = ShardingSpec.cyclic(mesh=dst_mesh, partition=P("x"))
 
     plan = TransportPlanner.plan(
-        src_spec=src_spec, dst_spec=dst_spec, data_shape=(4,), local_rank=0
+        src_local_rank=0, src_spec=src_spec, dst_spec=dst_spec, src_data_shape=(4,)
     )
 
     counts = plan.send_counts.tolist()
@@ -219,7 +233,7 @@ def test_iter_device_slices():
     dst_spec = ShardingSpec.cyclic(mesh=dst_mesh, partition=P("x"))
 
     plan = TransportPlanner.plan(
-        src_spec=src_spec, dst_spec=dst_spec, data_shape=(6,), local_rank=0
+        src_local_rank=0, src_spec=src_spec, dst_spec=dst_spec, src_data_shape=(6,)
     )
 
     slices = list(plan.iter_device_slices())
@@ -249,14 +263,12 @@ def test_multi_axis_dynamic_routing_dims():
     # For Dim 1 (hash y) -> routing values: [1, 0]
     # We supply src_indices to substitute explicit routing vectors since planner accepts indices or data_values.
 
-    src_layout = src_spec._to_layout((2, 2))
-    dst_layout = dst_spec._to_layout((2, 2))
-
     plan = TransportPlanner.compute_plan(
-        src_layout=src_layout,
-        dst_layout=dst_layout,
-        local_rank=0,
-        src_indices=jnp.array([0, 1], dtype=jnp.int32),
+        src_local_rank=0,
+        src_data_shape=(2, 2),
+        src_spec=src_spec,
+        dst_spec=dst_spec,
+        src_routing_indices=jnp.array([0, 1], dtype=jnp.int32),
     )
 
     # Since it's dynamic Hash over mesh shape 2x2:

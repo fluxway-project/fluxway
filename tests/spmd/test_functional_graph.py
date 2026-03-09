@@ -1,138 +1,195 @@
-from typing import Any, Type
+from typing import Any, Optional
 import sys
 import os
-import copy
 
 sys.path.append(os.getcwd())
 
 from fluxway.control_plane.graph.functional import FunctionalGraph
-from fluxway.common.types.configs import SPMDConfig
-from fluxway.common.decorators import spmd, operator
+from fluxway.common.decorators import spmd, operator, data_type
+
+
+@data_type()
+class DummyData:
+    h_obs: Optional[Any] = None
+    h_action: Optional[Any] = None
+    h_reward: Optional[Any] = None
+    h_train: Optional[Any] = None
+    dummy_tensor: Optional[Any] = None
+    input1: Optional[Any] = None
+    input2: Optional[Any] = None
+    h_fwd: Optional[Any] = None
+    dummy: Optional[Any] = None
+
+
+# Universal sharding config for replicated data
+REP = {"type": "replicated", "axis": []}
 
 
 @spmd(mesh_axis_names=("data",), mesh_axis_shapes=(1,))
 class DummySPMD:
     """Mock SPMD for testing graph topology."""
 
-    # Stubs for static analysis
-    @classmethod
-    def get_spmd_config(cls) -> Any: ...
-    @classmethod
-    def get_resource(cls) -> Any: ...
+    @operator(
+        output_sharding={
+            "h_obs": REP,
+            "h_action": REP,
+            "h_reward": REP,
+            "h_train": REP,
+            "dummy_tensor": REP,
+            "input1": REP,
+            "input2": REP,
+            "h_fwd": REP,
+            "dummy": REP,
+        },
+        input_sharding={
+            "h_obs": REP,
+            "h_action": REP,
+            "h_reward": REP,
+            "h_train": REP,
+            "dummy_tensor": REP,
+            "input1": REP,
+            "input2": REP,
+            "h_fwd": REP,
+            "dummy": REP,
+        },
+    )
+    def compute(self, data: DummyData) -> DummyData:
+        return data
 
-    @operator
-    def compute(self, *args, **kwargs):
-        pass
+    @operator(
+        output_sharding={
+            "h_obs": REP,
+            "h_action": REP,
+            "h_reward": REP,
+            "h_train": REP,
+            "dummy_tensor": REP,
+            "input1": REP,
+            "input2": REP,
+            "h_fwd": REP,
+            "dummy": REP,
+        },
+        input_sharding={
+            "h_obs": REP,
+            "h_action": REP,
+            "h_reward": REP,
+            "h_train": REP,
+            "dummy_tensor": REP,
+            "input1": REP,
+            "input2": REP,
+            "h_fwd": REP,
+            "dummy": REP,
+        },
+    )
+    def optimize(self, data: DummyData) -> DummyData:
+        return data
 
-    @operator
-    def optimize(self, *args, **kwargs):
-        pass
+    @operator(
+        output_sharding={
+            "h_obs": REP,
+            "h_action": REP,
+            "h_reward": REP,
+            "h_train": REP,
+            "dummy_tensor": REP,
+            "input1": REP,
+            "input2": REP,
+            "h_fwd": REP,
+            "dummy": REP,
+        },
+        input_sharding={
+            "h_obs": REP,
+            "h_action": REP,
+            "h_reward": REP,
+            "h_train": REP,
+            "dummy_tensor": REP,
+            "input1": REP,
+            "input2": REP,
+            "h_fwd": REP,
+            "dummy": REP,
+        },
+    )
+    def step(self, data: DummyData) -> DummyData:
+        return data
 
-    @operator
-    def step(self, *args, **kwargs):
-        pass
+    @operator(
+        output_sharding={
+            "h_obs": REP,
+            "h_action": REP,
+            "h_reward": REP,
+            "h_train": REP,
+            "dummy_tensor": REP,
+            "input1": REP,
+            "input2": REP,
+            "h_fwd": REP,
+            "dummy": REP,
+        },
+        input_sharding={
+            "h_obs": REP,
+            "h_action": REP,
+            "h_reward": REP,
+            "h_train": REP,
+            "dummy_tensor": REP,
+            "input1": REP,
+            "input2": REP,
+            "h_fwd": REP,
+            "dummy": REP,
+        },
+    )
+    def rollout(self, data: DummyData) -> DummyData:
+        return data
 
-    @operator
-    def rollout(self, *args, **kwargs):
-        pass
+    @operator(
+        output_sharding={
+            "h_obs": REP,
+            "h_action": REP,
+            "h_reward": REP,
+            "h_train": REP,
+            "dummy_tensor": REP,
+            "input1": REP,
+            "input2": REP,
+            "h_fwd": REP,
+            "dummy": REP,
+        },
+        input_sharding={
+            "h_obs": REP,
+            "h_action": REP,
+            "h_reward": REP,
+            "h_train": REP,
+            "dummy_tensor": REP,
+            "input1": REP,
+            "input2": REP,
+            "h_fwd": REP,
+            "dummy": REP,
+        },
+    )
+    def compute_reward(self, data: DummyData) -> DummyData:
+        return data
 
-    @operator
-    def compute_reward(self, *args, **kwargs):
-        pass
-
-    @operator
-    def train_step(self, *args, **kwargs):
-        pass
-
-
-def _mock_metas():
-    """
-    [Beginner's Guide: Why do we need to mock metadata?]
-
-    In Fluxway's formal workflow, each operator needs to strictly define its input/output data types (Dataclass)
-    and tensor sharding strategies. The Builder performs rigorous physical validation when connecting edges:
-    1. Validate whether the output of A and the input of B are type-compatible.
-    2. Validate whether data needs to be rearranged (Resharding) when transferred from A's memory distribution to B's.
-
-    In "graph logic tests," we often only care about "whether Node A is connected to Node B," without worrying about specific physical implementations.
-
-    The purpose of this function is:
-    1. Dynamically inject (Patch) metadata so the Builder thinks these Dummy operators have valid inputs and outputs.
-    2. Disable strict physical validation (e.g., validate_tensor_io_match), allowing us to quickly test various complex graph topologies (e.g., RL loops, multi-input merges) without defining complex data structures.
-    3. Ensure each test node gets an independent metadata copy (Deepcopy) to prevent test interference.
-    """
-    from fluxway.common.types.configs import OperatorMeta
-
-    # Shield physical validation logic, keep only topological logic
-    # OperatorMeta.validate_tensor_io_match = lambda self, dst, src_is_output, ctx: None
-
-    metas = {}
-    for op in [
-        "compute",
-        "optimize",
-        "step",
-        "rollout",
-        "compute_reward",
-        "train_step",
-    ]:
-        metas[op] = OperatorMeta(
-            name=op,
-            fn_name=op,
-            data_inputs=[],
-            control_inputs=[],
-            sync_inputs=[],
-            data_outputs=[],
-            sync_outputs=[],
-            input_arguments={},
-            output_arguments={},
-            # Inject virtual sharding info to trigger Builder's EdgeShardingInfo routing records
-            # Support arbitrary names for topology testing
-            input_sharding={
-                k: {"type": "replicated"}
-                for k in [
-                    "dummy_tensor",
-                    "input1",
-                    "input2",
-                    "h_obs",
-                    "h_action",
-                    "h_reward",
-                    "h_train",
-                ]
-            },
-            output_sharding={
-                k: {"type": "replicated"}
-                for k in [
-                    "dummy_tensor",
-                    "input1",
-                    "input2",
-                    "h_obs",
-                    "h_action",
-                    "h_reward",
-                    "h_train",
-                ]
-            },
-        )
-    DummySPMD.get_operator_metas = classmethod(lambda cls: metas)
-
-    # Intercept configuration acquisition to ensure Builder gets metas processed by Mock
-    orig_get_config = DummySPMD.get_spmd_config
-
-    def mock_get_config(cls: Type["DummySPMD"]) -> SPMDConfig:
-        config = orig_get_config()
-        if config is None:
-            config = SPMDConfig()
-        # Core: Must use deepcopy!
-        # Otherwise, all nodes in the graph using DummySPMD will point to the same meta object,
-        # causing edge info to overwrite each other.
-        config.operator_metas = copy.deepcopy(metas)
-        config.operators = {op: getattr(DummySPMD, op) for op in metas.keys()}
-        return config
-
-    DummySPMD.get_spmd_config = classmethod(mock_get_config)
-
-
-# Execute Mock injection
-_mock_metas()
+    @operator(
+        output_sharding={
+            "h_obs": REP,
+            "h_action": REP,
+            "h_reward": REP,
+            "h_train": REP,
+            "dummy_tensor": REP,
+            "input1": REP,
+            "input2": REP,
+            "h_fwd": REP,
+            "dummy": REP,
+        },
+        input_sharding={
+            "h_obs": REP,
+            "h_action": REP,
+            "h_reward": REP,
+            "h_train": REP,
+            "dummy_tensor": REP,
+            "input1": REP,
+            "input2": REP,
+            "h_fwd": REP,
+            "dummy": REP,
+        },
+    )
+    def train_step(self, data: DummyData) -> DummyData:
+        return data
 
 
 def test_functional_graph_single_chain():

@@ -2,6 +2,7 @@ import unittest
 import asyncio
 from unittest.mock import MagicMock
 import jax.numpy as jnp
+import numpy as np
 
 from fluxway.transport.communication import SyncDataDistributor, AsyncDataDistributor
 from fluxway.common.types.sharding import ShardingSpec, P
@@ -16,10 +17,12 @@ class TestDataDistributor(unittest.TestCase):
 
         # Setup simple data
         self.data = jnp.arange(10, dtype=jnp.float32)
-        self.transport_tensor = TransportTensor(self.data)
+        self.transport_tensor = TransportTensor(self.data, global_shape=(20,))
 
         # Specs with Mesh for inference
-        self.mesh = DeviceMesh((2,), ("x",), jnp.array([0, 1]))
+        self.mesh = DeviceMesh(
+            axis_names=("x",), device_shape=(2,), device_ids=np.array([0, 1])
+        )
 
         self.src_spec = ShardingSpec.chunk(mesh=self.mesh, partition=P("x"))
         self.dst_spec = ShardingSpec.chunk(mesh=self.mesh, partition=P("x"))
@@ -49,14 +52,8 @@ class TestDataDistributor(unittest.TestCase):
     def test_async_distributor(self):
         dist = AsyncDataDistributor(self.local_rank)
 
-        # Updated API: send_fn takes 6 arguments
         async def async_send_fn(
-            device_id,
-            tensors,
-            counts,
-            has_spatial_indices_list,
-            is_ragged_list,
-            has_origin_indices_list,
+            device_id, tensors, counts, global_shapes, meta_tensor_state_list
         ):
             await asyncio.sleep(0.01)
             return f"ok_{device_id}"
@@ -88,37 +85,34 @@ class TestDataDistributor(unittest.TestCase):
         ragged_data = jnp.arange(6, dtype=jnp.float32)
         # lengths [2, 1, 3] -> splits [0, 2, 3, 6]
         ragged_tt = TransportTensor(
-            ragged_data, nested_splits=[jnp.array([0, 2, 3, 6])]
+            ragged_data, nested_splits=[jnp.array([0, 2, 3, 6])], global_shape=(12,)
         )
 
-        spatial_indices = jnp.arange(10, dtype=jnp.int32)
-        spatial_tt = TransportTensor(dense_data, spatial_indices=spatial_indices)
+        routing_indices = jnp.arange(10, dtype=jnp.int32)
+        spatial_tt = TransportTensor(
+            dense_data, routing_indices=routing_indices, global_shape=(20,)
+        )
 
         origin_indices = jnp.array([100, 101, 102], dtype=jnp.int32)
         # If we have origin indices, the count should match
         origin_data = jnp.arange(3, dtype=jnp.float32)
-        origin_tt = TransportTensor(origin_data, origin_indices=origin_indices)
+        origin_tt = TransportTensor(
+            origin_data, origin_indices=origin_indices, global_shape=(6,)
+        )
 
         batch = [spatial_tt, ragged_tt, origin_tt]
 
         async def async_send_fn(
-            device_id,
-            tensors,
-            counts,
-            has_spatial_indices_list,
-            is_ragged_list,
-            has_origin_indices_list,
+            device_id, tensors, counts, global_shapes, meta_tensor_state_list
         ):
-            self.assertEqual(len(has_spatial_indices_list), 3)
-            self.assertEqual(len(is_ragged_list), 3)
-            self.assertEqual(len(has_origin_indices_list), 3)
+            self.assertEqual(len(meta_tensor_state_list), 3)
 
             # spatial_tt is first (primary)
-            self.assertTrue(has_spatial_indices_list[0])
+            self.assertTrue(bool(meta_tensor_state_list[0] & 4))
             # ragged_tt is second
-            self.assertTrue(is_ragged_list[1])
+            self.assertTrue(bool(meta_tensor_state_list[1] & 1))
             # origin_tt is third
-            self.assertTrue(has_origin_indices_list[2])
+            self.assertTrue(bool(meta_tensor_state_list[2] & 2))
 
             return f"ok_{device_id}"
 
@@ -140,22 +134,21 @@ class TestDataDistributor(unittest.TestCase):
         """Test a batch where all tensors have spatial indices."""
         dist = AsyncDataDistributor(self.local_rank)
 
-        spatial_indices = jnp.arange(10, dtype=jnp.int32)
-        tt1 = TransportTensor(jnp.arange(10), spatial_indices=spatial_indices)
-        tt2 = TransportTensor(jnp.arange(10) + 10, spatial_indices=spatial_indices)
+        routing_indices = jnp.arange(10, dtype=jnp.int32)
+        tt1 = TransportTensor(
+            jnp.arange(10), routing_indices=routing_indices, global_shape=(20,)
+        )
+        tt2 = TransportTensor(
+            jnp.arange(10) + 10, routing_indices=routing_indices, global_shape=(20,)
+        )
 
         batch = [tt1, tt2]
 
         async def async_send_fn(
-            device_id,
-            tensors,
-            counts,
-            has_spatial_list,
-            is_ragged_list,
-            has_origin_list,
+            device_id, tensors, counts, global_shapes, meta_tensor_state_list
         ):
-            self.assertEqual(has_spatial_list, [True, True])
-            # In current implementation, we only send ONE shared spatial_indices tensor at the end
+            self.assertEqual(meta_tensor_state_list, [4, 4])
+            # In current implementation, we only send ONE shared routing_indices tensor at the end
             # so flat tensors should be: [tt1_data, tt2_data, shared_spatial_idx]
             self.assertEqual(len(tensors), 3)
             return f"ok_{device_id}"
@@ -170,24 +163,23 @@ class TestDataDistributor(unittest.TestCase):
         dist = AsyncDataDistributor(self.local_rank)
 
         idx = jnp.arange(5, dtype=jnp.int32)
-        t1 = TransportTensor(jnp.zeros(5))  # dense
+        t1 = TransportTensor(jnp.zeros(5), global_shape=(10,))  # dense
         t2 = TransportTensor(
-            jnp.ones(5), nested_splits=[jnp.array([0, 2, 5])], spatial_indices=idx
+            jnp.ones(5),
+            nested_splits=[jnp.array([0, 2, 5])],
+            routing_indices=idx,
+            global_shape=(10,),
         )  # ragged+idx
-        t3 = TransportTensor(jnp.ones(5) * 2, spatial_indices=idx)  # dense+idx
+        t3 = TransportTensor(
+            jnp.ones(5) * 2, routing_indices=idx, global_shape=(10,)
+        )  # dense+idx
 
         batch = [t1, t2, t3]
 
         async def async_send_fn(
-            device_id,
-            tensors,
-            counts,
-            has_spatial_list,
-            is_ragged_list,
-            has_origin_list,
+            device_id, tensors, counts, global_shapes, meta_tensor_state_list
         ):
-            self.assertEqual(has_spatial_list, [False, True, True])
-            self.assertEqual(is_ragged_list, [False, True, False])
+            self.assertEqual(meta_tensor_state_list, [0, 5, 4])
             # flat tensors: [t1_data, t2_data, t2_len, t3_data, shared_idx]
             self.assertEqual(len(tensors), 5)
             self.assertEqual(len(counts), 5)

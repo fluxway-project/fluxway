@@ -393,7 +393,7 @@ if RAY_AVAILABLE:
             driver = self._spmd_manager.get_driver_handle(reader_id)
             if driver is not None:
                 try:
-                    await driver.pause_reading.remote()
+                    await driver.pause_sources.remote()
                     self._paused_readers.add(reader_id)
                     logger.debug(f"Paused reader {reader_id} due to backpressure")
                 except Exception as e:
@@ -409,7 +409,7 @@ if RAY_AVAILABLE:
             driver = self._spmd_manager.get_driver_handle(reader_id)
             if driver is not None:
                 try:
-                    await driver.resume_reading.remote()
+                    await driver.resume_sources.remote()
                     self._paused_readers.discard(reader_id)
                     logger.debug(f"Resumed reader {reader_id}")
                 except Exception as e:

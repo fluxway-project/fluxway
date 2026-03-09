@@ -12,6 +12,7 @@ Usage:
     graph = builder.build(name="my_graph")
 """
 
+from fluxway import SPMDConfig
 import copy
 from typing import Any, Dict, List, Optional, Callable, Type, Tuple
 import logging
@@ -25,6 +26,8 @@ from fluxway.common.types import (
     ResourceSpec,
 )
 from fluxway.common.mesh import DeviceMesh
+from fluxway.common.types.sharding import ShardingConfig
+from fluxway.common.types.configs import ArgumentType
 
 
 logger = logging.getLogger(__name__)
@@ -42,6 +45,14 @@ class Builder:
         self._nodes: Dict[str, Node] = {}
         self._edges: List[Edge] = []
         self._spmd_classes: Dict[str, Type] = {}
+        self._uuid_counter = 0
+        self._output_uuids: Dict[
+            Tuple[str, str, str], int
+        ] = {}  # {(node, op, out_name): tuuid}
+
+    def _next_uuid(self) -> int:
+        self._uuid_counter += 1
+        return self._uuid_counter
 
     def add_node(
         self,
@@ -152,6 +163,17 @@ class Builder:
         self._nodes[name] = node
         self._spmd_classes[name] = spmd_class
 
+        # Pre-assign UUIDs for all operator outputs to ensure stable ordered routing
+        for op_name, meta in spmd_config.operator_metas.items():
+            out_args = meta.get_arguments(is_output=True, arg_type=ArgumentType.DATA)
+            tuuids = []
+            for out_name in out_args:
+                u_key = (name, op_name, out_name)
+                if u_key not in self._output_uuids:
+                    self._output_uuids[u_key] = self._next_uuid()
+                tuuids.append(self._output_uuids[u_key])
+            meta.output_uuids = tuuids
+
         return self
 
     # -------------------------------------------------------------------------
@@ -240,6 +262,8 @@ class Builder:
         condition_fn: Optional[Callable[..., bool]] = None,
         source_output: Optional[str] = None,
         target_input: Optional[str] = None,
+        tensor_map: Optional[Dict[str, str]] = None,
+        symmetric_to: Optional[Tuple[str, str, str, str]] = None,
     ) -> "Builder":
         """
         Add a generic edge specifying source and target op names.
@@ -280,6 +304,7 @@ class Builder:
             source_op=source_op,
             target_op=target_op,
             condition_fn=condition_fn,
+            symmetric_to=symmetric_to,
         )
 
         # All edges go into _edges (no semantic distinction anymore)
@@ -294,6 +319,48 @@ class Builder:
             condition_fn,
             source_output,
             target_input,
+            tensor_map=tensor_map,
+            symmetric_to=symmetric_to,
+        )
+
+        return self
+
+    def add_symmetric_path(
+        self,
+        node1: str,
+        op1_fwd: str,
+        op1_bwd: str,
+        node2: str,
+        op2_fwd: str,
+        op2_bwd: str,
+        tensor_map: Optional[Dict[str, str]] = None,
+    ) -> "Builder":
+        """
+        Create a pair of symmetric edges (forward/backward) between two nodes.
+
+        This enables 'Zero-Declaration' routing in the backward pass. The backward
+        pass will automatically use the provenance information captured during
+        the forward pass to route data (gradients) back to its origin.
+
+        Args:
+            node1: Source node for forward (Target for backward)
+            op1_fwd: Forward op on node1
+            op1_bwd: Backward op on node1
+            node2: Target node for forward (Source for backward)
+            op2_fwd: Forward op on node2
+            op2_bwd: Backward op on node2
+            tensor_map: Mapping for the backward edge tensors (e.g., {"grad_out": "grad_in"}).
+                        If None, matching names are mapped.
+        """
+        fwd_key = (node1, op1_fwd, node2, op2_fwd)
+        bwd_key = (node2, op2_bwd, node1, op1_bwd)
+
+        # 1. Forward Edge: node1:op1_fwd -> node2:op2_fwd
+        self.add_func_edge(node1, op1_fwd, node2, op2_fwd, symmetric_to=bwd_key)
+
+        # 2. Backward Edge: node2:op2_bwd -> node1:op1_bwd
+        self.add_func_edge(
+            node2, op2_bwd, node1, op1_bwd, tensor_map=tensor_map, symmetric_to=fwd_key
         )
 
         return self
@@ -358,6 +425,8 @@ class Builder:
         condition_fn: Optional[Callable[..., bool]],
         source_output: Optional[str] = None,
         target_input: Optional[str] = None,
+        tensor_map: Optional[Dict[str, str]] = None,
+        symmetric_to: Optional[Tuple[str, str, str, str]] = None,
     ) -> None:
         """
         Validate and link operator metadata between two nodes.
@@ -374,11 +443,48 @@ class Builder:
             source_output,
             target_input,
             ctx,
+            tensor_map=tensor_map,
         )
 
         # 2. Linking Phase (Update topology and sharding info in SPMDConfigs)
+        # Compute sharding maps for topology before linking
+        src_out_specs = effective_sharding["src_out_specs"]
+        dst_in_specs = effective_sharding["dst_in_specs"]
+
+        # TUUID Generation and Mapping
+        # We assign an integer TUUID to cada tensor produced by an operator
+        tuuid_map: Dict[str, int] = {}  # {target_name: tuuid}
+        tuuid_src_out: Dict[int, Any] = {}  # {tuuid: src_spec}
+        tuuid_dst_in: Dict[int, Any] = {}  # {tuuid: dst_spec}
+
+        if tensor_map:
+            for src_name, target_name in tensor_map.items():
+                u_key = (source_node, source_op, src_name)
+                u = self._output_uuids[u_key]
+                tuuid_map[target_name] = u
+                tuuid_src_out[u] = src_out_specs[src_name]
+                tuuid_dst_in[u] = dst_in_specs[target_name]
+        else:
+            ds_names = effective_sharding["dst_names"]
+            for n in ds_names:
+                u_key = (source_node, source_op, n)
+                u = self._output_uuids[u_key]
+                tuuid_map[n] = u
+                tuuid_src_out[u] = src_out_specs[n]
+                tuuid_dst_in[u] = dst_in_specs[n]
+
         self._link_topology(
-            source_node, source_op, target_node, target_op, condition_fn, tensor_map
+            source_node,
+            source_op,
+            target_node,
+            target_op,
+            condition_fn,
+            tensor_map,
+            src_meta,
+            tuuid_map=tuuid_map,
+            tuuid_src_out=tuuid_src_out,
+            tuuid_dst_in=tuuid_dst_in,
+            symmetric_to=symmetric_to,
         )
         self._link_sharding(
             source_node,
@@ -390,6 +496,9 @@ class Builder:
             effective_sharding,
             condition_fn,
             tensor_map,
+            tuuid_map=tuuid_map,
+            tuuid_src_out=tuuid_src_out,
+            tuuid_dst_in=tuuid_dst_in,
         )
 
     def _validate_edge_io(
@@ -401,6 +510,7 @@ class Builder:
         source_output: Optional[str],
         target_input: Optional[str],
         ctx: str,
+        tensor_map: Optional[Dict[str, str]] = None,
     ) -> Tuple[OperatorMeta, OperatorMeta, Dict[str, Any], Dict[str, str]]:
         """
         Unified validation for edge IO.
@@ -426,13 +536,10 @@ class Builder:
             ctx=ctx,
         )
 
-        from fluxway.common.types.sharding import ShardingConfig
-        from fluxway.common.types.configs import ArgumentType
-
         # This implementation treats parameter names as placeholders and resolves
         # the underlying flattened tensor fields automatically.
-        src_args = src_meta.get_arguments(is_output=True, arg_type=ArgumentType.TENSOR)
-        dst_args = dst_meta.get_arguments(is_output=False, arg_type=ArgumentType.TENSOR)
+        src_args = src_meta.get_arguments(is_output=True, arg_type=ArgumentType.DATA)
+        dst_args = dst_meta.get_arguments(is_output=False, arg_type=ArgumentType.DATA)
 
         effective_src_names = src_args
         effective_dst_names = dst_args
@@ -468,7 +575,7 @@ class Builder:
             target_input = effective_dst_names[0]
             explicit_target = True
 
-        tensor_map = {}
+        tensor_map = tensor_map if tensor_map is not None else {}
 
         # Positional mapping if both endpoints were explicitly specified and their structures match
         if (
@@ -579,6 +686,11 @@ class Builder:
         target_op: str,
         condition_fn: Optional[Callable[..., bool]],
         tensor_map: Dict[str, str],
+        src_meta: OperatorMeta,
+        tuuid_map: Dict[str, int],
+        tuuid_src_out: Dict[int, Any],
+        tuuid_dst_in: Dict[int, Any],
+        symmetric_to: Optional[Tuple[str, str, str, str]] = None,
     ) -> None:
         """Link nodes within the SPMDConfig topology dictionaries."""
         src_cfg = self._nodes[source_node].spmd_config
@@ -592,22 +704,93 @@ class Builder:
         # Link Successor
         if target_node not in src_cfg.topology[source_op].successors:
             src_cfg.topology[source_op].successors[target_node] = SPMDTopologyInfo(
-                spmd_id=target_node, condition_fn=condition_fn, tensor_map=tensor_map
+                spmd_id=target_node,
+                world_size=dst_cfg.num_workers,
+                mesh=dst_cfg.mesh,
+                condition_fn=condition_fn,
+                tuuid_map=tuuid_map,
+                tuuid_sharding=tuuid_dst_in,
+                symmetric_to=symmetric_to,
+                is_interleaved=getattr(src_meta, "is_interleaved", False),
+                interleave_unit_size=getattr(src_meta, "interleave_unit_size", 1),
             )
         else:
-            src_cfg.topology[source_op].successors[target_node].tensor_map.update(
-                tensor_map
-            )
+            topo = src_cfg.topology[source_op].successors[target_node]
+            topo.world_size = dst_cfg.num_workers
+            topo.mesh = dst_cfg.mesh
+            topo.tuuid_map.update(tuuid_map)
+            topo.tuuid_sharding.update(tuuid_dst_in)
+            if symmetric_to:
+                topo.symmetric_to = symmetric_to
 
         # Link Predecessor
         if source_node not in dst_cfg.topology[target_op].predecessors:
             dst_cfg.topology[target_op].predecessors[source_node] = SPMDTopologyInfo(
-                spmd_id=source_node, tensor_map=tensor_map
+                spmd_id=source_node,
+                world_size=src_cfg.num_workers,
+                mesh=src_cfg.mesh,
+                tuuid_map=tuuid_map,
+                tuuid_sharding=tuuid_src_out,
+                symmetric_to=symmetric_to,
+                is_interleaved=getattr(src_meta, "is_interleaved", False),
+                interleave_unit_size=getattr(src_meta, "interleave_unit_size", 1),
             )
         else:
-            dst_cfg.topology[target_op].predecessors[source_node].tensor_map.update(
-                tensor_map
+            topo = dst_cfg.topology[target_op].predecessors[source_node]
+            topo.world_size = src_cfg.num_workers
+            topo.mesh = src_cfg.mesh
+            topo.tuuid_map.update(tuuid_map)
+            topo.tuuid_sharding.update(tuuid_src_out)
+            if symmetric_to:
+                topo.symmetric_to = symmetric_to
+
+    def _infer_interleave_params(
+        self, spmd_config: SPMDConfig, meta: OperatorMeta
+    ) -> Tuple[bool, int]:
+        """
+        Infer interleave parameters based on mesh and output sharding.
+
+        Logic:
+        1. If it's not a producer (source), it doesn't interleave by default.
+        2. If it's a source, we look for 'interleavable' axes.
+           An axis is interleavable if it is used for sharding.
+           The workers NOT part of the sharded dimension form a 'unit'.
+        """
+        if spmd_config.mesh is None or not isinstance(spmd_config.mesh, DeviceMesh):
+            raise ValueError(
+                f"\n[Fluxway Topology Error] In {spmd_config.spmd_id}:\n"
+                f"  Mesh is not defined or not a DeviceMesh.\n"
+                f"  Fix: Add mesh_axis_names and mesh_axis_shapes to the @operator decorator."
             )
+        mesh: DeviceMesh = spmd_config.mesh
+        if not mesh or mesh.size <= 1:
+            return False, 1
+
+        # Identify axes used in output sharding
+        sharded_axes = set()
+        for v in (meta.output_sharding or {}).values():
+            from fluxway.common.types.sharding import ShardingSpec
+
+            if isinstance(v, dict):
+                axis = v.get("axis", [])
+                if isinstance(axis, str):
+                    sharded_axes.add(axis)
+                else:
+                    sharded_axes.update(axis)
+            elif isinstance(v, ShardingSpec):
+                for sub in v.partition.partitions.values():
+                    sharded_axes.update(sub)
+
+        # interleave_unit_size is the product of sizes of axes NOT used for sharding
+        # These represent "Replicated" or "Model Parallel" groups that must act together.
+        unit_size = 1
+        for ax_name, ax_size in zip(mesh.axis_names, mesh.shape, strict=True):  # type: ignore
+            if ax_name not in sharded_axes:
+                unit_size *= ax_size
+
+        # If we have more than one unit, we can interleave them
+        is_interleaved = mesh.size > unit_size
+        return is_interleaved, unit_size
 
     def _link_sharding(
         self,
@@ -620,53 +803,112 @@ class Builder:
         effective_sharding: Dict[str, Any],
         condition_fn: Optional[Callable[..., bool]],
         tensor_map: Dict[str, str],
+        tuuid_map: Dict[str, int],
+        tuuid_src_out: Dict[int, Any],
+        tuuid_dst_in: Dict[int, Any],
     ) -> None:
         """Inject edge sharding information into OperatorMeta objects."""
+        src_cfg = self._nodes[source_node].spmd_config
         src_out_specs = effective_sharding["src_out_specs"]
         dst_in_specs = effective_sharding["dst_in_specs"]
 
-        if tensor_map:
-            effective_src_out = {
-                target_name: src_out_specs[src_name]
-                for src_name, target_name in tensor_map.items()
-            }
-            effective_dst_in = {
-                src_name: dst_in_specs[target_name]
-                for src_name, target_name in tensor_map.items()
-            }
-        else:
-            src_names = effective_sharding["src_names"]
-            dst_names = effective_sharding["dst_names"]
-            effective_src_out = {n: src_out_specs[n] for n in src_names}
-            effective_dst_in = {n: dst_in_specs[n] for n in dst_names}
+        # Use explicitly defined properties from OperatorMeta
+        is_interleaved = getattr(src_meta, "is_interleaved", False)
+        interleave_unit_size = getattr(src_meta, "interleave_unit_size", 1)
 
-        # Source -> Successor Sharding
+        # Legacy automated inference (if not explicitly set via @spmd_source)
+        is_source = src_meta.is_source
+        if not is_source:
+            # Graph-based fallback: if this node:op has no incoming edges, it's a source
+            has_preds = any(
+                e.target_node == source_node and e.target_op == source_op
+                for e in self._edges
+            )
+            if not has_preds:
+                is_source = True
+
+        if is_source and not is_interleaved:
+            # Inference based on Sharding and Mesh
+            auto_interleaved, auto_unit_size = self._infer_interleave_params(
+                src_cfg, src_meta
+            )
+            if auto_interleaved:
+                is_interleaved = auto_interleaved
+                interleave_unit_size = auto_unit_size
+
+        if is_interleaved:
+            logger.debug(
+                f"[Builder] Edge {source_node}.{source_op} -> {target_node}.{target_op} inferred as INTERLEAVED "
+                f"(unit_size={interleave_unit_size})"
+            )
 
         dst_meta.input_pre_sharding.setdefault(source_node, []).append(
             EdgeShardingInfo(
                 condition_fn=condition_fn,
-                tensor_sharding=effective_src_out,
+                tuuid_sharding=tuuid_src_out,
+                tuuid_map=tuuid_map,
                 target_op=target_op,
                 tensor_map=tensor_map,
+                input_param_map=dst_meta.input_param_map,
+                output_param_map=src_meta.output_param_map,
+                is_interleaved=is_interleaved,
+                interleave_unit_size=interleave_unit_size,
             )
         )
         src_meta.output_post_sharding.setdefault(target_node, []).append(
             EdgeShardingInfo(
                 condition_fn=condition_fn,
-                tensor_sharding=effective_dst_in,
+                tuuid_sharding=tuuid_dst_in,
+                tuuid_map=tuuid_map,
                 target_op=target_op,
                 tensor_map=tensor_map,
+                input_param_map=dst_meta.input_param_map,
+                output_param_map=src_meta.output_param_map,
+                is_interleaved=is_interleaved,
+                interleave_unit_size=interleave_unit_size,
             )
         )
 
         logger.debug(
-            "Builder linked sharding: %s.%s <-> %s.%s, tensor_keys=%s",
+            "Builder linked sharding: %s.%s <-> %s.%s, tuuids=%s",
             source_node,
             source_op,
             target_node,
             target_op,
-            list(effective_src_out.keys()),
+            list(tuuid_map.values()),
         )
+
+        # When a Static tensor flows into a larger mesh, the data must be large enough at
+        # runtime to cover all target workers. We can't know global_shape at build time,
+        # so emit a warning to catch the most common misconfiguration early.
+        from fluxway.common.types.sharding import ChunkPartition, ShardingSpec
+
+        for src_name, dst_name in tensor_map.items():
+            s_spec = src_out_specs.get(src_name)
+            t_spec = dst_in_specs.get(dst_name)
+            if (
+                isinstance(s_spec, ShardingSpec)
+                and isinstance(t_spec, ShardingSpec)
+                and isinstance(s_spec.strategy, ChunkPartition)
+                and isinstance(t_spec.strategy, ChunkPartition)
+                and s_spec.mesh is not None
+                and t_spec.mesh is not None
+                and s_spec.mesh.size < t_spec.mesh.size
+            ):
+                logger.warning(
+                    "\n[Fluxway Config Warning] Static tensor '%s' "
+                    "(edge %s.%s -> %s.%s) flows from mesh(size=%d) to mesh(size=%d). "
+                    "Ensure the data size along every partitioned dimension is >= %d at "
+                    "runtime, otherwise some workers will starve silently.",
+                    src_name,
+                    source_node,
+                    source_op,
+                    target_node,
+                    target_op,
+                    s_spec.mesh.size,
+                    t_spec.mesh.size,
+                    t_spec.mesh.size,
+                )
 
     def build(self, name: str = "") -> Graph:
         """

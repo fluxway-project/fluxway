@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Tuple, Union
+from typing import Any, Callable, List, Optional, Tuple, Union
 import logging
 
+import numpy as np
+
 from fluxway.common.backend import get_backend
-from fluxway.common.types.sharding import ShardingSpec, Layout
+from fluxway.common.types.sharding import ShardingSpec
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +27,6 @@ class TransportPlan:
     send_counts: Any
     target_num_workers: int
     replication_factor: int = 1
-    spatial_indices: Optional[Any] = None
 
     @property
     def is_replicated(self) -> bool:
@@ -33,10 +34,9 @@ class TransportPlan:
 
     @property
     def send_offsets(self) -> Any:
-        backend = get_backend()
-        cs = backend.cumsum(self.send_counts, dim=0)
-        zero = backend.zeros((1,), dtype=backend.int32())
-        return backend.cat([zero, cs[:-1]], dim=0)
+        counts = np.array(self.send_counts)
+        cs = np.cumsum(counts)
+        return np.concatenate([[0], cs[:-1]]).astype(np.int32)
 
     @property
     def send_counts_tensor(self) -> Any:
@@ -44,10 +44,12 @@ class TransportPlan:
 
     def iter_device_slices(self):
         """Iterate by device: (device_id, offset, count)."""
-        backend = get_backend()
+        import numpy as np
+
+        counts = np.array(self.send_counts)
         offset = 0
         for device_id in range(self.target_num_workers):
-            count = int(backend.item(self.send_counts[device_id]))
+            count = int(counts[device_id])
             yield device_id, offset, count
             offset += count
 
@@ -68,42 +70,59 @@ class TransportPlanner:
 
     @staticmethod
     def compute_plan(
-        src_layout: Layout,
-        dst_layout: Layout,
-        local_rank: int,
-        src_indices: Optional[Any] = None,
-        data_values: Optional[Any] = None,
+        src_local_rank: int,
+        src_data_shape: Tuple[int, ...],
+        src_spec: ShardingSpec,
+        dst_spec: ShardingSpec,
+        src_index_desc: Optional[Any] = None,
+        dst_index_desc: Optional[Any] = None,
+        src_routing_shard_resolver: Optional[Callable[[int, int], Any]] = None,
+        src_routing_indices: Optional[Any] = None,
+        src_routing_based_values: Optional[Any] = None,
     ) -> TransportPlan:
-        """Diff(L_src, L_dst) using pre-computed Layouts."""
+        """Diff(S_src, S_dst) using stateless ShardingSpecs."""
         # N-D Native logic extracts the correct dimensionalities implicitly.
         # Default destination dimension 0 is passed to respect returning a legacy single
         # dimension for 1D layout serialization/inspection in tests.
-        routing_dim = dst_layout.routing_dim
+        routing_dim = dst_spec.routing_dim
         if routing_dim is None:
-            if dst_layout.partitions:
-                routing_dim = next(iter(dst_layout.partitions.keys()))
+            if dst_spec.partitions:
+                routing_dim = next(iter(dst_spec.partitions.keys()))
             else:
                 routing_dim = 0
 
+        # Create a partial resolver bound to the data_shape and src_index_desc
+        if src_routing_shard_resolver:
+            src_shard_resolver = src_routing_shard_resolver
+        else:
+
+            def src_shard_resolver(rank, dim):
+                return src_spec.get_shard_indices(
+                    rank,
+                    dim,
+                    dim_size=src_data_shape[dim]
+                    if src_data_shape and dim < len(src_data_shape)
+                    else 0,
+                    index_desc=src_index_desc,
+                )
+
         # Call internal static method (JIT-friendly)
-        (
-            sort_indices,
-            dest_devices,
-            send_counts,
-            spatial_indices,
-            target_num_workers,
-            replica_size,
-        ) = TransportPlanner._compute_plan_internal(
-            src_indices=src_indices,
-            data_values=data_values,
-            dst_index_desc=dst_layout.index_desc,
-            dst_routing_dim=routing_dim,
-            dst_data_shape=dst_layout.data_shape,
-            dst_strategy=dst_layout.strategy,
-            dst_mesh=dst_layout.mesh,
-            dst_partitions=dst_layout.partitions,
-            src_shard_resolver=src_layout.get_shard_indices,
-            local_rank=local_rank,
+        (sort_indices, dest_devices, send_counts, target_num_workers, replica_size) = (
+            TransportPlanner._compute_plan_internal(
+                src_local_rank=src_local_rank,
+                src_data_shape=src_data_shape,
+                src_routing_indices=src_routing_indices,
+                src_routing_based_values=src_routing_based_values,
+                dst_index_desc=dst_index_desc,
+                dst_routing_dim=routing_dim,
+                dst_strategy=dst_spec.strategy,
+                dst_mesh=dst_spec.mesh,
+                dst_partitions=dst_spec.partitions,
+                dst_replica_axes=dst_spec.replica_axes,
+                dst_replica_size=dst_spec.replica_size,
+                src_spec=src_spec,
+                src_index_desc=src_index_desc,
+            )
         )
 
         return TransportPlan(
@@ -112,47 +131,36 @@ class TransportPlanner:
             send_counts=send_counts,
             target_num_workers=target_num_workers,
             replication_factor=replica_size,
-            spatial_indices=spatial_indices,
         )
 
     @staticmethod
     def _compute_plan_internal(
-        src_indices: Optional[Any],
-        data_values: Optional[Any],
+        src_local_rank: int,
+        src_data_shape: Tuple[int, ...],
+        src_routing_indices: Optional[Any],
+        src_routing_based_values: Optional[Any],
         dst_index_desc: Any,
         dst_routing_dim: Optional[Union[int, Tuple[int, ...]]],
-        dst_data_shape: Tuple[int, ...],
         dst_strategy: Optional[Callable],
         dst_mesh: Optional[Any],
         dst_partitions: Optional[dict],
-        src_shard_resolver: Callable[[int, int], Any],
-        local_rank: int,
-    ) -> Tuple[Any, Any, Any, Any, int, int]:
+        dst_replica_axes: Optional[Any],
+        dst_replica_size: int,
+        src_spec: Optional[Any] = None,
+        src_index_desc: Optional[Any] = None,
+    ) -> Tuple[Any, Any, Any, int, int]:
         """Internal static logical core for JIT compilation."""
         backend = get_backend()
 
         dst_num_workers = dst_mesh.size if dst_mesh else 1
         logger.debug(
-            f"[Planner] Compute plan: local_rank={local_rank}, src_indices={src_indices}, dst_num_workers={dst_num_workers}, dst_data_shape={dst_data_shape}"
+            f"[Planner] Compute plan: local_rank={src_local_rank}, src_indices={src_routing_indices}, dst_num_workers={dst_num_workers}, src_data_shape={src_data_shape}"
         )
 
         dst_is_content_addressable = (
             getattr(dst_strategy, "routing_paradigm", None) is not None
             and dst_strategy.routing_paradigm.name == "DYNAMIC"
         )
-
-        dst_replica_axes = None
-        dst_replica_size = 1
-        if dst_mesh and dst_partitions is not None:
-            used = set()
-            for axes in dst_partitions.values():
-                used.update(axes)
-            all_axes = set(dst_mesh.axis_names)
-            repl = sorted(all_axes - used, key=lambda x: dst_mesh.axis_names.index(x))
-            if repl:
-                dst_replica_axes = repl
-                for ax in repl:
-                    dst_replica_size *= dst_mesh.shape[dst_mesh.axis_names.index(ax)]
 
         # Step 1: Recover global indices held by this rank
         # Standardize routing_dims to tuple for multi-axis dynamic routing
@@ -162,13 +170,7 @@ class TransportPlanner:
             if isinstance(dst_routing_dim, int)
             else (dst_routing_dim or (0,))
         )
-
-        # Fallback for explicit src_indices overriding the primary dimension.
-        primary_dim = routing_dims[0] if routing_dims else 0
-        if src_indices is not None:
-            primary_src_spatial_indices = src_indices
-        else:
-            primary_src_spatial_indices = src_shard_resolver(local_rank, primary_dim)
+        primary_dim = routing_dims[0]
 
         # =====================================================================
         # [ N-D Cross-Mesh Routing & Cartesian Broadcasting ]
@@ -194,8 +196,15 @@ class TransportPlanner:
         # Every pair (n, m) now perfectly describes the 2D coordinate on the Mesh.
         # =====================================================================
 
-        ndim = len(dst_data_shape)
-        mesh_coords = [None] * len(dst_mesh.shape) if dst_mesh else []
+        # The planner operates on the logical global domain.
+        # src_data_shape is provided by the distributor as the global shape.
+        global_shape = src_data_shape
+        ndim = len(global_shape)
+
+        mesh_coords: List[Optional[Any]] = (
+            [None] * len(dst_mesh.shape) if dst_mesh else []
+        )
+        combined_valid_mask = backend.ones((1,), dtype=backend.int32())
 
         from fluxway.common.types.sharding import ChunkPartition
 
@@ -214,12 +223,21 @@ class TransportPlanner:
                 else (base_strategy if not dst_is_content_addressable else _CHUNK)
             )
 
-            if d == primary_dim and src_indices is not None:
-                indices_for_routing = src_indices
-            elif is_dynamic_dim and data_values is not None:
-                indices_for_routing = data_values
+            if is_dynamic_dim and src_routing_based_values is not None:
+                input_for_routing = src_routing_based_values
+            elif d == primary_dim and src_routing_indices is not None:
+                input_for_routing = src_routing_indices
             else:
-                indices_for_routing = src_shard_resolver(local_rank, d)
+                if src_spec is not None:
+                    input_for_routing = src_spec.get_shard_indices(
+                        src_local_rank,
+                        d,
+                        dim_size=global_shape[d],
+                        index_desc=src_index_desc,
+                    )
+                else:
+                    # Fallback for anonymous shards (1:1 mapping)
+                    input_for_routing = backend.arange(0, src_data_shape[d])
 
             # Identify sub-mesh assigned to this tensor dimension
             axes = dst_partitions[d]
@@ -230,11 +248,22 @@ class TransportPlanner:
                 sub_num_workers *= s
 
             logical_ranks_d = strategy(
-                indices_for_routing,
-                dim_size=dst_data_shape[d],
+                input_for_routing,
+                dim_size=global_shape[d],
                 num_workers=sub_num_workers,
                 index_desc=dst_index_desc if is_dynamic_dim else None,
             )
+
+            # Compute valid mask for this dimension and broadcast it
+            is_valid_d = backend.cast(input_for_routing >= 0, backend.int32())
+            if len(dst_partitions) == 1:
+                combined_valid_mask = is_valid_d
+            else:
+                new_shape = [1] * ndim
+                new_shape[d] = -1
+                combined_valid_mask = combined_valid_mask * backend.reshape(
+                    is_valid_d, tuple(new_shape)
+                )
 
             unraveled = backend.unravel_index(logical_ranks_d, sub_mesh_shape)
             if not isinstance(unraveled, tuple):
@@ -320,32 +349,40 @@ class TransportPlanner:
         sort_indices = backend.argsort(primary_dest_flat, dim=0, stable=True)
 
         # Step 5: Compute send counts
-        # Generate the count of elements destined for each device using bincount.
-        # We use the physical target world size to ensure the counts array is correctly sized.
+        # Filter out sentinels (-1) from padded JIT operations
+        valid_mask_flat = backend.reshape(combined_valid_mask, (-1,))
 
-        send_counts = _bincount(backend, primary_dest_flat, minlength=dst_num_workers)
-
-        return (
-            sort_indices,
-            dest_devices,
-            send_counts,
-            primary_src_spatial_indices,
-            dst_num_workers,
-            num_replicas,
+        # We ensure primary_dest_flat is safe for bincount (no -1)
+        # and use weights to count only valid entries.
+        safe_primary_dest = backend.where(valid_mask_flat > 0, primary_dest_flat, 0)
+        send_counts = _bincount(
+            backend,
+            safe_primary_dest,
+            weights=backend.cast(valid_mask_flat, backend.float32()),
+            minlength=dst_num_workers,
         )
+        send_counts = backend.cast(send_counts, backend.int32())
+
+        return (sort_indices, dest_devices, send_counts, dst_num_workers, num_replicas)
 
     @staticmethod
     def plan(
+        src_local_rank: int,
         src_spec: ShardingSpec,
         dst_spec: ShardingSpec,
-        data_shape: Tuple[int, ...],
-        local_rank: int,
-        index_desc: Any = None,
+        src_data_shape: Tuple[int, ...],
+        src_index_desc: Any = None,
+        dst_index_desc: Any = None,
     ) -> TransportPlan:
         """High-level Diff API."""
-        src_layout = src_spec._to_layout(data_shape, index_desc)
-        dst_layout = dst_spec._to_layout(data_shape, index_desc)
-        return TransportPlanner.compute_plan(src_layout, dst_layout, local_rank)
+        return TransportPlanner.compute_plan(
+            src_local_rank,
+            src_data_shape,
+            src_spec,
+            dst_spec,
+            src_index_desc=src_index_desc,
+            dst_index_desc=dst_index_desc,
+        )
 
 
 # ============================================================
@@ -353,6 +390,8 @@ class TransportPlanner:
 # ============================================================
 
 
-def _bincount(backend, tensor: Any, minlength: int = 0) -> Any:
+def _bincount(
+    backend, tensor: Any, weights: Optional[Any] = None, minlength: int = 0
+) -> Any:
     """Cross-backend bincount."""
-    return backend.bincount(tensor, minlength=minlength)
+    return backend.bincount(tensor, weights=weights, minlength=minlength)

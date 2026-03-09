@@ -1,6 +1,6 @@
 import pytest
 
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 from fluxway.common.types.tensor import TransportTensor
 from fluxway.common.types.sharding import ShardingSpec, P
@@ -55,8 +55,11 @@ def test_embedding_lookup_flow():
     # --- 1. Setup Global Data & Meshes ---
     bk = get_backend()
 
-    # Global Data: 12 keys, vocab size 8, dim 2.
-    global_keys = bk.arange(0, 12, dtype=bk.int32())
+    # Global Data: 12 keys (data), 12 indices (coordinates)
+    global_indices = bk.arange(0, 12, dtype=bk.int32())
+    # Users input can be anything, here we use offset values to distinguish from indices
+    global_keys = bk.arange(100, 112, dtype=bk.int32())
+
     vocab_size = 8
     emb_dim = 2
     # reshape
@@ -67,13 +70,24 @@ def test_embedding_lookup_flow():
     expected_global_output = global_emb_table[global_ids]
 
     # Meshes
-    mesh0 = DeviceMesh((2,), ("x",), [0, 1])
-    mesh1 = DeviceMesh((4,), ("y",), [0, 1, 2, 3])
-    mesh2 = DeviceMesh((2,), ("z",), [0, 1])
+    mesh0 = DeviceMesh(("x",), (2,), [0, 1])
+    mesh1 = DeviceMesh(("y",), (4,), [0, 1, 2, 3])
+    mesh2 = DeviceMesh(("z",), (2,), [0, 1])
+    from fluxway.common.index_descriptor import FunctionalIndex
 
     # Sharding Specs
     spec0 = ShardingSpec.chunk(mesh=mesh0, partition=P("x"))
-    spec1 = ShardingSpec.hash(mesh=mesh1, partition=P("y"))
+
+    def hash_fn(keys):
+        return keys % vocab_size
+
+    base_hash_spec = ShardingSpec.hash(mesh=mesh1, partition=P("y"))
+    spec1 = ShardingSpec(
+        strategy=base_hash_spec.strategy,
+        mesh=mesh1,
+        partition=P("y"),
+        index_descriptor=FunctionalIndex(hash_fn),
+    )
     spec2 = ShardingSpec.chunk(mesh=mesh2, partition=P("z"))
 
     # --- 2. Simulation Environment ---
@@ -88,12 +102,15 @@ def test_embedding_lookup_flow():
     rank0_keys = global_keys[:6]
     rank1_keys = global_keys[6:]
 
-    inputs = {0: TransportTensor(rank0_keys), 1: TransportTensor(rank1_keys)}
+    inputs = {
+        0: TransportTensor(rank0_keys, origin_indices=global_indices[:6]),
+        1: TransportTensor(rank1_keys, origin_indices=global_indices[6:]),
+    }
 
     # Rank 0 sends
     dist0 = cluster[0].distributor
 
-    def send_wrapper_0(target, tensors, counts, includes_indices=False):
+    def send_wrapper_0(target, tensors, counts, *args, **kwargs):
         cluster[0].send([target], tensors, counts, cluster)
         return True
 
@@ -109,7 +126,7 @@ def test_embedding_lookup_flow():
     # Rank 1 sends
     dist1 = cluster[1].distributor
 
-    def send_wrapper_1(target, tensors, counts, includes_indices=False):
+    def send_wrapper_1(target, tensors, counts, *args, **kwargs):
         cluster[1].send([target], tensors, counts, cluster)
         return True
 
@@ -121,7 +138,27 @@ def test_embedding_lookup_flow():
         capacity=6,
     )
 
-    # --- 4. Forward Phase 2: Embedding Lookup (SPMD1) ---
+    # --- 4. Forward Phase 1 Verification: Input (SPMD0) -> Embedding (SPMD1) ---
+    # Verify that keys were correctly routed to SPMD1 ranks based on hash_fn(key) = key % 8
+    # Global keys: [100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111]
+    # Hashes (k%8):[4,   5,   6,   7,   0,   1,   2,   3,   4,   5,   6,   7]
+    # Mesh1 size 4, so Rank = Hash % 4.
+    # Expected mapping:
+    # Hash 0 -> Rank 0 (Key 104)
+    # Hash 1 -> Rank 1 (Key 105)
+    # Hash 2 -> Rank 2 (Key 106)
+    # Hash 3 -> Rank 3 (Key 107)
+    # Hash 4 -> Rank 0 (Key 100, 108)
+    # Hash 5 -> Rank 1 (Key 101, 109)
+    # Hash 6 -> Rank 2 (Key 102, 110)
+    # Hash 7 -> Rank 3 (Key 103, 111)
+
+    expected_rank0_keys = bk.tensor([104, 100, 108], dtype=bk.int32())
+    expected_rank1_keys = bk.tensor([105, 101, 109], dtype=bk.int32())
+    expected_rank2_keys = bk.tensor([106, 102, 110], dtype=bk.int32())
+    expected_rank3_keys = bk.tensor([107, 103, 111], dtype=bk.int32())
+
+    # --- 5. Forward Phase 2: Embedding Lookup (SPMD1) ---
 
     spmd1_results = {}
 
@@ -130,28 +167,39 @@ def test_embedding_lookup_flow():
         shards = cluster[r].process_incoming()
 
         all_keys = []
+        all_global_indices = []
 
         for tensors, counts in shards:
-            count = counts[0]
-            if count > 0:
+            if counts[0] > 0:
                 # Valid unpadded data
-                buffer = tensors[0]
-                all_keys.append(buffer[:count])
+                all_keys.append(tensors[0][: counts[0]])
+                # origin_indices are packed into tensors[1] by the distributor
+                all_global_indices.append(tensors[1][: counts[1]])
 
         if not all_keys:
             spmd1_results[r] = (
-                bk.tensor([], dtype=bk.int32()),
+                bk.tensor([], dtype=bk.float32()),
                 bk.tensor([], dtype=bk.int32()),
             )
             continue
 
         local_keys = bk.cat(all_keys)
-        local_indices = local_keys  # Key=Index
+        global_indices = bk.cat(all_global_indices)
+
+        # Verification of received data on SPMD1
+        if r == 0:
+            assert bk.equal(bk.sort(local_keys)[0], bk.sort(expected_rank0_keys)[0])
+        elif r == 1:
+            assert bk.equal(bk.sort(local_keys)[0], bk.sort(expected_rank1_keys)[0])
+        elif r == 2:
+            assert bk.equal(bk.sort(local_keys)[0], bk.sort(expected_rank2_keys)[0])
+        elif r == 3:
+            assert bk.equal(bk.sort(local_keys)[0], bk.sort(expected_rank3_keys)[0])
 
         # Lookup
         local_emb = global_emb_table[local_keys % vocab_size]
 
-        spmd1_results[r] = (local_emb, local_indices)
+        spmd1_results[r] = (local_emb, global_indices)
 
     # --- 5. Forward Phase 3: Combine (SPMD1 -> SPMD2) ---
     # "All-to-All Return"
@@ -171,6 +219,8 @@ def test_embedding_lookup_flow():
     rank1_total_count = 0
     rank0_offsets = {}  # src_rank -> start_offset
     rank1_offsets = {}
+    rank0_tags_list = []
+    rank1_tags_list = []
 
     # We must iterate in the same order as distribute (0..3) to set offsets correctly
     # if we assume sequential arrival, OR we allocate specific slots per rank.
@@ -181,17 +231,17 @@ def test_embedding_lookup_flow():
         if len(_emb) == 0:
             continue
 
-        # For Zero-Copy setups, receivers generally need to pre-allocate memory buffers.
-        # In a real environment, the sender might exchange metadata first or the planner logic
-        # is fully deterministic across nodes. Here we manually compute expected sizes.
+        # Coordinate-based routing: Use _idx (global_indices) to determine destination
         val_idx = bk.to_numpy(_idx)
         count0 = 0
         count1 = 0
         for v in val_idx:
             if v < 6:
                 count0 += 1
+                rank0_tags_list.append(r)
             else:
                 count1 += 1
+                rank1_tags_list.append(r)
 
         if count0 > 0:
             rank0_offsets[r] = rank0_total_count
@@ -215,17 +265,19 @@ def test_embedding_lookup_flow():
     # We will verify `buffer0` and `buffer1` directly.
 
     for r in range(4):
-        local_emb, local_indices = spmd1_results[r]
+        local_emb, global_indices = spmd1_results[r]
         if len(local_emb) == 0:
             continue
 
-        t_tensor = TransportTensor(local_emb, indices=local_indices)
+        t_tensor = TransportTensor(
+            local_emb, origin_indices=global_indices, global_shape=(12, emb_dim)
+        )
 
         dist = cluster[r].distributor
 
         # Send wrapper calling receive_slices
         def send_wrapper_combine(
-            target, tensors, counts, includes_indices=False, source_rank=r
+            target, tensors, counts, *args, source_rank=r, **kwargs
         ):
             if target in cluster:
                 # This calls receive_slices -> writes into target_buffers Zero-Copy
@@ -238,7 +290,6 @@ def test_embedding_lookup_flow():
             source=spec1,
             target=spec2,
             send_fn=send_wrapper_combine,
-            global_shape=(12, emb_dim),
             capacity=12,
         )
 
@@ -246,6 +297,9 @@ def test_embedding_lookup_flow():
 
     # Verify Rank 0 (indices 0..5)
     # Zero-Copy: check the buffer directly
+    assert cluster[0].receiver.target_buffers is not None, (
+        "Rank 0 target_buffers should be registered"
+    )
     rank0_data = cluster[0].receiver.target_buffers[0]
 
     expected_r0 = expected_global_output[:6]
@@ -281,103 +335,233 @@ def test_embedding_lookup_flow():
     # --- 7. Backward Pass: Gradients (SPMD2 -> SPMD1) ---
     # "Dispatch Gradients"
 
-    # Mock Gradients (Index based)
-    _tmp_casted = global_keys.astype(bk.float32())
-    _tmp_reshaped = bk.reshape(_tmp_casted, (-1, 1))
+    from fluxway.common.types.tensor import SymmetryReceipt
+    from fluxway.common.types.sharding import MirrorPartition
 
-    # Use backend tile
-    global_grads = bk.tile(_tmp_reshaped, (1, emb_dim))
+    # Mock Gradients (Same shape and layout as target_buffers received from SPMD1)
+    # We take the actual buffered forward embeddings and apply a transformation (e.g. * 2.0)
+    # to distinguish from forward values and verify routing.
+    grads0_tensor = cluster[0].receiver.target_buffers[0] * 2.0
+    grads1_tensor = cluster[1].receiver.target_buffers[0] * 2.0
 
-    # Rank 0 Grads (0..5)
-    grads0 = TransportTensor(global_grads[:6], indices=rank0_keys)
-    # Rank 1 Grads (6..11)
-    grads1 = TransportTensor(global_grads[6:], indices=rank1_keys)
+    # Verification: Ensure grads correspond to the correct global indices
+    # Rank 0 should have global indices 0..5, Rank 1 should have 6..11
+    # We verify this indirectly by checking the shape and later the routing symmetry.
+    assert grads0_tensor.shape[0] == 6
+    assert grads1_tensor.shape[0] == 6
 
-    grad_acc = {r: [] for r in range(4)}
+    rank0_tags = bk.tensor(rank0_tags_list, dtype=bk.int32())
+    rank1_tags = bk.tensor(rank1_tags_list, dtype=bk.int32())
 
-    # Send from Rank 0
-    dist_bk_0 = cluster[
-        0
-    ].distributor  # Re-using dist 0 (Rank 0 of Sim) for Rank 0 of SPMD2
+    grads0 = TransportTensor(
+        grads0_tensor,
+        receipt=SymmetryReceipt(world_size=4, sender_rank_tags=rank0_tags),
+    )
+    grads1 = TransportTensor(
+        grads1_tensor,
+        receipt=SymmetryReceipt(world_size=4, sender_rank_tags=rank1_tags),
+    )
 
-    def send_wrapper_bk_0(target, tensors, counts, includes_indices=False):
-        if target in grad_acc:
-            grad_acc[target].append((tensors, counts))
+    spec_mirror = ShardingSpec(
+        strategy=MirrorPartition(source="fwd"), mesh=mesh1, partition=P("y")
+    )
+
+    # --- 8. Backward Pass Execution (SPMD2 -> SPMD1) ---
+    # We use Zero-Copy on SPMD1 (Receivers) for the Backward Update to ensure dense reception.
+
+    # Pre-calculate Backward Offsets for SPMD1 (Embedding Ranks 0..3)
+    # The source for this is SPMD2 (Ranks 0..1).
+    # Forward Phase 3 sent data from SPMD1 (r) to SPMD2 (target).
+    # Symmetric routing means SPMD1 (r) will receive from SPMD2 (target) in reverse.
+
+    for r in range(4):
+        _emb, _idx = spmd1_results[r]
+        if len(_emb) == 0:
+            continue
+
+        # Determine how many elements this rank sent to each SPMD2 rank
+        # Rank 2 (SPMD2 R0): values with index < 6
+        # Rank 0/1 (SPMD2 R0/R1) can be mapped from cluster dict.
+        # We need to register buffers on cluster[r].receiver
+
+        bw_offsets = {}
+        total_bw_count = 0
+
+        # Consistent with Forward Phase 3 routing:
+        # Global indices 0..5 -> SPMD2 Rank 0
+        # Global indices 6..11 -> SPMD2 Rank 1
+
+        # We iterate over SPMD2 ranks (0, 1) to determine offsets for incoming gradients
+        for spmd2_r in [0, 1]:
+            count = 0
+            val_idx = bk.to_numpy(_idx)
+            for v in val_idx:
+                if spmd2_r == 0 and v < 6:
+                    count += 1
+                elif spmd2_r == 1 and v >= 6:
+                    count += 1
+
+            if count > 0:
+                # In backward pass, the source is spmd2_r
+                bw_offsets[spmd2_r] = total_bw_count
+                total_bw_count += count
+
+        # Register Zero-Copy buffer for gradients on this rank
+        # It must match the forward output shape exactly
+        bw_grad_buffer = bk.zeros(_emb.shape, dtype=bk.float32())
+        cluster[r].receiver.register_zero_copy_buffers([bw_grad_buffer], bw_offsets)
+
+    # Send from SPMD2 Rank 0
+    dist_bk_0 = cluster[0].distributor
+
+    def send_wrapper_bk_0(target, tensors, counts, *args, **kwargs):
+        # Call receive_slices to trigger Zero-Copy write
+        cluster[target].receiver.receive_slices(0, tensors, counts)
         return True
-
-    # Check 3: Implicit Spec0 (Chunk) Source -> Content Spec1 (Hash) Target
-    # Gradient has same shape as embedding.
-    # Note: spec0 was on Mesh0. spec2 is on Mesh2. Both Chunk.
-    # We use spec2 here.
 
     _res, _ = dist_bk_0.distribute(
         local_data=grads0,
         source=spec2,
-        target=spec1,
+        target=spec_mirror,
         send_fn=send_wrapper_bk_0,
         capacity=6,
     )
 
-    # Send from Rank 1
+    # Send from SPMD2 Rank 1
     dist_bk_1 = cluster[1].distributor
 
-    def send_wrapper_bk_1(target, tensors, counts, includes_indices=False):
-        if target in grad_acc:
-            grad_acc[target].append((tensors, counts))
+    def send_wrapper_bk_1(target, tensors, counts, *args, **kwargs):
+        # Call receive_slices to trigger Zero-Copy write
+        cluster[target].receiver.receive_slices(1, tensors, counts)
         return True
 
     _res, _ = dist_bk_1.distribute(
         local_data=grads1,
         source=spec2,
-        target=spec1,
+        target=spec_mirror,
         send_fn=send_wrapper_bk_1,
         capacity=6,
     )
 
-    # --- 8. Verify Backward Update (SPMD1) ---
+    # --- 9. Final Verification: Dense Gradients on SPMD1 ---
 
     for r in range(4):
-        shards = grad_acc[r]
-        if not shards:
-            local_grads = bk.tensor([], dtype=bk.float32())
-        else:
-            all_g = []
-            for tensors, counts in shards:
-                buffer = tensors[0]
-                count = counts[0]
-                if count > 0:
-                    all_g.append(buffer[:count])
-            local_grads = bk.cat(all_g) if all_g else bk.tensor([], dtype=bk.float32())
-
-        expected_indices = spmd1_results[r][1]
-
-        if len(expected_indices) == 0:
-            assert len(local_grads) == 0
+        expected_grads = spmd1_results[r][0] * 2.0
+        if len(expected_grads) == 0:
             continue
 
-        _e_tmp = expected_indices.astype(bk.float32())
-        _e_reshaped = bk.reshape(_e_tmp, (-1, 1))
-        # Use backend tile
-        expected_grads = bk.tile(_e_reshaped, (1, emb_dim))
+        # Verify dense buffer directly
+        # The receiver should have written everything into target_buffers[0]
+        actual_grads = cluster[r].receiver.target_buffers[0]
 
-        l_sorted, _ = bk.sort(local_grads.flatten())
-        e_sorted, _ = bk.sort(expected_grads.flatten())
+        assert actual_grads.shape == expected_grads.shape, (
+            f"Rank {r} dense grad shape mismatch"
+        )
 
-        assert bk.equal(l_sorted, e_sorted), f"Rank {r} Grad mismatch"
+        # Value check: MirrorPartition + SymmetryReceipt should preserve exact order
+        assert bk.equal(actual_grads, expected_grads), (
+            f"Rank {r} dense grad value/order mismatch"
+        )
 
+        # Confirm "Dense" expectation: local_keys length == local_grads length
+        assert len(actual_grads) == len(spmd1_results[r][0]), (
+            f"Rank {r} n-to-n consistency check failed"
+        )
 
-def test_jit_shielding_flow():
+    # --- 10. Backward Return (SPMD1 -> SPMD0) ---
+    # Final step: Gradients return from Embedding (SPMD1) to Input (SPMD0)
+
+    # We need to capture results on Rank 0 and 1 (SPMD0)
+    spmd0_grad_acc = {0: [], 1: []}
+
+    # spec0 is the source for Phase 1 dispatch
+    # we use speculative mirror to go back
+    spec_mirror_0 = ShardingSpec(
+        strategy=MirrorPartition(source="fwd"), mesh=mesh0, partition=P("x")
+    )
+
+    for r in range(4):
+        # The gradient on SPMD1 is the dense buffer we just verified
+        dense_grads = cluster[r].receiver.target_buffers[0]
+        if len(dense_grads) == 0:
+            continue
+
+        # We need the tags from Phase 1 to route back
+        # The distributor collected these during forward dispatch
+        dist = cluster[r].distributor
+
+        # In a real system, the transport would handle the SymmetryReceipt.
+        # Here we simulate by creating a TransportTensor with the correct metadata.
+        # Since Forward Phase 1 used content-based routing, the receipt was implicit.
+        # However, for the simulation to work with SymmetryReceipt, we need to know who sent what.
+
+        # For simplicity in this test, we know the routing symmetry:
+        # Global Keys 0..5 (SPMD0 Rank 0) -> SPMD1
+        # Global Keys 6..11 (SPMD0 Rank 1) -> SPMD1
+
+        # We simulate the receipt by looking at the origin_indices we sent in Forward Phase 3
+        _, global_indices = spmd1_results[r]
+
+        # Create a tag list: source_rank is SPMD0 rank (0 or 1)
+        # Global index < 6 came from Rank 0, index >= 6 came from Rank 1
+        tags = []
+        for idx in bk.to_numpy(global_indices):
+            tags.append(0 if idx < 6 else 1)
+
+        grad_tensor_1_to_0 = TransportTensor(
+            dense_grads,
+            origin_indices=global_indices,
+            receipt=SymmetryReceipt(
+                world_size=2, sender_rank_tags=bk.tensor(tags, dtype=bk.int32())
+            ),
+        )
+
+        def send_wrapper_1_to_0(target, tensors, counts, *args, **kwargs):
+            if target in spmd0_grad_acc:
+                spmd0_grad_acc[target].append((tensors, counts))
+            return True
+
+        # Dispatch back to SPMD0
+        dist.distribute(
+            local_data=grad_tensor_1_to_0,
+            source=spec1,
+            target=spec_mirror_0,
+            send_fn=send_wrapper_1_to_0,
+            capacity=12,
+        )
+
+    # --- 11. Final Verification on SPMD0 ---
+    for r in [0, 1]:
+        shards = spmd0_grad_acc[r]
+        all_g = []
+        for tensors, counts in shards:
+            if counts[0] > 0:
+                all_g.append(tensors[0][: counts[0]])
+
+        final_grads = bk.cat(all_g)
+
+        # Expected: 2.0 * input embeddings
+        # Rank 0: indices 0..5, Rank 1: indices 6..11
+        if r == 0:
+            expected = expected_global_output[:6] * 2.0
+        else:
+            expected = expected_global_output[6:] * 2.0
+
+        assert len(final_grads) == 6
+        assert bk.equal(
+            bk.sort(final_grads.flatten())[0], bk.sort(expected.flatten())[0]
+        )
     """Verifies that transport can be shielded from JIT."""
     bk = get_backend()
 
     # Setup simple data
-    mesh = DeviceMesh((1,), ("x",), [0])
+    mesh = DeviceMesh(("x",), (1,), [0])
     spec = ShardingSpec.chunk(mesh, P("x"))
 
     # A global list to capture side-effects from the shielded function
     side_effects = []
 
-    def side_effect_send(target, tensors, counts, includes_indices=False):
+    def side_effect_send(target, tensors, counts, *args, **kwargs):
         count = counts[0]
         if count > 0:
             side_effects.append(tensors[0][:count])
@@ -436,24 +620,29 @@ def test_jit_shielding_flow():
 def test_jit_plan_and_shard():
     """Verify that _plan_and_shard supports JIT compilation via vmap and bounds."""
 
-    mesh = DeviceMesh((2,), ("x",), [0, 1])
+    mesh = DeviceMesh(("x",), (2,), [0, 1])
     spec = ShardingSpec.chunk(mesh, P("x"))
 
     distributor = DataDistributor(0)
 
+    backend = get_backend()
+
     @compile
     def plan_kernel(flat_values):
-        (
-            padded_buffers_lists,
-            send_counts,
-            dest_devices,
-            rep_factor,
-            spatial_indices,
-            padded_routing,
-            sort_indices,
-        ) = distributor._plan_and_shard(
-            TransportTensor(flat_values), source=spec, target=spec, capacity=4
+        res = distributor._plan_and_shard(
+            TransportTensor(flat_values, global_shape=backend.shape(flat_values)),
+            source=spec,
+            target=spec,
+            capacity=4,
         ).__next__()
+        (
+            targets,
+            tensors,
+            counts,
+            sort_idx,
+            global_shapes_list,
+            hash_meta_tensor_state_list,
+        ) = res
         return flat_values
 
     pass
@@ -492,7 +681,7 @@ def test_colocation_dispatch():
     """Verify that distribute can take a List of TransportTensors and share the same plan."""
     bk = get_backend()
 
-    mesh = DeviceMesh((2,), ("x",), [0, 1])
+    mesh = DeviceMesh(("x",), (2,), [0, 1])
     spec_src = ShardingSpec.chunk(mesh, P("x"))
     spec_dst = ShardingSpec.chunk(mesh, P("x"))
 
@@ -500,15 +689,22 @@ def test_colocation_dispatch():
     keys = bk.tensor([10, 20, 30, 40], dtype=bk.int32())
     vals = bk.tensor([0.1, 0.2, 0.3, 0.4], dtype=bk.float32())
 
-    # Let's say routing logic depends on keys
-    tt_keys = TransportTensor(keys)
-    tt_vals = TransportTensor(vals)
+    # 4 elements total, distributed across 2 ranks (2 elements per rank)
+    # Rank 0 (dist1) should have the first 2 elements locally
+    tt_keys = TransportTensor(keys[:2], global_shape=(4,))
+    tt_vals = TransportTensor(vals[:2], global_shape=(4,))
 
     dist1 = DataDistributor(0)  # local rank 0 (handles first 2 elements in chunk)
 
     received_payloads = []
 
-    def mock_send(target, tensors, counts, includes_indices=False):
+    def mock_send(
+        target: int,
+        tensors: list,
+        counts: list,
+        global_shapes_list: Optional[list] = None,
+        meta_tensor_state_list: Optional[list] = None,
+    ):
         received_payloads.append((target, tensors, counts))
         return True
 
@@ -524,10 +720,8 @@ def test_colocation_dispatch():
     assert len(received_payloads) > 0
     _, tensors, counts = received_payloads[0]
 
-    # Since dense, no lengths. Just 2 data buffers + routing.
-    assert len(tensors) == 3, (
-        f"Expected 3 tensors (keys, vals, routing) but got {len(tensors)}"
-    )
+    # Since dense and static, no lengths or extra routing. Just 2 data buffers.
+    assert len(tensors) == 2, f"Expected 2 tensors (keys, vals) but got {len(tensors)}"
 
     buffer_keys = tensors[0][: counts[0]]
     buffer_vals = tensors[1][: counts[0]]

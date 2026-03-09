@@ -4,7 +4,18 @@ Core data type definitions for Fluxway framework.
 Based on ARCHITECTURE.md sections 2.1.1, 3.2.1, 4.2, 4.3
 """
 
-from typing import Callable, Dict, List, Optional, Any, Type, Annotated, TypeVar, Union
+from typing import (
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Any,
+    Type,
+    Annotated,
+    TypeVar,
+    Union,
+    Tuple,
+)
 
 from pydantic import BaseModel, Field, ConfigDict
 
@@ -33,6 +44,35 @@ Data = Annotated[T, DataFlow]
 Control = Annotated[T, ControlFlow]
 
 
+class FluxwayBaseSchema(BaseModel):
+    """Base model for all Fluxway configuration and metadata types."""
+
+    def as_dict(self, **kwargs) -> Dict[str, Any]:
+        """
+        Convert model to dictionary.
+        Renamed from Pydantic's model_dump for better domain alignment.
+        """
+        return self.model_dump(**kwargs)
+
+
+class TensorProxy(FluxwayBaseSchema):
+    """
+    A lightweight proxy representing a tensor in the computational graph.
+
+    It uses a globally unique identifier (int TUUID) to track dependencies and
+    sharding specifications independently of the variable names used in
+    operator functions.
+    """
+
+    tuuid: int
+    name: Optional[str] = None  # Original name for debugging
+    shape: Optional[Tuple[int, ...]] = None
+    dtype: Optional[str] = None
+
+    def __repr__(self):
+        return f"TensorProxy(tuuid={self.tuuid}, name={self.name})"
+
+
 class NodeType(str, Enum):
     """Node type identifier."""
 
@@ -47,17 +87,6 @@ class ReaderState(str, Enum):
     PAUSED = "paused"  # Paused due to backpressure
     COMPLETED = "completed"
     ERROR = "error"
-
-
-class FluxwayBaseSchema(BaseModel):
-    """Base model for all Fluxway configuration and metadata types."""
-
-    def as_dict(self, **kwargs) -> Dict[str, Any]:
-        """
-        Convert model to dictionary.
-        Renamed from Pydantic's model_dump for better domain alignment.
-        """
-        return self.model_dump(**kwargs)
 
 
 class MailboxStatus(FluxwayBaseSchema):
@@ -75,11 +104,22 @@ class SPMDTopologyInfo(FluxwayBaseSchema):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     spmd_id: str
-    # Map of output tensors to target operator input tensors
-    # {src_tensor: dst_tensor}
-    tensor_map: Dict[str, str] = Field(default_factory=dict)
+    # Physical scale of the remote node
+    world_size: int = 1
+    mesh: Any = None
+    # TUUID-based sharding mapping: {tuuid: ShardingSpec}
+    tuuid_sharding: Dict[int, Any] = Field(default_factory=dict)
+    # Map of local parameter/argument names to their assigned UUIDs.
+    # {param_name: tuuid}
+    tuuid_map: Dict[str, int] = Field(default_factory=dict)
     # Optional condition function for conditional edges
     condition_fn: Optional[Callable[..., bool]] = None
+    # Link to the symmetric edge (src_node, src_op, dst_node, dst_op)
+    symmetric_to: Optional[Tuple[str, str, str, str]] = None
+    # Whether this remote node is an interleaved source
+    is_interleaved: bool = False
+    # Size of the interleaved group (if applicable)
+    interleave_unit_size: int = 1
 
 
 class SPMDTopology(FluxwayBaseSchema):
@@ -104,8 +144,8 @@ class SPMDConfig(FluxwayBaseSchema):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     # Mesh axis configuration (e.g., ("data", 4), ("model", 2))
-    # Mesh is now stored as DeviceMesh directly
-    mesh: Optional[Any] = None  # DeviceMesh (use Any to avoid circular import)
+    spmd_id: str = ""
+    mesh: Any = None  # DeviceMesh (use Any to avoid circular import)
 
     # Generic operator registration
     operators: Dict[str, Callable] = Field(default_factory=dict)
@@ -122,13 +162,6 @@ class SPMDConfig(FluxwayBaseSchema):
     max_worker_step_skew: int = (
         0  # Max allowed step diff between workers in a mesh (intra-SPMD sync)
     )
-    # use_global_step_indexing:
-    # - If False (default): output step should be consistent with the input/execution step.
-    # - If True:
-    #   - periodic operators: output_step = total_rank * _current_step + local_rank
-    #   - standard operators: output_step = _current_step
-    use_global_step_indexing: bool = False
-
     # Global step limit for the SPMD. If set, source operators will self-terminate
     # after reaching this step count.
     max_steps: Optional[int] = None
@@ -139,17 +172,6 @@ class SPMDConfig(FluxwayBaseSchema):
         if self.mesh is None:
             return 1
         return int(self.mesh.size)
-
-    @property
-    def has_mesh(self) -> bool:
-        """Check if mesh is defined."""
-        return self.mesh is not None
-
-    def get_mesh_size(self) -> int:
-        """Get total number of devices in mesh."""
-        if not self.has_mesh or self.mesh is None:
-            return 1
-        return self.mesh.size
 
 
 # =============================================================================
@@ -223,6 +245,10 @@ class Edge(FluxwayBaseSchema):
     target_op: Optional[str] = None  # Target node's op name
     condition_fn: Optional[Callable[..., bool]] = None
 
+    # Link to the symmetric edge (for automatic mirror-sharding based routing)
+    # Format: (source_node, source_op, target_node, target_op)
+    symmetric_to: Optional[Tuple[str, str, str, str]] = None
+
 
 class Node(FluxwayBaseSchema):
     """
@@ -246,8 +272,8 @@ class Node(FluxwayBaseSchema):
 class ArgumentType(str, Enum):
     """Argument type for fluxway transfer data."""
 
-    STATE = "state"  # State argument
-    TENSOR = "tensor"  # Tensor argument
+    CONTROL = "control"  # Control argument
+    DATA = "data"  # Data argument
     STATIC = "static"  # Static argument
 
 
@@ -256,14 +282,20 @@ class EdgeShardingInfo(FluxwayBaseSchema):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    # Tensor sharding for this edge: {tensor_name: raw dict or ShardingSpec}
-    tensor_sharding: Dict[str, Any] = Field(default_factory=dict)
-    # Target node's op name
-    target_op: Optional[str] = None
-    # Map of output tensors to target operator input tensors
-    tensor_map: Dict[str, str] = Field(default_factory=dict)
+    world_size: int = 1
+    mesh: Any = None
+    # New TUUID-based sharding mapping: {tuuid: ShardingSpec}
+    tuuid_sharding: Dict[int, Any] = Field(default_factory=dict)
+    # Map of local parameter/argument names to their assigned UUIDs.
+    tuuid_map: Dict[str, int] = Field(default_factory=dict)
     # Condition function for conditional edges
     condition_fn: Optional[Callable[..., bool]] = None
+    # output_param_map: source op's output mapping (sender side)
+    # input_param_map: target op's input mapping (receiver side)
+    output_param_map: Dict[str, List[str]] = Field(default_factory=dict)
+    input_param_map: Dict[str, List[str]] = Field(default_factory=dict)
+    is_interleaved: bool = False
+    interleave_unit_size: int = 1
 
 
 class BarrierType(str, Enum):
@@ -308,13 +340,30 @@ class TolerantBarrierConfig(BarrierConfig):
     retrieval_policy: str = "latest"  # "latest", "oldest", "closest"
 
 
+class OperatorContext(FluxwayBaseSchema):
+    """Context provided to an operator during execution."""
+
+    physical_rank: int
+    physical_world_size: int
+    logical_rank: int
+    logical_world_size: int
+    step: int
+    is_interleaved: bool = False
+
+
 class OperatorMeta(FluxwayBaseSchema):
     """Metadata attached to an operator function."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     name: str
+
     is_source: Optional[bool] = None  # Explicitly mark as source (producer)
+    # Whether this is an interleaved source.
+    is_interleaved: bool = False
+    # Size of the interleaved group (e.g., 1 for single-worker).
+    interleave_unit_size: int = 1
+
     priority: int = 0  # Priority for execution order (lower value -> higher priority)
     max_inflight_steps: int = (
         0  # Max steps predecessors can lead (backpressure_threshold)
@@ -323,8 +372,10 @@ class OperatorMeta(FluxwayBaseSchema):
     # serialization / circular import surprises across control-plane and worker.
     input_arguments: Optional[Dict[str, List[str]]] = None
     output_arguments: Optional[Dict[str, List[str]]] = None
-    input_sharding: Dict[str, Any] = Field(default_factory=dict)
-    output_sharding: Dict[str, Any] = Field(default_factory=dict)
+    input_sharding: Dict[Any, Any] = Field(default_factory=dict)
+    output_sharding: Dict[Any, Any] = Field(default_factory=dict)
+    # Ordered list of UUIDs for flattened output tensors (populated by Builder)
+    output_uuids: List[int] = Field(default_factory=list)
 
     # Implicit Mapping Support:
     # Tracks logical placeholders (parameters in function signature) to their flattened fields.
@@ -332,6 +383,12 @@ class OperatorMeta(FluxwayBaseSchema):
     # Value: List of flattened field names
     input_param_map: Dict[str, List[str]] = Field(default_factory=dict)
     output_param_map: Dict[str, List[str]] = Field(default_factory=dict)
+
+    # Deterministic Pytree meta for strict reconstruction
+    # Key: Parameter name
+    # Value: treedef for unflattening
+    input_treedefs: Dict[str, Any] = Field(default_factory=dict)
+    output_treedef: Optional[Any] = None
 
     # Linking sharding specs (populated by Builder when constructing the graph)
     # For the current operator:
@@ -368,7 +425,7 @@ class OperatorMeta(FluxwayBaseSchema):
 
     def state_names(self, is_output: bool) -> List[str]:
         """Get state argument names from input/output arguments."""
-        return self.get_arguments(is_output=is_output, arg_type=ArgumentType.STATE)
+        return self.get_arguments(is_output=is_output, arg_type=ArgumentType.CONTROL)
 
     def validate_and_update_state_output_match_dest_input(
         self,
@@ -416,7 +473,7 @@ class OperatorMeta(FluxwayBaseSchema):
         # Update src.output_arguments.state = dst.input_state
         if self.output_arguments is None:
             self.output_arguments = {}
-        self.output_arguments[ArgumentType.STATE.value] = list(dst_input_state)
+        self.output_arguments[ArgumentType.CONTROL.value] = list(dst_input_state)
 
 
 class Graph(FluxwayBaseSchema):
@@ -699,7 +756,7 @@ class AsyncStepConfig(FluxwayBaseSchema):
         default_factory=dict
     )  # Per-node step overrides
     default_max_inflight_steps: int = (
-        0  # Maximum generic step difference for flow control
+        1  # Maximum generic step difference for flow control
     )
     min_lock_duration: float = (
         1.0  # Minimum lock duration (prevent frequent lock/unlock)

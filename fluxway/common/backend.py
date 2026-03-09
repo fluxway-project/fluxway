@@ -94,6 +94,21 @@ class TensorBackend(ABC):
         pass
 
     @abstractmethod
+    def size(self, tensor: Any) -> int:
+        """Returns the total number of elements in the tensor."""
+        pass
+
+    @abstractmethod
+    def print(self, fmt: str, **kwargs) -> None:
+        """Backend-safe print (e.g., jax.debug.print)."""
+        pass
+
+    @abstractmethod
+    def cast(self, tensor: Any, dtype: Any) -> Any:
+        """Casts the tensor to the specified dtype."""
+        pass
+
+    @abstractmethod
     def item(self, tensor: Any) -> Any:
         pass
 
@@ -163,7 +178,11 @@ class TensorBackend(ABC):
 
     @abstractmethod
     def unique(
-        self, x: Any, return_inverse: bool = False, return_counts: bool = False
+        self,
+        x: Any,
+        return_index: bool = False,
+        return_inverse: bool = False,
+        return_counts: bool = False,
     ) -> Any:
         """Returns the unique elements of the input tensor."""
         pass
@@ -208,12 +227,19 @@ class TensorBackend(ABC):
         pass
 
     @abstractmethod
+    def dynamic_slice_in_dim(self, x: Any, start: Any, size: int, axis: int = 0) -> Any:
+        """Slice x along a specific axis starting at `start` with length `size`."""
+        pass
+
+    @abstractmethod
     def dynamic_slice_update(self, x: Any, update: Any, start: Any) -> Any:
         """Update x starting at `start` with `update`. Returns updated tensor."""
         pass
 
     @abstractmethod
-    def bincount(self, x: Any, minlength: int = 0) -> Any:
+    def bincount(
+        self, x: Any, weights: Optional[Any] = None, minlength: int = 0
+    ) -> Any:
         """Count occurrences of each value in array of non-negative ints."""
         pass
 
@@ -249,7 +275,7 @@ class TensorBackend(ABC):
         pass
 
     @abstractmethod
-    def get_dlpack_slice(self, tensor: Any, indices: Optional[Any] = None) -> Any:
+    def get_dlpack_slice(self, tensor: Any, cursor: Optional[Any] = None) -> Any:
         """
         Returns a DLPack-compatible object viewing a slice of the tensor without copying.
         Typically used for ragged/sparse transport optimization.
@@ -326,6 +352,12 @@ class TorchBackend(TensorBackend):
     def shape(self, tensor: Any) -> Any:
         return tensor.shape
 
+    def size(self, tensor: Any) -> int:
+        return tensor.numel()
+
+    def cast(self, tensor: Any, dtype: Any) -> Any:
+        return tensor.to(dtype)
+
     def item(self, tensor: Any) -> Any:
         return tensor.item()
 
@@ -373,6 +405,9 @@ class TorchBackend(TensorBackend):
     def diff(self, x: Any, dim: int = -1) -> Any:
         return self._torch.diff(x, dim=dim)
 
+    def print(self, fmt: str, **kwargs) -> None:
+        print(fmt.format(**kwargs))
+
     def unique_consecutive(
         self, x: Any, return_inverse: bool = False, return_counts: bool = False
     ) -> Any:
@@ -418,6 +453,10 @@ class TorchBackend(TensorBackend):
 
         return x
 
+    def dynamic_slice_in_dim(self, x: Any, start: Any, size: int, axis: int = 0) -> Any:
+        idx = self._torch.arange(size, device=x.device, dtype=self._torch.int64) + start
+        return self._torch.index_select(x, axis, idx)
+
     def dynamic_slice_update(self, x: Any, update: Any, start: Any) -> Any:
         """Simulates dynamic update (in-place for Torch).
 
@@ -445,12 +484,20 @@ class TorchBackend(TensorBackend):
 
         return x
 
-    def bincount(self, x: Any, minlength: int = 0) -> Any:
-        return self._torch.bincount(x, minlength=minlength)
+    def bincount(
+        self, x: Any, weights: Optional[Any] = None, minlength: int = 0
+    ) -> Any:
+        return self._torch.bincount(x, weights=weights, minlength=minlength)
 
     def unique(
-        self, x: Any, return_inverse: bool = False, return_counts: bool = False
+        self,
+        x: Any,
+        return_index: bool = False,
+        return_inverse: bool = False,
+        return_counts: bool = False,
     ) -> Any:
+        # Note: return_index is not directly supported in torch.unique for 1D.
+        # But we can emulate it if needed. For now, we assume return_inverse.
         return self._torch.unique(
             x, return_inverse=return_inverse, return_counts=return_counts
         )
@@ -589,6 +636,12 @@ class JaxBackend(TensorBackend):
     def shape(self, tensor: Any) -> Any:
         return tensor.shape
 
+    def size(self, tensor: Any) -> int:
+        return tensor.size
+
+    def cast(self, tensor: Any, dtype: Any) -> Any:
+        return tensor.astype(dtype)
+
     def item(self, tensor: Any) -> Any:
         return tensor.item()
 
@@ -614,6 +667,9 @@ class JaxBackend(TensorBackend):
             # Assumes numerical
             return self._jnp.argsort(-x, axis=dim)
         return self._jnp.argsort(x, axis=dim)
+
+    def print(self, fmt: str, **kwargs) -> None:
+        self._jax.debug.print(fmt, **kwargs)
 
     def sort(
         self, x: Any, dim: int = -1, descending: bool = False, stable: bool = False
@@ -672,12 +728,18 @@ class JaxBackend(TensorBackend):
         return uniques
 
     def unique(
-        self, x: Any, return_inverse: bool = False, return_counts: bool = False
+        self,
+        x: Any,
+        return_index: bool = False,
+        return_inverse: bool = False,
+        return_counts: bool = False,
     ) -> Any:
-        # jnp.unique returns (uniques, [inverse], [counts])
-        # Torch returns (uniques, [inverse], [counts]) in the same order.
+        # jnp.unique returns (uniques, [indices], [inverse], [counts])
         return self._jnp.unique(
-            x, return_inverse=return_inverse, return_counts=return_counts
+            x,
+            return_index=return_index,
+            return_inverse=return_inverse,
+            return_counts=return_counts,
         )
 
     def sum(self, x: Any, dim: Any = None) -> Any:
@@ -721,6 +783,16 @@ class JaxBackend(TensorBackend):
 
         return self._jax.lax.dynamic_slice(x, start, size)
 
+    def dynamic_slice_in_dim(self, x: Any, start: Any, size: int, axis: int = 0) -> Any:
+        ndim = x.ndim
+        start_indices = [0] * ndim
+        start_indices[axis] = start
+
+        slice_sizes = list(x.shape)
+        slice_sizes[axis] = size
+
+        return self._jax.lax.dynamic_slice(x, tuple(start_indices), tuple(slice_sizes))
+
     def dynamic_slice_update(self, x: Any, update: Any, start: Any) -> Any:
         # Ensure start is a tuple matching input dimensions
         if isinstance(start, int):
@@ -732,8 +804,10 @@ class JaxBackend(TensorBackend):
 
         return self._jax.lax.dynamic_update_slice(x, update, start)
 
-    def bincount(self, x: Any, minlength: int = 0) -> Any:
-        return self._jnp.bincount(x, length=minlength)
+    def bincount(
+        self, x: Any, weights: Optional[Any] = None, minlength: int = 0
+    ) -> Any:
+        return self._jnp.bincount(x, weights=weights, length=minlength)
 
     def vmap(self, fun: Any, in_axes: Any = 0, out_axes: Any = 0) -> Any:
         return self._jax.vmap(fun, in_axes=in_axes, out_axes=out_axes)
