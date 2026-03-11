@@ -9,7 +9,7 @@ import logging
 import numpy as np
 
 from fluxway.common.backend import get_backend
-from fluxway.common.types.sharding import ShardingSpec
+from fluxway.common.types.sharding import PhysicalLayout
 
 logger = logging.getLogger(__name__)
 
@@ -72,15 +72,15 @@ class TransportPlanner:
     def compute_plan(
         src_local_rank: int,
         src_data_shape: Tuple[int, ...],
-        src_spec: ShardingSpec,
-        dst_spec: ShardingSpec,
+        src_spec: PhysicalLayout,
+        dst_spec: PhysicalLayout,
         src_index_desc: Optional[Any] = None,
         dst_index_desc: Optional[Any] = None,
         src_routing_shard_resolver: Optional[Callable[[int, int], Any]] = None,
         src_routing_indices: Optional[Any] = None,
         src_routing_based_values: Optional[Any] = None,
     ) -> TransportPlan:
-        """Diff(S_src, S_dst) using stateless ShardingSpecs."""
+        """Diff(L_src, L_dst) using physical layouts."""
         # N-D Native logic extracts the correct dimensionalities implicitly.
         # Default destination dimension 0 is passed to respect returning a legacy single
         # dimension for 1D layout serialization/inspection in tests.
@@ -368,8 +368,8 @@ class TransportPlanner:
     @staticmethod
     def plan(
         src_local_rank: int,
-        src_spec: ShardingSpec,
-        dst_spec: ShardingSpec,
+        src_spec: PhysicalLayout,
+        dst_spec: PhysicalLayout,
         src_data_shape: Tuple[int, ...],
         src_index_desc: Any = None,
         dst_index_desc: Any = None,

@@ -2,18 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Union, Optional
+from typing import Any, Callable, Dict, List, Tuple, Union, Optional
+import logging
 
 import asyncio
 import numpy as np
 
-
-from typing import Any, Callable, Dict, List, Tuple
-import logging
-
 from fluxway.common.backend import get_backend
 from fluxway.transport.planner import TransportPlanner
-from fluxway.common.types.sharding import ShardingSpec, MirrorPartition
+from fluxway.common.types.sharding import PhysicalLayout
 from fluxway.common.types.tensor import TransportTensor
 from fluxway.common.execution import compile
 from fluxway.common.index_descriptor import ContinuousIndex, IndexDescriptor
@@ -53,8 +50,8 @@ class BaseDataDistributor:
     def _plan_single_tensor_group(
         self,
         local_data: Union[TransportTensor, List[TransportTensor]],
-        source: ShardingSpec,
-        target: ShardingSpec,
+        source: PhysicalLayout,
+        target: PhysicalLayout,
         capacity: Optional[Union[int, List[int]]] = None,
         tuuid: Optional[Union[int, List[int]]] = None,
         tuuid_to_name: Optional[Dict[int, str]] = None,
@@ -97,7 +94,28 @@ class BaseDataDistributor:
             # If no explicit origin, routing_indices (e.g. MoE Routine) act as the physical identity.
             src_geometry_indices = primary.routing_indices
 
-        if src_geometry_indices is None and not source.is_content_addressable:
+        # Signal-driven Routing Detection (Referential Dependency)
+        is_referential = (source and source.is_referential) or (
+            target and target.is_referential
+        )
+        is_mirror = is_referential  # Current implementation equates referential with mirror/follow intent
+
+        # Resolve Source Signal (Geometry vs Content vs Reference)
+        if is_referential and primary.receipt is not None:
+            # Mirror/Reflective: Signal is the historical receipt
+            src_geometry_indices = None
+            dst_content_routing_values = None
+        elif src_geometry_indices is not None:
+            if hasattr(src_geometry_indices, "materialize"):
+                src_geometry_indices = src_geometry_indices.materialize()
+        elif source and source.is_content_addressable:
+            src_geometry_indices = (
+                primary.routing_indices
+                if primary.routing_indices is not None
+                else primary.flat_values
+            )
+        elif source:
+            # Algebraic Static: Signal is rank-based geometry
             source_routing_dim = (
                 source.routing_dim if source.routing_dim is not None else 0
             )
@@ -112,29 +130,17 @@ class BaseDataDistributor:
             effective_rank = source.get_shard_rank(self.local_rank, source_routing_dim)
             start = effective_rank * dim_size
             src_geometry_indices = np.arange(start, start + dim_size, dtype=np.int32)
-        elif src_geometry_indices is not None:
-            if hasattr(src_geometry_indices, "materialize"):
-                src_geometry_indices = src_geometry_indices.materialize()
-            # Else already a tensor/numpy array, compatible with planner.
-        elif source.is_content_addressable:
-            # For content-addressable data (e.g. IDs), the values themselves can serve as identity
-            # if no explicit geometry or routing indices are available.
-            src_geometry_indices = (
-                primary.routing_indices
-                if primary.routing_indices is not None
-                else primary.flat_values
-            )
         else:
             raise ValueError(
-                f"Invalid type for src_geometry_indices: {type(src_geometry_indices)}. "
+                f"[Distributor] Invalid type for src_geometry_indices: {type(src_geometry_indices)}. "
                 f"Source: {source.strategy.name}. "
                 f"TUUIDs: {self._format_tuuids(tuuid, tuuid_to_name)}. "
                 "For content-addressable sharding, please ensure target routing indices are provided."
             )
 
-        # Resolve Routing Values (Actual Content for Hash/Dynamic routing)
-        # These values determine WHICH worker handles the data. (e.g. KV ID)
-        if dst_is_content_addressable:
+        # Resolve Destination Signal (Content-based Hash)
+        dst_is_content_addressable = target.is_content_addressable if target else False
+        if dst_is_content_addressable and not is_referential:
             dst_content_routing_values = (
                 primary.routing_indices
                 if primary.routing_indices is not None
@@ -151,7 +157,14 @@ class BaseDataDistributor:
         )
 
         # Static routing (e.g., batch-partitioned) requires global_shape to calculate shard boundaries.
-        if not target.is_content_addressable and not source.is_content_addressable:
+        if (
+            not is_referential
+            and target
+            and source
+            and not target.is_content_addressable
+            and not source.is_content_addressable
+            and primary.shape != ()
+        ):
             is_fallback_shape = (dst_shape == local_shape) or (
                 primary.global_shape is None
             )
@@ -170,10 +183,11 @@ class BaseDataDistributor:
         # For Static-to-Static routing every partitioned dimension must be large enough
         # to cover all workers in that sub-mesh. If data < workers, some workers will always
         # starve silently — treat this as a hard configuration error.
-        # Note: global_shape=None (EOS / Interleaved-skip empty packets) bypasses this check
-        # because those paths never reach here (they go through _propagate_empty_packets directly).
         if (
-            not target.is_content_addressable
+            not is_referential
+            and target
+            and source
+            and not target.is_content_addressable
             and not source.is_content_addressable
             and dst_shape is not None
             and target.partitions
@@ -196,15 +210,16 @@ class BaseDataDistributor:
                         f"or reduce the target mesh size."
                     )
 
-        logger.debug(
-            f"[Distributor] Planning: src_mesh={source.mesh.size if source.mesh else 1}, "
-            f"dst_mesh={target.mesh.size if target.mesh else 1}, "
-            f"local_rank={self.local_rank}, src_indices={src_geometry_indices}"
-        )
+        if source and target:
+            logger.debug(
+                f"[Distributor] Planning: src_mesh={source.mesh.size if source.mesh else 1}, "
+                f"dst_mesh={target.mesh.size if target.mesh else 1}, "
+                f"local_rank={self.local_rank}, src_indices={src_geometry_indices}"
+            )
 
-        routing_dim = target.routing_dim
+        routing_dim = target.routing_dim if target else 0
         if routing_dim is None:
-            if target.partitions:
+            if target and target.partitions:
                 routing_dim = next(iter(target.partitions.keys()))
             else:
                 routing_dim = 0
@@ -222,15 +237,6 @@ class BaseDataDistributor:
             capacity = selected_capacity
         elif capacity is None:
             capacity = actual_req
-
-        # Mirror Sharding path (precisely route back to producer origin)
-        is_mirror = (
-            isinstance(source, ShardingSpec)
-            and isinstance(source.strategy, MirrorPartition)
-        ) or (
-            isinstance(target, ShardingSpec)
-            and isinstance(target.strategy, MirrorPartition)
-        )
 
         global_shapes_list = [tt.global_shape for tt in tensors_to_pack]
 
@@ -281,6 +287,24 @@ class BaseDataDistributor:
                 compact_desc_info.append(None)
 
             has_meta_tensor_state_list.append(meta_tensor_state)
+
+        if primary.shape == ():
+            if target and self.local_rank != 0:
+                return
+
+            target_world_size = target.mesh.size if target and target.mesh else 1
+            all_target_ranks = list(range(target_world_size))
+
+            yield (
+                all_target_ranks,
+                payloads,
+                [1] * len(payloads),
+                None,
+                global_shapes_list,
+                has_meta_tensor_state_list,
+                [None] * len(has_meta_tensor_state_list),
+            )
+            return
 
         if is_mirror and primary.receipt is not None:
             mirror_target_world_size = primary.receipt.world_size
@@ -464,8 +488,8 @@ class BaseDataDistributor:
     def plan_and_shard(
         self,
         local_data: Union[TransportTensor, List[TransportTensor]],
-        source: Optional[ShardingSpec] = None,
-        target: Optional[ShardingSpec] = None,
+        source: Optional[PhysicalLayout] = None,
+        target: Optional[PhysicalLayout] = None,
         capacity: Optional[Union[int, List[int]]] = None,
         tuuid: Optional[Union[int, List[int]]] = None,
         tuuid_to_name: Optional[Dict[int, str]] = None,
@@ -515,8 +539,8 @@ class SyncDataDistributor(BaseDataDistributor):
     def distribute(
         self,
         local_data: Optional[Union[TransportTensor, List[TransportTensor]]] = None,
-        source: Optional[ShardingSpec] = None,
-        target: Optional[ShardingSpec] = None,
+        source: Optional[PhysicalLayout] = None,
+        target: Optional[PhysicalLayout] = None,
         send_fn: Optional[Callable] = None,
         capacity: Optional[Union[int, List[int]]] = None,
         tuuid: Optional[Union[int, List[int]]] = None,
@@ -575,8 +599,8 @@ class AsyncDataDistributor(BaseDataDistributor):
     async def distribute(
         self,
         local_data: Optional[Union[TransportTensor, List[TransportTensor]]] = None,
-        source: Optional[ShardingSpec] = None,
-        target: Optional[ShardingSpec] = None,
+        source: Optional[PhysicalLayout] = None,
+        target: Optional[PhysicalLayout] = None,
         send_fn: Optional[Callable] = None,
         capacity: Optional[Union[int, List[int]]] = None,
         tuuid: Optional[Union[int, List[int]]] = None,

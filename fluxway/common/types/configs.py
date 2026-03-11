@@ -335,9 +335,24 @@ class TolerantBarrierConfig(BarrierConfig):
     """
 
     type: BarrierType = BarrierType.TOLERANT
-    anchor_tensor: Optional[str] = None
-    staleness: Dict[str, int] = Field(default_factory=dict)
+    tensor_staleness: Dict[int, int] = Field(default_factory=dict)
+    state_staleness: Dict[str, int] = Field(default_factory=dict)
+    debug_names: Dict[int, str] = Field(default_factory=dict, exclude=True)
     retrieval_policy: str = "latest"  # "latest", "oldest", "closest"
+
+    # Input field for logical paths (resolved during initialization)
+    staleness: Dict[str, int] = Field(default_factory=dict, exclude=True)
+
+    def resolve(self, resolver_fn: Callable[[str], Optional[int]]) -> None:
+        """Resolve all stale paths to TUUIDs or Control States."""
+        for key, val in self.staleness.items():
+            tuuid = resolver_fn(key)
+            if tuuid is not None:
+                self.tensor_staleness[tuuid] = val
+                self.debug_names[tuuid] = key
+            else:
+                # Might be a control state, preserve for runtime check in OperatorManager
+                self.state_staleness[key] = val
 
 
 class OperatorContext(FluxwayBaseSchema):
@@ -374,30 +389,15 @@ class OperatorMeta(FluxwayBaseSchema):
     output_arguments: Optional[Dict[str, List[str]]] = None
     input_sharding: Dict[Any, Any] = Field(default_factory=dict)
     output_sharding: Dict[Any, Any] = Field(default_factory=dict)
-    # Ordered list of UUIDs for flattened output tensors (populated by Builder)
     output_uuids: List[int] = Field(default_factory=list)
 
-    # Implicit Mapping Support:
-    # Tracks logical placeholders (parameters in function signature) to their flattened fields.
-    # Key: Parameter name or "return" placeholder
-    # Value: List of flattened field names
+    # Implicit parameter-to-field mappings
     input_param_map: Dict[str, List[str]] = Field(default_factory=dict)
     output_param_map: Dict[str, List[str]] = Field(default_factory=dict)
-
-    # Deterministic Pytree meta for strict reconstruction
-    # Key: Parameter name
-    # Value: treedef for unflattening
     input_treedefs: Dict[str, Any] = Field(default_factory=dict)
     output_treedef: Optional[Any] = None
 
-    # Linking sharding specs (populated by Builder when constructing the graph)
-    # For the current operator:
-    # - input_pre_sharding: Records all "predecessor SPMD -> current SPMD" edges and their sharding,
-    #   including conditional edges; key is predecessor spmd_id, value is a list of edges from that predecessor.
-    #   Structure: {pred_spmd_id: List[EdgeShardingInfo]}
-    # - output_post_sharding: Records all "current SPMD -> successor SPMD" edges and their sharding,
-    #   also including conditional edges; key is successor spmd_id.
-    #   Structure: {succ_spmd_id: List[EdgeShardingInfo]}
+    # Linking metadata (populated by Builder)
     input_pre_sharding: Dict[str, List[EdgeShardingInfo]] = Field(default_factory=dict)
     output_post_sharding: Dict[str, List[EdgeShardingInfo]] = Field(
         default_factory=dict
@@ -408,16 +408,32 @@ class OperatorMeta(FluxwayBaseSchema):
         StandardBarrierConfig, PeriodicBarrierConfig, TolerantBarrierConfig
     ] = Field(default_factory=StandardBarrierConfig)
 
-    def get_arguments(self, is_output: bool, arg_type: "ArgumentType") -> List[str]:
-        """
-        Get input/output arguments list for a given arg type.
+    def resolve_sharding_topology(
+        self, resolver_fn: Callable[[str], Optional[int]]
+    ) -> None:
+        for sharding in [self.input_sharding, self.output_sharding]:
+            for spec in sharding.values():
+                # ShardingSpec handles both referential and algebraic logic
+                if hasattr(spec, "routing") and hasattr(spec.routing, "resolve"):
+                    spec.routing.resolve(resolver_fn)
 
-        Note: input_arguments/output_arguments store keys as ArgumentType.value (str).
-        """
+    def resolve_async_strategy(
+        self, resolver_fn: Callable[[str], Optional[int]]
+    ) -> None:
+        if hasattr(self.barrier_config, "resolve"):
+            self.barrier_config.resolve(resolver_fn)
+
+    def get_arguments(self, is_output: bool, arg_type: "ArgumentType") -> List[str]:
         args_map = self.output_arguments if is_output else self.input_arguments
-        if not args_map:
-            return []
-        return list(args_map.get(arg_type.value) or [])
+
+        if args_map and arg_type.value in args_map:
+            return list(args_map[arg_type.value])
+
+        if arg_type == ArgumentType.DATA:
+            sharding = self.output_sharding if is_output else self.input_sharding
+            return list(sharding.keys())
+
+        return []
 
     # ---------------------------------------------------------------------
     # Compare / validate helpers (used by control-plane graph builder)

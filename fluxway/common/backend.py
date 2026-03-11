@@ -192,6 +192,10 @@ class TensorBackend(ABC):
         pass
 
     @abstractmethod
+    def mean(self, x: Any) -> Any:
+        pass
+
+    @abstractmethod
     def max(self, x: Any) -> Any:
         pass
 
@@ -416,7 +420,12 @@ class TorchBackend(TensorBackend):
         )
 
     def sum(self, x: Any, dim: Any = None) -> Any:
-        return self._torch.sum(x, dim=dim)
+        if dim is not None:
+            return x.sum(dim=dim)
+        return x.sum()
+
+    def mean(self, x: Any) -> Any:
+        return x.mean()
 
     def max(self, x: Any) -> Any:
         return self._torch.max(x)
@@ -744,6 +753,9 @@ class JaxBackend(TensorBackend):
 
     def sum(self, x: Any, dim: Any = None) -> Any:
         return self._jnp.sum(x, axis=dim)
+
+    def mean(self, x: Any) -> Any:
+        return self._jnp.mean(x)
 
     def max(self, x: Any) -> Any:
         return self._jnp.max(x)

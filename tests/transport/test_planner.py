@@ -24,8 +24,8 @@ def test_static_to_static():
     """Source: chunk(2), Rank 0 has [0,50). Target: chunk(4). Expect 2 plans."""
     src_mesh = DeviceMesh(device_shape=(2,), axis_names=("x",))
     dst_mesh = DeviceMesh(device_shape=(4,), axis_names=("x",))
-    src_spec = ShardingSpec.chunk(mesh=src_mesh, partition=P("x"))
-    dst_spec = ShardingSpec.chunk(mesh=dst_mesh, partition=P("x"))
+    src_spec = ShardingSpec.chunk(P("x")).bind(src_mesh)
+    dst_spec = ShardingSpec.chunk(P("x")).bind(dst_mesh)
 
     plan = TransportPlanner.plan(
         src_local_rank=0, src_spec=src_spec, dst_spec=dst_spec, src_data_shape=(100,)
@@ -44,8 +44,8 @@ def test_static_to_static_rank1():
     """Same scenario, but from Rank 1's perspective."""
     src_mesh = DeviceMesh(device_shape=(2,), axis_names=("x",))
     dst_mesh = DeviceMesh(device_shape=(4,), axis_names=("x",))
-    src_spec = ShardingSpec.chunk(mesh=src_mesh, partition=P("x"))
-    dst_spec = ShardingSpec.chunk(mesh=dst_mesh, partition=P("x"))
+    src_spec = ShardingSpec.chunk(P("x")).bind(src_mesh)
+    dst_spec = ShardingSpec.chunk(P("x")).bind(dst_mesh)
 
     plan = TransportPlanner.plan(
         src_local_rank=1, src_spec=src_spec, dst_spec=dst_spec, src_data_shape=(100,)
@@ -67,8 +67,8 @@ def test_static_to_dynamic_hash():
 
     src_mesh = DeviceMesh(device_shape=(1,), axis_names=("x",))
     dst_mesh = DeviceMesh(device_shape=(2,), axis_names=("x",))
-    src_spec = ShardingSpec.chunk(mesh=src_mesh, partition=P("x"))
-    dst_spec = ShardingSpec.hash(mesh=dst_mesh, partition=P("x"))
+    src_spec = ShardingSpec.chunk(P("x")).bind(src_mesh)
+    dst_spec = ShardingSpec.hash(P("x")).bind(dst_mesh)
 
     plan = TransportPlanner.plan(
         src_local_rank=0,
@@ -103,8 +103,8 @@ def test_dynamic_to_static():
     """
     dep = jnp.array([0, 1, 0, 1, 0, 1], dtype=jnp.int32)
     mesh = DeviceMesh(device_shape=(2,), axis_names=("x",))
-    src_spec = ShardingSpec.hash(mesh=mesh, partition=P("x"))
-    dst_spec = ShardingSpec.chunk(mesh=mesh, partition=P("x"))
+    src_spec = ShardingSpec.hash(P("x")).bind(mesh)
+    dst_spec = ShardingSpec.chunk(P("x")).bind(mesh)
 
     plan = TransportPlanner.plan(
         src_local_rank=0,
@@ -126,8 +126,8 @@ def test_dynamic_to_dynamic():
     splits = [jnp.array([0, 10, 30, 40], dtype=jnp.int32)]
 
     mesh = DeviceMesh(device_shape=(2,), axis_names=("x",))
-    src_spec = ShardingSpec.greedy(mesh=mesh, partition=P("x"))
-    dst_spec = ShardingSpec.hash(mesh=mesh, partition=P("x"))
+    src_spec = ShardingSpec.greedy(P("x")).bind(mesh)
+    dst_spec = ShardingSpec.hash(P("x")).bind(mesh)
 
     plan = TransportPlanner.plan(
         src_local_rank=0,
@@ -147,18 +147,12 @@ def test_dynamic_to_dynamic():
 
 def test_routing_indices_dual_tensor():
     """Key-value dispatch: key determines device, value follows."""
-    key_data = jnp.array([0, 1, 2, 3], dtype=jnp.int32)
     mesh = DeviceMesh(device_shape=(2,), axis_names=("x",))
 
-    val_spec = ShardingSpec.derive_from(
-        driver_spec=ShardingSpec.hash(mesh=mesh, partition=P("x")),
-        driver_data_shape=(4,),
-        driver_index_desc=ExplicitIndex(indices=key_data),
-        follow_dim=0,
-    )
+    val_spec = ShardingSpec.hash(P("x")).bind(mesh)
 
     src_mesh = DeviceMesh(device_shape=(1,), axis_names=("x",))
-    src_spec = ShardingSpec.chunk(mesh=src_mesh, partition=P("x"))
+    src_spec = ShardingSpec.chunk(P("x")).bind(src_mesh)
 
     plan = TransportPlanner.plan(
         src_local_rank=0, src_spec=src_spec, dst_spec=val_spec, src_data_shape=(4,)
@@ -176,8 +170,8 @@ def test_replicate_fanout():
     src_mesh = DeviceMesh(device_shape=(2,), axis_names=("x",))
     dst_mesh = DeviceMesh(device_shape=(2, 2), axis_names=("x", "y"))
 
-    src_spec = ShardingSpec.chunk(mesh=src_mesh, partition=P("x"))
-    dst_spec = ShardingSpec.chunk(mesh=dst_mesh, partition=P("x"))
+    src_spec = ShardingSpec.chunk(P("x")).bind(src_mesh)
+    dst_spec = ShardingSpec.chunk(P("x")).bind(dst_mesh)
 
     plan = TransportPlanner.plan(
         src_local_rank=0, src_spec=src_spec, dst_spec=dst_spec, src_data_shape=(10,)
@@ -203,8 +197,8 @@ def test_ragged_data_reorder():
 
     src_mesh = DeviceMesh(device_shape=(1,), axis_names=("x",))
     dst_mesh = DeviceMesh(device_shape=(2,), axis_names=("x",))
-    src_spec = ShardingSpec.chunk(mesh=src_mesh, partition=P("x"))
-    dst_spec = ShardingSpec.cyclic(mesh=dst_mesh, partition=P("x"))
+    src_spec = ShardingSpec.chunk(P("x")).bind(src_mesh)
+    dst_spec = ShardingSpec.cyclic(P("x")).bind(dst_mesh)
 
     plan = TransportPlanner.plan(
         src_local_rank=0, src_spec=src_spec, dst_spec=dst_spec, src_data_shape=(4,)
@@ -229,8 +223,8 @@ def test_iter_device_slices():
     """Verify iter_device_slices yields correct (device, offset, count) tuples."""
     src_mesh = DeviceMesh(device_shape=(1,), axis_names=("x",))
     dst_mesh = DeviceMesh(device_shape=(3,), axis_names=("x",))
-    src_spec = ShardingSpec.chunk(mesh=src_mesh, partition=P("x"))
-    dst_spec = ShardingSpec.cyclic(mesh=dst_mesh, partition=P("x"))
+    src_spec = ShardingSpec.chunk(P("x")).bind(src_mesh)
+    dst_spec = ShardingSpec.cyclic(P("x")).bind(dst_mesh)
 
     plan = TransportPlanner.plan(
         src_local_rank=0, src_spec=src_spec, dst_spec=dst_spec, src_data_shape=(6,)
@@ -251,11 +245,11 @@ def test_multi_axis_dynamic_routing_dims():
     # 2D Mesh [2, 2]
     src_mesh = DeviceMesh(device_shape=(1, 1), axis_names=("x", "y"))
     dst_mesh = DeviceMesh(device_shape=(2, 2), axis_names=("x", "y"))
-    src_spec = ShardingSpec.chunk(mesh=src_mesh, partition=P("x", "y"))
+    src_spec = ShardingSpec.chunk(P("x", "y")).bind(src_mesh)
 
     # Target expects a tuple for multi-dimensional content addressing
-    dst_spec = ShardingSpec.hash(
-        mesh=dst_mesh, partition=P("x", "y"), routing_dim=(0, 1)
+    dst_spec = ShardingSpec.hash(partition=P("x", "y"), routing_dim=(0, 1)).bind(
+        dst_mesh
     )
 
     # Assume we have 4 tokens (2x2 data grid) mapped dynamically over two dimensions.

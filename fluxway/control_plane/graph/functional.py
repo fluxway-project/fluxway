@@ -186,12 +186,12 @@ class NodeProxy:
                     )
                     for out_name in out_args:
                         u_key = (self.node_id, op_name, out_name)
-                        if u_key not in self._graph._builder._output_uuids:
+                        if u_key not in self._graph._builder._tuuid_slots:
                             # Safety check: ensure builder assigned it
                             raise RuntimeError(
                                 f"TUUID for {u_key} not found in Builder registry."
                             )
-                        output_uuids[out_name] = self._graph._builder._output_uuids[
+                        output_uuids[out_name] = self._graph._builder._tuuid_slots[
                             u_key
                         ]
 

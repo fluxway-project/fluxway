@@ -198,6 +198,7 @@ def operator(
     periodic_barrier: Optional[int] = None,
     max_inflight_steps: int = 0,
     is_source: Optional[bool] = None,
+    barrier_config: Optional[Any] = None,
 ):
     """
     Mark a function as a Fluxway operator with automatic metadata inference.
@@ -217,6 +218,7 @@ def operator(
             periodic_barrier,
             max_inflight_steps,
             is_source,
+            barrier_config,
         )
 
     # At this point, name is either a str or None
@@ -234,6 +236,7 @@ def operator(
             periodic_barrier,
             max_inflight_steps,
             is_source,
+            barrier_config,
         )
 
     return decorator
@@ -250,6 +253,7 @@ def _create_operator_wrapper(
     periodic_barrier,
     max_inflight_steps,
     is_source,
+    barrier_config=None,
 ):
     from fluxway.common.types.configs import (
         ArgumentType,
@@ -362,7 +366,6 @@ def _create_operator_wrapper(
     ):
         resolved = {}
         if isinstance(sharding_val, dict):
-            # If it's a sharding spec (not nested mapping), apply uniformly to all data fields in this branch
             if "type" in sharding_val and "axis" in sharding_val:
                 for df in data_fields:
                     resolved[df] = sharding_val
@@ -501,8 +504,6 @@ def _create_operator_wrapper(
                 )
     output_sharding = resolved_output_sharding
 
-    output_sharding = resolved_output_sharding
-
     # Periodic barrier constraints
     if periodic_barrier is not None:
         if len(final_tensors) + len(final_states) != 1:
@@ -549,12 +550,6 @@ def _create_operator_wrapper(
     elif output_sharding:
         output_args = {ArgumentType.DATA.value: list(output_sharding.keys())}
 
-    barrier_config = (
-        PeriodicBarrierConfig(n=periodic_barrier)
-        if periodic_barrier is not None
-        else StandardBarrierConfig()
-    )
-
     meta = OperatorMeta(
         name=name,
         is_source=is_source,
@@ -575,7 +570,13 @@ def _create_operator_wrapper(
         else (
             tree_flatten_type(return_tp) if _is_fluxway_data_type(return_tp) else None
         ),
-        barrier_config=barrier_config,
+        barrier_config=barrier_config
+        if barrier_config
+        else (
+            PeriodicBarrierConfig(n=periodic_barrier)
+            if periodic_barrier is not None
+            else StandardBarrierConfig()
+        ),
     )
 
     @functools.wraps(func)
@@ -598,7 +599,7 @@ def _create_operator_wrapper(
                 f"Fluxway Execution Error: Cannot instantiate class for operator '{name}'."
             )
 
-        instance_key = (id(cls), name)
+        instance_key = id(cls)  # different function in one class share one instance.
         if instance_key not in _instance_storage.instances:
             _instance_storage.instances[instance_key] = cls()
 

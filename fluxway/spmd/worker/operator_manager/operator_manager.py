@@ -10,13 +10,13 @@ Responsibilities:
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Type, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Set, Type, Tuple, TYPE_CHECKING
 import threading
 import logging
 import inspect
 
 from fluxway.common.types.configs import ArgumentType
-from fluxway.common.types.sharding import ShardingSpec
+from fluxway.common.types.sharding import ShardingSpec, PhysicalLayout
 from fluxway.common.types import EdgeShardingInfo
 from fluxway.common.mesh import DeviceMesh
 from fluxway.spmd.worker.operator_manager.dispatcher import (
@@ -59,7 +59,7 @@ class ResolvedTopologyInfo:
     world_size: int = 1
 
     mesh: Optional[DeviceMesh] = None
-    # Sharding by TUUID
+    # Sharding by TUUID (Logical)
     tuuid_sharding: Dict[int, ShardingSpec] = field(default_factory=dict)
     # Map from logical path to TUUID
     tuuid_map: Dict[str, int] = field(default_factory=dict)
@@ -142,8 +142,26 @@ class OperatorManager:
         # Thread lock
         self._lock = threading.Lock()
 
+        # Central TUUID registry for resolving all routing logic (Source of Truth)
+        # Only production-side routing (outputs/predecessors) are registered here.
+        self._tuuid_registry: Dict[int, ShardingSpec] = {}
+
+        # Context-isolated resolution caches
+        self._resolved_input_cache: Dict[Tuple[str, int], PhysicalLayout] = {}
+        self._resolved_producer_cache: Dict[int, ShardingSpec] = {}
+
+        # Performance Caches
+        # (op_name, tuuid, pre_spmd_id, rank, step_mod) -> List[int]
+        self._producer_cache: Dict[Tuple[str, int, str, int, int], List[int]] = {}
+        # (tuuid, pre_spmd_id) -> PhysicalLayout (projected)
+        self._effective_layout_cache: Dict[Tuple[int, str], PhysicalLayout] = {}
+
         # Parse topology from OperatorMeta
         self._parse_operator_metadata()
+
+        # Populate output sharding (TUUID-keyed) for all local operators
+        for op_name in self._operators:
+            self._output_sharding[op_name] = self.get_output_sharding(op_name)
 
         # Pre-compute expected tensor shards after routing strategies are ready
         self._precompute_expected_tensor_shards()
@@ -151,55 +169,123 @@ class OperatorManager:
         # Pre-compute operator input types from function signatures
         self._precompute_operator_input_types()
 
-    def _get_spec_by_tuuid(
-        self, sharding_map: Dict[int, ShardingSpec], tuuid: int
-    ) -> Optional[ShardingSpec]:
-        """Direct lookup for sharding spec by TUUID."""
-        return sharding_map.get(tuuid)
+    def _resolve_input_spec(self, op_name: str, tuuid: int) -> Optional[PhysicalLayout]:
+        """
+        Resolve a consumer-side input requirement for a specific operator.
+        Returns a PhysicalLayout bound to the current mesh.
+        """
+        key = (op_name, tuuid)
+        if key in self._resolved_input_cache:
+            return self._resolved_input_cache[key]
 
-    def _get_effective_sharding_spec(
-        self, spec: Optional[ShardingSpec], info: ResolvedTopologyInfo
+        # Check local requirement map (ShardingSpec)
+        routing = self._input_sharding.get(op_name, {}).get(tuuid)
+
+        # Resolution logic
+        if routing is None:
+            return None
+
+        if routing.is_referential:
+            if routing.routing.tuuid is None:
+                raise ValueError(
+                    f"[Fluxway Topology Resolution Error] Incomplete referential routing for input '{tuuid}' in operator '{op_name}'. "
+                    f"The logical path '{routing.routing.path}' failed to resolve to a concrete TUUID. "
+                    "This usually happens when the path points to an operator or field that is not defined in the graph as a predecessor."
+                )
+            # Resolve the producer's logical routing first
+            producer_routing = self._resolve_producer_spec(routing.routing.tuuid)
+            if producer_routing:
+                # bind to PhysicalLayout on current mesh
+                layout = producer_routing.bind(self._mesh)
+                self._resolved_input_cache[key] = layout
+                return layout
+            return None
+
+        # Concrete requirement, bind it
+        layout = routing.bind(self._mesh)
+        self._resolved_input_cache[key] = layout
+        return layout
+
+    def _resolve_producer_spec(
+        self,
+        tuuid: int,
+        provider_map: Optional[Dict[int, ShardingSpec]] = None,
+        _trace: Optional[Set[int]] = None,
     ) -> Optional[ShardingSpec]:
-        """
-        Extract the effective sharding spec for routing/assembly.
-        If the edge is interleaved, this returns a spec projected onto a sub-mesh
-        matching the interleave unit size.
-        """
+        """Resolve a producer-side implementation (Logical Truth)."""
+        if provider_map is None and tuuid in self._resolved_producer_cache:
+            return self._resolved_producer_cache[tuuid]
+
+        spec = provider_map.get(tuuid) if provider_map is not None else None
+        if spec is None:
+            spec = self._tuuid_registry.get(tuuid)
+
         if spec is None:
             return None
 
+        if spec.is_referential:
+            if spec.routing.tuuid is None:
+                raise ValueError(f"Incomplete producer ref for TUUID {tuuid}")
+
+            current_trace = _trace or set()
+            if tuuid in current_trace:
+                raise RuntimeError(f"Circular sharding reference at TUUID {tuuid}")
+            current_trace.add(tuuid)
+
+            resolved = self._resolve_producer_spec(
+                spec.routing.tuuid, _trace=current_trace
+            )
+            if resolved and provider_map is None:
+                self._resolved_producer_cache[tuuid] = resolved
+            return resolved
+
+        if provider_map is None:
+            self._resolved_producer_cache[tuuid] = spec
+        return spec
+
+    def _register_sharding_specs(self, specs: Dict[int, ShardingSpec]) -> None:
+        """
+        Register a batch of ShardingSpec into the global registry.
+        """
+        for tuuid, routing in specs.items():
+            existing = self._tuuid_registry.get(tuuid)
+            if existing and not existing.is_referential:
+                continue
+            self._tuuid_registry[tuuid] = routing
+
+    def _get_effective_layout(
+        self, routing: Optional[ShardingSpec], info: ResolvedTopologyInfo
+    ) -> Optional[PhysicalLayout]:
+        """
+        Extract the effective layout for routing/assembly.
+        """
+        if routing is None:
+            return None
+
+        mesh = info.mesh if info.mesh else self._mesh
+
         if not info.is_interleaved:
-            return spec
+            return routing.bind(mesh)
 
         # INTERLEAVED SOURCE ABSTRACTION:
-        # We must override the spec's mesh to the active unit size (typically 1 for source)
-        # so that resolve_producers/resolve_consumers correctly maps a single active source
-        # rank to all its targets.
-        if spec.mesh:
-            from fluxway.common.mesh import DeviceMesh
+        # Override the data dimension to correctly represent the unit size.
+        unit_size = info.interleave_unit_size
+        other_dims_size = 1
+        for s in mesh.shape[1:]:
+            other_dims_size *= s
 
-            base_mesh = spec.mesh
-            # INTERLEAVED: Override the data dimension to correctly represent the unit size.
-            unit_size = info.interleave_unit_size
-            other_dims_size = 1
-            for s in base_mesh.shape[1:]:
-                other_dims_size *= s
-
-            if unit_size % other_dims_size != 0:
-                raise ValueError(
-                    f"[OperatorManager] Interleave unit size {unit_size} is not compatible with "
-                    f"sub-mesh axes {base_mesh.axis_names[1:]} having total size {other_dims_size}. "
-                    "The unit size must be a multiple of the size of the non-sharded dimensions."
-                )
-
-            first_axis_size = unit_size // other_dims_size
-            new_shape = (first_axis_size,) + base_mesh.shape[1:]
-
-            sub_mesh = DeviceMesh(
-                device_shape=new_shape, axis_names=base_mesh.axis_names
+        if unit_size % other_dims_size != 0:
+            raise ValueError(
+                f"[Fluxway Interleave Error] Topology '{info.spmd_id}' specifies interleave_unit_size={unit_size}, "
+                f"which is not divisible by the sub-mesh size {other_dims_size} (axes {mesh.axis_names[1:]}). "
+                "Ensure that the unit size is a multiple of the size of the non-sharded dimensions."
             )
-            return spec.with_mesh(sub_mesh)
-        return spec
+
+        first_axis_size = unit_size // other_dims_size
+        new_shape = (first_axis_size,) + mesh.shape[1:]
+
+        sub_mesh = DeviceMesh(device_shape=new_shape, axis_names=mesh.axis_names)
+        return routing.bind(sub_mesh)
 
     def resolve_tensor_producers(
         self,
@@ -211,53 +297,77 @@ class OperatorManager:
     ) -> List[int]:
         """
         Locate the physical source ranks producing a specific tensor shard by its TUUID.
+        Uses memoization to avoid re-calculating fixed sharding overlaps.
         """
-        input_spec = self._get_spec_by_tuuid(
-            self._input_sharding.get(op_name, {}), tensor_tuuid
-        )
-
         pre_info = self._predecessor_topology.get(op_name, {}).get(pre_spmd_id)
         if not pre_info:
             return []
 
-        pre_sharding = self._get_spec_by_tuuid(pre_info.tuuid_sharding, tensor_tuuid)
-
-        # Resolve effective sharding (handles interleaved sub-mesh projections)
-        effective_pre_spec = self._get_effective_sharding_spec(pre_sharding, pre_info)
-
-        # Handle Interleaved Unit indexing (shifting base rank based on step)
-        unit_base_rank = 0
+        # Determine Cache Key (handles Interleaved source periodicity)
+        step_mod = 0
         if pre_info.is_interleaved:
             total_units = pre_info.world_size // pre_info.interleave_unit_size
-            active_unit_idx = step % total_units
-            unit_base_rank = active_unit_idx * pre_info.interleave_unit_size
+            step_mod = step % total_units
 
-        if effective_pre_spec:
-            if input_spec is None:
+        cache_key = (op_name, tensor_tuuid, pre_spmd_id, current_rank, step_mod)
+        if cache_key in self._producer_cache:
+            return self._producer_cache[cache_key]
+
+        # Resolve layouts
+        input_layout = self._resolve_input_spec(op_name, tensor_tuuid)
+        producer_routing = self._resolve_producer_spec(
+            tensor_tuuid, provider_map=pre_info.tuuid_sharding
+        )
+
+        eff_key = (tensor_tuuid, pre_spmd_id)
+        if eff_key in self._effective_layout_cache:
+            effective_pre_layout = self._effective_layout_cache[eff_key]
+        else:
+            effective_pre_layout = self._get_effective_layout(
+                producer_routing, pre_info
+            )
+            self._effective_layout_cache[eff_key] = effective_pre_layout
+
+        # Calculate Overlap
+        unit_base_rank = 0
+        if pre_info.is_interleaved:
+            unit_base_rank = step_mod * pre_info.interleave_unit_size
+
+        producers: List[int] = []
+        if effective_pre_layout:
+            if input_layout is None:
                 raise ValueError(
-                    f"[OperatorManager] Missing input sharding for TUUID {tensor_tuuid} in '{op_name}'."
+                    f"[Fluxway Assembly Error] Missing consumer-side PhysicalLayout for TUUID {tensor_tuuid} in operator '{op_name}'. "
+                    "Strict sharding mode requires all data inputs to have a valid routing specification."
                 )
 
-            relative_producers = effective_pre_spec.resolve_producers(
-                input_spec, current_rank
+            relative_producers = effective_pre_layout.resolve_producers(
+                input_layout, current_rank
             )
-            return [unit_base_rank + r for r in relative_producers]
 
-        if pre_info.is_interleaved:
+            if relative_producers:
+                unique_producers = {}
+                for r in relative_producers:
+                    identity = effective_pre_layout.get_logical_identity(r)
+                    if identity not in unique_producers:
+                        unique_producers[identity] = r + unit_base_rank
+                producers = list(unique_producers.values())
+        else:
+            # Locate the field name for helpful error message
+            tuuid_name = pre_info.tuuid_map.get(str(tensor_tuuid), str(tensor_tuuid))
+            for path, tid in pre_info.tuuid_map.items():
+                if tid == tensor_tuuid:
+                    tuuid_name = path
+                    break
+
             raise ValueError(
-                f"[OperatorManager] Missing sharding specs for interleaved source "
-                f"TUUID {tensor_tuuid} from {pre_spmd_id} in {op_name}."
+                f"[Fluxway Topology Error] Missing producer routing for TUUID {tensor_tuuid} (path: '{tuuid_name}') "
+                f"coming from predecessor '{pre_spmd_id}' into operator '{op_name}'. "
+                "Verify that the predecessor correctly defines its output sharding in @operator or the graph builder."
             )
 
-        if input_spec is not None:
-            raise ValueError(
-                f"[OperatorManager] Partial sharding info for TUUID {tensor_tuuid} in {op_name}: target has spec but source doesn't."
-            )
-
-        raise ValueError(
-            f"[OperatorManager] Missing sharding specifications for TUUID {tensor_tuuid} "
-            f"from {pre_spmd_id} in {op_name}. In strict TUUID mode, all tensors must be explicitly sharded."
-        )
+        self._producer_cache[cache_key] = producers
+        return producers
 
     # =========================================================================
     # Metadata Parsing (at initialization)
@@ -274,6 +384,11 @@ class OperatorManager:
                     # Link build-time UUIDs to runtime ShardingSpecs
                     sharding = {}
                     if info.tuuid_sharding:
+                        if info.mesh is None:
+                            logger.warning(
+                                f"[OperatorManager] Predecessor '{pred_id}' for '{op_name}' has no mesh defined. "
+                                f"Falling back to local mesh {self._mesh}, which may cause incorrect shard count precomputation."
+                            )
                         pred_mesh = info.mesh if info.mesh is not None else self._mesh
                         sharding = self._build_sharding_specs(
                             info.tuuid_sharding, pred_mesh
@@ -291,6 +406,8 @@ class OperatorManager:
                         interleave_unit_size=getattr(info, "interleave_unit_size", 1),
                         is_self_loop=(info.spmd_id == self._spmd_id),
                     )
+                    # Sync edge sharding to global registry
+                    self._register_sharding_specs(sharding)
 
                 self._successor_topology.setdefault(op_name, {})
                 for succ_id, info in top.successors.items():
@@ -313,6 +430,8 @@ class OperatorManager:
                         interleave_unit_size=getattr(info, "interleave_unit_size", 1),
                         is_self_loop=(info.spmd_id == self._spmd_id),
                     )
+                    # Note: We do NOT register successor requirements into the global
+                    # Production Truth registry. They are only context for routing.
 
         if self._mesh is None:
             raise ValueError(f"OperatorManager[{self._spmd_id}]: mesh is None")
@@ -328,18 +447,46 @@ class OperatorManager:
 
             self._dispatchers[op_name] = create_dispatcher(meta)
 
+            # Resolve sharding specs for all local input parameters
             local_input_specs = self._build_sharding_specs(
                 meta.input_sharding, self._mesh
             )
-            # This ensures that all routing and sharding lookups use TUUIDs.
+
+            # Collect all available TUUIDs from predecessors to create a logical path -> TUUID lookup
+            global_path_to_tuuid: Dict[str, int] = {}
             for pre_info in self._predecessor_topology.get(op_name, {}).values():
                 # Bind Local Spec with TUUID by [Injected Argument Name -> TUUID] dict.
                 # The local function arguments name is the pre_info.tuuid_map key, which was binded in _validate_and_link_edge
-                for arg_name, tuuid in pre_info.tuuid_map.items():
-                    if arg_name in local_input_specs:
-                        self._input_sharding[op_name][tuuid] = local_input_specs[
-                            arg_name
-                        ]
+                global_path_to_tuuid.update(pre_info.tuuid_map)
+
+            # Structured Expansion: Map top-level specs to physical TUUIDs using input_param_map
+            # input_param_map is the 'source of truth' for the parameter tree structure
+            for param_name, spec in local_input_specs.items():
+                # Get list of logical field paths belonging to this parameter (e.g., 'ctx.val', 'ctx.id')
+                nested_fields = meta.input_param_map.get(param_name, [param_name])
+                for field_path in nested_fields:
+                    if field_path in global_path_to_tuuid:
+                        tuuid = global_path_to_tuuid[field_path]
+                        self._input_sharding[op_name][tuuid] = spec
+                        # Register in global registry ONLY if it doesn't collide with a producer.
+                        # Actually, we SHOULD NOT register input requirements into the global registry
+                        # at all, as they represent the consumer's perspective, not the truth of the TUUID.
+                        # self._register_sharding_specs({tuuid: spec})
+
+            # Strict Validation: Ensure every data tensor required by the operator has a spec
+            for field_path in self._expected_tensor_names[op_name]:
+                if field_path in global_path_to_tuuid:
+                    tuuid = global_path_to_tuuid[field_path]
+                    if tuuid not in self._input_sharding[op_name]:
+                        raise ValueError(
+                            f"[Fluxway Topology Error] Field '{field_path}' in operator '{op_name}' "
+                            f"(TUUID {tuuid}) has no sharding specification. "
+                            f"Check @operator definition for parameter containing this field."
+                        )
+
+            # Resolve local output TUUIDs and register them
+            self._output_sharding[op_name] = self.get_output_sharding(op_name)
+            self._register_sharding_specs(self._output_sharding[op_name])
 
             self._expected_state_names[op_name] = list(
                 meta.get_arguments(is_output=False, arg_type=ArgumentType.CONTROL) or []
@@ -390,43 +537,12 @@ class OperatorManager:
                             f"Static arguments: {list(self._static_args.keys())}"
                         )
 
-            # Resolve staleness configuration keys to TUUIDs where applicable
-            from fluxway.common.types.configs import TolerantBarrierConfig
+            # Resolve referential links and async strategy
+            def res_fn(path: str, op_name: str = op_name) -> Optional[int]:
+                return self.resolve_path(op_name, path)
 
-            if meta.barrier_config and isinstance(
-                meta.barrier_config, TolerantBarrierConfig
-            ):
-                resolved_staleness = {}
-                for name_or_path, value in meta.barrier_config.staleness.items():
-                    # Check if it's a tensor field from predecessors
-                    tuuid = None
-                    for pre_info in pre_topology.values():
-                        if name_or_path in pre_info.tuuid_map:
-                            tuuid = pre_info.tuuid_map[name_or_path]
-                            break
-
-                    if tuuid is not None:
-                        resolved_staleness[tuuid] = value
-                    elif name_or_path in self._expected_state_names[op_name]:
-                        # Valid control state
-                        resolved_staleness[name_or_path] = value
-                    else:
-                        # Neither a tensor field nor a state -> Strict error
-                        available_fields = set()
-                        for pre_info in pre_topology.values():
-                            available_fields.update(pre_info.tuuid_map.keys())
-
-                        raise ValueError(
-                            f"[Fluxway Init Error] Operator '{op_name}' has staleness config for '{name_or_path}', "
-                            "but it is neither a valid input tensor field provided by any predecessor "
-                            "nor a registered control state parameter.\n"
-                            f"Available fields: {sorted(available_fields)}\n"
-                            f"Expected states: {self._expected_state_names[op_name]}"
-                        )
-
-                meta.barrier_config = meta.barrier_config.model_copy(
-                    update={"staleness": resolved_staleness}
-                )
+            meta.resolve_sharding_topology(res_fn)
+            meta.resolve_async_strategy(res_fn)
 
             # Build global TUUID -> Op dispatch table
             for u in self._input_sharding[op_name]:
@@ -442,6 +558,34 @@ class OperatorManager:
                 f"predecessors={list(self._predecessor_topology[op_name].keys())}, "
                 f"successors={list(self._successor_topology[op_name].keys())}"
             )
+
+    def resolve_path(self, op_name: str, path: str) -> int:
+        """
+        Unified resolver for logical paths to TUUIDs.
+
+        Logic:
+        1. If path is 'op.field', looks for 'field' in predecessors of 'op'.
+        2. If path is just 'field', looks for 'field' in predecessors of the current 'op_name'.
+        """
+        if "." in path:
+            target_op, field = path.split(".", 1)
+        else:
+            target_op, field = op_name, path
+
+        pre_topo = self.get_predecessor_topology(target_op)
+        for pre_info in pre_topo.values():
+            if field in pre_info.tuuid_map:
+                return pre_info.tuuid_map[field]
+
+        # Aggregate available fields for helpful error message
+        available = set()
+        for p_name, p_info in pre_topo.items():
+            available.update(p_info.tuuid_map.keys())
+
+        raise ValueError(
+            f"[OperatorManager] Cannot resolve logical path '{path}' to a TUUID. "
+            f"Target operator '{target_op}' predecessors provide: {sorted(available)}"
+        )
 
     def register_eager_inputs(
         self,
@@ -471,10 +615,12 @@ class OperatorManager:
                 if expected_counts and u in expected_counts:
                     self._expected_tensor_shards_cache[op_name][u] = expected_counts[u]
                 else:
-                    # Default: expect one shard from each rank in the source mesh
-                    self._expected_tensor_shards_cache[op_name][u] = (
-                        spec.mesh.size if spec.mesh else 1
-                    )
+                    # Eager mode routing logic would need a mesh to compute counts.
+                    # We might need to bind or assume replication.
+                    self._expected_tensor_shards_cache[op_name][u] = 1
+
+            # Sync to global registry
+            self._register_sharding_specs(tuuid_sharding)
 
         logger.debug(
             f"[OperatorManager] Registered eager inputs for {op_name}: "
@@ -489,7 +635,7 @@ class OperatorManager:
         parsed = {}
         for key, raw_spec in raw_specs.items():
             if isinstance(raw_spec, dict):
-                parsed[key] = ShardingConfig.model_validate(raw_spec).to_spec(mesh)
+                parsed[key] = ShardingConfig.model_validate(raw_spec).to_routing()
             elif isinstance(raw_spec, ShardingSpec):
                 parsed[key] = raw_spec
         return parsed
@@ -508,22 +654,6 @@ class OperatorManager:
             f"Operator '{op_name}' has no registered metadata in SPMDConfig. "
             "In strict TUUID mode, all operators must have explicit OperatorMeta."
         )
-
-    def _infer_world_size_from_sharding(self, sharding_map: Dict[str, Any]) -> int:
-        """Infer total rank from sharding specs."""
-        for spec in sharding_map.values():
-            if isinstance(spec, ShardingSpec) and spec.mesh is not None:
-                return spec.mesh.size
-        return 1
-
-    def _extract_mesh_from_sharding(
-        self, sharding_map: Dict[str, Any]
-    ) -> Optional[DeviceMesh]:
-        """Extract mesh from sharding specs."""
-        for spec in sharding_map.values():
-            if isinstance(spec, ShardingSpec) and spec.mesh is not None:
-                return spec.mesh
-        return None
 
     def _precompute_expected_tensor_shards(self) -> None:
         """

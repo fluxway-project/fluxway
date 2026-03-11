@@ -12,7 +12,7 @@ Completion tracking is event-driven, not polled:
 Zero-copy shard writing is supported via TransportReceiver delegation.
 """
 
-from fluxway.common.types.configs import BarrierConfig
+from fluxway.common.types.configs import BarrierConfig, TolerantBarrierConfig
 import asyncio
 import logging
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -238,6 +238,9 @@ class WorkerMailbox:
         # Retrieval policy for tolerant params: {op_name: {name_or_uuid: policy_string}}
         self._retrieval_policy: Dict[str, Dict[Any, str]] = {}
 
+        # Barrier configurations: {op_name: BarrierConfig}
+        self._barrier_configs: Dict[str, "BarrierConfig"] = {}
+
         self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
@@ -289,7 +292,11 @@ class WorkerMailbox:
             from fluxway.common.types.configs import TolerantBarrierConfig
 
             if isinstance(barrier_config, TolerantBarrierConfig):
-                staleness_dict = barrier_config.staleness
+                # Merge tensor and state staleness for internal lookback
+                staleness_dict = {
+                    **barrier_config.tensor_staleness,
+                    **barrier_config.state_staleness,
+                }
                 policy = barrier_config.retrieval_policy
             else:
                 staleness_dict = {}
@@ -298,6 +305,7 @@ class WorkerMailbox:
             self._staleness_config[op_name] = staleness_dict
             self._expected_tensor_counts[op_name] = expected_tensors
             self._expected_state_names[op_name] = expected_states
+            self._barrier_configs[op_name] = barrier_config
 
             # Currently apply one policy per operator for all its staleness configs
             self._retrieval_policy.setdefault(op_name, {})
@@ -757,16 +765,59 @@ class WorkerMailbox:
             )
 
             result: Dict[int, Dict[Tuple[str, int], List[TransportTensor]]] = {}
+            # We want to collect ALL tensors expected by this operator, including stale ones
+            # First, check what TUUIDs this operator expects
+            expected_counts = self._expected_tensor_counts.get(op_name, {})
+
+            # Combine all TUUIDs from current slots and expected list
+            all_tuuids = (
+                set(self._tensor_slots.get(op_name, {}).keys())
+                | set(self._zc_receivers.get(op_name, {}).keys())
+                | set(expected_counts.keys())
+            )
+
             for tuuid in all_tuuids:
-                # ZC Priority: Wrapped as a single-element shard list for API consistency
+                # 1. Try exact step (ZC first)
                 zc = self._zc_receivers.get(op_name, {}).get(tuuid, {}).get(step)
                 if zc and zc.target_buffers:
                     zc_tensor = TransportTensor(*zc.target_buffers)
                     result[tuuid] = {("__zero_copy__", -1): [zc_tensor]}
                     continue
 
-                # Buffered Fallback: Data is stored as discrete shards
                 slotted = self._tensor_slots.get(op_name, {}).get(tuuid, {}).get(step)
+                if slotted and len(slotted) >= expected_counts.get(tuuid, 0):
+                    result[tuuid] = dict(slotted)
+                    continue
+
+                # 2. Try staleness lookback
+                # Need to check the barrier config to be sure about TUUID staleness
+                barrier_config = self._get_barrier_config(op_name)
+                max_staleness = 0
+                if isinstance(barrier_config, TolerantBarrierConfig):
+                    max_staleness = barrier_config.tensor_staleness.get(tuuid, 0)
+
+                if max_staleness > 0:
+                    policy = self._retrieval_policy.get(op_name, {}).get(
+                        tuuid, "latest"
+                    )
+                    step_slots = self._tensor_slots.get(op_name, {}).get(tuuid, {})
+                    target_count = expected_counts.get(tuuid, 0)
+
+                    valid_steps = [
+                        k
+                        for k in range(max(0, step - max_staleness), step + 1)
+                        if k in step_slots and len(step_slots[k]) >= target_count
+                    ]
+
+                    if valid_steps:
+                        best_k = (
+                            valid_steps[0] if policy == "oldest" else valid_steps[-1]
+                        )
+                        result[tuuid] = dict(step_slots[best_k])
+                        continue
+
+                # 3. Last resort: just return whatever arrived for this step even if incomplete
+                # (Standard behavior if no staleness defined)
                 if slotted:
                     result[tuuid] = dict(slotted)
 
@@ -777,6 +828,10 @@ class WorkerMailbox:
         if op_name in self._periodic_barriers:
             return self._periodic_barriers[op_name]
         return self._barriers.get(op_name, {}).get(step)
+
+    def _get_barrier_config(self, op_name: str) -> Optional["BarrierConfig"]:
+        """Internal helper to get barrier config."""
+        return self._barrier_configs.get(op_name)
 
     async def get_tensor_shard(
         self,

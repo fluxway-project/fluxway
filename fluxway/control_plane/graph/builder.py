@@ -26,7 +26,12 @@ from fluxway.common.types import (
     ResourceSpec,
 )
 from fluxway.common.mesh import DeviceMesh
-from fluxway.common.types.sharding import ShardingConfig
+from fluxway.common.types.sharding import (
+    ShardingSpec,
+    ShardingConfig,
+    ChunkPartition,
+    AlgebraicRouting,
+)
 from fluxway.common.types.configs import ArgumentType
 
 
@@ -46,9 +51,9 @@ class Builder:
         self._edges: List[Edge] = []
         self._spmd_classes: Dict[str, Type] = {}
         self._uuid_counter = 0
-        self._output_uuids: Dict[
-            Tuple[str, str, str], int
-        ] = {}  # {(node, op, out_name): tuuid}
+        # Unified Registry for all TUUID slots: {(node, op, name): tuuid}
+        # Includes both definitions (outputs) and references (inputs)
+        self._tuuid_slots: Dict[Tuple[str, str, str], int] = {}
 
     def _next_uuid(self) -> int:
         self._uuid_counter += 1
@@ -110,11 +115,13 @@ class Builder:
                             required_axes = v.get("axis", [])
                             if isinstance(required_axes, str):
                                 required_axes = [required_axes]
-                        elif hasattr(v, "partition"):
-                            # It's a ShardingSpec-like object
+                        elif isinstance(v, ShardingSpec) and isinstance(
+                            v.routing, AlgebraicRouting
+                        ):
+                            # It's a concrete ShardingSpec
                             required_axes = [
                                 ax
-                                for sub in v.partition.partitions.values()
+                                for sub in v.routing.partition.partitions.values()
                                 for ax in sub
                             ]
 
@@ -130,7 +137,6 @@ class Builder:
 
             # Re-bind the mesh at the config and spec level
             spmd_config.mesh = mesh
-            from fluxway.common.types.sharding import ShardingSpec
 
             for meta in spmd_config.operator_metas.values():
                 for sharding_dict in [meta.input_sharding, meta.output_sharding]:
@@ -138,7 +144,10 @@ class Builder:
                         continue
                     for k, v in sharding_dict.items():
                         if isinstance(v, ShardingSpec):
-                            sharding_dict[k] = v.with_mesh(mesh)
+                            # In the new architecture, we don't 'with_mesh' on logical routing.
+                            # The mesh binding happens at runtime via PhysicalLayout.
+                            # However, we can validate or store it if needed.
+                            pass
 
         if not isinstance(spmd_config.mesh, DeviceMesh):
             raise ValueError(
@@ -168,10 +177,10 @@ class Builder:
             out_args = meta.get_arguments(is_output=True, arg_type=ArgumentType.DATA)
             tuuids = []
             for out_name in out_args:
-                u_key = (name, op_name, out_name)
-                if u_key not in self._output_uuids:
-                    self._output_uuids[u_key] = self._next_uuid()
-                tuuids.append(self._output_uuids[u_key])
+                slot = (name, op_name, out_name)
+                if slot not in self._tuuid_slots:
+                    self._tuuid_slots[slot] = self._next_uuid()
+                tuuids.append(self._tuuid_slots[slot])
             meta.output_uuids = tuuids
 
         return self
@@ -459,16 +468,45 @@ class Builder:
 
         if tensor_map:
             for src_name, target_name in tensor_map.items():
-                u_key = (source_node, source_op, src_name)
-                u = self._output_uuids[u_key]
+                u = self._tuuid_slots.get((source_node, source_op, src_name))
+                if u is None:
+                    raise RuntimeError(
+                        f"TUUID Definition not found for {source_node}.{source_op}.{src_name}"
+                    )
+
+                # Input-side slot registration with consistency check
+                target_slot = (target_node, target_op, target_name)
+                if (
+                    target_slot in self._tuuid_slots
+                    and self._tuuid_slots[target_slot] != u
+                ):
+                    raise ValueError(
+                        f"TUUID Conflict at {target_node}.{target_op}.{target_name}: "
+                        f"already bound to TUUID {self._tuuid_slots[target_slot]}, "
+                        f"attempted to bind to {u} via {source_node}.{source_op}"
+                    )
+                self._tuuid_slots[target_slot] = u
+
                 tuuid_map[target_name] = u
                 tuuid_src_out[u] = src_out_specs[src_name]
                 tuuid_dst_in[u] = dst_in_specs[target_name]
         else:
             ds_names = effective_sharding["dst_names"]
             for n in ds_names:
-                u_key = (source_node, source_op, n)
-                u = self._output_uuids[u_key]
+                u = self._tuuid_slots.get((source_node, source_op, n))
+                if u is None:
+                    raise RuntimeError(
+                        f"TUUID Definition not found for {source_node}.{source_op}.{n}"
+                    )
+
+                target_slot = (target_node, target_op, n)
+                if (
+                    target_slot in self._tuuid_slots
+                    and self._tuuid_slots[target_slot] != u
+                ):
+                    raise ValueError(f"TUUID Conflict at {target_node}.{target_op}.{n}")
+                self._tuuid_slots[target_slot] = u
+
                 tuuid_map[n] = u
                 tuuid_src_out[u] = src_out_specs[n]
                 tuuid_dst_in[u] = dst_in_specs[n]
@@ -615,20 +653,21 @@ class Builder:
         ):
             tensor_map[effective_src_names[0]] = effective_dst_names[0]
 
-        if not tensor_map:
+        if not tensor_map and (effective_src_names and effective_dst_names):
             raise ValueError(
                 f"\n[Fluxway Topology Error] In {ctx}:\n"
                 f"  Could not automatically map outputs from '{source_node}.{source_op}' to inputs of '{target_node}.{target_op}'.\n"
+                f"  Both operators have data fields, but no names matched.\n"
                 f"  Available outputs: {list(src_args)}\n"
                 f"  Available inputs: {list(dst_args)}\n"
                 f"  Fix: Explicitly specify target arguments using kwargs handling or ensure argument names intersect."
             )
 
         # 4. Validate and Extract Sharding Specs
-        def to_spec(raw, mesh):
+        def to_routing(raw):
             if isinstance(raw, dict):
                 try:
-                    return ShardingConfig.model_validate(raw).to_spec(mesh)
+                    return ShardingConfig.model_validate(raw).to_routing()
                 except Exception as e:
                     raise ValueError(
                         f"\n[Fluxway Sharding Error] In {ctx}:\n"
@@ -638,14 +677,15 @@ class Builder:
                     ) from e
             return raw
 
-        src_out_specs = {
-            k: to_spec(v, src_cfg.mesh)
-            for k, v in (src_meta.output_sharding or {}).items()
+        src_meta.output_sharding = {
+            k: to_routing(v) for k, v in (src_meta.output_sharding or {}).items()
         }
-        dst_in_specs = {
-            k: to_spec(v, dst_cfg.mesh)
-            for k, v in (dst_meta.input_sharding or {}).items()
+        src_out_specs = src_meta.output_sharding
+
+        dst_meta.input_sharding = {
+            k: to_routing(v) for k, v in (dst_meta.input_sharding or {}).items()
         }
+        dst_in_specs = dst_meta.input_sharding
 
         src_names = list(tensor_map.keys())
         dst_names = list(tensor_map.values())
@@ -744,6 +784,19 @@ class Builder:
             if symmetric_to:
                 topo.symmetric_to = symmetric_to
 
+        # Eagerly resolve topological and async strategy references
+        dst_meta = dst_cfg.operator_metas[target_op]
+
+        def resolver_src(path: str) -> Optional[int]:
+            return self._resolve_path_to_tuuid(source_node, source_op, path)
+
+        def resolver_dst(path: str) -> Optional[int]:
+            return self._resolve_path_to_tuuid(target_node, target_op, path)
+
+        for meta, res in [(src_meta, resolver_src), (dst_meta, resolver_dst)]:
+            meta.resolve_sharding_topology(res)
+            meta.resolve_async_strategy(res)
+
     def _infer_interleave_params(
         self, spmd_config: SPMDConfig, meta: OperatorMeta
     ) -> Tuple[bool, int]:
@@ -769,8 +822,6 @@ class Builder:
         # Identify axes used in output sharding
         sharded_axes = set()
         for v in (meta.output_sharding or {}).values():
-            from fluxway.common.types.sharding import ShardingSpec
-
             if isinstance(v, dict):
                 axis = v.get("axis", [])
                 if isinstance(axis, str):
@@ -778,7 +829,7 @@ class Builder:
                 else:
                     sharded_axes.update(axis)
             elif isinstance(v, ShardingSpec):
-                for sub in v.partition.partitions.values():
+                for sub in v.partitions.values():
                     sharded_axes.update(sub)
 
         # interleave_unit_size is the product of sizes of axes NOT used for sharding
@@ -809,6 +860,7 @@ class Builder:
     ) -> None:
         """Inject edge sharding information into OperatorMeta objects."""
         src_cfg = self._nodes[source_node].spmd_config
+        dst_cfg = self._nodes[target_node].spmd_config
         src_out_specs = effective_sharding["src_out_specs"]
         dst_in_specs = effective_sharding["dst_in_specs"]
 
@@ -881,19 +933,19 @@ class Builder:
         # When a Static tensor flows into a larger mesh, the data must be large enough at
         # runtime to cover all target workers. We can't know global_shape at build time,
         # so emit a warning to catch the most common misconfiguration early.
-        from fluxway.common.types.sharding import ChunkPartition, ShardingSpec
-
         for src_name, dst_name in tensor_map.items():
             s_spec = src_out_specs.get(src_name)
             t_spec = dst_in_specs.get(dst_name)
             if (
                 isinstance(s_spec, ShardingSpec)
                 and isinstance(t_spec, ShardingSpec)
-                and isinstance(s_spec.strategy, ChunkPartition)
-                and isinstance(t_spec.strategy, ChunkPartition)
-                and s_spec.mesh is not None
-                and t_spec.mesh is not None
-                and s_spec.mesh.size < t_spec.mesh.size
+                and isinstance(s_spec.routing, AlgebraicRouting)
+                and isinstance(t_spec.routing, AlgebraicRouting)
+                and isinstance(s_spec.routing.strategy, ChunkPartition)
+                and isinstance(t_spec.routing.strategy, ChunkPartition)
+                and src_cfg.mesh is not None
+                and dst_cfg.mesh is not None
+                and src_cfg.mesh.size < dst_cfg.mesh.size
             ):
                 logger.warning(
                     "\n[Fluxway Config Warning] Static tensor '%s' "
@@ -905,9 +957,9 @@ class Builder:
                     source_op,
                     target_node,
                     target_op,
-                    s_spec.mesh.size,
-                    t_spec.mesh.size,
-                    t_spec.mesh.size,
+                    src_cfg.mesh.size,
+                    dst_cfg.mesh.size,
+                    dst_cfg.mesh.size,
                 )
 
     def build(self, name: str = "") -> Graph:
@@ -943,6 +995,20 @@ class Builder:
 
         return graph
 
+    def _resolve_path_to_tuuid(
+        self, node_name: str, op_name: str, path: str
+    ) -> Optional[int]:
+        """
+        Find the physical TUUID for a logical path like 'forward.y'.
+        Searches the unified slot registry (covers both definitions and references).
+        """
+        if "." in path:
+            target_op, field = path.split(".", 1)
+        else:
+            target_op, field = op_name, path
+
+        return self._tuuid_slots.get((node_name, target_op, field))
+
     def reset(self) -> "Builder":
         """
         Reset the builder to empty state.
@@ -953,6 +1019,7 @@ class Builder:
         self._nodes.clear()
         self._spmd_classes.clear()
         self._edges.clear()
+        self._tuuid_slots.clear()
         return self
 
     def get_spmd_class(self, node_name: str) -> Optional[Type]:

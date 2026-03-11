@@ -13,8 +13,8 @@ class SparseEmbeddingSPMD:
     def __init__(self, vocab_size: int = 1000, embed_dim: int = 3):
         self.embed_dim = embed_dim
         self.vocab_size = vocab_size
-        # Simple parameter initialization
         self.params = jnp.ones((vocab_size, embed_dim)) * 0.01
+        self._forward_ids_cache = {}
 
     @operator(
         name="lookup",
@@ -26,19 +26,16 @@ class SparseEmbeddingSPMD:
         output_sharding={"sparse_features": {"type": "dynamic", "axis": ["shard"]}},
     )
     def lookup(self, unique_ids: TransportTensor) -> LookupOutput:
-        """
-        Receives 'unique_ids' directly.
-        """
-        rank = self.rank  # type: ignore rank and world_size has been injected by the decorator
-        world_size = self.world_size  # type: ignore
+        rank = self.rank
+        world_size = self.world_size
+        step = self.ctx.step
 
         ids = unique_ids.flat_values
-        # Use modulo to stay within vocab_size for demo
+        self._forward_ids_cache[step] = ids
+
         local_ids = jnp.mod(ids, self.vocab_size)
         embeddings = self.params[local_ids] * rank * world_size
 
-        # Determine global shape for downstream routing.
-        # Embeddings are (num_uniques, embed_dim), so global shape corresponds to (global_batch, embed_dim).
         g_shape = None
         if unique_ids.global_shape and len(unique_ids.global_shape) >= 1:
             g_shape = (unique_ids.global_shape[0], self.embed_dim)
@@ -50,7 +47,7 @@ class SparseEmbeddingSPMD:
             global_shape=g_shape,
         )
         print(
-            f"[SparseSPMD] lookup rank={rank}, unique ids={unique_ids.flat_values}, global_shape={g_shape}, output embeddings={output.flat_values}"
+            f"[SparseSPMD] lookup rank={rank}, step={step}, unique ids={ids}, output embeddings={output.flat_values}"
         )
         return LookupOutput(sparse_features=output)
 
@@ -62,27 +59,21 @@ class SparseEmbeddingSPMD:
         },
     )
     def update(self, grads: TransportTensor) -> None:
-        ids = grads.routing_indices
+        step = self.ctx.step
+        ids = self._forward_ids_cache.pop(step, None)
+
         if ids is None:
-            print(
-                f"[SparseSPMD] Worker {self.rank} Update Error: Gradients missing routing_indices"
+            raise ValueError(
+                f"Worker {self.rank} Update Error: Missing forward cache for step {step}"
             )
-            return
 
         g_flat = grads.flat_values
-
-        # Correctly handle unique gradients if they weren't uniquified upstream
-        # Although ideally they should be uniquified at Dense worker.
-        # For robustness, we can do it here too if multiple dense workers send grads for same ID.
-
-        # Modulo for demo params
         local_ids = jnp.mod(ids, self.vocab_size)
 
-        # Scatter-add gradients to parameters (simple SGD update)
         self.params = self.params.at[local_ids].add(-0.1 * g_flat)
 
         print(
-            f"[SparseSPMD] Worker {self.rank} Update Task: Updated {len(ids)} IDs. Grad Sum: {jnp.sum(g_flat)}"
+            f"[SparseSPMD] Worker {self.rank} Update Task: Step {step}, updated {len(ids)} IDs. Grad Sum: {jnp.sum(g_flat)}"
         )
 
 

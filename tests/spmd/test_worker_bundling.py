@@ -75,8 +75,8 @@ class TestWorkerBundling(unittest.IsolatedAsyncioTestCase):
         mesh = DeviceMesh(
             axis_names=("x",), device_shape=(2,), device_ids=np.array([0, 1])
         )
-        spec1 = ShardingSpec.chunk(mesh, P("x"))
-        spec2 = ShardingSpec.chunk(mesh, P())  # replicated
+        spec1 = ShardingSpec.chunk(P("x")).bind(mesh)
+        spec2 = ShardingSpec.chunk(P()).bind(mesh)  # replicated
 
         # Simulate worker._send_output grouping logic
         tensors = [
@@ -181,8 +181,9 @@ class TestWorkerBundling(unittest.IsolatedAsyncioTestCase):
             0,
             "s0",
             0,
-            payload_groups=[[data1], [data2]],
-            counts_groups=[[10], [10]],
+            sender_world_size=1,
+            payloads=[data1, data2],
+            counts=[10, 10],
             meta_tensor_state_list=[0, 0],
         )
 
@@ -203,8 +204,8 @@ class TestWorkerBundling(unittest.IsolatedAsyncioTestCase):
         mesh = DeviceMesh(
             axis_names=("x",), device_shape=(2,), device_ids=np.array([0, 1])
         )
-        spec1 = ShardingSpec.chunk(mesh, P("x"))
-        spec2 = ShardingSpec.chunk(mesh, P())
+        spec1 = ShardingSpec.chunk(P("x")).bind(mesh)
+        spec2 = ShardingSpec.chunk(P()).bind(mesh)
 
         # Scenario 1: Mixed sharding in one @data_type
         # Flattened fields:

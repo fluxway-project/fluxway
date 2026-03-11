@@ -27,13 +27,19 @@ def assert_indices_equal(actual, expected):
     # In JIT padding, this might be an array of all 0s, but we expect
     # the framework to handle the mask. If we're comparing physical indices:
     if expected.size == 0:
-        # If the actual array is all zeros and not intended to be [0],
-        # it's usually padding. But a safer check for test consistency:
-        assert actual.size == 0 or jnp.all(actual == 0)
+        # If the actual array is all zeros or -1 and not intended to be [0],
+        # it's usually padding.
+        actual_effective = actual[actual != -1]
+        assert actual_effective.size == 0 or jnp.all(actual_effective == 0)
         return
 
     # Check that the first N elements match
-    assert jnp.array_equal(actual[: expected.size], expected)
+    # Handle JAX padding -1 or 0
+    actual_effective = actual[actual != -1]
+    if expected.size == 0:
+        assert actual_effective.size == 0 or jnp.all(actual_effective == 0)
+        return
+    assert jnp.array_equal(actual_effective[: expected.size], expected)
 
 
 # ---- chunk ----
@@ -42,7 +48,7 @@ def assert_indices_equal(actual, expected):
 def test_chunk_layout_dense():
     """chunk on dense [100] -> 2 devices."""
     mesh = DeviceMesh(device_shape=(2,), axis_names=("x",))
-    spec = ShardingSpec.chunk(mesh=mesh, partition=P("x"))
+    spec = ShardingSpec.chunk(P("x")).bind(mesh)
     data_shape = (100,)
 
     # These assertions are for a 4-device mesh, but the test uses 2 devices.
@@ -70,7 +76,7 @@ def test_chunk_layout_dense():
 def test_chunk_layout_multidim():
     """chunk on dim=1 of [4, 10] -> 2 devices."""
     mesh = DeviceMesh(device_shape=(2,), axis_names=("x",))
-    spec = ShardingSpec.chunk(mesh=mesh, partition=P(None, "x"))
+    spec = ShardingSpec.chunk(P(None, "x")).bind(mesh)
     data_shape = (4, 10)
 
     # assert layout.partitions[1] == ("x",) is now implicit in P(None, "x")
@@ -86,7 +92,7 @@ def test_chunk_layout_ragged():
     """chunk on ragged tensor (index_desc = splits)."""
     splits = [jnp.array([0, 3, 5], dtype=jnp.int32)]
     mesh = DeviceMesh(device_shape=(2,), axis_names=("x",))
-    spec = ShardingSpec.chunk(mesh=mesh, partition=P("x"))
+    spec = ShardingSpec.chunk(P("x")).bind(mesh)
     data_shape = (2,)
     index_desc = RaggedIndex(splits=splits)
 
@@ -108,7 +114,7 @@ def test_chunk_layout_ragged():
 def test_cyclic_layout():
     """cyclic on [10] -> 2 devices."""
     mesh = DeviceMesh(device_shape=(2,), axis_names=("x",))
-    spec = ShardingSpec.cyclic(mesh=mesh, partition=P("x"))
+    spec = ShardingSpec.cyclic(P("x")).bind(mesh)
     data_shape = (10,)
 
     indices0 = spec.get_shard_indices(0, 0, data_shape[0])
@@ -125,7 +131,7 @@ def test_hash_layout_with_index_desc():
     """hash using ragged splits as hash seed."""
     splits = [jnp.array([0, 10, 20], dtype=jnp.int32)]
     mesh = DeviceMesh(device_shape=(3,), axis_names=("x",))
-    spec = ShardingSpec.hash(mesh=mesh, partition=P("x"))
+    spec = ShardingSpec.hash(P("x")).bind(mesh)
     data_shape = (2,)
     index_desc = RaggedIndex(splits=splits)
 
@@ -144,7 +150,7 @@ def test_hash_layout_with_routing_indices():
     """hash using external routing_indices indices."""
     dep = jnp.array([5, 3, 7, 2], dtype=jnp.int32)
     mesh = DeviceMesh(device_shape=(3,), axis_names=("x",))
-    spec = ShardingSpec.hash(mesh=mesh, partition=P("x"))
+    spec = ShardingSpec.hash(P("x")).bind(mesh)
     data_shape = (4,)
     index_desc = ExplicitIndex(indices=dep)
 
@@ -164,7 +170,7 @@ def test_hash_layout_with_custom_function():
         return indices * 2
 
     mesh = DeviceMesh(device_shape=(3,), axis_names=("x",))
-    spec = ShardingSpec.hash(mesh=mesh, partition=P("x"))
+    spec = ShardingSpec.hash(P("x")).bind(mesh)
     data_shape = (4,)
     index_desc = FunctionalIndex(hash_fn=custom_hash)
 
@@ -180,7 +186,7 @@ def test_hash_layout_with_custom_function():
 def test_hash_layout_default():
     """hash with no index_desc or routing_indices - hash indices directly."""
     mesh = DeviceMesh(device_shape=(3,), axis_names=("x",))
-    spec = ShardingSpec.hash(mesh=mesh, partition=P("x"))
+    spec = ShardingSpec.hash(P("x")).bind(mesh)
     data_shape = (6,)
 
     indices0 = spec.get_shard_indices(0, 0, data_shape[0])
@@ -199,7 +205,7 @@ def test_greedy_layout():
     """greedy load-balanced on ragged tensor."""
     splits = [jnp.array([0, 10, 30, 40], dtype=jnp.int32)]
     mesh = DeviceMesh(device_shape=(2,), axis_names=("x",))
-    spec = ShardingSpec.greedy(mesh=mesh, partition=P("x"))
+    spec = ShardingSpec.greedy(P("x")).bind(mesh)
     data_shape = (3,)
     index_desc = RaggedIndex(splits=splits)
 
@@ -214,42 +220,47 @@ def test_greedy_layout():
 
 
 def test_follow_layout():
-    """follow another layout's device_mesh."""
+    """follow creates a referential spec via a string TUUID path."""
     mesh = DeviceMesh(device_shape=(2,), axis_names=("x",))
-    src_spec = ShardingSpec.hash(mesh=mesh, partition=P("x"))
-    data_shape = (4,)
-    src_index_desc = ExplicitIndex(indices=jnp.array([0, 1, 0, 1], dtype=jnp.int32))
 
-    follow_spec = ShardingSpec.follow(src_spec, dim=0, driver_index_desc=src_index_desc)
+    # follow() requires a string path that will be resolved at runtime
+    follow_spec = ShardingSpec.follow("train_step.embedding.weight")
+    follow_layout = follow_spec.bind(mesh)
 
-    indices0 = follow_spec.get_shard_indices(0, 0, data_shape[0])
-    indices1 = follow_spec.get_shard_indices(1, 0, data_shape[0])
+    assert follow_layout.is_referential is True
+    assert follow_layout.spec.routing.path == "train_step.embedding.weight"
 
-    assert_indices_equal(indices0, jnp.array([0, 2], dtype=jnp.int32))
-    assert_indices_equal(indices1, jnp.array([1, 3], dtype=jnp.int32))
+    # Passing a non-string should raise immediately
+    src_layout = ShardingSpec.hash(P("x")).bind(mesh)
+    try:
+        ShardingSpec.follow(src_layout)
+        raise AssertionError("Expected TypeError was not raised")
+    except TypeError as e:
+        assert "string path" in str(e)
 
 
 # ---- derive_from (convenience) ----
 
 
 def test_derive_from():
-    """derive_from: one-line key->value routing_indices."""
+    """derive_from: key->value same-distribution routing."""
     key_data = jnp.array([0, 1, 2, 3], dtype=jnp.int32)
     mesh = DeviceMesh(device_shape=(2,), axis_names=("x",))
+    index_desc = ExplicitIndex(indices=key_data)
     val_spec = ShardingSpec.derive_from(
-        driver_spec=ShardingSpec.hash(mesh=mesh, partition=P("x")),
+        driver_spec=ShardingSpec.hash(P("x")).bind(mesh),
         driver_data_shape=(4,),
-        driver_index_desc=ExplicitIndex(indices=key_data),
+        driver_index_desc=index_desc,
         follow_dim=0,
-    )
+    ).bind(mesh)
     data_shape = (4, 16)
 
-    # Check shard shape limits for routing dim 0 on 2 workers (mesh size)
-    # The original diff had 4 workers, but the mesh is 2.
-    assert val_spec.get_shard_shape(0, data_shape) == (2, 16)  # (4 / 2, 16)
+    # hash (key_data = [0,1,2,3]) mod 2: rank0={0,2}, rank1={1,3}
+    # get_shard_shape requires index_desc for dynamic (content-addressable) routing
+    assert val_spec.get_shard_shape(0, data_shape, index_desc) == (2, 16)
 
-    indices0 = val_spec.get_shard_indices(0, 0, data_shape[0])
-    indices1 = val_spec.get_shard_indices(1, 0, data_shape[0])
+    indices0 = val_spec.get_shard_indices(0, 0, data_shape[0], index_desc)
+    indices1 = val_spec.get_shard_indices(1, 0, data_shape[0], index_desc)
 
     assert_indices_equal(indices0, jnp.array([0, 2], dtype=jnp.int32))
     assert_indices_equal(indices1, jnp.array([1, 3], dtype=jnp.int32))
@@ -261,7 +272,7 @@ def test_derive_from():
 def test_implicit_replication():
     """Sharding on one axis implies replication on others."""
     mesh = DeviceMesh(device_shape=(2, 2), axis_names=("x", "y"))
-    spec = ShardingSpec.chunk(mesh=mesh, partition=P("x"))
+    spec = ShardingSpec.chunk(P("x")).bind(mesh)
     data_shape = (10,)
 
     chunk0 = jnp.arange(0, 5, dtype=jnp.int32)
@@ -296,7 +307,7 @@ def test_implicit_replication():
 def test_multi_axis_chunk_2x3():
     """Chunk on mesh (x=2, y=3) with P(('x','y')) → 6-way split."""
     mesh = DeviceMesh(device_shape=(2, 3), axis_names=("x", "y"))
-    spec = ShardingSpec.chunk(mesh=mesh, partition=P(("x", "y")))
+    spec = ShardingSpec.chunk(P(("x", "y"))).bind(mesh)
     data_shape = (12,)
 
     for r in range(6):
@@ -308,7 +319,7 @@ def test_multi_axis_chunk_2x3():
 def test_multi_axis_replication():
     """Mesh (x=2, y=2, z=3), shard on ('x','y') → z is replicated (factor 3)."""
     mesh = DeviceMesh(device_shape=(2, 2, 3), axis_names=("x", "y", "z"))
-    spec = ShardingSpec.chunk(mesh=mesh, partition=P(("x", "y")))
+    spec = ShardingSpec.chunk(P(("x", "y"))).bind(mesh)
     data_shape = (8,)
 
     assert set(spec.replica_axes or ()) == {"z"}
@@ -342,7 +353,7 @@ def test_multi_axis_replication():
 def test_multi_axis_cyclic():
     """Cyclic on mesh (x=2, y=2) with P(('x','y')) → 4-way cyclic."""
     mesh = DeviceMesh(device_shape=(2, 2), axis_names=("x", "y"))
-    spec = ShardingSpec.cyclic(mesh=mesh, partition=P(("x", "y")))
+    spec = ShardingSpec.cyclic(P(("x", "y"))).bind(mesh)
     data_shape = (8,)
 
     assert_indices_equal(
@@ -368,7 +379,7 @@ def test_multi_axis_cyclic():
 
 def test_sharding_spec_repr():
     mesh = DeviceMesh(device_shape=(2,), axis_names=("x",))
-    spec = ShardingSpec.chunk(mesh=mesh, partition=P("x"))
+    spec = ShardingSpec.chunk(P("x")).bind(mesh)
     r = repr(spec)
     assert "ChunkPartition" in r
     assert "P(" in r
@@ -380,7 +391,7 @@ def test_sharding_spec_repr():
 def test_non_divisible_shard_sizes():
     """Verify non-divisible sizes: 10 items chunked over 3 devices."""
     mesh = DeviceMesh(device_shape=(3,), axis_names=("x",))
-    spec = ShardingSpec.chunk(mesh=mesh, partition=P("x"))
+    spec = ShardingSpec.chunk(P("x")).bind(mesh)
     data_shape = (10,)
 
     # chunk size = max((10 + 3 - 1) // 3, 1) = 4
@@ -399,7 +410,7 @@ def test_non_divisible_shard_sizes():
 def test_zero_sized_outputs():
     """Verify chunk handles dim_sizes or chunk_sizes that result in 0 workload."""
     mesh = DeviceMesh(device_shape=(4,), axis_names=("x",))
-    spec = ShardingSpec.chunk(mesh=mesh, partition=P("x"))
+    spec = ShardingSpec.chunk(P("x")).bind(mesh)
     # Size 2 over 4 devices -> chunk_size = 1. Remaining 2 devices get empty.
     data_shape = (2,)
 
@@ -417,7 +428,7 @@ def test_mixed_static_dynamic_strategies():
     """Combining dynamic hash(routing_dim=0) with implicitly static layouts."""
     mesh = DeviceMesh(device_shape=(2, 2), axis_names=("x", "y"))
     # Dynamic routing on dim 0 along x, static replication on y.
-    spec = ShardingSpec.hash(mesh=mesh, partition=P("x"), routing_dim=0)
+    spec = ShardingSpec.hash(P("x"), routing_dim=0).bind(mesh)
     data_shape = (6, 128)
 
     # rank = 0: coords(0, 0), dim 0 routing = 0 (hash)
@@ -435,7 +446,7 @@ def test_mixed_static_dynamic_strategies():
 def test_scalar_tensor_empty_partitions():
     """Complete replication for empty partitioning `P()`."""
     mesh = DeviceMesh(device_shape=(2, 2), axis_names=("x", "y"))
-    spec = ShardingSpec.chunk(mesh=mesh, partition=P())
+    spec = ShardingSpec.chunk(P()).bind(mesh)
     data_shape = (10, 10)
 
     assert spec.replica_size == 4
@@ -454,7 +465,7 @@ def test_scalar_tensor_empty_partitions():
 def test_redundant_replenishment():
     """P('x') on a 3D mesh ('x', 'y', 'z') -> replica_size = y * z."""
     mesh = DeviceMesh(device_shape=(2, 3, 4), axis_names=("x", "y", "z"))
-    spec = ShardingSpec.chunk(mesh=mesh, partition=P("x"))
+    spec = ShardingSpec.chunk(P("x")).bind(mesh)
 
     assert spec.replica_size == 12
     assert set(spec.replica_axes or ()) == {"y", "z"}

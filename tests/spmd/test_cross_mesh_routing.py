@@ -69,13 +69,9 @@ class _AssemblyMixin:
         return t.flat_values
 
     def _get_routing_indices(self, t: TransportTensor):
-        si = t.routing_indices
-        if si is None:
-            return None
-        # ContinuousIndex / tensor - just return the underlying array
-        if hasattr(si, "to_tensor"):
-            return si.to_tensor()
-        return si
+        if isinstance(t, TransportTensor):
+            return t.routing_indices_materialized
+        return None
 
     def _normalize_and_cat_shards(self, tensors, dim=0):
         backend = get_backend()
@@ -118,7 +114,11 @@ class _AssemblyMixin:
             return None
         origin_list = []
         for s in shards:
-            idx = getattr(s, "origin_indices", None)
+            idx = (
+                s.origin_indices_materialized
+                if hasattr(s, "origin_indices_materialized")
+                else None
+            )
             if idx is None:
                 idx = self._get_routing_indices(s)
             if idx is None:
@@ -170,7 +170,11 @@ class _AssemblyMixin:
 
         all_indices_list = []
         for s in valid_shards:
-            idx = s.origin_indices
+            idx = (
+                s.origin_indices_materialized
+                if hasattr(s, "origin_indices_materialized")
+                else None
+            )
             if idx is None:
                 idx = self._get_routing_indices(s)
             if idx is None:
@@ -343,6 +347,7 @@ class TestDynamicToStaticAssembly(unittest.TestCase):
         has_mirror: bool,
     ):
         from fluxway.common.types.sharding import (
+            AlgebraicRouting,
             ShardingSpec,
             PartitionSpec,
             ChunkPartition,
@@ -351,7 +356,9 @@ class TestDynamicToStaticAssembly(unittest.TestCase):
         mesh = DeviceMesh(device_shape=(world_size,), axis_names=("dp",))
         strategy = ChunkPartition()
         # PartitionSpec takes positional axis names: P("dp") means dim-0 is sharded on "dp"
-        spec = ShardingSpec(strategy=strategy, mesh=mesh, partition=PartitionSpec("dp"))
+        spec = ShardingSpec(
+            routing=AlgebraicRouting(strategy=strategy, partition=PartitionSpec("dp"))
+        ).bind(mesh)
         w = _MockWorker(rank=rank)
         valid = [s for s in shards if get_backend().shape(w._get_values(s))[0] > 0]
         if not valid:
@@ -570,16 +577,18 @@ class TestOperatorManagerPhase2MeshCorrectness(unittest.TestCase):
             "sparse_features spec missing from successor entry (TUUID lookup)",
         )
 
+        # In the new architecture, mesh is stored on ResolvedTopologyInfo, not ShardingSpec.
+        # The ShardingSpec is purely logical; binding to a mesh produces a PhysicalLayout.
         self.assertEqual(
-            sparse_spec.mesh.size,
+            succ_entry.mesh.size,
             RECEIVER_SIZE,
-            f"target_spec.mesh.size should be {RECEIVER_SIZE} (receiver), "
-            f"got {sparse_spec.mesh.size}. Phase 2 must use pinned_succ_entry.mesh, not self._mesh.",
+            f"succ_entry.mesh.size should be {RECEIVER_SIZE} (receiver), "
+            f"got {succ_entry.mesh.size}. Phase 2 must use pinned_succ_entry.mesh, not self._mesh.",
         )
         self.assertEqual(
-            sparse_spec.mesh.axis_names,
+            succ_entry.mesh.axis_names,
             ("dp",),
-            "target_spec.mesh.axis_names should be the receiver's.",
+            "succ_entry.mesh.axis_names should be the receiver's.",
         )
 
     def test_predecessor_physical_identity_comes_from_phase0(self):
@@ -616,7 +625,9 @@ class TestOperatorManagerPhase2MeshCorrectness(unittest.TestCase):
             name="forward",
             input_pre_sharding={"EmbeddingTable": [edge]},
             input_arguments={"tensor": ["emb1"]},
-            input_sharding={"emb1": ShardingSpec.chunk(receiver_mesh, PartitionSpec())},
+            input_sharding={
+                "emb1": ShardingSpec.chunk(PartitionSpec()).bind(receiver_mesh)
+            },
         )
         topology = {
             "forward": SPMDTopology(
@@ -656,6 +667,7 @@ class TestEmbeddingToDenseFullCommunication(unittest.TestCase):
     def test_e2e_embedding_to_dense_communication(self):
         from fluxway.transport.communication import AsyncDataDistributor
         from fluxway.common.types.sharding import (
+            AlgebraicRouting,
             ShardingSpec,
             PartitionSpec,
             ChunkPartition,
@@ -669,15 +681,17 @@ class TestEmbeddingToDenseFullCommunication(unittest.TestCase):
         # 1. Setup Meshes and Specs
         sender_mesh = DeviceMesh(device_shape=(SENDER_SIZE,), axis_names=("shard",))
         source_spec = ShardingSpec(
-            strategy=ChunkPartition(),
-            mesh=sender_mesh,
-            partition=PartitionSpec("shard"),
-        )
+            routing=AlgebraicRouting(
+                strategy=ChunkPartition(), partition=PartitionSpec("shard")
+            )
+        ).bind(sender_mesh)
 
         receiver_mesh = DeviceMesh(device_shape=(RECEIVER_SIZE,), axis_names=("dp",))
         target_spec = ShardingSpec(
-            strategy=ChunkPartition(), mesh=receiver_mesh, partition=PartitionSpec("dp")
-        )
+            routing=AlgebraicRouting(
+                strategy=ChunkPartition(), partition=PartitionSpec("dp")
+            )
+        ).bind(receiver_mesh)
 
         # 2. Prepare shards on 4 Senders
         # We simulate a slightly shuffled embedding result:
@@ -714,10 +728,12 @@ class TestEmbeddingToDenseFullCommunication(unittest.TestCase):
 
             async def mock_send(
                 target_rank: int,
+                tuuids: list,
                 tensors: list,
                 counts: list,
                 global_shapes_list: Optional[list] = None,
                 meta_tensor_state_list: Optional[list] = None,
+                compact_params_list: Optional[list] = None,
             ):
                 if int(counts[0]) > 0:
                     # Construct a received shard
@@ -768,6 +784,7 @@ class TestScalarAndComplexObjectRouting(unittest.TestCase):
     def test_scalar_sharding_inference(self):
         from fluxway.common.mesh import DeviceMesh
         from fluxway.common.types.sharding import (
+            AlgebraicRouting,
             ShardingSpec,
             ChunkPartition,
             PartitionSpec,
@@ -776,8 +793,10 @@ class TestScalarAndComplexObjectRouting(unittest.TestCase):
         mesh = DeviceMesh(device_shape=(2,), axis_names=("dp",))
         # Case: A scalar sharded on 'dp' (should be treated as replicated/safe)
         spec = ShardingSpec(
-            strategy=ChunkPartition(), mesh=mesh, partition=PartitionSpec("dp")
-        )
+            routing=AlgebraicRouting(
+                strategy=ChunkPartition(), partition=PartitionSpec("dp")
+            )
+        ).bind(mesh)
 
         # Local scalar shape
         local_shape = ()
@@ -792,6 +811,7 @@ class TestScalarAndComplexObjectRouting(unittest.TestCase):
         # Mocks the _send_output logic in worker.py
         from fluxway.common.types.tensor import TransportTensor
         from fluxway.common.types.sharding import (
+            AlgebraicRouting,
             ShardingSpec,
             ChunkPartition,
             PartitionSpec,
@@ -800,8 +820,10 @@ class TestScalarAndComplexObjectRouting(unittest.TestCase):
 
         mesh = DeviceMesh(device_shape=(2,), axis_names=("dp",))
         spec = ShardingSpec(
-            strategy=ChunkPartition(), mesh=mesh, partition=PartitionSpec("dp")
-        )
+            routing=AlgebraicRouting(
+                strategy=ChunkPartition(), partition=PartitionSpec("dp")
+            )
+        ).bind(mesh)
 
         # Mock scalar value and how worker.py wraps it
         tensor_data = np.array(0.5)
@@ -825,6 +847,7 @@ class TestStaticToStaticCoverageValidation(unittest.TestCase):
 
     def _make_specs(self, total_items: int, dp: int):
         from fluxway.common.types.sharding import (
+            AlgebraicRouting,
             ShardingSpec,
             ChunkPartition,
             PartitionSpec,
@@ -833,13 +856,15 @@ class TestStaticToStaticCoverageValidation(unittest.TestCase):
         sender_mesh = DeviceMesh(device_shape=(1,), axis_names=("worker",))
         receiver_mesh = DeviceMesh(device_shape=(dp,), axis_names=("dp",))
         source_spec = ShardingSpec(
-            strategy=ChunkPartition(),
-            mesh=sender_mesh,
-            partition=PartitionSpec("worker"),
-        )
+            routing=AlgebraicRouting(
+                strategy=ChunkPartition(), partition=PartitionSpec("worker")
+            )
+        ).bind(sender_mesh)
         target_spec = ShardingSpec(
-            strategy=ChunkPartition(), mesh=receiver_mesh, partition=PartitionSpec("dp")
-        )
+            routing=AlgebraicRouting(
+                strategy=ChunkPartition(), partition=PartitionSpec("dp")
+            )
+        ).bind(receiver_mesh)
         return source_spec, target_spec, total_items
 
     def _run_distributor(self, values, global_shape, source_spec, target_spec):
@@ -852,13 +877,7 @@ class TestStaticToStaticCoverageValidation(unittest.TestCase):
         )
         distributor = AsyncDataDistributor(local_rank=0)
 
-        async def mock_send(
-            target_rank: int,
-            tensors: list,
-            counts: list,
-            global_shapes_list: Optional[list] = None,
-            meta_tensor_state_list: Optional[list] = None,
-        ):
+        async def mock_send(*args, **kwargs):
             return True
 
         async def _run():
@@ -875,13 +894,7 @@ class TestStaticToStaticCoverageValidation(unittest.TestCase):
 
         distributor = AsyncDataDistributor(local_rank=0)
 
-        async def mock_send(
-            target_rank: int,
-            tensors: list,
-            counts: list,
-            global_shapes_list: Optional[list] = None,
-            meta_tensor_state_list: Optional[list] = None,
-        ):
+        async def mock_send(*args, **kwargs):
             return True
 
         with self.assertRaises(ValueError) as ctx:
@@ -900,13 +913,7 @@ class TestStaticToStaticCoverageValidation(unittest.TestCase):
 
         distributor = AsyncDataDistributor(local_rank=0)
 
-        async def mock_send(
-            target_rank: int,
-            tensors: list,
-            counts: list,
-            global_shapes_list: Optional[list] = None,
-            meta_tensor_state_list: Optional[list] = None,
-        ):
+        async def mock_send(*args, **kwargs):
             return True
 
         try:
@@ -928,13 +935,7 @@ class TestStaticToStaticCoverageValidation(unittest.TestCase):
 
         distributor = AsyncDataDistributor(local_rank=0)
 
-        async def mock_send(
-            target_rank: int,
-            tensors: list,
-            counts: list,
-            global_shapes_list: Optional[list] = None,
-            meta_tensor_state_list: Optional[list] = None,
-        ):
+        async def mock_send(*args, **kwargs):
             return True
 
         # Should not raise

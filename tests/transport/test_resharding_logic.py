@@ -19,8 +19,8 @@ def test_resharding_2_to_6_static_chunk():
     # Target Mesh: 6 nodes
     dst_mesh = DeviceMesh(device_shape=(6,), axis_names=("x",))
 
-    src_spec = ShardingSpec.chunk(mesh=src_mesh, partition=P("x"))
-    dst_spec = ShardingSpec.chunk(mesh=dst_mesh, partition=P("x"))
+    src_spec = ShardingSpec.chunk(P("x")).bind(src_mesh)
+    dst_spec = ShardingSpec.chunk(P("x")).bind(dst_mesh)
 
     global_shape = (24,)
 
@@ -76,10 +76,10 @@ def test_identity_collapse_hash():
     data = jnp.array([0, 6, 12, 18], dtype=jnp.int32)
 
     src_mesh = DeviceMesh(device_shape=(1,), axis_names=("x",))
-    src_spec = ShardingSpec.chunk(mesh=src_mesh, partition=P("x"))
+    src_spec = ShardingSpec.chunk(P("x")).bind(src_mesh)
 
     # Dynamic routing based on the values themselves
-    dst_spec = ShardingSpec.hash(mesh=mesh, partition=P("x"))
+    dst_spec = ShardingSpec.hash(P("x")).bind(mesh)
 
     plan = TransportPlanner.compute_plan(
         src_local_rank=0,

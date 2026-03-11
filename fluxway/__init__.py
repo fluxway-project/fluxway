@@ -46,6 +46,7 @@ from fluxway.common.types import (
     ResourceSpec,
     # Sharding types
     ShardingSpec,
+    PhysicalLayout,
     PartitionSpec,
     ChunkPartition,
     CyclicPartition,
@@ -72,6 +73,7 @@ __all__ = [
     "ResourceSpec",
     # Sharding
     "ShardingSpec",
+    "PhysicalLayout",
     "PartitionSpec",
     "ChunkPartition",
     "CyclicPartition",

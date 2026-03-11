@@ -34,7 +34,7 @@ from fluxway.common.types import (
 )
 from fluxway.common.index_descriptor import IndexDescriptor
 from fluxway.common.types.tensor import TransportTensor
-from fluxway.common.types.sharding import ShardingSpec
+from fluxway.common.types.sharding import ShardingSpec, PhysicalLayout
 from fluxway.common.utils.tree import tree_flatten, tree_unflatten
 from typing import Any, Dict, List, Optional, Tuple, Type, get_type_hints
 from fluxway.common.backend import get_backend
@@ -184,7 +184,7 @@ class SPMDWorker:
 
         # Metadata for "Mirror Sharding" (Symmetry Routing)
         # Structure: {step_id: {op_name.tuuid: TransportTensor}}
-        self._step_input_cache: Dict[int, Dict[str, TransportTensor]] = {}
+        self._step_tuuid_cache: Dict[int, Dict[int, TransportTensor]] = {}
 
         # Tracks which (op_name, step) barriers have been registered to avoid double-declaring.
         self._barriers_declared: Dict[Tuple[str, int], bool] = {}
@@ -982,6 +982,10 @@ class SPMDWorker:
         assembled_list = await asyncio.gather(*assemble_tasks)
         tuuid_to_assembled = dict(zip(unique_tuuids, assembled_list, strict=True))  # type: ignore
 
+        if step not in self._step_tuuid_cache:
+            self._step_tuuid_cache[step] = {}
+        self._step_tuuid_cache[step].update(tuuid_to_assembled)
+
         input_kwargs = {}
         for p_name, p_tuuids in p_to_tuuids.items():
             if not p_tuuids or p_tuuids[0] is None:
@@ -1041,12 +1045,11 @@ class SPMDWorker:
         shards: Dict[Any, List[TransportTensor]],
     ) -> TransportTensor:
         """Assemble tensor shards into a complete TransportTensor."""
-        # Note: Input spec is now retrieved by TUUID
-        input_sharding = self._op_manager.get_input_sharding(op_name)
-        input_spec = input_sharding.get(tuuid)
+        # Note: Input layout is now retrieved as a PhysicalLayout bound to current mesh
+        input_layout = self._op_manager._resolve_input_spec(op_name, tuuid)
         predecessor_topology = self._op_manager.get_predecessor_topology(op_name)
 
-        if input_spec is None or input_spec.is_content_addressable:
+        if input_layout is None or input_layout.is_content_addressable:
             # Fallback or dynamic: merge all shards
             return self._assemble_to_dynamic_tensor(
                 op_name, tuuid, step, shards, predecessor_topology
@@ -1061,11 +1064,11 @@ class SPMDWorker:
 
         if has_dynamic_predecessor:
             return self._assemble_dynamic_to_static_tensor(
-                op_name, tuuid, step, shards, input_spec, predecessor_topology
+                op_name, tuuid, step, shards, input_layout, predecessor_topology
             )
         else:
             return await self._assemble_static_to_static_tensor(
-                op_name, tuuid, step, shards, input_spec, predecessor_topology
+                op_name, tuuid, step, shards, input_layout, predecessor_topology
             )
 
     def _filter_shards_by_routing(
@@ -1214,7 +1217,7 @@ class SPMDWorker:
         return None
 
     def _heal_empty_shape(
-        self, input_spec: "ShardingSpec", reference_values: Optional[Any] = None
+        self, input_layout: "PhysicalLayout", reference_values: Optional[Any] = None
     ) -> "TransportTensor":
         """Return a correctly-shaped empty TransportTensor when no data arrived.
 
@@ -1224,8 +1227,8 @@ class SPMDWorker:
         dtype = backend.int32()
         # Attempt to infer feature dimension from global_shape in the spec
         feature_dim: Optional[int] = None
-        if hasattr(input_spec, "global_shape") and input_spec.global_shape:
-            gs = list(input_spec.global_shape)
+        if hasattr(input_layout, "global_shape") and input_layout.global_shape:
+            gs = list(input_layout.global_shape)
             if len(gs) >= 2:
                 feature_dim = gs[1]  # assume axis-0 is the batch/routing dim
         # Fallback: peek at a non-empty reference tensor
@@ -1249,7 +1252,7 @@ class SPMDWorker:
         tuuid: int,
         step: int,
         shards: Dict[Any, List["TransportTensor"]],
-        input_spec: "ShardingSpec",
+        input_layout: "PhysicalLayout",
         predecessor_topology: Dict[str, Any],
     ) -> "TransportTensor":
         """Assemble static-to-static tensor using exact physical shards."""
@@ -1295,9 +1298,7 @@ class SPMDWorker:
             )
 
         # Mirror receipt: only when this edge is declared symmetric
-        has_mirror = any(
-            info.symmetric_to is not None for info in predecessor_topology.values()
-        )
+        has_mirror = True
         merged_receipt = self._maybe_merge_receipts(shard_list, has_mirror)
 
         return TransportTensor(
@@ -1308,13 +1309,57 @@ class SPMDWorker:
             receipt=merged_receipt,
         )
 
+    def _assemble_scalar_reduction(
+        self,
+        op_name: str,
+        tuuid: int,
+        step: int,
+        shards: Dict[Any, List[TransportTensor]],
+        input_layout: "PhysicalLayout",
+    ) -> TransportTensor:
+        backend = get_backend()
+
+        all_values = []
+        for rank_shards in shards.values():
+            for s in rank_shards:
+                val = self._get_values(s)
+                if backend.shape(val) != ():
+                    val = backend.reshape(val, ())
+                all_values.append(val)
+
+        if not all_values:
+            raise ValueError(
+                f"No scalar shards found for TUUID {tuuid} at step {step} for reduction."
+            )
+
+        stacked = backend.stack(all_values)
+        op = (
+            input_layout.reduce_op.value
+            if hasattr(input_layout.reduce_op, "value")
+            else str(input_layout.reduce_op)
+        )
+        op = op.lower()
+
+        if op == "sum":
+            reduced = backend.sum(stacked)
+        elif op == "mean":
+            reduced = backend.mean(stacked)
+        elif op == "min":
+            reduced = backend.min(stacked)
+        elif op == "max":
+            reduced = backend.max(stacked)
+        else:
+            raise ValueError(f"Unsupported reduction op: {op}")
+
+        return TransportTensor.from_tensor(reduced, global_shape=())
+
     def _assemble_dynamic_to_static_tensor(
         self,
         op_name: str,
         tuuid: int,
         step: int,
         shards: Dict[Any, List["TransportTensor"]],
-        input_spec: "ShardingSpec",
+        input_layout: "PhysicalLayout",
         predecessor_topology: Dict[str, Any],
     ) -> "TransportTensor":
         """Assemble dynamic-to-static (Sparse-to-Dense) tensor using origin_indices."""
@@ -1328,15 +1373,13 @@ class SPMDWorker:
             s for s in filtered_shards if backend.shape(self._get_values(s))[0] > 0
         ]
         if not valid_shards:
-            return self._heal_empty_shape(input_spec)
+            return self._heal_empty_shape(input_layout)
 
         # Mirror receipt: only when this edge is declared symmetric
-        has_mirror = any(
-            info.symmetric_to is not None for info in predecessor_topology.values()
-        )
+        has_mirror = True
         all_receipt = self._maybe_merge_receipts(valid_shards, has_mirror)
 
-        routing_dim = getattr(input_spec, "routing_dim", 0)
+        routing_dim = getattr(input_layout, "routing_dim", 0)
         if isinstance(routing_dim, (list, tuple)):
             routing_dim = routing_dim[0]
 
@@ -1364,8 +1407,8 @@ class SPMDWorker:
         global_shape_list[routing_dim] = inferred_dim_size
         global_shape = tuple(global_shape_list)
 
-        local_shape = input_spec.get_shard_shape(self.rank, data_shape=global_shape)
-        slice_start, slice_end = input_spec.get_shard_bounds(
+        local_shape = input_layout.get_shard_shape(self.rank, data_shape=global_shape)
+        slice_start, slice_end = input_layout.get_shard_bounds(
             self.rank, routing_dim, data_shape=global_shape
         )
 
@@ -1448,9 +1491,7 @@ class SPMDWorker:
         )
 
         # Mirror receipt: only when this edge is declared symmetric
-        has_mirror = any(
-            info.symmetric_to is not None for info in predecessor_topology.values()
-        )
+        has_mirror = True
         merged_receipt = self._maybe_merge_receipts(filtered_shards, has_mirror)
 
         # DETERMINISTIC SORTING:
@@ -1545,9 +1586,13 @@ class SPMDWorker:
                 )
 
         # Cleanup Mirror Sharding Cache for very old steps
-        old_steps = [s for s in self._step_input_cache.keys() if s < step - 5]
+        old_steps = [
+            s
+            for s in self._step_tuuid_cache.keys()
+            if s < step - self.config.operator_metas[op_name].max_inflight_steps + 1
+        ]
         for s in old_steps:
-            del self._step_input_cache[s]
+            del self._step_tuuid_cache[s]
 
     # =========================================================================
     # Data Sending
@@ -1605,12 +1650,15 @@ class SPMDWorker:
                 if not isinstance(val, TransportTensor):
                     val = TransportTensor.from_tensor(val)
 
-                # Resolve ShardingSpecs
-                source_spec = self._op_manager.get_output_sharding(op_name).get(u)
-                target_spec = succ_info.tuuid_sharding.get(u)
+                # Resolve ShardingSpec and bind to PhysicalLayout
+                source_logical = self._op_manager.get_output_sharding(op_name).get(u)
+                target_logical = succ_info.tuuid_sharding.get(u)
 
-                if source_spec is None or target_spec is None:
+                if source_logical is None or target_logical is None:
                     continue
+
+                source_spec = source_logical.bind(self._mesh)
+                target_spec = target_logical.bind(succ_info.mesh or self._mesh)
 
                 # INTERLEAVED SOURCE ABSTRACTION:
                 # For interleaved units, override the source mesh to represent the active unit.
@@ -1636,18 +1684,19 @@ class SPMDWorker:
                                 axis_names=base_mesh.axis_names,
                                 device_ids=unit_ranks,
                             )
-                            source_spec = source_spec.with_mesh(sub_mesh)
+                            source_spec = source_logical.bind(sub_mesh)
 
-                # Automate Mirror Injection:
-                from fluxway.common.types.sharding import MirrorPartition
+                # Automate Mirror Injection (Referential Routing)
+                from fluxway.common.types.sharding import ReferentialRouting
 
-                if isinstance(source_spec, ShardingSpec) and isinstance(
-                    source_spec.strategy, MirrorPartition
+                if isinstance(source_spec, PhysicalLayout) and isinstance(
+                    source_spec.spec.routing, ReferentialRouting
                 ):
-                    source_node_arg = source_spec.strategy.source
-                    if exec_step in self._step_input_cache:
-                        cached_input = self._step_input_cache[exec_step].get(
-                            source_node_arg
+                    mirror_tuuid = source_spec.spec.routing.tuuid
+
+                    if mirror_tuuid is not None and exec_step in self._step_tuuid_cache:
+                        cached_input = self._step_tuuid_cache[exec_step].get(
+                            mirror_tuuid
                         )
                         if cached_input and cached_input.receipt:
                             val = TransportTensor(

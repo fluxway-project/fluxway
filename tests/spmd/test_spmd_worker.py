@@ -958,7 +958,7 @@ def test_replicate_operator_manager():
 @pytest.mark.asyncio
 async def test_send_output_none_mesh():
     # Test fallback to default mesh when config.mesh is None
-    # This specifically verifies the fix for ShardingSpec.chunk(None, ...)
+    # This specifically verifies the fix for ShardingSpec.chunk(...).bind(None)
     # Use a dummy mesh for config to satisfy OperatorManager initialization
     config = _make_config(DeviceMesh(axis_names=("dp",), device_shape=(1,)), "compute")
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
@@ -970,7 +970,7 @@ async def test_send_output_none_mesh():
 
     worker._op_manager = MagicMock()
     test_mesh = DeviceMesh(axis_names=("data",), device_shape=(1,))
-    def_spec = ShardingSpec.chunk(test_mesh, PartitionSpec())
+    def_spec = ShardingSpec.chunk(PartitionSpec()).bind(test_mesh)
 
     # Mock sharding for a tensor with TUUID 123
     # We leave it empty to trigger the default source_spec chunk call

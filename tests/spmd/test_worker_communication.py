@@ -4,7 +4,7 @@ import jax.numpy as jnp
 from unittest.mock import AsyncMock
 
 from fluxway.common.types.tensor import TransportTensor, SymmetryReceipt
-from fluxway.common.types.sharding import ShardingSpec, MirrorPartition, PartitionSpec
+from fluxway.common.types.sharding import ShardingSpec
 from fluxway.common.mesh import DeviceMesh
 from fluxway.transport.communication import BaseDataDistributor
 
@@ -162,10 +162,7 @@ class TestWorkerCommunicationLogic(unittest.IsolatedAsyncioTestCase):
         tt = TransportTensor(data, receipt=receipt)
 
         # 2. Define a Mirror Sharding Spec
-        mirror_strategy = MirrorPartition(source="some_op.input_tensor")
-        spec = ShardingSpec(
-            strategy=mirror_strategy, mesh=mesh, partition=PartitionSpec()
-        )
+        spec = ShardingSpec.follow("some_op.input_tensor").bind(mesh)
 
         distributor = BaseDataDistributor(local_rank=0)
 

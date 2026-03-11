@@ -31,6 +31,7 @@ def _meta_to_topology(meta: OperatorMeta) -> Dict[str, SPMDTopology]:
                 is_interleaved=e.is_interleaved,
                 interleave_unit_size=e.interleave_unit_size,
                 mesh=e.mesh,
+                world_size=e.mesh.size if getattr(e, "mesh", None) else 0,
             )
     for succ_id, edges in meta.output_post_sharding.items():
         if edges:
@@ -42,6 +43,7 @@ def _meta_to_topology(meta: OperatorMeta) -> Dict[str, SPMDTopology]:
                 is_interleaved=e.is_interleaved,
                 interleave_unit_size=e.interleave_unit_size,
                 mesh=e.mesh,
+                world_size=e.mesh.size if getattr(e, "mesh", None) else 0,
             )
     top_dict[meta.name] = top
     return top_dict
@@ -60,12 +62,13 @@ async def test_multi_worker_interleaved_unit_mesh_inheritance():
         axis_names=("data",), device_shape=(2,), device_ids=[0, 1]
     )
 
-    sharding = ShardingSpec.chunk(loader_mesh, PartitionSpec("data", "mp"))
+    sharding = ShardingSpec.chunk(PartitionSpec("data", "mp"))
     edge_info = EdgeShardingInfo(
         is_interleaved=True,
         interleave_unit_size=2,
         tuuid_sharding={1001: sharding},
         tuuid_map={"t1": 1001},
+        mesh=loader_mesh,
     )
 
     loader_meta = OperatorMeta(
@@ -82,12 +85,15 @@ async def test_multi_worker_interleaved_unit_mesh_inheritance():
     processor_meta = OperatorMeta(
         name="processor",
         input_arguments={ArgumentType.DATA.value: ["t1"]},
-        input_sharding={1001: ShardingSpec.chunk(processor_mesh, PartitionSpec())},
+        input_sharding={"t1": ShardingSpec.chunk(PartitionSpec())},
         input_pre_sharding={"loader": [edge_info]},
     )
 
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
     cls = cls.modified_class if cls else SPMDWorker
+
+    def dummy_processor(t1: np.ndarray = None):
+        pass
 
     # Instantiate Loader Workers
     loader_workers = []
@@ -109,7 +115,7 @@ async def test_multi_worker_interleaved_unit_mesh_inheritance():
         config = SPMDConfig(
             mesh=processor_mesh,
             spmd_id="processor",
-            operators={"processor": lambda t1: None},
+            operators={"processor": dummy_processor},
             operator_metas={"loader": loader_meta, "processor": processor_meta},
             topology=_meta_to_topology(processor_meta),
         )
@@ -165,12 +171,13 @@ async def test_multi_worker_interleaved_unit_mesh_inheritance():
 @pytest.mark.asyncio
 async def test_single_worker_interleaved_unit():
     loader_mesh = DeviceMesh(axis_names=("data",), device_shape=(4,))
-    sharding = ShardingSpec.chunk(loader_mesh, PartitionSpec("data"))
+    sharding = ShardingSpec.chunk(PartitionSpec("data"))
     edge = EdgeShardingInfo(
         is_interleaved=True,
         interleave_unit_size=4,
         tuuid_sharding={2001: sharding},
         tuuid_map={"t1": 2001},
+        mesh=loader_mesh,
     )
     loader_meta = OperatorMeta(
         name="loader",

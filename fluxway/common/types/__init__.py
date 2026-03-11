@@ -66,6 +66,7 @@ from .sharding import (
     IndexedPartition,
     GreedyPartition,
     ShardingSpec,
+    PhysicalLayout,
 )
 
 # Unified tensor wrapper
@@ -121,7 +122,8 @@ __all__ = [
     "ChunkPartition",
     "CyclicPartition",
     "IndexedPartition",
-    "GreedyPartition",
+    GreedyPartition,
     "ShardingSpec",
+    "PhysicalLayout",
     "TransportTensor",
 ]

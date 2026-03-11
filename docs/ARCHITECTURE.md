@@ -1022,7 +1022,7 @@ class WorkerHandle:
 7. 扩展性设计
 7.1 支持更多Sharding策略
 框架设计支持插件式的Sharding策略扩展：
-实现 ShardingStrategy 接口
+实现 ShardingSpec 接口
 注册到框架中
 在配置中指定使用
 7.2 支持多种传输后端

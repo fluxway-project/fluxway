@@ -100,11 +100,4 @@ class DenseSPMD:
         # 3. Create TransportTensors.
         # We don't even need to manually set routing_indices if the receiver
         # can infer them from provenance, but keeping them doesn't hurt.
-        grad1 = TransportTensor(
-            g1_unique, global_shape=context.user_emb_unique.global_shape
-        )
-        grad2 = TransportTensor(
-            g2_unique, global_shape=context.item_emb_unique.global_shape
-        )
-
-        return {"grad1": grad1, "grad2": grad2}
+        return {"grad1": g1_unique, "grad2": g2_unique}
