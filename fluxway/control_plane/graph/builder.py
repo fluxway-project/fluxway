@@ -31,6 +31,7 @@ from fluxway.common.types.sharding import (
     ShardingConfig,
     ChunkPartition,
     AlgebraicRouting,
+    ReferentialRouting,
 )
 from fluxway.common.types.configs import ArgumentType
 
@@ -690,20 +691,25 @@ class Builder:
         src_names = list(tensor_map.keys())
         dst_names = list(tensor_map.values())
 
-        for name in src_names:
-            if name not in src_out_specs:
-                raise ValueError(
-                    f"\n[Fluxway Sharding Error] In {ctx}:\n"
-                    f"  Output tensor '{name}' in operator '{source_node}.{source_op}' has no sharding defined.\n"
-                    f"  Fix: Add output_sharding={{'{name}': ...}} to the @operator decorator."
-                )
+        for src_name, dst_name in tensor_map.items():
+            src_spec = src_out_specs[src_name]
+            dst_spec = dst_in_specs[dst_name]
 
-        for name in dst_names:
-            if name not in dst_in_specs:
+            src_is_mirror = isinstance(src_spec.routing, ReferentialRouting)
+            dst_is_mirror = isinstance(dst_spec.routing, ReferentialRouting)
+
+            if src_is_mirror != dst_is_mirror:
+                mismatch_type = "Source" if src_is_mirror else "Destination"
+                other_type = "Mirror (Referential)"
+                current_type = "Algebraic (Static/Dynamic)"
+
                 raise ValueError(
-                    f"\n[Fluxway Sharding Error] In {ctx}:\n"
-                    f"  Input tensor '{name}' in operator '{target_node}.{target_op}' has no sharding defined.\n"
-                    f"  Fix: Add input_sharding={{'{name}': ...}} to the @operator decorator."
+                    f"\n[Fluxway Sharding Protocol Error] In {ctx}:\n"
+                    f"  Sharding protocol mismatch for tensor '{src_name}' -> '{dst_name}'.\n"
+                    f"  {mismatch_type} uses {other_type} routing, but the other side uses {current_type}.\n"
+                    f"  Fluxway requires both sides of a communication edge to agree on the routing protocol.\n"
+                    f"  Fix: If you are using mirror/follow routing, ensure both the producer's output_sharding "
+                    f"and the consumer's input_sharding are set to type='mirror'."
                 )
 
         return (

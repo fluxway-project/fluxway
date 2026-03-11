@@ -171,14 +171,18 @@ class ShardingConfig(FluxwayBaseSchema):
                 "Valid types: replicated, static, dynamic, mirror."
             )
 
-        if self.fn in ("hash_routing", "hash") or self.sharding_type == "dynamic":
-            strategy = _INDEXED
+        if self.fn in ("hash_routing", "hash"):
+            # Explicit hash-based routing ALWAYS uses modulo
+            strategy = _INDEXED_MODULO
+        elif self.sharding_type == "dynamic":
+            # Default dynamic (no fn specified) now uses chunking as requested
+            strategy = _INDEXED_CHUNK
         elif self.fn == "cyclic":
             strategy = _CYCLIC
         elif self.fn == "greedy":
             strategy = _GREEDY
         elif self.fn in ("chunk", "block", None) or self.sharding_type == "static":
-            # Default to chunk-sharding for static/unspecified assignments
+            # Default to chunk-sharding for static assignments
             strategy = _CHUNK
         else:
             raise ValueError(
@@ -311,8 +315,38 @@ class CyclicPartition(PartitionStrategy):
         return (src_rank % gcd) == (dst_rank % gcd)
 
 
-class IndexedPartition(PartitionStrategy):
-    """Dynamic partitioning based on values or lookup tables."""
+class IndexedChunkPartition(PartitionStrategy):
+    """Dynamic partitioning using continuous chunks based on index values."""
+
+    routing_paradigm: RoutingParadigm = RoutingParadigm.DYNAMIC
+
+    def __call__(self, indices, dim_size, num_workers, index_desc=None):
+        backend = get_backend()
+
+        if isinstance(index_desc, ExplicitIndex):
+            values = index_desc.indices
+        elif isinstance(index_desc, FunctionalIndex):
+            values = index_desc.hash_fn(indices)
+        elif isinstance(index_desc, RaggedIndex):
+            starts = index_desc.splits[0][:-1]
+            values = backend.take(starts, indices)
+        else:
+            values = indices
+
+        if num_workers <= 1:
+            return backend.zeros(backend.shape(values), dtype=backend.int32())
+
+        chunk_size = max((dim_size + num_workers - 1) // num_workers, 1)
+        ranks = backend.cast(values // chunk_size, backend.int32())
+        return backend.where(
+            ranks >= num_workers,
+            backend.full(backend.shape(ranks), num_workers - 1, dtype=backend.int32()),
+            ranks,
+        )
+
+
+class IndexedModuloPartition(PartitionStrategy):
+    """Dynamic partitioning using modulo hashing based on index values."""
 
     routing_paradigm: RoutingParadigm = RoutingParadigm.DYNAMIC
 
@@ -363,8 +397,13 @@ class GreedyPartition(PartitionStrategy):
 # Singleton instances for common strategies.
 _CHUNK = ChunkPartition()
 _CYCLIC = CyclicPartition()
-_INDEXED = IndexedPartition()
+_INDEXED_CHUNK = IndexedChunkPartition()
+_INDEXED_MODULO = IndexedModuloPartition()
 _GREEDY = GreedyPartition()
+
+# TODO(He Jia) I'm not sure if we need this implicity default alias, maybe it's a bug.
+# Compatibility Aliases
+IndexedPartition = IndexedChunkPartition
 
 
 # ============================================================
@@ -473,19 +512,19 @@ class ShardingSpec(FluxwayBaseSchema):
 
     @staticmethod
     def index(partition: PartitionSpec, routing_dim: int = 0) -> ShardingSpec:
-        """Dynamic: routing based on explicit array/tuple indices."""
+        """Dynamic: routing based on explicit array/tuple indices. Default to chunking."""
         return ShardingSpec(
             routing=AlgebraicRouting(
-                strategy=_INDEXED, partition=partition, routing_dim=routing_dim
+                strategy=_INDEXED_CHUNK, partition=partition, routing_dim=routing_dim
             )
         )
 
     @staticmethod
     def hash(partition: PartitionSpec, routing_dim: int = 0) -> ShardingSpec:
-        """Dynamic: routing based on element values directly."""
+        """Dynamic: routing based on element values directly. Uses modulo hashing."""
         return ShardingSpec(
             routing=AlgebraicRouting(
-                strategy=_INDEXED, partition=partition, routing_dim=routing_dim
+                strategy=_INDEXED_MODULO, partition=partition, routing_dim=routing_dim
             )
         )
 
@@ -515,7 +554,9 @@ class ShardingSpec(FluxwayBaseSchema):
     @staticmethod
     def derive_from(
         driver_spec: "PhysicalLayout",
+        driver_data_shape: Optional[Tuple[int, ...]] = None,
         driver_index_desc: Any = None,
+        follow_dim: int = 0,
     ) -> "ShardingSpec":
         """One-liner for routing_indices distribution. Follows the same strategy but for a different tensor."""
         return ShardingSpec(
@@ -523,6 +564,7 @@ class ShardingSpec(FluxwayBaseSchema):
                 strategy=driver_spec.spec.strategy,
                 partition=driver_spec.spec.partition,
                 index_descriptor=driver_index_desc,
+                routing_dim=follow_dim,
             )
         )
 
@@ -558,6 +600,10 @@ class PhysicalLayout(FluxwayBaseSchema):
     @property
     def is_static(self) -> bool:
         return self.spec.is_static
+
+    @property
+    def routing(self) -> Union[AlgebraicRouting, ReferentialRouting]:
+        return self.spec.routing
 
     @property
     def strategy(self) -> "PartitionStrategy":

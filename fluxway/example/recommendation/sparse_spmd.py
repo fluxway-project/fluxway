@@ -18,7 +18,6 @@ class SparseEmbeddingSPMD:
 
     @operator(
         name="lookup",
-        # We can dynamically name the tensor argument via metadata
         data_argument=["unique_ids"],
         input_sharding={
             "unique_ids": {"type": "dynamic", "axis": ["shard"], "fn": "hash_routing"}
@@ -43,7 +42,8 @@ class SparseEmbeddingSPMD:
         output = TransportTensor(
             embeddings,
             origin_indices=unique_ids.origin_indices,
-            routing_indices=unique_ids.origin_indices,
+            # Use unique IDs as routing indices for better introspection/fallback
+            routing_indices=ids,
             global_shape=g_shape,
         )
         print(
@@ -55,7 +55,7 @@ class SparseEmbeddingSPMD:
         name="update",
         data_argument=["grads"],
         input_sharding={
-            "grads": {"type": "dynamic", "axis": ["shard"], "fn": "hash_routing"}
+            "grads": {"type": "mirror", "source": "lookup.sparse_features"}
         },
     )
     def update(self, grads: TransportTensor) -> None:
