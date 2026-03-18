@@ -1,4 +1,5 @@
 import jax.numpy as jnp
+
 from fluxway.common.decorators import spmd, operator
 from fluxway.common.types.tensor import TransportTensor
 from .data_types import LookupOutput
@@ -6,9 +7,7 @@ from .data_types import LookupOutput
 
 @spmd(mesh_axis_names=("shard",), mesh_axis_shapes=(4,))
 class SparseEmbeddingSPMD:
-    """
-    Generic lookup table.
-    """
+    """Generic sharded embedding table with forward lookup and gradient-based update."""
 
     def __init__(self, vocab_size: int = 1000, embed_dim: int = 3):
         self.embed_dim = embed_dim
@@ -25,10 +24,7 @@ class SparseEmbeddingSPMD:
         output_sharding={"sparse_features": {"type": "dynamic", "axis": ["shard"]}},
     )
     def lookup(self, unique_ids: TransportTensor) -> LookupOutput:
-        rank = self.rank
-        world_size = self.world_size
         step = self.ctx.step
-
         ids = unique_ids.flat_values
         self._forward_ids_cache[step] = ids
 
@@ -42,12 +38,12 @@ class SparseEmbeddingSPMD:
         output = TransportTensor(
             embeddings,
             origin_indices=unique_ids.origin_indices,
-            # Use unique IDs as routing indices for better introspection/fallback
             routing_indices=ids,
             global_shape=g_shape,
         )
         print(
-            f"[SparseSPMD] lookup world_size={world_size} rank={rank}, step={step}, unique ids={ids}, output embeddings={output.flat_values}"
+            f"[SparseEmbeddingSPMD.lookup] rank={self.rank} step={step} "
+            f"ids={ids} embeddings={output.flat_values}"
         )
         return LookupOutput(sparse_features=output)
 
@@ -64,16 +60,16 @@ class SparseEmbeddingSPMD:
 
         if ids is None:
             raise ValueError(
-                f"Worker {self.rank} Update Error: Missing forward cache for step {step}"
+                f"Worker {self.rank}: missing forward cache for step {step}"
             )
 
-        g_flat = grads.flat_values
         local_ids = jnp.mod(ids, self.vocab_size)
-        print(
-            f"[SparseSPMD] update rank={self.rank} step={step} ids_len={len(ids)} ids={ids} g_flat_shape={g_flat.shape} g_flat={g_flat}"
-        )
+        self.params = self.params.at[local_ids].add(-0.1 * grads.flat_values)
 
-        self.params = self.params.at[local_ids].add(-0.1 * g_flat)
+        print(
+            f"[SparseEmbeddingSPMD.update] rank={self.rank} step={step} "
+            f"ids={ids} grads={grads.flat_values}"
+        )
 
 
 def hash_routing(tensor, mesh):

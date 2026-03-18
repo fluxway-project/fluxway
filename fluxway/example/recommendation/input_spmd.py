@@ -1,26 +1,20 @@
 import jax.numpy as jnp
+
 from fluxway.common.decorators import spmd, operator
+from fluxway.common.types.tensor import TransportTensor
 from .data_types import UserBatch, InputNodeOutput, DPFeatures
 
 
 def hash_routing(tensor, mesh):
-    from fluxway.common.types.tensor import TransportTensor
-
-    # Feature IDs are stored in flat_values for input sharding
     val = tensor.flat_values if isinstance(tensor, TransportTensor) else tensor
-
-    # If it's a 2D matrix (like ID batch or gradients), we hash based on the first column (the IDs)
     if len(val.shape) > 1:
         val = val[:, 0]
-
     return jnp.mod(val, mesh.size)
 
 
 @spmd(mesh_axis_names=("dp",), mesh_axis_shapes=(2,))
 class InputSPMD:
-    """
-    Deduplicates multiple features and routes them to respective tables.
-    """
+    """Deduplicates features and routes them to respective embedding tables."""
 
     @operator(
         name="process",
@@ -42,23 +36,13 @@ class InputSPMD:
         },
     )
     def process(self, data: UserBatch) -> InputNodeOutput:
-        # 1. Handle User ID (Routing to Table 1)
         u_user, inv_user = data.active.user_id.unique_with_routing()
-
-        print(
-            f"[InputSPMD] process rank={self.rank}, u_user={u_user.flat_values}, inv_user={inv_user.flat_values}"
-        )
-
-        # 2. Handle Item ID (Routing to Table 2)
         u_item, inv_item = data.passive.target_item_id.unique_with_routing()
 
         print(
-            f"[InputSPMD] process rank={self.rank}, u_item={u_item.flat_values}, inv_item={inv_item.flat_values}"
-        )
-
-        # 3. Features to pass through as-is (DP aligned)
-        dp_data = DPFeatures(
-            labels=data.labels, dense_stats=data.passive.target_item_stats
+            f"[InputSPMD.process] rank={self.rank} "
+            f"unique_users={u_user.flat_values} user_inv={inv_user.flat_values} "
+            f"unique_items={u_item.flat_values} item_inv={inv_item.flat_values}"
         )
 
         return InputNodeOutput(
@@ -66,5 +50,7 @@ class InputSPMD:
             user_inv=inv_user,
             unique_item_ids=u_item,
             item_inv=inv_item,
-            dp_data=dp_data,
+            dp_data=DPFeatures(
+                labels=data.labels, dense_stats=data.passive.target_item_stats
+            ),
         )

@@ -1,6 +1,8 @@
 import jax.numpy as jnp
 from typing import Any, Dict, Optional
+
 from fluxway.common.decorators import spmd_source, operator
+from fluxway.common.index_descriptor import ContinuousIndex
 from fluxway.common.types.tensor import TransportTensor
 from fluxway.reader import GrainReader
 from .data_types import UserBatch, ActiveFeatures, PassiveFeatures, LabelFeatures
@@ -14,8 +16,8 @@ from .data_types import UserBatch, ActiveFeatures, PassiveFeatures, LabelFeature
 )
 class RecommendationReader(GrainReader):
     """
-    Refactored Reader SPMD for Recommendation Example.
-    Uses col-store (Active/Passive/Label) schema.
+    Produces batches of UserBatch in col-store layout (Active / Passive / Label).
+    When no data_source is provided, generates a 1000-sample synthetic dataset.
     """
 
     def _create_data_loader(
@@ -27,11 +29,8 @@ class RecommendationReader(GrainReader):
         shard_count: Optional[int] = None,
     ):
         if "data_source" not in static_args:
-            # Synthetic dataset following the Active/Passive/Label pattern
-            # Note: We use lists to represent ragged/variable length data
-            data = []
-            for i in range(1000):
-                sample = {
+            data = [
+                {
                     "user_id": [1000 + i],
                     "user_age_level": [i % 5],
                     "request_hour": [18],
@@ -42,7 +41,8 @@ class RecommendationReader(GrainReader):
                     "target_item_stats": [0.05, 19.9],
                     "is_click": [1 if i % 3 == 0 else 0],
                 }
-                data.append(sample)
+                for i in range(1000)
+            ]
             static_args["data_source"] = data
             static_args.setdefault("batch_size", 24)
             static_args.setdefault("num_epochs", 1)
@@ -61,12 +61,11 @@ class RecommendationReader(GrainReader):
         },
     )
     def read(self) -> Optional[UserBatch]:
-        """Produces a batch of UserBatch."""
         static_args = getattr(self, "static_args", {})
         batch_size = static_args.get("batch_size", 24)
-        samples = []
 
-        for i in range(batch_size):
+        samples = []
+        for _ in range(batch_size):
             item = self.next_item()
             if item is None:
                 break
@@ -75,14 +74,9 @@ class RecommendationReader(GrainReader):
         if not samples:
             return None
 
-        # In Interleaved Source mode, the logical_world_size is the unit size (1).
         logical_world = self.ctx.logical_world_size if hasattr(self, "ctx") else 1
         global_batch_size = batch_size * logical_world
         g_shape = (global_batch_size,)
-
-        # 1. Active Features
-        from fluxway.common.index_descriptor import ContinuousIndex
-
         origins = ContinuousIndex.chunk(0, global_batch_size)
 
         active = ActiveFeatures(
@@ -118,7 +112,6 @@ class RecommendationReader(GrainReader):
             ),
         )
 
-        # 2. Passive Features
         passive = PassiveFeatures(
             target_item_id=TransportTensor.from_lists(
                 [s["target_item_id"] for s in samples],
@@ -140,7 +133,6 @@ class RecommendationReader(GrainReader):
             ),
         )
 
-        # 3. Label Features
         labels = LabelFeatures(
             is_click=TransportTensor.from_lists(
                 [s["is_click"] for s in samples],
