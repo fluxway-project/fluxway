@@ -2,13 +2,13 @@
 Standardized Reader implementation leveraging Google Grain.
 """
 
-import logging
 from typing import Any, Dict, Optional
 
 from fluxway.common.decorators import spmd, operator
+from fluxway.common.utils.logging import get_logger
 from .base_reader import BaseReader
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 try:
     import grain.python as grain

@@ -13,7 +13,6 @@ Responsibilities:
 Note: Controller layer only starts drivers. Workers are started by drivers.
 """
 
-import logging
 import asyncio
 from typing import Any, Dict, List, Optional
 
@@ -25,8 +24,9 @@ except ImportError:
     RAY_AVAILABLE = False
 
 from fluxway.common.types import SPMDConfig
+from fluxway.common.utils.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class SPMDHandle:

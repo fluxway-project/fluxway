@@ -16,15 +16,15 @@ Supports async callbacks for Ray Actor Controller.
 """
 
 import asyncio
-import logging
 from typing import TYPE_CHECKING, Dict
 
 from fluxway.common.types import ControllerState, ControllerEvent
+from fluxway.common.utils.logging import get_logger
 
 if TYPE_CHECKING:
     from ..controller import ControllerActor
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class ControllerStateMachine:

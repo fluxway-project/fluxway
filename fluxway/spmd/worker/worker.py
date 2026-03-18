@@ -47,6 +47,7 @@ from fluxway.common.backend import get_backend
 from fluxway.common.types.configs import MailboxStatus
 from fluxway.common.types.tensor import SymmetryReceipt
 from fluxway.common.utils import ensure_logging_configured
+from fluxway.common.utils.logging import get_logger
 from fluxway.rpc.protocol import DataPlaneCallable
 from .mailbox import WorkerMailbox
 from .operator_manager import OperatorManager
@@ -54,7 +55,7 @@ from .operator_manager.dispatcher import SKIPPED
 from fluxway.transport.communication import AsyncDataDistributor
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @ray.remote
@@ -195,7 +196,7 @@ class SPMDWorker:
         # Tracks which (op_name, step) barriers have been registered to avoid double-declaring.
         self._barriers_declared: Dict[Tuple[str, int], bool] = {}
 
-        logger.debug(f"SPMD Worker initialized: spmd_id={spmd_id}, rank={rank}")
+        logger.debug(f"Worker initialized spmd_id={spmd_id} rank={rank}")
 
         # Start heartbeat if driver_handle is provided
         if self._driver_handle is not None:
@@ -247,7 +248,8 @@ class SPMDWorker:
             rank: DataPlaneCallable(h) for rank, h in handlers.items()
         }
         logger.debug(
-            f"[spmd_id={self.spmd_id} rank={self.rank}] Registered predecessor handlers: {spmd_id}, ranks={list(handlers.keys())}"
+            f"Registered predecessor handlers predecessor_spmd_id={spmd_id} "
+            f"ranks={list(handlers.keys())} spmd_id={self.spmd_id} rank={self.rank}"
         )
 
         # Check if all handlers are registered for auto-start
@@ -270,7 +272,8 @@ class SPMDWorker:
             rank: DataPlaneCallable(h) for rank, h in handlers.items()
         }
         logger.debug(
-            f"[spmd_id={self.spmd_id} rank={self.rank}] Registered successor handlers: {spmd_id}, ranks={list(handlers.keys())}"
+            f"Registered successor handlers successor_spmd_id={spmd_id} "
+            f"ranks={list(handlers.keys())} spmd_id={self.spmd_id} rank={self.rank}"
         )
 
         # Check if all handlers are registered for auto-start
@@ -291,8 +294,8 @@ class SPMDWorker:
         self._expected_predecessor_count = predecessor_count
         self._expected_successor_count = successor_count
         logger.debug(
-            f"[spmd_id={self.spmd_id}] Worker {self.rank} expects {predecessor_count} predecessors, "
-            f"{successor_count} successors"
+            f"Topology expectation set predecessor_count={predecessor_count} "
+            f"successor_count={successor_count} spmd_id={self.spmd_id} rank={self.rank}"
         )
 
         # If both are 0 (source node with no successors), auto-start immediately
@@ -314,7 +317,7 @@ class SPMDWorker:
             or self._expected_successor_count is None
         ):
             logger.debug(
-                f"[{self.spmd_id} Rank {self.rank}] _check_and_auto_start: Waiting for topology counts..."
+                f"Waiting for topology counts spmd_id={self.spmd_id} rank={self.rank}"
             )
             return
 
@@ -327,31 +330,32 @@ class SPMDWorker:
         )
 
         logger.debug(
-            f"[{self.spmd_id} Rank {self.rank}] _check_and_auto_start: "
+            f"Handler registration status "
             f"pred={len(self._predecessor_handlers)}/{self._expected_predecessor_count} "
-            f"succ={len(self._successor_handlers)}/{self._expected_successor_count}"
+            f"succ={len(self._successor_handlers)}/{self._expected_successor_count} "
+            f"spmd_id={self.spmd_id} rank={self.rank}"
         )
 
         if pred_registered and succ_registered:
             logger.debug(
-                f"[spmd_id={self.spmd_id}] Worker {self.rank}: All handlers registered "
-                f"(pred={len(self._predecessor_handlers)}/{self._expected_predecessor_count}, "
-                f"succ={len(self._successor_handlers)}/{self._expected_successor_count}), "
-                f"auto-starting execution"
+                f"All handlers registered auto-starting "
+                f"pred={len(self._predecessor_handlers)}/{self._expected_predecessor_count} "
+                f"succ={len(self._successor_handlers)}/{self._expected_successor_count} "
+                f"spmd_id={self.spmd_id} rank={self.rank}"
             )
             self._auto_start()
 
     def _auto_start(self) -> None:
         """Internal auto-start method."""
         logger.debug(
-            f"[{self.spmd_id} Rank {self.rank}] _auto_start CALLED. _running={self._running}"
+            f"_auto_start called running={self._running} spmd_id={self.spmd_id} rank={self.rank}"
         )
         if self._running:
             return
 
         self._running = True
         self._start_event.set()
-        logger.debug(f"[spmd_id={self.spmd_id}] Worker {self.rank} auto-started")
+        logger.debug(f"Worker auto-started spmd_id={self.spmd_id} rank={self.rank}")
 
         # Trigger source operators (operators with 0 input tensors)
         asyncio.create_task(self._trigger_source_operators())
@@ -362,11 +366,11 @@ class SPMDWorker:
         """
         source_ops = self._op_manager.get_source_operators()
         logger.debug(
-            f"[{self.spmd_id} Rank {self.rank}] Identified source operators: {source_ops}"
+            f"Source operators identified ops={source_ops} spmd_id={self.spmd_id} rank={self.rank}"
         )
         for op_name in source_ops:
             logger.info(
-                f"[{self.spmd_id} Rank {self.rank}] AUTO-TRIGGERING source operator '{op_name}' for step 0"
+                f"Auto-triggering source op for step 0 op={op_name} spmd_id={self.spmd_id} rank={self.rank}"
             )
             await self._enqueue(op_name, 0)
 
@@ -381,9 +385,7 @@ class SPMDWorker:
         When blocked, tasks of this op_name will be held in pending queue
         instead of being executed. Other ops continue normally.
         """
-        logger.debug(
-            f"[spmd_id={self.spmd_id} rank={self.rank}] BLOCK_OP applied for {op_name}"
-        )
+        logger.debug(f"Op blocked op={op_name} spmd_id={self.spmd_id} rank={self.rank}")
         self._op_runnable[op_name].clear()
 
     async def unblock_op(self, op_name: str) -> None:
@@ -399,7 +401,7 @@ class SPMDWorker:
             self._pending_blocked[op_name].clear()
 
         logger.debug(
-            f"[spmd_id={self.spmd_id} rank={self.rank}] UNBLOCK_OP applied for {op_name}"
+            f"Op unblocked op={op_name} spmd_id={self.spmd_id} rank={self.rank}"
         )
 
     def is_op_blocked(self, op_name: str) -> bool:
@@ -430,8 +432,8 @@ class SPMDWorker:
         self._ensure_step_declared(op_name, step)
 
         logger.debug(
-            f"[spmd_id={self.spmd_id} rank={self.rank}] Prepared eager op {op_name} "
-            f"for step {step} with {len(tuuid_sharding)} inputs."
+            f"Prepared eager op op={op_name} step={step} input_count={len(tuuid_sharding)} "
+            f"spmd_id={self.spmd_id} rank={self.rank}"
         )
 
     # =========================================================================
@@ -460,8 +462,8 @@ class SPMDWorker:
         )
         if not is_periodic and step < exec_step:
             logger.warning(
-                f"[spmd_id={self.spmd_id}] Dropping stale state data: op={op_name}, names={names}, "
-                f"step={step} < exec_step={exec_step}"
+                f"Dropped stale state data op={op_name} names={names} "
+                f"step={step} exec_step={exec_step} spmd_id={self.spmd_id} rank={self.rank}"
             )
             return
 
@@ -469,15 +471,13 @@ class SPMDWorker:
         self._ensure_step_declared(op_name, step)
 
         logger.debug(
-            f"[spmd_id={self.spmd_id} rank={self.rank}] RECEIVED STATES: op={op_name}, step={step}, names={names}"
+            f"Received states op={op_name} step={step} names={names} "
+            f"spmd_id={self.spmd_id} rank={self.rank}"
         )
 
         # Cache in mailbox — barrier fires on_ready automatically
         await self._mailbox.deposit_states(
             op_name, step=step, names=names, values=values
-        )
-        logger.debug(
-            f"[spmd_id={self.spmd_id}] Worker {self.rank} received states: op={op_name}, names={names}, step={step}"
         )
 
     async def receive_shards(
@@ -629,7 +629,7 @@ class SPMDWorker:
         deposit_states can return immediately without blocking on queue insertion.
         """
         logger.debug(
-            f"[spmd_id={self.spmd_id} rank={self.rank}] Step ready: op={op_name}, step={step}"
+            f"Step ready op={op_name} step={step} spmd_id={self.spmd_id} rank={self.rank}"
         )
         asyncio.create_task(self._enqueue(op_name, step))
 
@@ -638,13 +638,13 @@ class SPMDWorker:
         from fluxway.common.types.configs import OperatorMeta
 
         logger.debug(
-            f"[Worker {self.spmd_id} Rank {self.rank}] _enqueue CALLED: op={op_name}, step={step}"
+            f"Enqueue called op={op_name} step={step} spmd_id={self.spmd_id} rank={self.rank}"
         )
         meta = self._op_manager._get_operator_metadata(op_name)
         priority = meta.priority if isinstance(meta, OperatorMeta) else 0
         await self._execution_queue.put((-priority, step, op_name))
         logger.debug(
-            f"[spmd_id={self.spmd_id} rank={self.rank}] Task enqueued: op={op_name}, step={step}"
+            f"Task enqueued op={op_name} step={step} priority={priority} spmd_id={self.spmd_id} rank={self.rank}"
         )
 
     # =========================================================================
@@ -661,7 +661,7 @@ class SPMDWorker:
         # Note: In Ray async actors, we schedule the task to run in the actor's event loop
         self._run_task = asyncio.get_event_loop().create_task(self._run())
         logger.debug(
-            f"[spmd_id={self.spmd_id}] Worker {self.rank} run loop task started (waiting for start signal)"
+            f"Run loop task started waiting for start signal spmd_id={self.spmd_id} rank={self.rank}"
         )
 
     async def _run(self) -> None:
@@ -673,24 +673,23 @@ class SPMDWorker:
         """
         # Wait for start signal from driver
         logger.debug(
-            f"[spmd_id={self.spmd_id}] Worker {self.rank} waiting for start signal..."
+            f"Waiting for start signal spmd_id={self.spmd_id} rank={self.rank}"
         )
         await self._start_event.wait()
 
-        logger.debug(
-            f"[spmd_id={self.spmd_id}] Worker {self.rank} execution loop started"
-        )
+        logger.debug(f"Execution loop started spmd_id={self.spmd_id} rank={self.rank}")
 
         # Normal SPMD mode: data-driven execution loop
         while self._running:
             try:
                 # Blocking wait for next task (async)
                 logger.debug(
-                    f"[spmd_id={self.spmd_id} rank={self.rank}] Execution loop waiting for task in _execution_queue..."
+                    f"Waiting for next task in execution queue spmd_id={self.spmd_id} rank={self.rank}"
                 )
                 priority, step, op_name = await self._execution_queue.get()
                 logger.debug(
-                    f"[spmd_id={self.spmd_id} rank={self.rank}] Execution loop picked up task: {op_name} step={step} priority={priority}"
+                    f"Execution loop picked up task op={op_name} step={step} priority={priority} "
+                    f"spmd_id={self.spmd_id} rank={self.rank}"
                 )
 
                 # Check if we should stop
@@ -704,12 +703,12 @@ class SPMDWorker:
                     async with self._pending_lock:
                         self._pending_blocked[op_name].append(step)
                     logger.debug(
-                        f"[spmd_id={self.spmd_id}] OP BLOCKED in queue: op={op_name}, step={step}"
+                        f"Op blocked in queue op={op_name} step={step} spmd_id={self.spmd_id} rank={self.rank}"
                     )
                     continue
 
                 logger.debug(
-                    f"[{self.spmd_id}] Task processing: op={op_name} step={step}"
+                    f"Processing task op={op_name} step={step} spmd_id={self.spmd_id} rank={self.rank}"
                 )
                 # Check if this op is in periodic_trigger mode
                 is_periodic = (
@@ -724,8 +723,8 @@ class SPMDWorker:
                     if step < exec_step:
                         # Truly stale task (already executed), drop it
                         logger.warning(
-                            f"[spmd_id={self.spmd_id}] Stale task dropped: op={op_name}, "
-                            f"task_step={step}, exec_step={exec_step}"
+                            f"Stale task dropped op={op_name} "
+                            f"task_step={step} exec_step={exec_step} spmd_id={self.spmd_id} rank={self.rank}"
                         )
                         continue
                     elif step > exec_step:
@@ -733,8 +732,8 @@ class SPMDWorker:
                         async with self._pending_lock:
                             self._pending_future_steps[op_name].append(step)
                         logger.debug(
-                            f"[spmd_id={self.spmd_id}] Future task held: op={op_name}, "
-                            f"task_step={step}, exec_step={exec_step}"
+                            f"Future task held op={op_name} "
+                            f"task_step={step} exec_step={exec_step} spmd_id={self.spmd_id} rank={self.rank}"
                         )
                         continue
 
@@ -746,12 +745,13 @@ class SPMDWorker:
 
             except asyncio.CancelledError:
                 logger.debug(
-                    f"[spmd_id={self.spmd_id}] Worker {self.rank} run loop cancelled"
+                    f"Run loop cancelled spmd_id={self.spmd_id} rank={self.rank}"
                 )
                 break
             except Exception as e:
                 logger.error(
-                    f"[spmd_id={self.spmd_id} rank={self.rank}] Error in execution loop: {e}"
+                    f"Error in execution loop error={e} "
+                    f"spmd_id={self.spmd_id} rank={self.rank}"
                 )
 
     async def stop(self) -> None:
@@ -766,7 +766,7 @@ class SPMDWorker:
         if self._heartbeat_task and not self._heartbeat_task.done():
             self._heartbeat_task.cancel()
 
-        logger.debug(f"[spmd_id={self.spmd_id}] Worker {self.rank} stopping")
+        logger.debug(f"Worker stopping spmd_id={self.spmd_id} rank={self.rank}")
 
     async def _check_all_empty(self, op_name: str, step: int) -> bool:
         """Check if all received shards for a step are empty packets."""
@@ -872,7 +872,8 @@ class SPMDWorker:
             dispatcher = self._op_manager.get_dispatcher(op_name)
             if not dispatcher.should_execute(self.rank, self._world_size, step):
                 logger.debug(
-                    f"[spmd_id={self.spmd_id} rank={self.rank}] Dispatcher logic skipped execution for op={op_name}, step={step}. Silence inactive unit."
+                    f"Dispatcher skipped execution op={op_name} step={step} "
+                    f"spmd_id={self.spmd_id} rank={self.rank}"
                 )
                 await self._mailbox.clear_step(op_name, step)
                 self._barriers_declared.pop((op_name, step), None)
@@ -882,8 +883,8 @@ class SPMDWorker:
             all_empty = await self._check_all_empty(op_name, step)
             if all_empty:
                 logger.debug(
-                    f"[spmd_id={self.spmd_id} rank={self.rank}] All received shards are empty for "
-                    f"op={op_name}, step={step}. Propagating per sparse routing rules."
+                    f"All shards empty propagating empty packets op={op_name} step={step} "
+                    f"spmd_id={self.spmd_id} rank={self.rank}"
                 )
                 await self._propagate_empty_packets(op_name, step)
                 await self._mailbox.clear_step(op_name, step)
@@ -895,8 +896,8 @@ class SPMDWorker:
                 input_data = await self._assemble_input(op_name, step)
             except Exception as e:
                 logger.error(
-                    f"[spmd_id={self.spmd_id} rank={self.rank}] Failed to assemble input data for "
-                    f"op={op_name}, step={step}: {e}"
+                    f"Failed to assemble input op={op_name} step={step} error={e} "
+                    f"spmd_id={self.spmd_id} rank={self.rank}"
                 )
                 raise e
 
@@ -910,19 +911,19 @@ class SPMDWorker:
                     self._op_manager.execute, op_name, step, input_data
                 )
             logger.debug(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] Execution finished: op={op_name}, step={step}"
+                f"Execution finished op={op_name} step={step} spmd_id={self.spmd_id} rank={self.rank}"
             )
 
             if result is None:
                 logger.debug(
-                    f"[spmd_id={self.spmd_id} rank={self.rank}] Operator {op_name} returned None. "
-                    f"Continuing to advance step."
+                    f"Operator returned None continuing op={op_name} "
+                    f"spmd_id={self.spmd_id} rank={self.rank}"
                 )
 
             # Send output
             logger.debug(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] About to send output: op={op_name}, "
-                f"at step={step}, result_type={type(result).__name__}"
+                f"Sending output op={op_name} step={step} result_type={type(result).__name__} "
+                f"spmd_id={self.spmd_id} rank={self.rank}"
             )
             await self._send_output(op_name, result, exec_step=step)
 
@@ -936,7 +937,9 @@ class SPMDWorker:
             import traceback
 
             logger.error(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] Operator {op_name} execution failed: {e}, traceback: {traceback.format_exc()}"
+                f"Operator execution failed op={op_name} error={e} "
+                f"traceback={traceback.format_exc()} "
+                f"spmd_id={self.spmd_id} rank={self.rank}"
             )
             raise
 
@@ -1561,7 +1564,7 @@ class SPMDWorker:
         self._current_steps[op_name] += 1
         new_step = self._current_steps[op_name]
         logger.debug(
-            f"[spmd_id={self.spmd_id} rank={self.rank}] _advance_step: op={op_name}, {old_step} -> {new_step}"
+            f"Step advanced op={op_name} {old_step}->{new_step} spmd_id={self.spmd_id} rank={self.rank}"
         )
 
         # If it's a source operator, automatically trigger the next step
@@ -1570,8 +1573,8 @@ class SPMDWorker:
             max_steps = self.config.max_steps
             if max_steps is not None and new_step >= max_steps:
                 logger.debug(
-                    f"[spmd_id={self.spmd_id} rank={self.rank}] Source operator '{op_name}' "
-                    f"reached max_steps ({max_steps}). Try to be terminated by driver."
+                    f"Source op reached max_steps stopping op={op_name} max_steps={max_steps} "
+                    f"spmd_id={self.spmd_id} rank={self.rank}"
                 )
                 # Do NOT enqueue new_step + 1, effectively stopping the pulse
             elif result is not None or result is SKIPPED:
@@ -1584,7 +1587,7 @@ class SPMDWorker:
                 )  # Use new_step for next step
             else:
                 logger.debug(
-                    f"[spmd_id={self.spmd_id} rank={self.rank}] Source operator {op_name} finished (returned None)"
+                    f"Source op finished op={op_name} spmd_id={self.spmd_id} rank={self.rank}"
                 )
 
         # Report op completion to driver (here new_step means water level)
@@ -1618,14 +1621,16 @@ class SPMDWorker:
         if self._driver_handle is not None:
             try:
                 logger.debug(
-                    f"[spmd_id={self.spmd_id} rank={self.rank}] Reporting op completion: {op_name}, step={step}"
+                    f"Reporting op completion op={op_name} step={step} "
+                    f"spmd_id={self.spmd_id} rank={self.rank}"
                 )
                 self._driver_handle.report_worker_op_completed.remote(
                     self.rank, op_name, step
                 )
             except Exception as e:
                 logger.error(
-                    f"[spmd_id={self.spmd_id} rank={self.rank}] Failed to report op completion: {e}"
+                    f"Failed to report op completion error={e} "
+                    f"spmd_id={self.spmd_id} rank={self.rank}"
                 )
 
         # # Cleanup Mirror Sharding Cache for very old steps
@@ -1831,7 +1836,11 @@ class SPMDWorker:
                             else "unknown"
                         )
                         logger.debug(
-                            f"[Distributor Plan] [SPMD {self.spmd_id}] [Rank {self.rank}] Name={name} TUUID={leaf_tuuid} global_shape={leaf_val.global_shape} tensor={leaf_val.flat_values} origin_indices={leaf_val.origin_indices} routing_indices={leaf_val.routing_indices}"
+                            f"Distributor plan name={name} tuuid={leaf_tuuid} "
+                            f"global_shape={leaf_val.global_shape} "
+                            f"origin_indices={leaf_val.origin_indices} "
+                            f"routing_indices={leaf_val.routing_indices} "
+                            f"spmd_id={self.spmd_id} rank={self.rank}"
                         )
 
                 # Accrue to distributor's internal plan
@@ -1907,8 +1916,9 @@ class SPMDWorker:
 
                 if names_to_send:
                     logger.debug(
-                        f"[spmd_id={self.spmd_id}] Worker {self.rank} sending control_arguments: names={names_to_send}, "
-                        f"output_step={output_step} to {spmd_id}"
+                        f"Sending control_arguments names={names_to_send} "
+                        f"step={output_step} target_spmd_id={spmd_id} "
+                        f"spmd_id={self.spmd_id} rank={self.rank}"
                     )
                     if self._driver_handle is not None:
                         try:
@@ -1921,8 +1931,8 @@ class SPMDWorker:
                             )
                         except Exception as e:
                             logger.error(
-                                f"[spmd_id={self.spmd_id}] Worker {self.rank} failed to send control_arguments "
-                                f"via driver: {e}"
+                                f"Failed to send control_arguments via driver error={e} "
+                                f"target_spmd_id={spmd_id} spmd_id={self.spmd_id} rank={self.rank}"
                             )
 
     def _reconstruct_data_type_from_dict(self, cls: Type, data: Dict[str, Any]) -> Any:
@@ -2005,7 +2015,8 @@ class SPMDWorker:
         """
         self.set_static_arg(state_name, state_value)
         logger.debug(
-            f"[spmd_id={self.spmd_id}] Worker {self.rank} received control_argument: {state_name}"
+            f"Received control_argument name={state_name} "
+            f"spmd_id={self.spmd_id} rank={self.rank}"
         )
 
     def send_control_argument(
@@ -2037,7 +2048,8 @@ class SPMDWorker:
 
         if self._driver_handle is None:
             logger.error(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] No driver handle set, cannot send control_argument"
+                f"No driver handle cannot send control_argument "
+                f"spmd_id={self.spmd_id} rank={self.rank}"
             )
             return
 
@@ -2046,12 +2058,14 @@ class SPMDWorker:
                 target_spmd_id, target_op_name, state_name, step, state_value
             )
             logger.debug(
-                f"[spmd_id={self.spmd_id}] Worker {self.rank} sent control_argument '{state_name}' "
-                f"to SPMD {target_spmd_id}, target_op={target_op_name}, step={step}"
+                f"Sent control_argument name={state_name} target_spmd_id={target_spmd_id} "
+                f"target_op={target_op_name} step={step} "
+                f"spmd_id={self.spmd_id} rank={self.rank}"
             )
         except Exception as e:
             logger.error(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] Failed to send control_argument: {e}"
+                f"Failed to send control_argument error={e} "
+                f"spmd_id={self.spmd_id} rank={self.rank}"
             )
 
     # =========================================================================
@@ -2067,7 +2081,9 @@ class SPMDWorker:
         self._heartbeat_task = asyncio.get_event_loop().create_task(
             self._heartbeat_loop()
         )
-        logger.debug(f"[spmd_id={self.spmd_id}] Worker {self.rank} heartbeat started")
+        logger.debug(
+            f"Worker heartbeat loop started spmd_id={self.spmd_id} rank={self.rank}"
+        )
 
     async def stop_heartbeat(self) -> None:
         """Stop heartbeat reporting."""
@@ -2124,13 +2140,15 @@ class SPMDWorker:
 
         try:
             self._driver_handle.receive_worker_heartbeat.remote(self.rank, heartbeat)
-            # logger.log(5,  # HEARTBEAT
-            #     f"[spmd_id={self.spmd_id}] Worker {self.rank} sent heartbeat: status={status.name}, "
-            #     f"op_steps={heartbeat.op_steps}, mailbox_full={mailbox_status.is_full}"
-            # )
+            logger.heartbeat(
+                f"Worker heartbeat sent status={status.name} "
+                f"op_steps={heartbeat.op_steps} mailbox_full={mailbox_status.is_full} "
+                f"spmd_id={self.spmd_id} rank={self.rank}"
+            )
         except Exception as e:
             logger.error(
-                f"[spmd_id={self.spmd_id} rank={self.rank}] Failed to send heartbeat: {e}"
+                f"Failed to send heartbeat error={e} "
+                f"spmd_id={self.spmd_id} rank={self.rank}"
             )
 
     async def _get_mailbox_status(self) -> MailboxStatus:
@@ -2200,7 +2218,9 @@ class SPMDWorker:
         """
         for event in self._source_pause_events.values():
             event.clear()
-        logger.debug(f"[spmd_id={self.spmd_id}] Sources paused on worker {self.rank}")
+        logger.debug(
+            f"Sources paused on worker spmd_id={self.spmd_id} rank={self.rank}"
+        )
 
     def resume_sources(self) -> None:
         """
@@ -2208,4 +2228,6 @@ class SPMDWorker:
         """
         for event in self._source_pause_events.values():
             event.set()
-        logger.debug(f"[spmd_id={self.spmd_id}] Sources resumed on worker {self.rank}")
+        logger.debug(
+            f"Sources resumed on worker spmd_id={self.spmd_id} rank={self.rank}"
+        )

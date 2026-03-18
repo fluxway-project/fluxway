@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 
+HEARTBEAT = 5  # Level numeric: HEARTBEAT=5 < DEBUG=10 < INFO=20
 
 DEFAULT_LOG_FORMAT = "%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
 DEFAULT_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -19,7 +20,24 @@ DEFAULT_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 ENV_LOG_LEVEL = "FLUXWAY_LOG_LEVEL"
 ENV_LOG_FORCE = "FLUXWAY_LOG_FORCE"
 
-_logger = logging.getLogger(__name__)
+
+logging.addLevelName(HEARTBEAT, "HEARTBEAT")
+
+
+class FluxwayLogger(logging.Logger):
+    """Logger subclass that adds the .heartbeat() convenience method."""
+
+    def heartbeat(self, msg: object, *args: object, **kwargs: object) -> None:
+        if self.isEnabledFor(HEARTBEAT):
+            self._log(HEARTBEAT, msg, args, **kwargs)
+
+
+logging.setLoggerClass(FluxwayLogger)
+
+
+def get_logger(name: str) -> FluxwayLogger:
+    """Return a FluxwayLogger for the given name."""
+    return logging.getLogger(name)  # type: ignore[return-value]
 
 
 def ensure_logging_configured(
@@ -35,12 +53,7 @@ def ensure_logging_configured(
     This is intentionally conservative: if handlers already exist, it does nothing
     (unless force=True). This avoids clobbering the application's logging setup.
     """
-
     root_logger = logging.getLogger()
-
-    HEARTBEAT = 5  # DEBUG=10, INFO=20, WARNING=30
-    logging.addLevelName(HEARTBEAT, "HEARTBEAT")
-    _logger.heartbeat = lambda msg: _logger.log(HEARTBEAT, msg)
 
     env_level = _parse_log_level(os.getenv(ENV_LOG_LEVEL))
     if level is not None:
@@ -64,8 +77,9 @@ def ensure_logging_configured(
     for handler in root_logger.handlers:
         handler.setLevel(resolved_level)
 
-    _logger.debug(
-        "Logging configured in PID=%s: level=%s, force=%s, env_level=%r, env_force=%r",
+    logger = get_logger(__name__)
+    logger.debug(
+        "Logging configured pid=%s level=%s force=%s env_level=%r env_force=%r",
         os.getpid(),
         logging.getLevelName(resolved_level),
         resolved_force,
@@ -82,7 +96,6 @@ def ensure_logger_info_visible(
 
     If the logger has an explicit level already, we don't override it.
     """
-
     if logger.level == logging.NOTSET:
         logger.setLevel(level)
 
@@ -103,8 +116,8 @@ def _parse_log_level(value: str | None) -> int:
     Parse a log level from env.
 
     Supported:
-    - Names: DEBUG/INFO/WARNING/ERROR/CRITICAL (case-insensitive)
-    - Integers: "10", "20", ...
+    - Names: HEARTBEAT/DEBUG/INFO/WARNING/ERROR/CRITICAL (case-insensitive)
+    - Integers: "5", "10", "20", ...
     """
     if not value:
         return logging.INFO
@@ -114,4 +127,6 @@ def _parse_log_level(value: str | None) -> int:
         return int(raw)
 
     name = raw.upper()
+    if name == "HEARTBEAT":
+        return HEARTBEAT
     return getattr(logging, name, logging.INFO)

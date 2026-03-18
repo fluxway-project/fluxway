@@ -16,7 +16,6 @@ Implemented as a Ray Actor for async operation.
 """
 
 import asyncio
-import logging
 import time
 from typing import Any, Dict, List, Optional
 
@@ -37,6 +36,7 @@ from ..common.types import (
     HeartbeatConfig,
 )
 from ..common.utils import ensure_logging_configured
+from ..common.utils.logging import get_logger
 from .monitor import Monitor
 from .scheduler import Scheduler
 from .spmd_manager import SPMDManager, SPMDHandle
@@ -45,7 +45,7 @@ from .heartbeat import HeartbeatManager
 from .state_machine import ControllerStateMachine
 from .async_manager import AsyncStepManager
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 if RAY_AVAILABLE:

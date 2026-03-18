@@ -14,10 +14,10 @@ Use cases:
 - Debugging and monitoring: Pause all Workers when needed
 """
 
-import logging
 from typing import Callable, Dict, Optional
+from fluxway.common.utils.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class SPMDSynchronizer:
@@ -52,7 +52,7 @@ class SPMDSynchronizer:
         """
         self._accumulation_steps = accumulation_steps
         logger.info(
-            f"[spmd_id={self.spmd_id}] Loop config updated: accumulation_steps={accumulation_steps}"
+            f"Loop config updated accumulation_steps={accumulation_steps} spmd_id={self.spmd_id}"
         )
 
     def step(self) -> str:
@@ -131,4 +131,4 @@ class SPMDSynchronizer:
         self._current_state = "idle"
         self._current_step = 0
         self._op_steps.clear()
-        logger.info(f"[spmd_id={self.spmd_id}] Synchronizer reset")
+        logger.info(f"Synchronizer reset spmd_id={self.spmd_id}")

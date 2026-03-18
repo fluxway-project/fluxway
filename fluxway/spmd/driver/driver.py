@@ -13,7 +13,6 @@ The SPMD Driver coordinates all workers within the SPMD:
 """
 
 import asyncio
-import logging
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -42,7 +41,9 @@ from .synchronizer.worker_sync import WorkerSynchronizer
 from .stateful_executor import StatefulExecutor
 from .monitor import SPMDMonitor
 
-logger = logging.getLogger(__name__)
+from fluxway.common.utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 if RAY_AVAILABLE:
@@ -135,8 +136,7 @@ if RAY_AVAILABLE:
             self._source_state: Optional[ReaderState] = ReaderState.INITIALIZING
 
             logger.debug(
-                f"[spmd_id={spmd_id}] SPMD Driver initialized: spmd_id={spmd_id}, "
-                f"num_workers={config.num_workers}"
+                f"Driver initialized spmd_id={spmd_id} num_workers={config.num_workers}"
             )
 
         # =====================================================================
@@ -163,9 +163,7 @@ if RAY_AVAILABLE:
                 True if workers were started successfully
             """
             try:
-                logger.debug(
-                    f"[spmd_id={self.spmd_id}] Initializing SPMD {self.spmd_id}"
-                )
+                logger.debug(f"Initializing SPMD spmd_id={self.spmd_id}")
 
                 # Set up worker synchronizer callbacks
                 self.worker_synchronizer.set_callbacks(
@@ -193,15 +191,12 @@ if RAY_AVAILABLE:
                 # all workers have reported their first heartbeat.
 
                 logger.debug(
-                    f"[spmd_id={self.spmd_id}] SPMD {self.spmd_id} workers started, "
-                    f"waiting for worker heartbeats to confirm readiness"
+                    f"Workers started waiting for heartbeats spmd_id={self.spmd_id}"
                 )
                 return True
 
             except Exception as e:
-                logger.error(
-                    f"[spmd_id={self.spmd_id}] SPMD {self.spmd_id} initialization failed: {e}"
-                )
+                logger.error(f"Initialization failed error={e} spmd_id={self.spmd_id}")
                 self.state_machine.trigger(DriverEvent.INIT_FAILED, error=str(e))
                 return False
 
@@ -234,12 +229,10 @@ if RAY_AVAILABLE:
 
                 self._worker_handles[rank] = worker
                 self._recovery_attempts[rank] = 0
-                logger.debug(
-                    f"[spmd_id={self.spmd_id}] Started worker {rank} for SPMD {self.spmd_id}"
-                )
+                logger.debug(f"Started worker rank={rank} spmd_id={self.spmd_id}")
 
             logger.debug(
-                f"[spmd_id={self.spmd_id}] Started {len(self._worker_handles)} workers for SPMD {self.spmd_id}"
+                f"All workers started worker_count={len(self._worker_handles)} spmd_id={self.spmd_id}"
             )
 
         def get_worker_handles(self) -> Dict[int, Any]:
@@ -268,8 +261,9 @@ if RAY_AVAILABLE:
                 successor_count: expected successor count for workers
             """
             logger.debug(
-                f"[spmd_id={self.spmd_id}] SPMD {self.spmd_id}: Starting topology registration with "
-                f"{predecessor_count} predecessors, {successor_count} successors"
+                f"Topology registration starting "
+                f"predecessor_count={predecessor_count} successor_count={successor_count} "
+                f"spmd_id={self.spmd_id}"
             )
 
             # Step 1: Notify workers of expected topology counts
@@ -281,23 +275,23 @@ if RAY_AVAILABLE:
                 for worker in self._worker_handles.values():
                     worker.register_predecessor_handlers.remote(spmd_id, handlers)
                 logger.debug(
-                    f"[spmd_id={self.spmd_id}] Registered predecessor {spmd_id}"
+                    f"Registered predecessor predecessor_spmd_id={spmd_id} spmd_id={self.spmd_id}"
                 )
 
             # Step 3: Register successor worker handles
             for spmd_id, handlers in successor_handlers.items():
                 for worker in self._worker_handles.values():
                     worker.register_successor_handlers.remote(spmd_id, handlers)
-                logger.debug(f"[spmd_id={self.spmd_id}] Registered successor {spmd_id}")
+                logger.debug(
+                    f"Registered successor successor_spmd_id={spmd_id} spmd_id={self.spmd_id}"
+                )
 
-            logger.debug(
-                f"[spmd_id={self.spmd_id}] SPMD {self.spmd_id}: topology registration completed"
-            )
+            logger.debug(f"Topology registration completed spmd_id={self.spmd_id}")
 
         def _restore_from_checkpoint(self, checkpoint_id: str) -> None:
             """Restore state from checkpoint (placeholder)."""
             logger.warning(
-                f"[spmd_id={self.spmd_id}] Checkpoint restore not implemented: {checkpoint_id}"
+                f"Checkpoint restore not implemented checkpoint_id={checkpoint_id} spmd_id={self.spmd_id}"
             )
 
         # =====================================================================
@@ -306,7 +300,7 @@ if RAY_AVAILABLE:
 
         def stop(self, save_checkpoint: bool = True) -> None:
             """Stop execution."""
-            logger.debug(f"[spmd_id={self.spmd_id}] Stopping SPMD {self.spmd_id}")
+            logger.debug(f"Stopping spmd_id={self.spmd_id}")
 
             # Stop heartbeat
             self._stop_heartbeat()
@@ -321,14 +315,12 @@ if RAY_AVAILABLE:
                     worker.stop.remote()
                 except Exception as e:
                     logger.error(
-                        f"[spmd_id={self.spmd_id}] Failed to stop worker {rank}: {e}"
+                        f"Failed to stop worker rank={rank} error={e} spmd_id={self.spmd_id}"
                     )
 
         def _save_checkpoint(self) -> None:
             """Save checkpoint (placeholder)."""
-            logger.warning(
-                f"[spmd_id={self.spmd_id}] Checkpoint save not implemented for SPMD {self.spmd_id}"
-            )
+            logger.warning(f"Checkpoint save not implemented spmd_id={self.spmd_id}")
 
         # =====================================================================
         # Worker Heartbeat Handling
@@ -346,11 +338,12 @@ if RAY_AVAILABLE:
             """
             self._worker_heartbeats[rank] = heartbeat
             self._worker_heartbeat_times[rank] = time.time()
-            # logger.debug(
-            #     f"[spmd_id={self.spmd_id}] Driver {self.spmd_id} received worker {rank} heartbeat: "
-            #     f"status={heartbeat.status.name}, op_steps={heartbeat.op_steps}, "
-            #     f"mailbox_full={heartbeat.mailbox_status.is_full if heartbeat.mailbox_status else False}"
-            # )
+            logger.heartbeat(
+                f"Received worker heartbeat rank={rank} "
+                f"status={heartbeat.status.name} op_steps={heartbeat.op_steps} "
+                f"mailbox_full={heartbeat.mailbox_status.is_full if heartbeat.mailbox_status else False} "
+                f"spmd_id={self.spmd_id}"
+            )
 
             # Check for worker error
             if heartbeat.error_message:
@@ -366,17 +359,16 @@ if RAY_AVAILABLE:
             if not self._workers_ready:
                 if len(self._worker_heartbeat_times) >= self.config.num_workers:
                     self._workers_ready = True
-                    # logger.debug(
-                    #     f"[spmd_id={self.spmd_id}] All {self.config.num_workers} workers are ready for SPMD {self.spmd_id}"
-                    # )
+                    logger.heartbeat(
+                        f"All workers ready worker_count={self.config.num_workers} spmd_id={self.spmd_id}"
+                    )
 
                     # Event-driven: trigger INIT_COMPLETE now that all workers are alive
                     if self.state_machine.state == DriverState.INITIALIZING:
                         self.state_machine.trigger(DriverEvent.INIT_COMPLETE)
-                        # logger.debug(
-                        #     f"[spmd_id={self.spmd_id}] INIT_COMPLETE triggered by worker heartbeats "
-                        #     f"for SPMD {self.spmd_id}"
-                        # )
+                        logger.heartbeat(
+                            f"INIT_COMPLETE triggered spmd_id={self.spmd_id}"
+                        )
 
             # Check if all workers are running (workers_running)
             if not self._workers_running and self._workers_ready:
@@ -391,22 +383,17 @@ if RAY_AVAILABLE:
                     and len(self._worker_heartbeats) >= self.config.num_workers
                 ):
                     self._workers_running = True
-                    # logger.debug(
-                    #     f"[spmd_id={self.spmd_id}] All workers are running for SPMD {self.spmd_id} "
-                    #     f"(topology registration complete)"
-                    # )
+                    logger.heartbeat(
+                        f"All workers running triggering START spmd_id={self.spmd_id}"
+                    )
                     # Trigger READY → RUNNING transition
                     if self.state_machine.state == DriverState.READY:
                         self.state_machine.trigger(DriverEvent.START)
-                        # logger.debug(
-                        #     f"[spmd_id={self.spmd_id}] START triggered, "
-                        #     f"driver state: READY → RUNNING"
-                        # )
 
         def _handle_worker_error(self, rank: int, error: str) -> None:
             """Handle worker error."""
             logger.error(
-                f"[spmd_id={self.spmd_id}] Worker {rank} in SPMD {self.spmd_id} reported error: {error}"
+                f"Worker error rank={rank} error={error} spmd_id={self.spmd_id}"
             )
 
             attempts = self._recovery_attempts.get(rank, 0)
@@ -452,7 +439,7 @@ if RAY_AVAILABLE:
                     )
                 except Exception as e:
                     logger.error(
-                        f"[spmd_id={self.spmd_id}] Failed to report op completion to controller: {e}"
+                        f"Failed to report op completion to controller error={e} spmd_id={self.spmd_id}"
                     )
 
         # =====================================================================
@@ -489,7 +476,7 @@ if RAY_AVAILABLE:
                     worker.block_op.remote(op_name)
                 except Exception as e:
                     logger.error(
-                        f"[spmd_id={self.spmd_id}] Failed to block worker {rank} op: {e}"
+                        f"Failed to block worker op rank={rank} error={e} spmd_id={self.spmd_id}"
                     )
 
         def _unblock_worker_op(self, rank: int, op_name: str) -> None:
@@ -500,7 +487,7 @@ if RAY_AVAILABLE:
                     worker.unblock_op.remote(op_name)
                 except Exception as e:
                     logger.error(
-                        f"[spmd_id={self.spmd_id}] Failed to unblock worker {rank} op: {e}"
+                        f"Failed to unblock worker op rank={rank} error={e} spmd_id={self.spmd_id}"
                     )
 
         def _block_all_workers(self) -> None:
@@ -512,7 +499,7 @@ if RAY_AVAILABLE:
                         worker.block_op.remote(op_name)
                 except Exception as e:
                     logger.error(
-                        f"[spmd_id={self.spmd_id}] Failed to block worker {rank}: {e}"
+                        f"Failed to block worker rank={rank} error={e} spmd_id={self.spmd_id}"
                     )
 
         # =====================================================================
@@ -535,15 +522,18 @@ if RAY_AVAILABLE:
                 try:
                     worker.receive_control.remote(target_op, step, names, values)
                     logger.debug(
-                        f"[spmd_id={self.spmd_id}] Broadcasted step {step} control_arguments {names} to worker {rank}"
+                        f"Broadcast control_arguments names={names} step={step} "
+                        f"target_rank={rank} spmd_id={self.spmd_id}"
                     )
                 except Exception as e:
                     logger.error(
-                        f"[spmd_id={self.spmd_id}] Failed to send control_arguments to worker: {e}"
+                        f"Failed to send control_arguments to worker rank={rank} error={e} "
+                        f"spmd_id={self.spmd_id}"
                     )
 
             logger.debug(
-                f"[spmd_id={self.spmd_id}] Broadcasted step {step} control_arguments {names} to all workers"
+                f"Broadcast control_arguments to all workers names={names} step={step} "
+                f"spmd_id={self.spmd_id}"
             )
 
         def routing_control_argument_to_controller(
@@ -570,11 +560,13 @@ if RAY_AVAILABLE:
                         self.spmd_id, target_spmd_id, target_op, names, step, values
                     )
                     logger.debug(
-                        f"[spmd_id={self.spmd_id}] Routed step {step} control_arguments {names} to controller"
+                        f"Routed control_arguments to controller names={names} step={step} "
+                        f"spmd_id={self.spmd_id}"
                     )
                 except Exception as e:
                     logger.error(
-                        f"[spmd_id={self.spmd_id}] Failed to route control_arguments to controller: {e}"
+                        f"Failed to route control_arguments to controller error={e} "
+                        f"spmd_id={self.spmd_id}"
                     )
 
         # =====================================================================
@@ -615,10 +607,9 @@ if RAY_AVAILABLE:
                         elapsed = time.time() - self._init_start_time
                         if elapsed > self._init_timeout:
                             logger.error(
-                                f"[spmd_id={self.spmd_id}] SPMD {self.spmd_id} worker init "
-                                f"timeout after {elapsed:.1f}s "
-                                f"(received heartbeat from "
-                                f"{len(self._worker_heartbeat_times)}/{self.config.num_workers} workers)"
+                                f"Worker init timeout spmd_id={self.spmd_id} "
+                                f"elapsed={elapsed:.1f}s "
+                                f"reported_workers={len(self._worker_heartbeat_times)}/{self.config.num_workers}"
                             )
                             self.state_machine.trigger(
                                 DriverEvent.INIT_FAILED,
@@ -626,7 +617,7 @@ if RAY_AVAILABLE:
                             )
                 except Exception as e:
                     logger.error(
-                        f"[spmd_id={self.spmd_id}] Error sending heartbeat: {e}"
+                        f"Error sending heartbeat error={e} spmd_id={self.spmd_id}"
                     )
 
                 time.sleep(self._heartbeat_config.heartbeat_interval)
@@ -682,13 +673,18 @@ if RAY_AVAILABLE:
 
             try:
                 self.controller_handle.receive_driver_heartbeat.remote(heartbeat)
-                # logger.log(5,  # HEARTBEAT
-                #     f"[spmd_id={self.spmd_id}] Driver {self.spmd_id} sent heartbeat: status={status.name}, "
-                #     f"state={heartbeat.state.name}, healthy_workers={healthy_count}/{self.config.num_workers}, "
-                #     f"op_steps={heartbeat.op_steps}, busy_ratio={self._busy_worker_ratio:.2f}"
-                # )
+                logger.heartbeat(
+                    f"Driver heartbeat sent status={status.name} "
+                    f"state={heartbeat.state.name} "
+                    f"healthy_workers={healthy_count}/{self.config.num_workers} "
+                    f"op_steps={heartbeat.op_steps} "
+                    f"busy_ratio={self._busy_worker_ratio:.2f} "
+                    f"spmd_id={self.spmd_id}"
+                )
             except Exception as e:
-                logger.error(f"[spmd_id={self.spmd_id}] Failed to send heartbeat: {e}")
+                logger.error(
+                    f"Failed to send heartbeat error={e} spmd_id={self.spmd_id}"
+                )
 
         # =====================================================================
         # Worker Recovery
@@ -705,7 +701,7 @@ if RAY_AVAILABLE:
                 True if recovery successful
             """
             logger.debug(
-                f"[spmd_id={self.spmd_id}] Attempting to recover worker {rank} in SPMD {self.spmd_id}"
+                f"Attempting to recover worker rank={rank} spmd_id={self.spmd_id}"
             )
 
             self._recovery_attempts[rank] = self._recovery_attempts.get(rank, 0) + 1
@@ -751,13 +747,13 @@ if RAY_AVAILABLE:
                     worker.start.remote()
 
                 logger.debug(
-                    f"[spmd_id={self.spmd_id}] Successfully recovered worker {rank}"
+                    f"Worker recovery successful rank={rank} spmd_id={self.spmd_id}"
                 )
                 return True
 
             except Exception as e:
                 logger.error(
-                    f"[spmd_id={self.spmd_id}] Failed to recover worker {rank}: {e}"
+                    f"Failed to recover worker rank={rank} error={e} spmd_id={self.spmd_id}"
                 )
                 return False
 
@@ -772,7 +768,7 @@ if RAY_AVAILABLE:
                     self.controller_handle.report_spmd_completed.remote(self.spmd_id)
                 except Exception as e:
                     logger.error(
-                        f"[spmd_id={self.spmd_id}] Failed to report completion: {e}"
+                        f"Failed to report completion error={e} spmd_id={self.spmd_id}"
                     )
 
         def _report_error(self, error: str) -> None:
@@ -782,7 +778,7 @@ if RAY_AVAILABLE:
                     self.controller_handle.report_spmd_error.remote(self.spmd_id, error)
                 except Exception as e:
                     logger.error(
-                        f"[spmd_id={self.spmd_id}] Failed to report error: {e}"
+                        f"Failed to report error error={e} spmd_id={self.spmd_id}"
                     )
 
         # =====================================================================
@@ -802,8 +798,8 @@ if RAY_AVAILABLE:
             self.graph_topology["predecessors"] = predecessors
             self.graph_topology["successors"] = successors
             logger.debug(
-                f"[spmd_id={self.spmd_id}] Updated topology for SPMD {self.spmd_id}: "
-                f"pred={predecessors}, succ={successors}"
+                f"Topology updated predecessors={predecessors} successors={successors} "
+                f"spmd_id={self.spmd_id}"
             )
 
         # =====================================================================
@@ -845,14 +841,14 @@ if RAY_AVAILABLE:
 
             self._is_paused = True
             self._source_state = ReaderState.PAUSED
-            logger.debug(f"[spmd_id={self.spmd_id}] Sources paused due to backpressure")
+            logger.debug(f"Sources paused due to backpressure spmd_id={self.spmd_id}")
 
             for worker in self._worker_handles.values():
                 try:
                     worker.pause_sources.remote()
                 except Exception as e:
                     logger.error(
-                        f"[spmd_id={self.spmd_id}] Failed to pause worker: {e}"
+                        f"Failed to pause worker error={e} spmd_id={self.spmd_id}"
                     )
 
         def resume_sources(self) -> None:
@@ -864,14 +860,14 @@ if RAY_AVAILABLE:
 
             self._is_paused = False
             self._source_state = ReaderState.READING
-            logger.debug(f"[spmd_id={self.spmd_id}] Sources resumed")
+            logger.debug(f"Sources resumed spmd_id={self.spmd_id}")
 
             for worker in self._worker_handles.values():
                 try:
                     worker.resume_sources.remote()
                 except Exception as e:
                     logger.error(
-                        f"[spmd_id={self.spmd_id}] Failed to resume worker: {e}"
+                        f"Failed to resume worker error={e} spmd_id={self.spmd_id}"
                     )
 
         def get_source_state(self) -> Optional[ReaderState]:
@@ -890,7 +886,7 @@ else:
         def __init__(self, spmd_id: str, **kwargs):
             self.spmd_id = spmd_id
             logger.warning(
-                f"[spmd_id={spmd_id}] Created mock SPMDDriver for {spmd_id} (Ray not available)"
+                f"Created mock SPMDDriver Ray not available spmd_id={spmd_id}"
             )
 
         @classmethod

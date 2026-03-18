@@ -11,8 +11,8 @@ Responsibilities:
 
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set, Type, Tuple, TYPE_CHECKING
+from fluxway.common.utils.logging import get_logger
 import threading
-import logging
 import inspect
 
 from fluxway.common.types.configs import ArgumentType
@@ -27,7 +27,7 @@ from fluxway.spmd.worker.operator_manager.dispatcher import (
 if TYPE_CHECKING:
     from fluxway.common.types import SPMDConfig, OperatorMeta
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 # =============================================================================
