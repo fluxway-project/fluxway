@@ -15,8 +15,8 @@ def _make_config(mesh, *op_names):
     for name in op_names:
         meta = OperatorMeta(
             name=name,
-            input_arguments={ArgumentType.TENSOR.value: ["in"]},
-            output_arguments={ArgumentType.TENSOR.value: ["out"]},
+            input_arguments={ArgumentType.DATA.value: ["in"]},
+            output_arguments={ArgumentType.DATA.value: ["out"]},
             input_sharding={"in": {"type": "replicated"}},
             output_sharding={"out": {"type": "replicated"}},
         )

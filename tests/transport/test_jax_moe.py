@@ -39,43 +39,43 @@ def test_large_scale_sparse_moe():
     """Test simulated large-scale sparse MoE using multi-bucket capacity and zero-copy."""
     bk = get_backend()
 
-    # 4 Experts
     num_workers = 4
     mesh = DeviceMesh(("x",), (num_workers,), list(range(num_workers)))
-    spec = ShardingSpec.chunk(mesh, P("x"))
+    spec = ShardingSpec.chunk(P("x")).bind(mesh)
 
     cluster = {i: VirtualRank(i, mesh) for i in range(num_workers)}
 
-    # Large scale tokens (100k)
     import numpy as np
 
     np.random.seed(42)
     total_tokens = 100000
     emb_dim = 64
 
-    # Random token embeddings
     tokens_np = np.random.randn(total_tokens, emb_dim).astype(np.float32)
     tokens = bk.tensor(tokens_np)
 
-    # Random routing to 4 experts (sparse distribution) -> each expert ~ 25k
     routing_np = np.random.randint(0, num_workers, size=total_tokens).astype(np.int32)
     routing = bk.tensor(routing_np)
 
     tt = TransportTensor(tokens, routing_indices=routing)
 
-    # Mock send wrapper
-    def send_wrapper_moe_0(target, tensors, counts, *args, **kwargs):
+    def send_wrapper_moe_0(
+        target,
+        tuuids,
+        tensors,
+        counts,
+        global_shapes=None,
+        meta_state_list=None,
+        compact_params=None,
+    ):
         count = counts[0]
         if count > 0:
             cluster[target].receiver.receive_slices(0, tensors, counts)
         return True
 
     capacity_buckets = [10000, 20000, 30000, 40000]
+    spec_target = ShardingSpec.hash(P("x")).bind(mesh)
 
-    # We set content addressable target to route based on `routing` array
-    spec_target = ShardingSpec.hash(mesh, P("x"))
-
-    # Using DataDistributor with capacity buckets
     _res, _ = cluster[0].distributor.distribute(
         local_data=tt,
         source=spec,
@@ -84,7 +84,6 @@ def test_large_scale_sparse_moe():
         capacity=capacity_buckets,
     )
 
-    # Check experts received their shards
     total_received = 0
     for r in range(num_workers):
         slices = cluster[r].receiver.get_buffered_slices()

@@ -33,7 +33,7 @@ class SparseEmbeddingSPMD:
         self._forward_ids_cache[step] = ids
 
         local_ids = jnp.mod(ids, self.vocab_size)
-        embeddings = self.params[local_ids] * rank * world_size
+        embeddings = self.params[local_ids] * local_ids[:, None]
 
         g_shape = None
         if unique_ids.global_shape and len(unique_ids.global_shape) >= 1:
@@ -47,7 +47,7 @@ class SparseEmbeddingSPMD:
             global_shape=g_shape,
         )
         print(
-            f"[SparseSPMD] lookup rank={rank}, step={step}, unique ids={ids}, output embeddings={output.flat_values}"
+            f"[SparseSPMD] lookup world_size={world_size} rank={rank}, step={step}, unique ids={ids}, output embeddings={output.flat_values}"
         )
         return LookupOutput(sparse_features=output)
 
@@ -55,7 +55,7 @@ class SparseEmbeddingSPMD:
         name="update",
         data_argument=["grads"],
         input_sharding={
-            "grads": {"type": "mirror", "source": "lookup.sparse_features"}
+            "grads": {"type": "mirror", "reference": "lookup.sparse_features"}
         },
     )
     def update(self, grads: TransportTensor) -> None:
@@ -69,12 +69,11 @@ class SparseEmbeddingSPMD:
 
         g_flat = grads.flat_values
         local_ids = jnp.mod(ids, self.vocab_size)
+        print(
+            f"[SparseSPMD] update rank={self.rank} step={step} ids_len={len(ids)} ids={ids} g_flat_shape={g_flat.shape} g_flat={g_flat}"
+        )
 
         self.params = self.params.at[local_ids].add(-0.1 * g_flat)
-
-        print(
-            f"[SparseSPMD] Worker {self.rank} Update Task: Step {step}, updated {len(ids)} IDs. Grad Sum: {jnp.sum(g_flat)}"
-        )
 
 
 def hash_routing(tensor, mesh):

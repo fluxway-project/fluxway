@@ -8,7 +8,6 @@ sys.path.append(os.getcwd())
 
 from fluxway.spmd.worker.worker import SPMDWorker
 from fluxway.common.types.configs import SPMDConfig, OperatorMeta
-from fluxway.common.types.tensor import TransportTensor
 from fluxway.common.mesh import DeviceMesh
 
 
@@ -38,58 +37,52 @@ def worker_config(mock_mesh):
 
 
 @pytest.mark.asyncio
-async def test_worker_self_receive_data(worker_config):
-    """Verify that _self_receive_data correctly calls receive_shards with unpacked payloads."""
+async def test_worker_receive_shards_dispatches_to_mailbox(worker_config):
+    """Verify that receive_shards correctly dispatches to the mailbox via deposit_shards."""
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
     cls = cls.modified_class if cls else SPMDWorker
     worker = cls(worker_config, rank=0, spmd_id="test_spmd")
 
-    # Mock mailbox deposit_shards (self-receive now goes directly to mailbox)
-    worker._mailbox.deposit_shards = AsyncMock()
-    # Mock operator manager for TUUID lookup
-    op2_meta = OperatorMeta(name="op2")
-    worker.config.operator_metas["op2"] = op2_meta
-    worker.config.operators["op2"] = lambda: None
+    from unittest.mock import MagicMock, AsyncMock
 
-    from unittest.mock import MagicMock
+    worker._mailbox.deposit_shards = AsyncMock(return_value=0)
+    worker._op_manager.get_operators_for_tuuid = MagicMock(return_value=["test_op"])
+    worker._op_manager.get_sender_world_size = MagicMock(return_value=1)
+    worker._ensure_step_declared = MagicMock()
 
-    worker._op_manager.get_operators_for_tuuid = MagicMock(return_value=["op2"])
+    test_data = np.array([1.0, 2.0])
+    await worker.receive_shards(
+        tuuids=[42],
+        step=0,
+        sender_id="src_spmd",
+        sender_rank=0,
+        payloads=[test_data],
+        counts=[2],
+    )
 
-    test_tensor = TransportTensor.from_tensor(np.array([1.0, 2.0]))
-
-    await worker._self_receive_data(u=123, step=5, tensor=test_tensor)
-
-    # Verify mailbox deposit
     worker._mailbox.deposit_shards.assert_called_once()
-    args, kwargs = worker._mailbox.deposit_shards.call_args
-    assert args[0] == "op2"
-    assert args[1] == [123]
-    assert args[2] == 5
-    assert args[3] == "test_spmd"
-    assert args[4] == 0  # self.rank
-    assert isinstance(args[5], int)  # sender_world_size
-    assert isinstance(args[6], list)  # payload_groups
-    assert isinstance(args[7], list)  # counts_groups
-    np.testing.assert_array_equal(args[6][0][0], test_tensor.flat_values)
-    assert args[7][0][0] == 2  # count
+    call_args = worker._mailbox.deposit_shards.call_args
+    assert call_args[0][0] == "test_op"
+    assert call_args[0][1] == [42]
+    assert call_args[0][2] == 0
+    assert call_args[0][3] == "src_spmd"
+    assert call_args[0][4] == 0  # sender_rank
 
 
 @pytest.mark.asyncio
-async def test_worker_self_receive_state(worker_config):
-    """Verify that _self_receive_state correctly calls receive_control with wrapped arguments."""
+async def test_worker_receive_control_dispatches_to_mailbox(worker_config):
+    """Verify that receive_control correctly calls deposit_states on the mailbox."""
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
     cls = cls.modified_class if cls else SPMDWorker
     worker = cls(worker_config, rank=0, spmd_id="test_spmd")
 
-    # Mock receive_control
-    worker.receive_control = AsyncMock()
+    worker._mailbox.deposit_states = AsyncMock()
+    worker._ensure_step_declared = lambda *a, **kw: None
 
-    await worker._self_receive_state(op_name="update", name="lr", step=10, data=0.01)
+    await worker.receive_control(op_name="test_op", step=3, names=["lr"], values=[0.01])
 
-    # Verify call signature matches the NEW receive_control signature
-    worker.receive_control.assert_called_once()
-    _, kwargs = worker.receive_control.call_args
-    assert kwargs["op_name"] == "update"
-    assert kwargs["step"] == 10
-    assert kwargs["names"] == ["lr"]
-    assert kwargs["values"] == [0.01]
+    worker._mailbox.deposit_states.assert_called_once()
+    _, kwargs = worker._mailbox.deposit_states.call_args
+    assert kwargs.get("names") == ["lr"] or worker._mailbox.deposit_states.call_args[0][
+        2:4
+    ] == (["lr"], [0.01])

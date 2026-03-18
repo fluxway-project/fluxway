@@ -724,13 +724,7 @@ class WorkerMailbox:
             # Create local receipt for the shard (Zero-Overhead: reconstructed locally)
             from fluxway.common.types.tensor import SymmetryReceipt
 
-            shard_receipt = None
-            if has_origin_indices:
-                num_rows = int(backend.shape(data_payload)[0])
-                # Optimization: For Mirror Sharding, we only need to know the origin rank.
-                # In this shard, all rows conceptually come from the same sender_rank.
-                shard_ranks = backend.full((num_rows,), rank, dtype=backend.int32())
-                shard_receipt = SymmetryReceipt(sender_world_size, shard_ranks)
+            shard_receipt = SymmetryReceipt(sender_world_size, rank)
 
             tensors.append(
                 TransportTensor(

@@ -121,6 +121,8 @@ class OperatorManager:
         self._dispatchers: Dict[str, ExecutionDispatcher] = {}
         # Global dispatch table: {tensor_tuuid: [op_name1, op_name2]}
         self._tuuid_to_op_inputs: Dict[int, List[str]] = {}
+        self._tuuid_to_op_outputs: Dict[int, Tuple[str, str]] = {}
+        self._logical_path_to_tuuid: Dict[Tuple[str, str], int] = {}
 
         for op_name in self._operators:
             self._input_sharding[op_name] = {}
@@ -537,54 +539,170 @@ class OperatorManager:
                             f"Static arguments: {list(self._static_args.keys())}"
                         )
 
-            # Resolve referential links and async strategy
-            def res_fn(path: str, op_name: str = op_name) -> Optional[int]:
-                return self.resolve_path(op_name, path)
+        # Phase 1: Logical Path & TUUID Discovery
+        # Build an exhaustive index of (OpName, FieldName) -> TUUID.
+        for op_name in self._operators:
+            meta = self._get_operator_metadata(op_name)
 
-            meta.resolve_sharding_topology(res_fn)
-            meta.resolve_async_strategy(res_fn)
+            # 1.1 Local Outputs
+            out_uuids = self.get_output_tuuids(op_name)
+            out_names = meta.get_arguments(is_output=True, arg_type=ArgumentType.DATA)
+            if out_names and out_uuids:
+                for name, tuuid in zip(out_names, out_uuids, strict=True):  # type: ignore
+                    self._logical_path_to_tuuid[(op_name, name)] = tuuid
+                    self._tuuid_to_op_outputs[tuuid] = (op_name, name)
 
-            # Build global TUUID -> Op dispatch table
-            for u in self._input_sharding[op_name]:
+            # 1.2 Local Input Dispatch Mapping
+            input_map = self._input_sharding.get(op_name, {})
+            for u in input_map:
                 if u not in self._tuuid_to_op_inputs:
                     self._tuuid_to_op_inputs[u] = []
                 if op_name not in self._tuuid_to_op_inputs[u]:
                     self._tuuid_to_op_inputs[u].append(op_name)
 
-            logger.debug(
-                f"Parsed operator meta for {op_name}: "
-                f"state={self._expected_state_names[op_name]}, "
-                f"tensor={self._expected_tensor_names[op_name]}, "
-                f"predecessors={list(self._predecessor_topology[op_name].keys())}, "
-                f"successors={list(self._successor_topology[op_name].keys())}"
+            # 1.3 Topology Knowledge (Predecessors & Successors)
+            for pre_info in self._predecessor_topology.get(op_name, {}).values():
+                for name, u in pre_info.tuuid_map.items():
+                    self._logical_path_to_tuuid[(pre_info.spmd_id, name)] = u
+                    self._tuuid_to_op_outputs[u] = (pre_info.spmd_id, name)
+
+            for succ_info in self._successor_topology.get(op_name, {}).values():
+                for name, u in succ_info.tuuid_map.items():
+                    self._logical_path_to_tuuid[(succ_info.spmd_id, name)] = u
+
+        # Phase 2: Strategy Truth Registration
+        for op_name in self._operators:
+            self._register_all_algebraic_specs(self._input_sharding.get(op_name, {}))
+            self._register_all_algebraic_specs(self._output_sharding.get(op_name, {}))
+            for pre_info in self._predecessor_topology.get(op_name, {}).values():
+                self._register_all_algebraic_specs(pre_info.tuuid_sharding)
+            for succ_info in self._successor_topology.get(op_name, {}).values():
+                self._register_all_algebraic_specs(succ_info.tuuid_sharding)
+
+        # Phase 3: Path Resolution (Binding)
+        for op_name in self._operators:
+
+            def res_fn(path: str, context_op=op_name) -> Optional[int]:
+                return self.resolve_path(context_op, path)
+
+            self._resolve_referential_uuids_in_map(
+                self._input_sharding.get(op_name, {}), res_fn
             )
+            self._resolve_referential_uuids_in_map(
+                self._output_sharding.get(op_name, {}), res_fn
+            )
+            for pre_info in self._predecessor_topology.get(op_name, {}).values():
+                self._resolve_referential_uuids_in_map(pre_info.tuuid_sharding, res_fn)
+            for succ_info in self._successor_topology.get(op_name, {}).values():
+                self._resolve_referential_uuids_in_map(succ_info.tuuid_sharding, res_fn)
+
+            meta = self._get_operator_metadata(op_name)
+            if meta:
+                meta.resolve_async_strategy(res_fn)
+
+        # Phase 4: Strategy Inheritance
+        for op_name in self._operators:
+            self._resolve_referential_strategies_in_map(
+                self._input_sharding.get(op_name, {})
+            )
+            self._resolve_referential_strategies_in_map(
+                self._output_sharding.get(op_name, {})
+            )
+            for pre_info in self._predecessor_topology.get(op_name, {}).values():
+                self._resolve_referential_strategies_in_map(pre_info.tuuid_sharding)
+            for succ_info in self._successor_topology.get(op_name, {}).values():
+                self._resolve_referential_strategies_in_map(succ_info.tuuid_sharding)
+
+            meta = self._get_operator_metadata(op_name)
+            logger.debug(
+                f"Resolved operator {op_name}: "
+                f"expected_tensors={self.get_expected_tensor_names(op_name)}"
+            )
+
+    def _resolve_referential_uuids_in_map(
+        self,
+        sharding_map: Dict[int, "ShardingSpec"],
+        resolver_fn: Callable[[str], Optional[int]],
+    ) -> None:
+        """Helper to resolve referential paths to TUUIDs in a specific map."""
+        for spec in sharding_map.values():
+            if spec.is_referential:
+                spec.routing.resolve(resolver_fn)
+
+    def _register_all_algebraic_specs(
+        self, sharding_map: Dict[int, "ShardingSpec"]
+    ) -> None:
+        """Helper to populate the global TUUID registry with concrete sharding information."""
+        from fluxway.common.types.sharding import AlgebraicRouting
+
+        for tuuid, spec in sharding_map.items():
+            if isinstance(spec.routing, AlgebraicRouting):
+                self._tuuid_registry[tuuid] = spec
+
+    def _resolve_referential_strategies_in_map(
+        self, sharding_map: Dict[int, "ShardingSpec"]
+    ) -> None:
+        """Helper to resolve referential sharding in a specific map."""
+        from fluxway.common.types.sharding import ShardingSpec
+
+        for _, spec in sharding_map.items():
+            if isinstance(spec, ShardingSpec) and spec.is_referential:
+                mirror_tuuid = spec.routing.tuuid
+                if mirror_tuuid is None:
+                    continue
+
+                # Follow the chain to the ultimate producer truth
+                truth_spec = self._resolve_producer_spec(mirror_tuuid)
+                if truth_spec:
+                    if truth_spec.is_referential:
+                        continue
+
+                    # Inject the ultimate algebraic truth into our referential spec
+                    spec.routing.resolve_sharding(truth_spec.routing)
 
     def resolve_path(self, op_name: str, path: str) -> int:
         """
         Unified resolver for logical paths to TUUIDs.
 
         Logic:
-        1. If path is 'op.field', looks for 'field' in predecessors of 'op'.
-        2. If path is just 'field', looks for 'field' in predecessors of the current 'op_name'.
+        1. If path is 'op.field', looks in Phase 1 index.
+        2. If path is just 'field', looks in context op's input/output map.
         """
+        if (op_name, path) in self._logical_path_to_tuuid:
+            return self._logical_path_to_tuuid[(op_name, path)]
+
         if "." in path:
             target_op, field = path.split(".", 1)
+            if (target_op, field) in self._logical_path_to_tuuid:
+                return self._logical_path_to_tuuid[(target_op, field)]
         else:
             target_op, field = op_name, path
 
+        # Fallback to topology search if index missed
         pre_topo = self.get_predecessor_topology(target_op)
         for pre_info in pre_topo.values():
             if field in pre_info.tuuid_map:
                 return pre_info.tuuid_map[field]
 
+        # 2. Search in successors (find field produced as output by target_op)
+        succ_topo = self.get_successor_topology(target_op)
+        for succ_info in succ_topo.values():
+            if field in succ_info.tuuid_map:
+                return succ_info.tuuid_map[field]
+
         # Aggregate available fields for helpful error message
-        available = set()
-        for p_name, p_info in pre_topo.items():
-            available.update(p_info.tuuid_map.keys())
+        available_pre = set()
+        for p_info in pre_topo.values():
+            available_pre.update(p_info.tuuid_map.keys())
+
+        available_succ = set()
+        for s_info in succ_topo.values():
+            available_succ.update(s_info.tuuid_map.keys())
 
         raise ValueError(
             f"[OperatorManager] Cannot resolve logical path '{path}' to a TUUID. "
-            f"Target operator '{target_op}' predecessors provide: {sorted(available)}"
+            f"Target operator '{target_op}' provides as inputs: {sorted(available_pre)}, "
+            f"produced as outputs: {sorted(available_succ)}"
         )
 
     def register_eager_inputs(
@@ -910,6 +1028,10 @@ class OperatorManager:
         """Get predecessor topology info for an operator."""
         return dict(self._predecessor_topology.get(op_name, {}))
 
+    def get_successor_topology(self, op_name: str) -> Dict[str, ResolvedTopologyInfo]:
+        """Get successor topology info for an operator."""
+        return dict(self._successor_topology.get(op_name, {}))
+
     def get_all_input_pre_sharding(
         self, op_name: str
     ) -> Dict[str, List[EdgeShardingInfo]]:
@@ -997,7 +1119,7 @@ class OperatorManager:
         if meta.output_sharding:
             for key, spec_dict in meta.output_sharding.items():
                 if isinstance(spec_dict, dict):
-                    spec = ShardingConfig.model_validate(spec_dict).to_spec(self._mesh)
+                    spec = ShardingConfig.model_validate(spec_dict).to_spec()
                 else:
                     spec = spec_dict
 

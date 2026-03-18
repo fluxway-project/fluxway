@@ -47,6 +47,59 @@ class BaseDataDistributor:
         self._current_source_spec = None
         self._current_target_spec = None
 
+    def _plan_mirror_group(
+        self,
+        receipt,
+        payloads,
+        has_meta_tensor_state_list,
+        compact_desc_info,
+        global_shapes_list,
+    ):
+        """Internal logic for Mirror Backflow (using physical receipts)."""
+        backend = get_backend()
+        mirror_target_world_size = receipt.world_size
+        sender_rank_tags = backend.as_tensor(receipt.sender_rank_tags)
+
+        stitched_tensors, tensors_size, tensor_offsets = _stitch_with_prime(
+            sender_rank_tags, payloads, mirror_target_world_size
+        )
+
+        counts_np = np.array(tensors_size)
+        offsets_np = np.array(tensor_offsets)
+
+        for i in range(mirror_target_world_size):
+            count = int(counts_np[i])
+            rank_flat_tensors = _get_rank_data_from_tree(
+                i, stitched_tensors, counts_np, offsets_np
+            )
+
+            if count > 0:
+                rank_flat_tensors = [t[:count] for t in rank_flat_tensors]
+            rank_flat_counts = [count] * len(rank_flat_tensors)
+
+            slice_params = []
+            for meta_state, desc_obj in zip(  # type: ignore
+                has_meta_tensor_state_list, compact_desc_info, strict=True
+            ):
+                if meta_state & 4:
+                    # TODO(He Jia): Support Cyclic mapping if needed
+                    offset = int(offsets_np[i])
+                    slice_params.append(
+                        desc_obj.slice(offset, offset + count).to_compact_params()
+                    )
+                else:
+                    slice_params.append(None)
+
+            yield (
+                [i],
+                rank_flat_tensors,
+                rank_flat_counts,
+                None,
+                global_shapes_list,
+                has_meta_tensor_state_list,
+                slice_params,
+            )
+
     def _plan_single_tensor_group(
         self,
         local_data: Union[TransportTensor, List[TransportTensor]],
@@ -62,8 +115,6 @@ class BaseDataDistributor:
         (e.g. follow-sharding or explicitly aligned tensors).
         """
 
-        backend = get_backend()
-
         # Pack all tensors and lengths
         # local_data can be a TransportTensor or List[TransportTensor]
         tensors_to_pack = (
@@ -73,52 +124,99 @@ class BaseDataDistributor:
         # Primary tensor drives routing
         primary = tensors_to_pack[0]
 
-        # Local shape from primary data.
-        if primary.is_ragged:
-            local_shape = (backend.size(primary.flat_values),)
-        else:
-            local_shape = tuple(primary.flat_values.shape)
+        # Logical shape for routing (respecting Ragged/Padded boundaries)
+        local_shape = primary.logical_shape
 
         src_shape = (
             primary.global_shape if primary.global_shape is not None else local_shape
         )
 
-        # Determine if the target layout is routing based on content (e.g. hashing)
-        # or static positions (e.g. batch partitioning).
-        dst_is_content_addressable = getattr(target, "is_content_addressable", False)
-
-        # Routing indices or implicit inference.
-        # These indices describe WHERE the data belongs in the global 1D geometry.
-        src_geometry_indices = primary.origin_indices
-        if src_geometry_indices is None:
-            # If no explicit origin, routing_indices (e.g. MoE Routine) act as the physical identity.
-            src_geometry_indices = primary.routing_indices
-
-        # Signal-driven Routing Detection (Referential Dependency)
+        # Signal-driven Routing Detection (Referential vs Algebraic)
         is_referential = (source and source.is_referential) or (
             target and target.is_referential
         )
-        is_mirror = is_referential  # Current implementation equates referential with mirror/follow intent
+        is_mirror = is_referential
 
-        # Resolve Source Signal (Geometry vs Content vs Reference)
+        # 1. Determine Addressability
+        # Mirror is never content-addressable (it uses physical receipts)
+        if is_referential:
+            dst_is_content_addressable = False
+        else:
+            dst_is_content_addressable = getattr(
+                target, "is_content_addressable", False
+            )
+
+        # 2. Pack Tensors and Metadata (Required for all paths)
+        payloads = []
+        has_meta_tensor_state_list = []
+        nested_length_list = []
+        compact_desc_info: List[Optional[IndexDescriptor]] = []
+
+        for tt in tensors_to_pack:
+            payloads.append(tt.flat_values)
+            meta_tensor_state = 0
+
+            if tt.is_ragged:
+                meta_tensor_state |= 1
+                splits = tt.nested_splits[0]
+                lengths = splits[1:] - splits[:-1]
+                nested_length_list.append(lengths)
+                if is_mirror:
+                    payloads.append(lengths)
+                    nested_length_list.append(None)
+            else:
+                nested_length_list.append(None)
+
+            if tt.origin_indices is not None:
+                if isinstance(tt.origin_indices, ContinuousIndex):
+                    meta_tensor_state |= 4
+                    compact_desc_info.append(tt.origin_indices)
+                else:
+                    meta_tensor_state |= 2
+                    idx = (
+                        tt.origin_indices.materialize()
+                        if hasattr(tt.origin_indices, "materialize")
+                        else tt.origin_indices
+                    )
+                    payloads.append(idx)
+                    nested_length_list.append(None)
+                    compact_desc_info.append(None)
+            else:
+                compact_desc_info.append(None)
+
+            has_meta_tensor_state_list.append(meta_tensor_state)
+
+        # 3. Explicit Mirror Early-Exit
         if is_referential and primary.receipt is not None:
-            # Mirror/Reflective: Signal is the historical receipt
-            src_geometry_indices = None
-            dst_content_routing_values = None
-        elif src_geometry_indices is not None:
+            global_shapes_list = [tt.global_shape for tt in tensors_to_pack]
+            yield from self._plan_mirror_group(
+                primary.receipt,
+                payloads=payloads,
+                has_meta_tensor_state_list=has_meta_tensor_state_list,
+                compact_desc_info=compact_desc_info,
+                global_shapes_list=global_shapes_list,
+            )
+            return
+
+        # >>> ALGEBRAIC PATH (Forward/Standard) <<<
+        # 1. Extract Initial Routing Signal from Primary Tensor
+        src_geometry_indices = primary.origin_indices
+        if src_geometry_indices is None:
+            src_geometry_indices = primary.routing_indices
+
+        # 2. Resolve Final Source Signal
+        if src_geometry_indices is not None:
+            # Case A: Explicitly provided indices (e.g. from a previous OP)
             if hasattr(src_geometry_indices, "materialize"):
                 src_geometry_indices = src_geometry_indices.materialize()
+            dst_content_routing_values = None
         elif source and source.is_content_addressable:
-            src_geometry_indices = (
-                primary.routing_indices
-                if primary.routing_indices is not None
-                else primary.flat_values
-            )
+            # Case B: Content-addressable (Dynamic) routing
+            src_geometry_indices = primary.flat_values
+            dst_content_routing_values = None
         elif source:
-            # Algebraic Static: Signal is rank-based geometry
-            source_routing_dim = (
-                source.routing_dim if source.routing_dim is not None else 0
-            )
+            # Case C: Rank-based (Static) routing
+            source_routing_dim = source.routing_dim
             if isinstance(source_routing_dim, tuple):
                 source_routing_dim = source_routing_dim[0]
 
@@ -130,12 +228,12 @@ class BaseDataDistributor:
             effective_rank = source.get_shard_rank(self.local_rank, source_routing_dim)
             start = effective_rank * dim_size
             src_geometry_indices = np.arange(start, start + dim_size, dtype=np.int32)
+            dst_content_routing_values = None
         else:
             raise ValueError(
-                f"[Distributor] Invalid type for src_geometry_indices: {type(src_geometry_indices)}. "
-                f"Source: {source.strategy.name}. "
-                f"TUUIDs: {self._format_tuuids(tuuid, tuuid_to_name)}. "
-                "For content-addressable sharding, please ensure target routing indices are provided."
+                f"[Fluxway Distributor Error] No sharding source available for TUUID(s): {self._format_tuuids(tuuid, tuuid_to_name)}.\n"
+                f"  Problem: The algebraic path requires either a valid 'source' layout or explicit 'routing_indices'.\n"
+                f"  Fix: Ensure the TransportTensor is initialized with a source PhysicalLayout."
             )
 
         # Resolve Destination Signal (Content-based Hash)
@@ -156,7 +254,6 @@ class BaseDataDistributor:
             primary.global_shape if primary.global_shape is not None else src_shape
         )
 
-        # Static routing (e.g., batch-partitioned) requires global_shape to calculate shard boundaries.
         if (
             not is_referential
             and target
@@ -172,17 +269,10 @@ class BaseDataDistributor:
             if dst_shape is None or (is_fallback_shape and src_mesh_size > 1):
                 raise ValueError(
                     f"[Distributor] Static-to-Static routing requires a valid 'global_shape' to determine shard boundaries. "
-                    f"Current data has local_shape={local_shape} but global_shape is missing (falling back to local). "
                     f"TUUID: {self._format_tuuids(tuuid, tuuid_to_name)}. "
-                    f"Source SPMD partition is {source.partitions}. "
-                    f"Destination SPMD partition is {target.partitions}. "
-                    f"In a multi-worker setup (src_mesh_size={src_mesh_size}), this would cause incorrect routing. "
                     f"Please ensure the source TransportTensor has 'global_shape' set explicitly."
                 )
 
-        # For Static-to-Static routing every partitioned dimension must be large enough
-        # to cover all workers in that sub-mesh. If data < workers, some workers will always
-        # starve silently — treat this as a hard configuration error.
         if (
             not is_referential
             and target
@@ -240,63 +330,23 @@ class BaseDataDistributor:
 
         global_shapes_list = [tt.global_shape for tt in tensors_to_pack]
 
-        # Pre-calculate flags for the bundle
-        payloads = []
-        has_meta_tensor_state_list = []
-        nested_length_list = []
-        # (to avoid JIT/Tensor overhead)
-        compact_desc_info: List[
-            Optional[IndexDescriptor]
-        ] = []  # List of descriptor_obj
-
-        # Interleaved Packing: All payloads (data, lengths, multiple indices)
-        # for a single TransportTensor are grouped together. This matches the
-        # unpacking logic in WorkerMailbox and SPMDWorker._send_fn.
-        for tt in tensors_to_pack:
-            # 1. Primary Data
-            payloads.append(tt.flat_values)
-            meta_tensor_state = 0
-
-            if tt.is_ragged:
-                meta_tensor_state |= 1  # is ragged
-                splits = tt.nested_splits[0]
-                lengths = splits[1:] - splits[:-1]
-                nested_length_list.append(lengths)
-                if is_mirror:
-                    payloads.append(lengths)
-                    nested_length_list.append(None)
-            else:
-                nested_length_list.append(None)
-
-            # 2. Origin Indices (bit 2) Compact Origin Indices (bit 4)
-            if tt.origin_indices is not None:
-                if isinstance(tt.origin_indices, ContinuousIndex):
-                    meta_tensor_state |= 4
-                    compact_desc_info.append(tt.origin_indices)
-                else:
-                    meta_tensor_state |= 2
-                    idx = (
-                        tt.origin_indices.materialize()
-                        if hasattr(tt.origin_indices, "materialize")
-                        else tt.origin_indices
-                    )
-                    payloads.append(idx)
-                    nested_length_list.append(None)
-                    compact_desc_info.append(None)
-            else:
-                compact_desc_info.append(None)
-
-            has_meta_tensor_state_list.append(meta_tensor_state)
-
         if primary.shape == ():
-            if target and self.local_rank != 0:
+            target_world_size = target.mesh.size if target and target.mesh else 1
+            src_world_size = source.mesh.size if source and source.mesh else 1
+
+            # Replicated dispatch: i = floor(j * M / N)
+            # Each target j expects exactly one copy from a specific source i.
+            targets_to_send = []
+            for j in range(target_world_size):
+                responsible_src = (j * src_world_size) // target_world_size
+                if responsible_src == self.local_rank:
+                    targets_to_send.append(j)
+
+            if not targets_to_send:
                 return
 
-            target_world_size = target.mesh.size if target and target.mesh else 1
-            all_target_ranks = list(range(target_world_size))
-
             yield (
-                all_target_ranks,
+                targets_to_send,
                 payloads,
                 [1] * len(payloads),
                 None,
@@ -307,48 +357,13 @@ class BaseDataDistributor:
             return
 
         if is_mirror and primary.receipt is not None:
-            mirror_target_world_size = primary.receipt.world_size
-            sender_rank_tags = backend.as_tensor(primary.receipt.sender_rank_tags)
-            stitched_tensors, tensors_size, tensor_offsets = _stitch_with_prime(
-                sender_rank_tags, payloads, mirror_target_world_size
+            yield from self._plan_mirror_group(
+                primary.receipt,
+                payloads,
+                has_meta_tensor_state_list,
+                compact_desc_info,
+                global_shapes_list,
             )
-
-            # counts returned from _stitch_with_prime is a single 1D tensor (world_size,)
-            # because it's calculated from prime_rank_tags (N,)
-            counts_np = np.array(tensors_size)
-
-            for i in range(mirror_target_world_size):
-                rank_flat_tensors = _get_rank_data_from_tree(
-                    i, stitched_tensors, counts_np, tensor_offsets
-                )
-                # Flat counts: all elements in the flat list share the same row count for this destination
-                rank_flat_counts = [int(counts_np[i])] * len(rank_flat_tensors)
-
-                slice_compact_desc_params: List[Optional[List[int]]] = []
-                for meta_tensor_state, desc_obj in zip(  # type: ignore
-                    has_meta_tensor_state_list,
-                    compact_desc_info,
-                    strict=True,  # type: ignore
-                ):  # type: ignore
-                    if meta_tensor_state & 4:
-                        # TODO(He Jia): Support Cyclic
-                        offset = int(np.array(tensor_offsets)[i])
-                        count = int(counts_np[i])
-                        slice_compact_desc_params.append(
-                            desc_obj.slice(offset, offset + count).to_compact_params()
-                        )
-                    else:
-                        slice_compact_desc_params.append(None)
-
-                yield (
-                    [i],
-                    rank_flat_tensors,
-                    rank_flat_counts,
-                    None,
-                    global_shapes_list,
-                    has_meta_tensor_state_list,
-                    slice_compact_desc_params,
-                )
             return
 
         payloads_tuple = tuple(payloads)
@@ -422,14 +437,21 @@ class BaseDataDistributor:
             p_idx = 0
             c_idx = 0
             for meta_state in has_meta_tensor_state_list:
-                # Data
+                # [Optimization Node]
+                # TODO(He Jia): Currently performing host-side eager slicing to strip JIT-induced
+                # padding (item_cap). This ensures receiver shape fidelity without triggering
+                # JAX dimension re-tracing. Future optimization should leverage low-level
+                # pointer slicing (e.g. via NCCL/C++ kernels) to avoid this eager JAX Python overhead.
+
                 p_data, p_len = padded_buffers_lists[p_idx]
-                p_flat.append(p_data[device_id])
-                c_flat.append(int(counts_per_payload[c_idx][device_id]))
+                count = int(counts_per_payload[c_idx][device_id])
+                p_flat.append(p_data[device_id][:count])
+                c_flat.append(count)
 
                 if p_len is not None:
-                    p_flat.append(p_len[device_id])
-                    c_flat.append(int(counts_per_payload[c_idx + 1][device_id]))
+                    count_len = int(counts_per_payload[c_idx + 1][device_id])
+                    p_flat.append(p_len[device_id][:count_len])
+                    c_flat.append(count_len)
                     c_idx += 1
 
                 p_idx += 1
@@ -437,8 +459,9 @@ class BaseDataDistributor:
 
                 if meta_state & 2:
                     p_data, _ = padded_buffers_lists[p_idx]
-                    p_flat.append(p_data[device_id])
-                    c_flat.append(int(counts_per_payload[c_idx][device_id]))
+                    count = int(counts_per_payload[c_idx][device_id])
+                    p_flat.append(p_data[device_id][:count])
+                    c_flat.append(count)
                     p_idx += 1
                     c_idx += 1
             return p_flat, c_flat
@@ -495,6 +518,7 @@ class BaseDataDistributor:
         tuuid_to_name: Optional[Dict[int, str]] = None,
     ) -> None:
         """Computes sharding plan and buffers data for all destinations."""
+
         # PLAN ISOLATION:
         # We MUST NOT reuse plans across separate calls to plan_and_shard.
         # Each call represents a distinct group of tensors that might have
@@ -930,22 +954,45 @@ class TransportReceiver:
 @compile(static_argnums=(2,))
 def _stitch_with_prime(prime_rank_tags, slave_tensors, world_size):
     """
-    prime_rank_tags: (N,) origin rang tags decide where to go
+    prime_rank_tags: (N,) or scalar - origin rang tags decide where to go
     slave_tensors: pytree (list/dict), with (N, ...extra_dims) tensors
     world_size: scalar
     """
     backend = get_backend()
 
+    # Fast path: If prime_rank_tags is a scalar, everyone goes to one destination
+    if (
+        isinstance(prime_rank_tags, (int, np.integer))
+        or len(backend.shape(prime_rank_tags)) == 0
+    ):
+        target_rank = int(prime_rank_tags)
+        counts = backend.zeros((world_size,), dtype=backend.int32())
+
+        if target_rank >= 0 and target_rank < world_size:
+            first_tensor = backend.tree_flatten(slave_tensors)[0][0]
+            rows = backend.shape(first_tensor)[0]
+            counts = backend.index_update(counts, (target_rank,), rows)
+
+        offsets = backend.zeros((world_size,), dtype=backend.int32())
+        return slave_tensors, counts, offsets
+
+    # Sentinel Protocol:
+    # Valid tags: 0 <= tag < world_size
+    # Invalid tags (Padding): tag == world_size
+    # We use minlength=world_size + 1 to naturally collect garbage in the last bin.
+
     sort_idx = backend.argsort(prime_rank_tags)
 
-    counts = backend.bincount(prime_rank_tags, minlength=world_size)
-    offsets = backend.cumsum(counts) - counts
+    counts_with_garbage = backend.bincount(prime_rank_tags, minlength=world_size + 1)
+    counts = counts_with_garbage[:world_size]
+
+    offsets_with_garbage = backend.cumsum(counts_with_garbage) - counts_with_garbage
+    offsets = offsets_with_garbage[:world_size]
 
     def reorder_fn(x):
         return x[sort_idx]
 
     stitched_tensors = backend.tree_map(reorder_fn, slave_tensors)
-
     return stitched_tensors, counts, offsets
 
 

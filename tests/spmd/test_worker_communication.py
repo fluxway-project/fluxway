@@ -26,7 +26,7 @@ class TestWorkerCommunicationLogic(unittest.IsolatedAsyncioTestCase):
             if tensor.routing_indices_materialized is not None:
                 group.append(tensor.routing_indices_materialized)
             if tensor.origin_indices is not None:
-                group.append(tensor.origin_indices)
+                group.append(tensor.origin_indices_materialized)
 
             # meta_state: bit0=ragged, bit1=origin, bit2=routing
             meta_state = 0
@@ -176,23 +176,19 @@ class TestWorkerCommunicationLogic(unittest.IsolatedAsyncioTestCase):
         # In Late Aggregation, we get results from the internal _dest_agg
         # Each entry in _dest_agg[rank] is a 4-tuple: (tensors, counts, shapes, meta)
         (
+            _tuuids,
             payload_tensors,
             payload_counts,
             global_shapes_list,
             meta_tensor_state_list,
+            _compact_params,
         ) = distributor._dest_agg[42][0]
 
         # Verification
         self.assertEqual(len(payload_tensors), 1)
-        # In current BaseDataDistributor._plan_and_shard mirror path:
-        # It calls _stitch_with_prime and then _get_rank_data_from_tree
-        # payload_tensors should be [data]
-        self.assertEqual(len(payload_tensors), 1)
         np.testing.assert_allclose(payload_tensors[0], data)
         self.assertEqual(payload_counts, [3])
-        self.assertEqual(
-            meta_tensor_state_list, [0]
-        )  # Mirror Path currently doesn't propagate indices?
+        self.assertEqual(meta_tensor_state_list, [0])
 
 
 if __name__ == "__main__":

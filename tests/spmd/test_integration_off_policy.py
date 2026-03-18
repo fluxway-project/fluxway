@@ -4,124 +4,72 @@ import pytest
 from fluxway.spmd.worker.mailbox.mailbox import WorkerMailbox
 from fluxway.common.types.configs import TolerantBarrierConfig
 
+TUUID_EMB = 2001
+TUUID_BATCH = 2002
+
 
 @pytest.mark.asyncio
 async def test_off_policy_staleness_integration():
-    """Simulate off-policy training where one SPMD (e.g. sparse_embedding) provides stale data."""
+    """Simulate off-policy training where sparse_embedding can be up to 2 steps stale."""
     mb = WorkerMailbox()
 
-    # Configuration:
-    # Sparse embedding can be up to 2 steps stale.
-    # Batch data is the anchor tensor (staleness 0, drives the step).
     config = TolerantBarrierConfig(
-        staleness={"sparse_embedding": 2, "batch_data": 0},
-        anchor_tensor="batch_data",
-        retrieval_policy="latest",
+        tensor_staleness={TUUID_EMB: 2, TUUID_BATCH: 0}, retrieval_policy="latest"
     )
 
-    # 1. Step 1 arrives normally
-    mb.declare_step(
-        "compute",
-        step=1,
-        expected_tensors={"sparse_embedding": 1, "batch_data": 1},
-        expected_states=[],
-        barrier_config=config,
-    )
-    await mb.deposit_shards(
-        "compute", ["sparse_embedding"], 1, "A", 0, [[np.array([0.1])]], [[1]]
-    )
-    await mb.deposit_shards(
-        "compute", ["batch_data"], 1, "A", 0, [[np.array([10])]], [[1]]
-    )
+    def declare(step):
+        mb.declare_step(
+            "compute",
+            step=step,
+            expected_tensors={TUUID_EMB: 1, TUUID_BATCH: 1},
+            expected_states=[],
+            barrier_config=config,
+        )
+
+    async def deposit(tuuid, step, val):
+        await mb.deposit_shards(
+            "compute", [tuuid], step, "A", 0, 1, [np.array([val])], [1]
+        )
+
+    # Step 1: both arrive
+    declare(1)
+    await deposit(TUUID_EMB, 1, 0.1)
+    await deposit(TUUID_BATCH, 1, 10.0)
     assert mb.is_step_ready("compute", 1), "Step 1 should be ready"
 
-    # 2. Step 2 arrives normally
-    mb.declare_step(
-        "compute",
-        step=2,
-        expected_tensors={"sparse_embedding": 1, "batch_data": 1},
-        expected_states=[],
-        barrier_config=config,
-    )
-    await mb.deposit_shards(
-        "compute", ["sparse_embedding"], 2, "A", 0, [[np.array([0.2])]], [[1]]
-    )
-    await mb.deposit_shards(
-        "compute", ["batch_data"], 2, "A", 0, [[np.array([20])]], [[1]]
-    )
+    # Step 2: both arrive
+    declare(2)
+    await deposit(TUUID_EMB, 2, 0.2)
+    await deposit(TUUID_BATCH, 2, 20.0)
     assert mb.is_step_ready("compute", 2), "Step 2 should be ready"
 
-    # 3. Simulate step 3, where sparse embedding is delayed.
-    mb.declare_step(
-        "compute",
-        step=3,
-        expected_tensors={"sparse_embedding": 1, "batch_data": 1},
-        expected_states=[],
-        barrier_config=config,
-    )
+    # Step 3: sparse_embedding delayed, uses step 2 (1 step stale <=2)
+    declare(3)
+    await deposit(TUUID_BATCH, 3, 30.0)
+    assert mb.is_step_ready("compute", 3), "Step 3 should be ready via stale fallback"
 
-    # We only deposit batch data for step 3
-    await mb.deposit_shards(
-        "compute", ["batch_data"], 3, "A", 0, [[np.array([30])]], [[1]]
-    )
+    shards_emb = await mb.get_tensor_shards("compute", TUUID_EMB, 3)
+    flat = [s for sl in shards_emb.values() for s in sl]
+    np.testing.assert_array_equal(flat[0].flat_values, [0.2])
 
-    # Step 3 should spring ready instantly! Because sparse_embedding from step 2 is 1 step stale, <= 2.
-    assert mb.is_step_ready("compute", 3), (
-        "Step 3 should be ready via stale data fallback"
-    )
+    shards_batch = await mb.get_tensor_shards("compute", TUUID_BATCH, 3)
+    flat_b = [s for sl in shards_batch.values() for s in sl]
+    np.testing.assert_array_equal(flat_b[0].flat_values, [30.0])
 
-    # Verify retrieved data for step 3
-    shards_emb_dict = await mb.get_tensor_shards("compute", "sparse_embedding", 3)
-    # Convert dict of (sender_id, rank) -> List[shards] to a flat list of shards
-    shards_emb = [s for shards in shards_emb_dict.values() for s in shards]
-    np.testing.assert_array_equal(shards_emb[0].flat_values, [0.2])
+    # Step 4: sparse_embedding delayed again, uses step 2 (2 steps stale <=2)
+    declare(4)
+    await deposit(TUUID_BATCH, 4, 40.0)
+    assert mb.is_step_ready("compute", 4), "Step 4 should be ready via stale fallback"
 
-    shards_batch_dict = await mb.get_tensor_shards("compute", "batch_data", 3)
-    shards_batch = [s for shards in shards_batch_dict.values() for s in shards]
-    np.testing.assert_array_equal(shards_batch[0].flat_values, [30.0])
+    shards_emb_4 = await mb.get_tensor_shards("compute", TUUID_EMB, 4)
+    flat4 = [s for sl in shards_emb_4.values() for s in sl]
+    np.testing.assert_array_equal(flat4[0].flat_values, [0.2])
 
-    # 4. Simulate step 4, where sparse embedding is delayed again.
-    mb.declare_step(
-        "compute",
-        step=4,
-        expected_tensors={"sparse_embedding": 1, "batch_data": 1},
-        expected_states=[],
-        barrier_config=config,
-    )
-    await mb.deposit_shards(
-        "compute", ["batch_data"], 4, "A", 0, [[np.array([40])]], [[1]]
-    )
+    # Step 5: step 2 is 3 steps stale >2 → NOT ready
+    declare(5)
+    await deposit(TUUID_BATCH, 5, 50.0)
+    assert not mb.is_step_ready("compute", 5), "Step 5 should NOT be ready (too stale)"
 
-    # Step 4 should also spring ready! Because sparse_embedding from step 2 is 2 steps stale, <= 2.
-    assert mb.is_step_ready("compute", 4), (
-        "Step 4 should be ready via stale data fallback"
-    )
-
-    shards_emb_4_dict = await mb.get_tensor_shards("compute", "sparse_embedding", 4)
-    shards_emb_4 = [s for shards in shards_emb_4_dict.values() for s in shards]
-    np.testing.assert_array_equal(shards_emb_4[0].flat_values, [0.2])
-
-    # 5. Simulate step 5, where sparse embedding is delayed YET again.
-    mb.declare_step(
-        "compute",
-        step=5,
-        expected_tensors={"sparse_embedding": 1, "batch_data": 1},
-        expected_states=[],
-        barrier_config=config,
-    )
-    await mb.deposit_shards(
-        "compute", ["batch_data"], 5, "A", 0, [[np.array([50])]], [[1]]
-    )
-
-    # Step 5 should NOT be ready! Because sparse_embedding from step 2 is 3 steps stale, which > 2.
-    assert not mb.is_step_ready("compute", 5), (
-        "Step 5 should NOT be ready because data is too stale"
-    )
-
-    # Once we deposit step 3's embedding, it becomes ready
-    await mb.deposit_shards(
-        "compute", ["sparse_embedding"], 3, "A", 0, [[np.array([0.3])]], [[1]]
-    )
-    assert mb.is_step_ready("compute", 5), (
-        "Step 5 should be ready after depositing new embedding data"
-    )
+    # Deposit step 3 embedding → step 5 becomes ready (3 steps stale <=2 from step 3)
+    await deposit(TUUID_EMB, 3, 0.3)
+    assert mb.is_step_ready("compute", 5), "Step 5 should be ready after new deposit"

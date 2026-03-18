@@ -67,11 +67,11 @@ class ControllerStateMachine:
             ControllerState.RUNNING,
             ControllerEvent.ALL_DRIVERS_COMPLETED,
         ): ControllerState.COMPLETED,
-        # If task run super fast, RUNNING may not be reached, and ALL_DRIVERS_COMPLETED may be received.
-        (
-            ControllerState.PENDING,
-            ControllerEvent.ALL_DRIVERS_COMPLETED,
-        ): ControllerState.COMPLETED,
+        # # If task run super fast, RUNNING may not be reached, and ALL_DRIVERS_COMPLETED may be received.
+        # (
+        #     ControllerState.PENDING,
+        #     ControllerEvent.ALL_DRIVERS_COMPLETED,
+        # ): ControllerState.COMPLETED,
         (
             ControllerState.TOPOLOGY_REGISTERING,
             ControllerEvent.ALL_DRIVERS_COMPLETED,

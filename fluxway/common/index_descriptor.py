@@ -101,6 +101,11 @@ class IndexDescriptor:
     def __rmod__(self, other):
         return other % self.materialize()
 
+    def __eq__(self, other):
+        if isinstance(other, IndexDescriptor):
+            return bool(get_backend().equal(self.materialize(), other.materialize()))
+        return bool(get_backend().equal(self.materialize(), other))
+
 
 class IndexPattern(enum.Enum):
     CONTIGUOUS = enum.auto()
@@ -212,6 +217,21 @@ class ContinuousIndex(IndexDescriptor):
             IndexPattern.STRIDED, start=start, step=step, count=count
         )
 
+    def __eq__(self, other):
+        if isinstance(other, ContinuousIndex):
+            return (
+                self.pattern == other.pattern
+                and self.start == other.start
+                and self.step == other.step
+                and self.count == other.count
+            )
+        if isinstance(other, IndexDescriptor):
+            return bool(get_backend().equal(self.materialize(), other.materialize()))
+        return bool(get_backend().equal(self.materialize(), other))
+
+    def __hash__(self):
+        return hash((self.pattern, self.start, self.step, self.count))
+
     @staticmethod
     def from_slice(s: python_slice, size: int) -> "ContinuousIndex":
         start = s.start if s.start is not None else 0
@@ -279,6 +299,17 @@ class ExplicitIndex(IndexDescriptor):
         idx_range = backend.arange(start, end, dtype=backend.int32())
         sliced_indices = backend.take(self.indices, idx_range)
         return ExplicitIndex(sliced_indices)
+
+    def __eq__(self, other):
+        bk = get_backend()
+        if isinstance(other, ExplicitIndex):
+            return bool(bk.equal(self.indices, other.indices))
+        if isinstance(other, IndexDescriptor):
+            return bool(bk.equal(self.indices, other.materialize()))
+        return bool(bk.equal(self.indices, other))
+
+    def __hash__(self):
+        return id(self)
 
 
 @dataclass(frozen=True)

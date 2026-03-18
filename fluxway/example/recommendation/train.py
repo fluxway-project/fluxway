@@ -33,8 +33,8 @@ async def run_training(args):
     # 1. Define Nodes with distinct worker counts
     # TrainingReader: 5 workers
     reader_mesh = DeviceMesh(device_shape=(5,), axis_names=("worker",))
-    # InputProcessor: 2 workers
-    input_mesh = DeviceMesh(device_shape=(2,), axis_names=("dp",))
+    # InputProcessor: 6 workers (Same as DenseLayers, beacause unique will corrupte the sharding)
+    input_mesh = DeviceMesh(device_shape=(6,), axis_names=("dp",))
     # Table1: 3 workers
     table1_mesh = DeviceMesh(device_shape=(3,), axis_names=("shard",))
     # Table2: 4 workers

@@ -25,7 +25,7 @@ class SymmetryReceipt:
         """
         Args:
             world_size: Total number of ranks in the source mesh.
-            sender_rank_tags: Tensor containing target worker ranks (same shape as flat_values).
+            sender_rank_tags: Tensor or int containing target worker ranks.
         """
         self._world_size = world_size
         self._sender_rank_tags = sender_rank_tags
@@ -38,30 +38,59 @@ class SymmetryReceipt:
     def sender_rank_tags(self) -> Any:
         return self._sender_rank_tags
 
+    def is_scalar(self) -> bool:
+        return isinstance(self._sender_rank_tags, (int, np.integer))
+
     def __getitem__(self, key: Any) -> "SymmetryReceipt":
         """Slice or gather symmetry metadata."""
-        # Simple slicing/indexing on backend arrays
+        if self.is_scalar():
+            return self
         return SymmetryReceipt(self._world_size, self._sender_rank_tags[key])
+
+    def materialize(self, length: int) -> Any:
+        """Returns a full-sized tensor of rank tags."""
+        if self.is_scalar():
+            backend = get_backend()
+            return backend.full(
+                (length,), int(self._sender_rank_tags), dtype=backend.int32()
+            )
+        return self._sender_rank_tags
 
     @classmethod
     def concatenate(
-        cls, receipts: List[Optional["SymmetryReceipt"]]
+        cls, receipts: List[Optional["SymmetryReceipt"]], lengths: List[int]
     ) -> Optional["SymmetryReceipt"]:
         """Concatenate multiple receipts into one."""
-        if not receipts or all(r is None for r in receipts):
+        if not receipts:
             return None
 
-        if any(r is None for r in receipts):
+        # Filter out None values and check for consistency
+        valid_receipts = [r for r in receipts if r is not None]
+        if not valid_receipts:
+            return None
+
+        if len(valid_receipts) != len(receipts):
             raise ValueError(
-                "Inconsistent provenance: Some shards have receipts while others don't."
+                f"Inconsistent provenance: Expected {len(receipts)} receipts, "
+                f"but found {len(valid_receipts)}. All shards must carry receipts."
             )
 
-        world_size = receipts[0].world_size
-        assert all(r.world_size == world_size for r in receipts)
+        world_size = valid_receipts[0].world_size
 
-        valid_receipts: List["SymmetryReceipt"] = receipts  # type: ignore
-        ranks = np.concatenate([r.sender_rank_tags for r in valid_receipts], axis=0)
-        return cls(world_size, ranks)
+        if all(receipt.is_scalar() for receipt in valid_receipts):
+            first_rank = valid_receipts[0].sender_rank_tags
+            if all(
+                receipt.sender_rank_tags == first_rank for receipt in valid_receipts
+            ):
+                return cls(world_size, first_rank)
+
+        backend = get_backend()
+        tags = []
+        for receipt, length in zip(valid_receipts, lengths, strict=True):  # type: ignore
+            tags.append(receipt.materialize(length))
+
+        merged_tags = backend.cat(tags, dim=0)
+        return cls(world_size, merged_tags)
 
 
 class Scalar:
@@ -160,6 +189,7 @@ class TransportTensor:
         global_shape: Optional[Tuple[int, ...]] = None,
         origin_indices: Optional[Any] = None,
         routing_indices: Optional[Any] = None,
+        receipt: Optional[SymmetryReceipt] = None,
     ) -> "TransportTensor":
         """Creates a dense TransportTensor directly from a multi-dimensional tensor.
 
@@ -170,6 +200,7 @@ class TransportTensor:
             routing_indices: Global indices mapping. Can be a materialized tensor, an explicit
                      ContinuousIndex, or a python `slice` object for O(1) regular patterns.
             global_shape: Optional global shape of the full tensor.
+            receipt: Optional symmetry receipt for provenance tracking.
         """
         if global_shape and origin_indices is None:
             from functools import reduce
@@ -184,6 +215,7 @@ class TransportTensor:
             origin_indices=origin_indices,
             routing_indices=routing_indices,
             global_shape=global_shape,
+            receipt=receipt,
         )
 
     @classmethod
@@ -194,6 +226,7 @@ class TransportTensor:
         global_shape: Optional[Tuple[int, ...]] = None,
         origin_indices: Optional[Any] = None,
         routing_indices: Optional[Any] = None,
+        receipt: Optional[SymmetryReceipt] = None,
     ) -> "TransportTensor":
         """Creates a TransportTensor from a nested list.
 
@@ -236,6 +269,8 @@ class TransportTensor:
                 [],
                 global_shape=global_shape,
                 origin_indices=origin_indices,
+                routing_indices=routing_indices,
+                receipt=receipt,
             )
 
         # Ragged tensor: use iterative flattening
@@ -286,6 +321,7 @@ class TransportTensor:
             global_shape=global_shape,
             origin_indices=origin_indices,
             routing_indices=routing_indices,
+            receipt=receipt,
         )
 
     def to_lists(self) -> List[Any]:
@@ -395,9 +431,28 @@ class TransportTensor:
 
     @property
     def shape(self) -> Tuple[int, ...]:
-        """Local shape of the data shard."""
+        """Local shape of the data shard (physical tensor shape with padding)."""
         backend = get_backend()
         return backend.shape(self._flat_values)
+
+    @property
+    def logical_count(self) -> int:
+        """Returns the number of logical elements in the primary dimension."""
+        backend = get_backend()
+        if self._nested_splits and len(self._nested_splits) > 0:
+            top_split = self._nested_splits[0]
+            if backend.shape(top_split)[0] > 0:
+                return int(backend.item(top_split[-1]))
+        return int(backend.shape(self._flat_values)[0])
+
+    @property
+    def logical_shape(self) -> Tuple[int, ...]:
+        """Returns the logical shape, honoring ragged boundaries."""
+        backend = get_backend()
+        p_shape = backend.shape(self._flat_values)
+        if self._nested_splits and len(self._nested_splits) > 0:
+            return (self.logical_count,) + p_shape[1:]
+        return p_shape
 
     @property
     def dtype(self) -> Any:
@@ -413,6 +468,10 @@ class TransportTensor:
     @property
     def receipt(self) -> Optional[SymmetryReceipt]:
         return self._receipt
+
+    @receipt.setter
+    def receipt(self, value: Optional[SymmetryReceipt]):
+        self._receipt = value
 
     @property
     def meta_state(self) -> int:
@@ -534,7 +593,7 @@ class TransportTensor:
             flat_values=uniques,
             routing_indices=uniques,
             origin_indices=origin_indices,
-            global_shape=None,
+            global_shape=self.global_shape,
         )
 
         return compacted, inverse_tt
@@ -919,7 +978,7 @@ class TransportTensor:
 
         # Propagate routing_indices through gather
         new_routing_indices = None
-        src_indices = self.routing_indices  # Materializes descriptor if needed
+        src_indices = self.routing_indices_materialized
         if src_indices is not None:
             gathered_indices = backend.take(src_indices, idx_flat)
             new_routing_indices = ExplicitIndex(gathered_indices)

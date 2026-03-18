@@ -132,7 +132,9 @@ class _AssemblyMixin:
             return None
         receipts = [s.receipt for s in shards]
         if all(r is not None for r in receipts):
-            return SymmetryReceipt.concatenate(receipts)
+            backend = get_backend()
+            lengths = [int(backend.shape(s.flat_values)[0]) for s in shards]
+            return SymmetryReceipt.concatenate(receipts, lengths)
         return None
 
     def _heal_empty_shape(self, input_spec, reference_values=None):
@@ -185,6 +187,14 @@ class _AssemblyMixin:
 
         max_idx = int(backend.item(backend.max(all_indices)))
         inferred_dim_size = max_idx + 1
+
+        # Prefer the global_shape carried by the received shards when available.
+        # Receivers only see a subset of indices, so local max_idx < global dim.
+        shard_global_shape = next(
+            (s.global_shape for s in valid_shards if s.global_shape is not None), None
+        )
+        if shard_global_shape and len(shard_global_shape) > routing_dim:
+            inferred_dim_size = shard_global_shape[routing_dim]
 
         val_shape = list(backend.shape(all_values))
         global_shape_list = val_shape[:]
@@ -736,10 +746,11 @@ class TestEmbeddingToDenseFullCommunication(unittest.TestCase):
                 compact_params_list: Optional[list] = None,
             ):
                 if int(counts[0]) > 0:
-                    # Construct a received shard
+                    g_shape = global_shapes_list[0] if global_shapes_list else None
                     received_tt = TransportTensor(
                         tensors[0],
                         origin_indices=tensors[1] if len(tensors) > 1 else None,
+                        global_shape=g_shape,
                     )
                     network_mailbox[target_rank].append(received_tt)
                 return True

@@ -185,7 +185,7 @@ class NodeProxy:
                         is_output=True, arg_type=ArgumentType.DATA
                     )
                     for out_name in out_args:
-                        u_key = (self.node_id, op_name, out_name)
+                        u_key = (self.node_id, op_name, "out", out_name)
                         if u_key not in self._graph._builder._tuuid_slots:
                             # Safety check: ensure builder assigned it
                             raise RuntimeError(
@@ -247,30 +247,37 @@ class FunctionalGraph:
     def reader(
         self,
         name: str,
-        src_dir: str,
-        data_type: str = "json",
-        batch_size: int = 1000,
-        file_pattern: str = "*",
+        reader_class: Type,
+        mesh_axis_names: Optional[tuple] = None,
+        mesh_shape: Optional[tuple] = None,
         num_workers: int = 1,
         resource: Optional[Dict[str, Any]] = None,
         description: str = "",
-        reader_class: Optional[Type] = None,
-        **static_args: Any,
+        **reader_kwargs: Any,
     ) -> NodeProxy:
         """
         Add a Reader node and return its proxy.
+
+        Args:
+            name: Unique identifier for the reader node.
+            reader_class: The SPMD reader class (must subclass GrainReader with @spmd).
+            mesh_axis_names: Axis names for the execution mesh.
+            mesh_shape: Shape of the execution mesh.
+            num_workers: Number of workers when no explicit mesh is given.
+            resource: Optional resource requirements dict.
+            description: Human-readable description.
+            **reader_kwargs: Additional static args (data_source, shuffle, etc.)
+                             forwarded to the reader via static_args at runtime.
         """
         self._builder.add_reader(
             name=name,
-            src_dir=src_dir,
-            data_type=data_type,
-            batch_size=batch_size,
-            file_pattern=file_pattern,
+            reader_class=reader_class,
+            mesh_axis_names=mesh_axis_names,
+            mesh_shape=mesh_shape,
             num_workers=num_workers,
             resource=resource,
             description=description,
-            reader_class=reader_class,
-            **static_args,
+            **reader_kwargs,
         )
         return NodeProxy(name, self)
 

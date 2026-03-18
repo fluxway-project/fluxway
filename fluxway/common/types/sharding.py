@@ -54,6 +54,18 @@ class Routing(FluxwayBaseSchema):
     def __hash__(self):
         return hash(tuple(self.__dict__.values()))
 
+    @property
+    def is_static(self) -> bool:
+        return False
+
+    @property
+    def is_dynamic(self) -> bool:
+        return False
+
+    @property
+    def is_referential(self) -> bool:
+        return False
+
 
 class AlgebraicRouting(Routing):
     """Routing derived from algebraic logic (strategy + axes)."""
@@ -65,6 +77,14 @@ class AlgebraicRouting(Routing):
     routing_dim: Union[int, Tuple[int, ...]] = 0
     index_descriptor: Optional[IndexDescriptor] = None
 
+    @property
+    def is_static(self) -> bool:
+        return self.strategy.routing_paradigm == RoutingParadigm.STATIC
+
+    @property
+    def is_dynamic(self) -> bool:
+        return self.strategy.routing_paradigm == RoutingParadigm.DYNAMIC
+
 
 class ReferentialRouting(Routing):
     """Routing derived from referencing another TUUID (mirror/follow)."""
@@ -73,17 +93,52 @@ class ReferentialRouting(Routing):
 
     path: str
     tuuid: Optional[int] = None
-
     # Map: Target Dimension -> Source Dimension
     dim_map: Dict[int, int] = Field(default_factory=lambda: {0: 0})
+    # To be populated during topology resolution phase to avoid late-binding logic in the Hot Path.
+    _resolved_routing: Optional[AlgebraicRouting] = None
+
+    @property
+    def is_referential(self) -> bool:
+        return True
+
+    @property
+    def routing_dim(self) -> Union[int, Tuple[int, ...]]:
+        if self._resolved_routing:
+            return self._resolved_routing.routing_dim
+        raise RuntimeError(
+            f"[Fluxway Referential Error] Unresolved 'mirror/follow' routing at path '{self.path}'.\n"
+            f"  Status: Unresolved (TUUID: {self.tuuid})\n"
+            f"  Fix: Ensure this strategy is resolved via Controller/Planner before the first step execution."
+        )
+
+    @property
+    def strategy(self) -> "PartitionStrategy":
+        if self._resolved_routing:
+            return self._resolved_routing.strategy
+        raise RuntimeError(
+            f"[Fluxway Referential Error] Strategy accessed on unresolved path '{self.path}'.\n"
+            f"  Fix: This typically means a 'mirror' tensor was used in a Forward path where its source was not yet materialized."
+        )
+
+    @property
+    def partition(self) -> "PartitionSpec":
+        if self._resolved_routing:
+            return self._resolved_routing.partition
+        raise RuntimeError(
+            f"[Fluxway Referential Error] Partition accessed on unresolved path '{self.path}'."
+        )
 
     def resolve(self, resolver_fn: Callable[[str], Optional[int]]) -> None:
         """Resolve the logical path to a physical TUUID."""
         if self.tuuid is None:
             object.__setattr__(self, "tuuid", resolver_fn(self.path))
 
+    def resolve_sharding(self, routing: AlgebraicRouting) -> None:
+        """Inject the physical routing strategy once resolved."""
+        object.__setattr__(self, "_resolved_routing", routing)
+
     def __hash__(self):
-        # Convert dict to sorted tuple of items for hashing
         items = tuple(sorted(self.dim_map.items())) if self.dim_map else ()
         return hash((self.path, self.tuuid, items))
 
@@ -137,11 +192,21 @@ P = PartitionSpec
 class ShardingConfig(FluxwayBaseSchema):
     """Bridge model to parse user-provided sharding dictionaries."""
 
+    model_config = ConfigDict(populate_by_name=True)
+
     sharding_type: str = Field(default="static", alias="type")
     axis: List[str] = Field(default_factory=list)
     fn: Optional[str] = None
     routing_dim: Union[int, Tuple[int, ...]] = 0
-    source: Optional[str] = None
+    reference: Optional[str] = None
+
+    def bind(self, mesh: DeviceMesh) -> PhysicalLayout:
+        """Binds the sharding config to a physical mesh, producing a PhysicalLayout."""
+        return self.to_spec().bind(mesh)
+
+    def to_spec(self) -> ShardingSpec:
+        """Alias for to_routing for backward compatibility."""
+        return self.to_routing()
 
     def to_routing(self) -> ShardingSpec:
         """Converts declarative config to a ShardingSpec (pure logic)."""
@@ -157,12 +222,12 @@ class ShardingConfig(FluxwayBaseSchema):
 
         # 2. Handle Referential Routing (Follow/Mirror)
         if self.sharding_type == "mirror":
-            if not self.source:
+            if not self.reference:
                 raise ValueError(
-                    "[Fluxway Sharding Config Error] 'mirror' (referential) sharding type REQUIRES a 'source' path "
-                    "specifying which TUUID to follow (e.g., source='train_step.state')."
+                    "[Fluxway Sharding Config Error] 'mirror' (referential) sharding type REQUIRES a 'reference' path "
+                    "specifying which TUUID to follow (e.g., reference='train_step.state')."
                 )
-            return ShardingSpec.follow(source_path=self.source)
+            return ShardingSpec.follow(reference_path=self.reference)
 
         # 3. Handle Algebraic Routing with Strategy Detection
         if self.sharding_type not in ("static", "dynamic"):
@@ -436,14 +501,21 @@ class ShardingSpec(FluxwayBaseSchema):
     def strategy(self) -> "PartitionStrategy":
         if isinstance(self.routing, AlgebraicRouting):
             return self.routing.strategy
+        if self.routing._resolved_routing:
+            return self.routing._resolved_routing.strategy
+
         raise RuntimeError(
-            f"Sharding strategy accessed on unresolved referential routing: {self.routing.path} (TUUID {self.routing.tuuid})"
+            f"Sharding strategy accessed on unresolved referential routing: {self.routing.path} (TUUID {self.routing.tuuid}). "
+            "Referential sharding (mirror/follow) MUST be resolved against its source producer before use."
         )
 
     @property
     def partition(self) -> "PartitionSpec":
         if isinstance(self.routing, AlgebraicRouting):
             return self.routing.partition
+        if self.routing._resolved_routing:
+            return self.routing._resolved_routing.partition
+
         raise RuntimeError(
             f"Partition spec accessed on unresolved referential routing: {self.routing.path} (TUUID {self.routing.tuuid})"
         )
@@ -452,7 +524,12 @@ class ShardingSpec(FluxwayBaseSchema):
     def routing_dim(self) -> Union[int, Tuple[int, ...]]:
         if isinstance(self.routing, AlgebraicRouting):
             return self.routing.routing_dim
-        return 0
+        if self.routing._resolved_routing:
+            return self.routing._resolved_routing.routing_dim
+
+        raise RuntimeError(
+            f"Routing dim accessed on unresolved referential routing: {self.routing.path} (TUUID {self.routing.tuuid})"
+        )
 
     @property
     def index_descriptor(self) -> Optional["IndexDescriptor"]:
@@ -466,35 +543,38 @@ class ShardingSpec(FluxwayBaseSchema):
 
     @property
     def is_referential(self) -> bool:
-        return isinstance(self.routing, ReferentialRouting)
+        """Returns True if this is a referential (Mirror/Follow) routing."""
+        return self.routing.is_referential
 
     @property
     def is_dynamic(self) -> bool:
-        if self.is_referential:
-            return False
-        return self.strategy.routing_paradigm == RoutingParadigm.DYNAMIC
+        """Returns True if the routing is value-based (Algebraic DYNAMIC)."""
+        return self.routing.is_dynamic
+
+    @property
+    def partitions(self):
+        """Returns the partition specification dictionary."""
+        return self.partition.partitions
 
     @property
     def is_content_addressable(self) -> bool:
+        """Alias for is_dynamic."""
         return self.is_dynamic
 
     @property
     def is_static(self) -> bool:
-        if self.is_referential:
-            return False
-        return self.strategy.routing_paradigm == RoutingParadigm.STATIC
+        """Returns True if the routing is rank-based (Algebraic STATIC)."""
+        return self.routing.is_static
 
-    @property
-    def partitions(self):
-        return self.partition.partitions if not self.is_referential else {}
+    def resolve(self, resolver_fn: Callable[[str], Optional[int]]) -> None:
+        """Resolve the logical path to a physical TUUID."""
+        if hasattr(self.routing, "resolve"):
+            self.routing.resolve(resolver_fn)
 
-    def __hash__(self):
-        return hash(self.routing)
-
-    def __eq__(self, other):
-        if not isinstance(other, ShardingSpec):
-            return False
-        return self.routing == other.routing
+    def resolve_sharding(self, routing: AlgebraicRouting) -> None:
+        """Inject the physical routing strategy once resolved."""
+        if hasattr(self.routing, "resolve_sharding"):
+            self.routing.resolve_sharding(routing)
 
     # ---- Factory Methods ----
 
@@ -538,17 +618,17 @@ class ShardingSpec(FluxwayBaseSchema):
 
     @staticmethod
     def follow(
-        source_path: str, dim_map: Optional[Dict[int, int]] = None
+        reference_path: str, dim_map: Optional[Dict[int, int]] = None
     ) -> "ShardingSpec":
-        if not isinstance(source_path, str):
+        if not isinstance(reference_path, str):
             raise TypeError(
                 f"ShardingSpec.follow() expects a string path (e.g., 'train_step.embedding.weight'), "
-                f"but received {type(source_path).__name__}. "
+                f"but received {type(reference_path).__name__}. "
                 f"If you want to copy an existing layout's strategy, use ShardingSpec.chunk(layout.routing.partition) "
                 f"and bind it to the same mesh explicitly."
             )
         return ShardingSpec(
-            routing=ReferentialRouting(path=source_path, dim_map=dim_map or {0: 0})
+            routing=ReferentialRouting(path=reference_path, dim_map=dim_map or {0: 0})
         )
 
     @staticmethod
@@ -849,6 +929,14 @@ class PhysicalLayout(FluxwayBaseSchema):
 
             d_logic = target_layout.get_shard_rank(target_rank, dim)
 
+            # Source Mapping for Replicated/Scalar data:
+            # If the source is fully replicated on this dimension, each destination
+            # rank only needs to receive from one specific source rank to avoid redundancy.
+            # Identity mapping: i = floor(j * M / N)
+            if not self.spec.partitions or dim not in self.spec.partitions:
+                responsible_sr = (target_rank * source_world) // target_layout.mesh.size
+                return [responsible_sr]
+
             producers = []
             for sr in range(source_world):
                 s_logic = self.get_shard_rank(sr, dim)
@@ -877,6 +965,16 @@ class PhysicalLayout(FluxwayBaseSchema):
             d_world_size = target_layout.shard_size(dim)
 
             s_logic = self.get_shard_rank(source_rank, dim)
+
+            # Match resolve_producers: If source is replicated, only send to assigned targets.
+            if not self.spec.partitions or dim not in self.spec.partitions:
+                source_world = self.mesh.size
+                consumers = []
+                for tr in range(target_world):
+                    responsible_sr = (tr * source_world) // target_world
+                    if responsible_sr == source_rank:
+                        consumers.append(tr)
+                return sorted(set(consumers))
 
             consumers = []
             for tr in range(target_world):
@@ -907,9 +1005,9 @@ class PhysicalLayout(FluxwayBaseSchema):
 
     @staticmethod
     def derive_from(
-        source_path: str, source_dim: int = 0, target_dim: int = 0
+        reference_path: str, source_dim: int = 0, target_dim: int = 0
     ) -> "ShardingSpec":
         """Specialized follow for derived tensors like routing_indices."""
         return ShardingSpec.follow(
-            source_path=source_path, dim_map={target_dim: source_dim}
+            reference_path=reference_path, dim_map={target_dim: source_dim}
         )

@@ -3,6 +3,7 @@ import pickle
 import jax.numpy as jnp
 from fluxway.common.types.tensor import TransportTensor
 from fluxway.common.backend import set_backend, get_backend
+from fluxway.common.index_descriptor import ContinuousIndex
 
 
 # Force JAX backend
@@ -352,8 +353,6 @@ def test_index_descriptor_cyclic_materialize():
 
 def test_index_descriptor_chunk_slice():
     """Chunk descriptor slice is O(1) — returns a new descriptor, not a tensor."""
-    from fluxway.common.index_descriptor import ContinuousIndex
-
     desc = ContinuousIndex.chunk(start=100, count=10)
     sub = desc.slice(2, 5)  # indices [102, 103, 104]
 
@@ -369,8 +368,6 @@ def test_index_descriptor_chunk_slice():
 
 def test_index_descriptor_cyclic_slice():
     """Cyclic descriptor slice is O(1)."""
-    from fluxway.common.index_descriptor import ContinuousIndex
-
     desc = ContinuousIndex.cyclic(start=0, step=4, count=8)
     # Original: [0, 4, 8, 12, 16, 20, 24, 28]
     sub = desc.slice(2, 5)  # elements at positions 2,3,4 → [8, 12, 16]
@@ -400,8 +397,8 @@ def test_slice_propagates_explicit_routing_indices():
     tensor = TransportTensor(data, routing_indices=indices)
     sliced = tensor.slice(1, 4)
 
-    assert backend.equal(
-        sliced.routing_indices, backend.tensor([101, 102, 103], dtype=backend.int32())
+    assert sliced.routing_indices == backend.tensor(
+        [101, 102, 103], dtype=backend.int32()
     )
     assert backend.equal(sliced.flat_values, backend.tensor([20.0, 30.0, 40.0]))
 
@@ -417,14 +414,12 @@ def test_slice_propagates_descriptor():
     tensor = TransportTensor(data, routing_indices=desc)
     sliced = tensor.slice(1, 4)
 
-    # Should have a derived descriptor, not a materialized tensor
-    assert sliced.index_descriptor is not None
-    assert sliced.index_descriptor.start == 51
-    assert sliced.index_descriptor.count == 3
+    assert isinstance(sliced.routing_indices, ContinuousIndex)
+    assert sliced.routing_indices.start == 51
+    assert sliced.routing_indices.count == 3
 
-    # routing_indices property should lazy-materialize
     expected = backend.tensor([51, 52, 53], dtype=backend.int32())
-    assert backend.equal(sliced.routing_indices, expected)
+    assert sliced.routing_indices == expected
 
 
 def test_dynamic_slice_propagates_descriptor():
@@ -440,9 +435,9 @@ def test_dynamic_slice_propagates_descriptor():
     size = backend.tensor(3, dtype=backend.int32())
     sliced = tensor.dynamic_slice(start, size)
 
-    assert sliced.index_descriptor is not None
-    assert sliced.index_descriptor.start == 2
-    assert sliced.index_descriptor.count == 3
+    assert isinstance(sliced.routing_indices, ContinuousIndex)
+    assert sliced.routing_indices.start == 2
+    assert sliced.routing_indices.count == 3
 
 
 def test_gather_propagates_routing_indices():
@@ -457,10 +452,9 @@ def test_gather_propagates_routing_indices():
     perm = backend.tensor([3, 1, 0, 2], dtype=backend.int32())
     gathered = tensor.gather(perm)
 
-    # Descriptor is destroyed (order broken), explicit tensor stored
-    assert not isinstance(gathered.index_descriptor, ContinuousIndex)
+    assert not isinstance(gathered.routing_indices, ContinuousIndex)
     expected = backend.tensor([103, 101, 100, 102], dtype=backend.int32())
-    assert backend.equal(gathered.routing_indices, expected)
+    assert gathered.routing_indices == expected
 
 
 def test_gather_propagates_explicit_indices():
@@ -474,7 +468,7 @@ def test_gather_propagates_explicit_indices():
     gathered = tensor.gather(perm)
 
     expected_indices = backend.tensor([30, 10], dtype=backend.int32())
-    assert backend.equal(gathered.routing_indices, expected_indices)
+    assert gathered.routing_indices == expected_indices
     assert backend.equal(gathered.flat_values, backend.tensor([[5.0, 6.0], [1.0, 2.0]]))
 
 
@@ -486,7 +480,6 @@ def test_no_indices_stays_none():
 
     sliced = tensor.slice(0, 2)
     assert sliced.routing_indices is None
-    assert sliced.index_descriptor is None
 
     gathered = tensor.gather(backend.tensor([1, 0], dtype=backend.int32()))
     assert gathered.routing_indices is None
@@ -494,8 +487,6 @@ def test_no_indices_stays_none():
 
 def test_descriptor_serialization():
     """ContinuousIndex survives pickle round-trip."""
-    from fluxway.common.index_descriptor import ContinuousIndex
-
     backend = get_backend()
     data = backend.tensor([1.0, 2.0, 3.0])
     desc = ContinuousIndex.chunk(start=42, count=3)
@@ -505,13 +496,12 @@ def test_descriptor_serialization():
     serialized = pickle.dumps(tensor)
     restored = pickle.loads(serialized)
 
-    assert restored.index_descriptor is not None
-    assert restored.index_descriptor.pattern.name == "CONTIGUOUS"
-    assert restored.index_descriptor.start == 42
-    assert restored.index_descriptor.count == 3
+    assert isinstance(restored.routing_indices, ContinuousIndex)
+    assert restored.routing_indices.start == 42
+    assert restored.routing_indices.count == 3
 
     expected = backend.tensor([42, 43, 44], dtype=backend.int32())
-    assert backend.equal(restored.routing_indices, expected)
+    assert restored.routing_indices == expected
 
 
 def test_slice_then_gather_chain():
@@ -524,19 +514,18 @@ def test_slice_then_gather_chain():
 
     tensor = TransportTensor(data, routing_indices=desc)
 
-    # slice [1:5] → descriptor (start=1, count=4)
+    # slice [1:5] → routing_indices is still ContinuousIndex (start=1, count=4)
     sliced = tensor.slice(1, 5)
-    assert sliced.index_descriptor is not None
-    assert sliced.index_descriptor.start == 1
-    assert sliced.index_descriptor.count == 4
+    assert isinstance(sliced.routing_indices, ContinuousIndex)
+    assert sliced.routing_indices.start == 1
+    assert sliced.routing_indices.count == 4
 
-    # gather [2,0] on sliced → explicit [3, 1]
     perm = backend.tensor([2, 0], dtype=backend.int32())
     gathered = sliced.gather(perm)
 
-    assert not isinstance(gathered.index_descriptor, ContinuousIndex)
+    assert not isinstance(gathered.routing_indices, ContinuousIndex)
     expected = backend.tensor([3, 1], dtype=backend.int32())
-    assert backend.equal(gathered.routing_indices, expected)
+    assert gathered.routing_indices == expected
 
 
 def test_from_tensor_and_slice():
@@ -544,23 +533,18 @@ def test_from_tensor_and_slice():
     backend = get_backend()
     data = backend.tensor([10.0, 20.0, 30.0, 40.0])
 
-    # Using slice for chunk descriptor
     tensor = TransportTensor.from_tensor(data, routing_indices=slice(100, 104))
 
-    assert tensor.index_descriptor is not None
-    assert tensor.index_descriptor.start == 100
-    assert tensor.index_descriptor.count == 4
-    assert tensor.index_descriptor.step == 1
+    assert isinstance(tensor.routing_indices, ContinuousIndex)
+    assert tensor.routing_indices.start == 100
+    assert tensor.routing_indices.count == 4
 
-    # The materialized global indices should match
     expected = backend.tensor([100, 101, 102, 103], dtype=backend.int32())
-    assert backend.equal(tensor.routing_indices, expected)
+    assert tensor.routing_indices == expected
 
-    # Using slice for cyclic descriptor
     tensor_strided = TransportTensor.from_tensor(
         data, routing_indices=slice(10, None, 2)
     )
-    assert tensor_strided.index_descriptor is not None
-    assert tensor_strided.index_descriptor.start == 10
-    assert tensor_strided.index_descriptor.step == 2
-    assert tensor_strided.index_descriptor.count == 4
+    assert isinstance(tensor_strided.routing_indices, ContinuousIndex)
+    assert tensor_strided.routing_indices.start == 10
+    assert tensor_strided.routing_indices.count == 4

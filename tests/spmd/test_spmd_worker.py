@@ -423,8 +423,8 @@ async def test_mailbox_declare_step_and_on_ready():
         "sender0",
         rank=0,
         sender_world_size=4,
-        payload_groups=[[tensor.flat_values]],
-        counts_groups=[[4]],
+        payloads=[tensor.flat_values],
+        counts=[4],
         meta_tensor_state_list=[0],
     )
     assert not fired
@@ -435,8 +435,8 @@ async def test_mailbox_declare_step_and_on_ready():
         "sender1",
         rank=1,
         sender_world_size=4,
-        payload_groups=[[tensor.flat_values]],
-        counts_groups=[[4]],
+        payloads=[tensor.flat_values],
+        counts=[4],
         meta_tensor_state_list=[0],
     )
     assert fired == [("compute", 0)]
@@ -460,8 +460,8 @@ async def test_mailbox_wait_step_ready():
             "sender0",
             rank=0,
             sender_world_size=4,
-            payload_groups=[[tensor.flat_values]],
-            counts_groups=[[3]],
+            payloads=[tensor.flat_values],
+            counts=[3],
             meta_tensor_state_list=[0],
         )
         await asyncio.sleep(0)
@@ -526,8 +526,8 @@ async def test_mailbox_periodic_trigger():
         sender_id="s0",
         rank=0,
         sender_world_size=4,
-        payload_groups=[[tensor.flat_values]],
-        counts_groups=[[1]],
+        payloads=[tensor.flat_values],
+        counts=[1],
         meta_tensor_state_list=[0],
     )
 
@@ -539,8 +539,8 @@ async def test_mailbox_periodic_trigger():
         sender_id="s1",
         rank=1,
         sender_world_size=4,
-        payload_groups=[[tensor.flat_values]],
-        counts_groups=[[1]],
+        payloads=[tensor.flat_values],
+        counts=[1],
         meta_tensor_state_list=[0],
     )
 
@@ -633,8 +633,8 @@ async def test_mailbox_tensor_put_get():
         "sender0",
         rank=0,
         sender_world_size=4,
-        payload_groups=[[tensor.flat_values]],
-        counts_groups=[[2]],
+        payloads=[tensor.flat_values],
+        counts=[2],
         meta_tensor_state_list=[0],
     )
     shards = await mb.get_tensor_shards("compute", 401, 0)
@@ -653,8 +653,8 @@ async def test_mailbox_tensor_multi_rank():
         "sender0",
         rank=0,
         sender_world_size=4,
-        payload_groups=[[tensor_zeros.flat_values]],
-        counts_groups=[[4]],
+        payloads=[tensor_zeros.flat_values],
+        counts=[4],
         meta_tensor_state_list=[0],
     )
     tensor_ones = TransportTensor.from_tensor(np.ones(4))
@@ -665,8 +665,8 @@ async def test_mailbox_tensor_multi_rank():
         "sender1",
         rank=1,
         sender_world_size=4,
-        payload_groups=[[tensor_ones.flat_values]],
-        counts_groups=[[4]],
+        payloads=[tensor_ones.flat_values],
+        counts=[4],
         meta_tensor_state_list=[0],
     )
     assert await mb.get_tensor_shard_count("compute", 501, 1) == 2
@@ -682,8 +682,8 @@ async def test_mailbox_op_isolation():
         "sender0",
         rank=0,
         sender_world_size=4,
-        payload_groups=[[np.array([1.0])]],
-        counts_groups=[[1]],
+        payloads=[np.array([1.0])],
+        counts=[1],
         meta_tensor_state_list=[0],
     )
     await mb.deposit_shards(
@@ -693,8 +693,8 @@ async def test_mailbox_op_isolation():
         "sender0",
         rank=0,
         sender_world_size=4,
-        payload_groups=[[np.array([2.0])]],
-        counts_groups=[[1]],
+        payloads=[np.array([2.0])],
+        counts=[1],
         meta_tensor_state_list=[0],
     )
     fwd = await mb.get_tensor_shards("compute", 601, 0)
@@ -722,8 +722,8 @@ async def test_mailbox_zero_copy_writes_into_buffer():
         sender_id="s0",
         rank=0,
         sender_world_size=4,
-        payload_groups=[[np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)]],
-        counts_groups=[[2]],
+        payloads=[np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)],
+        counts=[2],
         meta_tensor_state_list=[0],
     )
     buffers = await mb.get_zero_copy_buffers("compute", 701, step=0)
@@ -749,8 +749,8 @@ async def test_mailbox_clear_step():
         "sender0",
         0,
         4,
-        payload_groups=[[tensor.flat_values]],
-        counts_groups=[[2]],
+        payloads=[tensor.flat_values],
+        counts=[2],
         meta_tensor_state_list=[0],
     )
     mb.declare_step("compute", 1, {}, [])
@@ -776,8 +776,8 @@ async def test_mailbox_get_size():
         "s0",
         0,
         1,
-        payload_groups=[[tensor.flat_values]],
-        counts_groups=[[2]],
+        payloads=[tensor.flat_values],
+        counts=[2],
         meta_tensor_state_list=[0],
     )
     await mb.deposit_shards(
@@ -787,8 +787,8 @@ async def test_mailbox_get_size():
         "s1",
         1,
         1,
-        payload_groups=[[tensor.flat_values]],
-        counts_groups=[[2]],
+        payloads=[tensor.flat_values],
+        counts=[2],
         meta_tensor_state_list=[0],
     )
     assert await mb.get_size() == 3
@@ -838,32 +838,29 @@ async def test_receive_multi_tensor_data():
     cls = cls.modified_class if cls else SPMDWorker
     worker = cls(config, rank=0)
 
-    # Declare the step first (workers normally do this via _start_step)
     worker._mailbox.declare_step(
-        "compute", step=1, expected_tensors={999: 1}, expected_states=[]
+        "compute", step=1, expected_tensors={998: 1, 999: 1}, expected_states=[]
     )
-    # Inject TUUID dispatch
     worker._op_manager.get_operators_for_tuuid = MagicMock(return_value=["compute"])
     worker._op_manager.get_sender_world_size = MagicMock(return_value=2)
 
     t1 = TransportTensor.from_tensor(np.array([1, 2]))
     t2 = TransportTensor.from_tensor(np.array([3, 4]))
 
+    # Two TUUIDs in one RPC call: flat payloads/counts for each
     await worker.receive_shards(
-        tuuids=[999],
+        tuuids=[998, 999],
         step=1,
         sender_id="s0",
         sender_rank=0,
-        payload_groups=[[t1.flat_values, t2.flat_values]],
-        counts_groups=[[2, 2]],
-        meta_tensor_state_list=[0],
+        payloads=[t1.flat_values, t2.flat_values],
+        counts=[2, 2],
+        meta_tensor_state_list=[0, 0],
     )
-    shards = await worker._mailbox.get_tensor_shards("compute", 999, 1)
-    received = shards[("s0", 0)]
-    assert isinstance(received, list)
-    assert len(received) == 2
-    np.testing.assert_array_equal(received[0].flat_values, [1, 2])
-    np.testing.assert_array_equal(received[1].flat_values, [3, 4])
+    s1 = await worker._mailbox.get_tensor_shards("compute", 998, 1)
+    s2 = await worker._mailbox.get_tensor_shards("compute", 999, 1)
+    np.testing.assert_array_equal(s1[("s0", 0)][0].flat_values, [1, 2])
+    np.testing.assert_array_equal(s2[("s0", 0)][0].flat_values, [3, 4])
 
 
 @pytest.mark.asyncio
@@ -893,8 +890,8 @@ async def test_mailbox_zero_copy_ragged():
         "s0",
         0,
         1,
-        payload_groups=[[tt.flat_values, np.array([3, 2], dtype=np.int32)]],
-        counts_groups=[[5, 2]],
+        payloads=[tt.flat_values, np.array([3, 2], dtype=np.int32)],
+        counts=[5, 2],
         meta_tensor_state_list=[1],  # meta_state 1 for ragged
     )
 
@@ -912,11 +909,12 @@ def test_replicate_operator_manager():
 
     mesh = DeviceMesh(axis_names=("x", "y"), device_shape=(2, 2))
 
+    replicated_spec = ShardingSpec.chunk(PartitionSpec())
     meta = OperatorMeta(
         name="test_op",
         input_arguments={ArgumentType.DATA.value: ["a"]},
         output_arguments={},
-        input_sharding={"a": {"type": "replicated"}},
+        input_sharding={"a": replicated_spec},
         output_sharding={},
     )
 
@@ -927,7 +925,6 @@ def test_replicate_operator_manager():
 
     from fluxway.common.types.configs import SPMDTopology, SPMDTopologyInfo
 
-    # Register with the operator name matching the meta name: "test_op"
     config = SPMDConfig(
         spmd_id="test",
         num_workers=4,
@@ -939,7 +936,7 @@ def test_replicate_operator_manager():
                 predecessors={
                     "test": SPMDTopologyInfo(
                         spmd_id="test",
-                        tuuid_sharding={1001: {"type": "replicated"}},
+                        tuuid_sharding={1001: replicated_spec},
                         tuuid_map={"a": 1001},
                     )
                 }
@@ -952,7 +949,9 @@ def test_replicate_operator_manager():
     # Query by the registered op name
     spec = manager.get_input_sharding("test_op")
     assert 1001 in spec
-    assert spec[1001].replica_size == 4
+    # get_input_sharding returns unbound ShardingSpec; bind to mesh to get replica_size
+    bound = spec[1001].bind(mesh)
+    assert bound.replica_size == 4
 
 
 @pytest.mark.asyncio
@@ -970,26 +969,30 @@ async def test_send_output_none_mesh():
 
     worker._op_manager = MagicMock()
     test_mesh = DeviceMesh(axis_names=("data",), device_shape=(1,))
-    def_spec = ShardingSpec.chunk(PartitionSpec()).bind(test_mesh)
+    # _send_output calls source_logical.bind(self._mesh) so these must be unbound ShardingSpecs
+    unbound_spec = ShardingSpec.chunk(PartitionSpec())
 
-    # Mock sharding for a tensor with TUUID 123
-    # We leave it empty to trigger the default source_spec chunk call
-    worker._op_manager.get_output_sharding.return_value = {123: def_spec}
+    worker._op_manager.get_output_sharding.return_value = {123: unbound_spec}
     worker._op_manager.get_output_tuuids.return_value = [123]
     worker._op_manager.get_successor_ids.return_value = ["succ"]
+    worker._op_manager.get_output_state_names.return_value = []
+    worker._op_manager.get_output_tuuid_to_name.return_value = {123: "out"}
+
+    op_meta_mock = MagicMock()
+    op_meta_mock.output_treedef = None
+    worker._op_manager.get_operator_metadata.return_value = op_meta_mock
+
+    disp_mock = MagicMock()
+    disp_mock.interleave_unit_size = None
+    worker._op_manager.get_dispatcher.return_value = disp_mock
 
     succ_info = MagicMock()
     succ_info.is_self_loop = False
-    succ_info.tuuid_sharding = {123: def_spec}
-    succ_info.tuuid_map = None
+    succ_info.tuuid_sharding = {123: unbound_spec}
     succ_info.mesh = test_mesh
     succ_info.is_interleaved = False
+    succ_info.interleave_unit_size = None
     worker._op_manager.get_successor_info.return_value = succ_info
-
-    # Mock operator metadata for TUUID lookup
-    op_meta = MagicMock()
-    op_meta.output_uuids = [123]
-    worker._op_manager.get_operator_meta.return_value = op_meta
 
     # Mock successor handlers
     handler = MagicMock()
@@ -997,10 +1000,7 @@ async def test_send_output_none_mesh():
 
     worker._successor_handlers = {"succ": {0: DataPlaneCallable(handler)}}
 
-    # Call _send_output
-    data = [np.array([1, 2, 3])]  # Flattened results
-    # This should not raise Errors
+    data = [np.array([1, 2, 3])]
     await worker._send_output("compute", data, exec_step=0)
 
-    # Verify distributor.distribute was called (indirectly by checking handler)
     assert handler.receive_shards.remote.called

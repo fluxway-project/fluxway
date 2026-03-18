@@ -72,19 +72,19 @@ class TestRecursiveDataType(unittest.TestCase):
         sharding = meta.input_sharding
 
         # Keys should be: param_name.field_path
-        self.assertEqual(sharding["inp.mid.leaf.val"], spec)
-        self.assertEqual(sharding["inp.mid.direct"]["type"], "dynamic")
-        self.assertEqual(sharding["inp.top_val"], spec)
+        self.assertEqual(sharding["mid.leaf.val"], spec)
+        self.assertEqual(sharding["mid.direct"]["type"], "dynamic")
+        self.assertEqual(sharding["top_val"], spec)
 
     def test_uniform_sharding_resolution(self):
         """Test applying one spec to an entire nested @data_type parameter branch."""
-        sharding = getattr(uniform_op, "_fluxway_operator_meta.input_sharding")
-        for field in ["inp.mid.leaf.val", "inp.mid.direct", "inp.top_val"]:
+        sharding = uniform_op._fluxway_operator_meta.input_sharding
+        for field in ["mid.leaf.val", "mid.direct", "top_val"]:
             self.assertEqual(sharding[field], spec)
 
     def test_output_sharding_resolution(self):
         """Test applying uniform spec to @data_type return (no parameter prefix for returns)."""
-        sharding = getattr(output_op, "_fluxway_operator_meta.output_sharding")
+        sharding = output_op._fluxway_operator_meta.output_sharding
         for field in ["mid.leaf.val", "mid.direct", "top_val"]:
             self.assertEqual(sharding[field], spec)
 

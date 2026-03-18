@@ -1,5 +1,4 @@
 import pytest
-from typing import Optional
 import jax.numpy as jnp
 import numpy as np
 
@@ -10,16 +9,9 @@ from fluxway.transport.communication import DataDistributor, TransportReceiver
 from fluxway.common.backend import set_backend
 
 
-# Force JAX backend
 @pytest.fixture(autouse=True)
 def use_jax_backend():
     set_backend("jax")
-    yield
-
-
-@pytest.fixture(autouse=False)
-def use_torch_backend():
-    set_backend("torch")
     yield
 
 
@@ -33,25 +25,25 @@ def test_distributor_receiver_integration():
         axis_names=("x",), device_shape=(2,), device_ids=np.array([0, 1])
     )
 
-    source_spec = ShardingSpec.chunk(mesh=src_mesh, partition=P("x"))
-    target_spec = ShardingSpec.chunk(mesh=dst_mesh, partition=P("x"))
+    source_spec = ShardingSpec.chunk(P("x")).bind(src_mesh)
+    target_spec = ShardingSpec.chunk(P("x")).bind(dst_mesh)
 
-    # Use Dense Data for distribution test
-    # 2 rows, 50 elements each
+    # 2 rows of 50 elements each
     values = jnp.array(np.random.randn(2, 50))
     data = TransportTensor(values, global_shape=(2, 50))
 
-    # Mock receivers
     receiver0 = TransportReceiver(wait_for_n_slices=0)
     receiver1 = TransportReceiver(wait_for_n_slices=0)
     receivers = [receiver0, receiver1]
 
     def mock_send(
         target: int,
+        tuuids: list,
         tensors: list,
         counts: list,
-        global_shapes_list: Optional[list] = None,
-        meta_tensor_state_list: Optional[list] = None,
+        global_shapes_list=None,
+        meta_tensor_state_list=None,
+        compact_params_list=None,
     ):
         rec = receivers[target]
         rec.receive_slices(local_rank, tensors, counts)

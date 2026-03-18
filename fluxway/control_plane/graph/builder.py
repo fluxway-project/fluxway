@@ -52,9 +52,9 @@ class Builder:
         self._edges: List[Edge] = []
         self._spmd_classes: Dict[str, Type] = {}
         self._uuid_counter = 0
-        # Unified Registry for all TUUID slots: {(node, op, name): tuuid}
+        # Unified Registry for all TUUID slots: {(node, op, direction, name): tuuid}
         # Includes both definitions (outputs) and references (inputs)
-        self._tuuid_slots: Dict[Tuple[str, str, str], int] = {}
+        self._tuuid_slots: Dict[Tuple[str, str, str, str], int] = {}
 
     def _next_uuid(self) -> int:
         self._uuid_counter += 1
@@ -178,7 +178,7 @@ class Builder:
             out_args = meta.get_arguments(is_output=True, arg_type=ArgumentType.DATA)
             tuuids = []
             for out_name in out_args:
-                slot = (name, op_name, out_name)
+                slot = (name, op_name, "out", out_name)
                 if slot not in self._tuuid_slots:
                     self._tuuid_slots[slot] = self._next_uuid()
                 tuuids.append(self._tuuid_slots[slot])
@@ -469,22 +469,22 @@ class Builder:
 
         if tensor_map:
             for src_name, target_name in tensor_map.items():
-                u = self._tuuid_slots.get((source_node, source_op, src_name))
+                u = self._tuuid_slots.get((source_node, source_op, "out", src_name))
                 if u is None:
                     raise RuntimeError(
-                        f"TUUID Definition not found for {source_node}.{source_op}.{src_name}"
+                        f"TUUID Definition not found for {source_node}.{source_op}.out.{src_name}"
                     )
 
                 # Input-side slot registration with consistency check
-                target_slot = (target_node, target_op, target_name)
+                target_slot = (target_node, target_op, "in", target_name)
                 if (
                     target_slot in self._tuuid_slots
                     and self._tuuid_slots[target_slot] != u
                 ):
                     raise ValueError(
-                        f"TUUID Conflict at {target_node}.{target_op}.{target_name}: "
+                        f"TUUID Conflict at {target_node}.{target_op}.in.{target_name}: "
                         f"already bound to TUUID {self._tuuid_slots[target_slot]}, "
-                        f"attempted to bind to {u} via {source_node}.{source_op}"
+                        f"attempted to bind to {u} via {source_node}.{source_op}.out.{src_name}"
                     )
                 self._tuuid_slots[target_slot] = u
 
@@ -494,18 +494,20 @@ class Builder:
         else:
             ds_names = effective_sharding["dst_names"]
             for n in ds_names:
-                u = self._tuuid_slots.get((source_node, source_op, n))
+                u = self._tuuid_slots.get((source_node, source_op, "out", n))
                 if u is None:
                     raise RuntimeError(
-                        f"TUUID Definition not found for {source_node}.{source_op}.{n}"
+                        f"TUUID Definition not found for {source_node}.{source_op}.out.{n}"
                     )
 
-                target_slot = (target_node, target_op, n)
+                target_slot = (target_node, target_op, "in", n)
                 if (
                     target_slot in self._tuuid_slots
                     and self._tuuid_slots[target_slot] != u
                 ):
-                    raise ValueError(f"TUUID Conflict at {target_node}.{target_op}.{n}")
+                    raise ValueError(
+                        f"TUUID Conflict at {target_node}.{target_op}.in.{n}"
+                    )
                 self._tuuid_slots[target_slot] = u
 
                 tuuid_map[n] = u
@@ -794,10 +796,10 @@ class Builder:
         dst_meta = dst_cfg.operator_metas[target_op]
 
         def resolver_src(path: str) -> Optional[int]:
-            return self._resolve_path_to_tuuid(source_node, source_op, path)
+            return self._resolve_path_to_tuuid(source_node, source_op, "out", path)
 
         def resolver_dst(path: str) -> Optional[int]:
-            return self._resolve_path_to_tuuid(target_node, target_op, path)
+            return self._resolve_path_to_tuuid(target_node, target_op, "in", path)
 
         for meta, res in [(src_meta, resolver_src), (dst_meta, resolver_dst)]:
             meta.resolve_sharding_topology(res)
@@ -1002,18 +1004,24 @@ class Builder:
         return graph
 
     def _resolve_path_to_tuuid(
-        self, node_name: str, op_name: str, path: str
+        self, node_name: str, op_name: str, primary_direction: str, path: str
     ) -> Optional[int]:
         """
         Find the physical TUUID for a logical path like 'forward.y'.
         Searches the unified slot registry (covers both definitions and references).
+        If not found in the primary direction, falls back to the other direction.
         """
         if "." in path:
             target_op, field = path.split(".", 1)
         else:
             target_op, field = op_name, path
 
-        return self._tuuid_slots.get((node_name, target_op, field))
+        tuuid = self._tuuid_slots.get((node_name, target_op, primary_direction, field))
+        if tuuid is not None:
+            return tuuid
+
+        other_direction = "out" if primary_direction == "in" else "in"
+        return self._tuuid_slots.get((node_name, target_op, other_direction, field))
 
     def reset(self) -> "Builder":
         """

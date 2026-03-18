@@ -74,21 +74,23 @@ def test_embedding_lookup_flow():
     mesh1 = DeviceMesh(("y",), (4,), [0, 1, 2, 3])
     mesh2 = DeviceMesh(("z",), (2,), [0, 1])
     from fluxway.common.index_descriptor import FunctionalIndex
+    from fluxway.common.types.sharding import AlgebraicRouting
 
     # Sharding Specs
-    spec0 = ShardingSpec.chunk(mesh=mesh0, partition=P("x"))
+    spec0 = ShardingSpec.chunk(P("x")).bind(mesh0)
 
     def hash_fn(keys):
         return keys % vocab_size
 
-    base_hash_spec = ShardingSpec.hash(mesh=mesh1, partition=P("y"))
+    base_hash_strategy = ShardingSpec.hash(P("y")).strategy
     spec1 = ShardingSpec(
-        strategy=base_hash_spec.strategy,
-        mesh=mesh1,
-        partition=P("y"),
-        index_descriptor=FunctionalIndex(hash_fn),
-    )
-    spec2 = ShardingSpec.chunk(mesh=mesh2, partition=P("z"))
+        routing=AlgebraicRouting(
+            strategy=base_hash_strategy,
+            partition=P("y"),
+            index_descriptor=FunctionalIndex(hash_fn),
+        )
+    ).bind(mesh1)
+    spec2 = ShardingSpec.chunk(P("z")).bind(mesh2)
 
     # --- 2. Simulation Environment ---
 
@@ -110,7 +112,7 @@ def test_embedding_lookup_flow():
     # Rank 0 sends
     dist0 = cluster[0].distributor
 
-    def send_wrapper_0(target, tensors, counts, *args, **kwargs):
+    def send_wrapper_0(target, tuuids, tensors, counts, *args, **kwargs):
         cluster[0].send([target], tensors, counts, cluster)
         return True
 
@@ -126,7 +128,7 @@ def test_embedding_lookup_flow():
     # Rank 1 sends
     dist1 = cluster[1].distributor
 
-    def send_wrapper_1(target, tensors, counts, *args, **kwargs):
+    def send_wrapper_1(target, tuuids, tensors, counts, *args, **kwargs):
         cluster[1].send([target], tensors, counts, cluster)
         return True
 
@@ -277,10 +279,9 @@ def test_embedding_lookup_flow():
 
         # Send wrapper calling receive_slices
         def send_wrapper_combine(
-            target, tensors, counts, *args, source_rank=r, **kwargs
+            target, tuuids, tensors, counts, *args, source_rank=r, **kwargs
         ):
             if target in cluster:
-                # This calls receive_slices -> writes into target_buffers Zero-Copy
                 cluster[target].receiver.receive_slices(source_rank, tensors, counts)
             return True
 
@@ -336,17 +337,10 @@ def test_embedding_lookup_flow():
     # "Dispatch Gradients"
 
     from fluxway.common.types.tensor import SymmetryReceipt
-    from fluxway.common.types.sharding import MirrorPartition
 
-    # Mock Gradients (Same shape and layout as target_buffers received from SPMD1)
-    # We take the actual buffered forward embeddings and apply a transformation (e.g. * 2.0)
-    # to distinguish from forward values and verify routing.
     grads0_tensor = cluster[0].receiver.target_buffers[0] * 2.0
     grads1_tensor = cluster[1].receiver.target_buffers[0] * 2.0
 
-    # Verification: Ensure grads correspond to the correct global indices
-    # Rank 0 should have global indices 0..5, Rank 1 should have 6..11
-    # We verify this indirectly by checking the shape and later the routing symmetry.
     assert grads0_tensor.shape[0] == 6
     assert grads1_tensor.shape[0] == 6
 
@@ -362,9 +356,8 @@ def test_embedding_lookup_flow():
         receipt=SymmetryReceipt(world_size=4, sender_rank_tags=rank1_tags),
     )
 
-    spec_mirror = ShardingSpec(
-        strategy=MirrorPartition(source="fwd"), mesh=mesh1, partition=P("y")
-    )
+    # mirror routing: follow the forward input spec (spec1) back to its source (mesh1)
+    spec_mirror = ShardingSpec.follow("fwd").bind(mesh1)
 
     # --- 8. Backward Pass Execution (SPMD2 -> SPMD1) ---
     # We use Zero-Copy on SPMD1 (Receivers) for the Backward Update to ensure dense reception.
@@ -414,8 +407,7 @@ def test_embedding_lookup_flow():
     # Send from SPMD2 Rank 0
     dist_bk_0 = cluster[0].distributor
 
-    def send_wrapper_bk_0(target, tensors, counts, *args, **kwargs):
-        # Call receive_slices to trigger Zero-Copy write
+    def send_wrapper_bk_0(target, tuuids, tensors, counts, *args, **kwargs):
         cluster[target].receiver.receive_slices(0, tensors, counts)
         return True
 
@@ -430,8 +422,7 @@ def test_embedding_lookup_flow():
     # Send from SPMD2 Rank 1
     dist_bk_1 = cluster[1].distributor
 
-    def send_wrapper_bk_1(target, tensors, counts, *args, **kwargs):
-        # Call receive_slices to trigger Zero-Copy write
+    def send_wrapper_bk_1(target, tuuids, tensors, counts, *args, **kwargs):
         cluster[target].receiver.receive_slices(1, tensors, counts)
         return True
 
@@ -476,9 +467,7 @@ def test_embedding_lookup_flow():
 
     # spec0 is the source for Phase 1 dispatch
     # we use speculative mirror to go back
-    spec_mirror_0 = ShardingSpec(
-        strategy=MirrorPartition(source="fwd"), mesh=mesh0, partition=P("x")
-    )
+    spec_mirror_0 = ShardingSpec.follow("fwd").bind(mesh0)
 
     for r in range(4):
         # The gradient on SPMD1 is the dense buffer we just verified
@@ -516,7 +505,7 @@ def test_embedding_lookup_flow():
             ),
         )
 
-        def send_wrapper_1_to_0(target, tensors, counts, *args, **kwargs):
+        def send_wrapper_1_to_0(target, tuuids, tensors, counts, *args, **kwargs):
             if target in spmd0_grad_acc:
                 spmd0_grad_acc[target].append((tensors, counts))
             return True
@@ -551,32 +540,27 @@ def test_embedding_lookup_flow():
         assert bk.equal(
             bk.sort(final_grads.flatten())[0], bk.sort(expected.flatten())[0]
         )
+
+
+def test_jit_shield_in_jit():
     """Verifies that transport can be shielded from JIT."""
     bk = get_backend()
 
-    # Setup simple data
     mesh = DeviceMesh(("x",), (1,), [0])
-    spec = ShardingSpec.chunk(mesh, P("x"))
+    spec = ShardingSpec.chunk(P("x")).bind(mesh)
 
-    # A global list to capture side-effects from the shielded function
     side_effects = []
 
-    def side_effect_send(target, tensors, counts, *args, **kwargs):
+    def side_effect_send(target, tuuids, tensors, counts, *args, **kwargs):
         count = counts[0]
         if count > 0:
             side_effects.append(tensors[0][:count])
         return True
 
-    # We want to run `distribute` safely inside a JIT-compiled function graph.
-    # The @shield decorator escapes tracing, allowing pure Python operations (loops, appending)
-    # or host-bound network invocations to execute eagerly without throwing JAX tracer errors.
-
     distributor = DataDistributor(0)
 
     @shield(result_shape=None)
     def shielded_distribute(data):
-        # Local wrapper to match distribute signature if needed,
-        # or just call distribute directly.
         _res, _ = distributor.distribute(
             local_data=data,
             source=spec,
@@ -585,74 +569,65 @@ def test_embedding_lookup_flow():
             capacity=3,
         )
 
-    # JIT-compiled step
     import jax
 
     @jax.jit
     def train_step(x):
-        # Do some compute
         y = x * 2
-
-        # Create TransportTensor
         tt = TransportTensor(y)
-
-        # Call guarded transport
         shielded_distribute(tt)
-
         return y
 
-    # Run
     input_data = bk.tensor([1, 2, 3], dtype=bk.float32())
     result = train_step(input_data)
 
-    # Verify result (compute happened)
     assert bk.equal(result, input_data * 2)
-
-    # Verify side effect (transport happened on host)
     assert len(side_effects) == 1
-    # The payload data should be numpy array (host), not JAX tracer or array
-    # verify values
+
     import numpy as np
 
     assert np.allclose(side_effects[0], [2, 4, 6])
 
 
 def test_jit_plan_and_shard():
-    """Verify that _plan_and_shard supports JIT compilation via vmap and bounds."""
+    """Verify that plan_and_shard distributes data correctly across ranks."""
+    bk = get_backend()
 
     mesh = DeviceMesh(("x",), (2,), [0, 1])
-    spec = ShardingSpec.chunk(mesh, P("x"))
+    spec = ShardingSpec.chunk(P("x")).bind(mesh)
+
+    # Rank 0 holds the first half of a 4-element global tensor
+    data = bk.tensor([1.0, 2.0, 3.0, 4.0], dtype=bk.float32())
+    tt = TransportTensor(data[:2], global_shape=(4,))
 
     distributor = DataDistributor(0)
+    received = []
 
-    backend = get_backend()
+    def mock_send(
+        target_id,
+        tuuids,
+        tensors,
+        counts,
+        global_shapes=None,
+        meta_state_list=None,
+        compact_params=None,
+    ):
+        count = counts[0]
+        if count > 0:
+            received.append((target_id, int(count)))
+        return True
 
-    @compile
-    def plan_kernel(flat_values):
-        res = distributor._plan_and_shard(
-            TransportTensor(flat_values, global_shape=backend.shape(flat_values)),
-            source=spec,
-            target=spec,
-            capacity=4,
-        ).__next__()
-        (
-            targets,
-            tensors,
-            counts,
-            sort_idx,
-            global_shapes_list,
-            hash_meta_tensor_state_list,
-        ) = res
-        return flat_values
+    distributor.distribute(tt, source=spec, target=spec, send_fn=mock_send)
 
-    pass
+    # Rank 0 (chunk) owns indices [0,1] → should send 2 items to target rank 0 only
+    assert len(received) == 1
+    assert received[0] == (0, 2)
 
 
 def test_unified_compile():
     """Verifies that unified compile correctly JITs functions."""
     bk = get_backend()
 
-    # Test functional correctness
     @compile
     def simple_mul(x):
         return x * 2.0
@@ -660,8 +635,6 @@ def test_unified_compile():
     res = simple_mul(bk.tensor([1.0, 2.0]))
     assert bk.equal(res, bk.tensor([2.0, 4.0]))
 
-    # Test JIT effects (JAX)
-    # Use side-effect detection to confirm it ran once (tracing) and then JIT (execution)
     side_effects = []
 
     @compile
@@ -682,8 +655,8 @@ def test_colocation_dispatch():
     bk = get_backend()
 
     mesh = DeviceMesh(("x",), (2,), [0, 1])
-    spec_src = ShardingSpec.chunk(mesh, P("x"))
-    spec_dst = ShardingSpec.chunk(mesh, P("x"))
+    spec_src = ShardingSpec.chunk(P("x")).bind(mesh)
+    spec_dst = ShardingSpec.chunk(P("x")).bind(mesh)
 
     # 4 elements total
     keys = bk.tensor([10, 20, 30, 40], dtype=bk.int32())
@@ -700,10 +673,12 @@ def test_colocation_dispatch():
 
     def mock_send(
         target: int,
+        tuuids: list,
         tensors: list,
         counts: list,
         global_shapes_list: Optional[list] = None,
         meta_tensor_state_list: Optional[list] = None,
+        compact_params_list: Optional[list] = None,
     ):
         received_payloads.append((target, tensors, counts))
         return True
@@ -803,3 +778,159 @@ def test_reconstruct_splits_from_lengths():
     assert jnp.allclose(segment_sums, expected_sums), (
         f"Segment sum mismatch. Got {segment_sums}"
     )
+
+
+def test_recommendation_spmd_values():
+    """
+    Verifies the numeric input and output values of the recommendation SPMD operators.
+    Matches the user's requirement to explicitly verify input/output values.
+    """
+    import jax.numpy as jnp
+    from fluxway.common.backend import set_backend
+    from fluxway.common.decorators import operator_context, _instance_storage
+    from fluxway.example.recommendation.input_spmd import InputSPMD
+    from fluxway.example.recommendation.sparse_spmd import SparseEmbeddingSPMD
+    from fluxway.example.recommendation.dense_spmd import DenseSPMD
+    from fluxway.example.recommendation.data_types import (
+        UserBatch,
+        ActiveFeatures,
+        PassiveFeatures,
+        LabelFeatures,
+    )
+    from fluxway.common.types.tensor import TransportTensor
+
+    set_backend("jax")
+
+    class MockCtx:
+        def __init__(self, step=0):
+            self.step = step
+
+    ctx_input = MockCtx(step=0)
+    ctx_user = MockCtx(step=0)
+    ctx_item = MockCtx(step=1)
+
+    # 1. Mock Input Data
+    g_shape = (2,)
+    active = ActiveFeatures(
+        user_id=TransportTensor(
+            jnp.array([100, 101], dtype=jnp.int32), global_shape=g_shape
+        ),
+        user_age_level=TransportTensor(
+            jnp.array([1, 2], dtype=jnp.int32), global_shape=g_shape
+        ),
+        request_hour=TransportTensor(
+            jnp.array([18, 19], dtype=jnp.int32), global_shape=g_shape
+        ),
+        hist_click_item_seq=TransportTensor(
+            jnp.array([200, 201], dtype=jnp.int32), global_shape=g_shape
+        ),
+        hist_seq_length=TransportTensor(
+            jnp.array([1, 1], dtype=jnp.int32), global_shape=g_shape
+        ),
+    )
+    passive = PassiveFeatures(
+        target_item_id=TransportTensor(
+            jnp.array([500, 501], dtype=jnp.int32), global_shape=g_shape
+        ),
+        target_item_category=TransportTensor(
+            jnp.array([5, 6], dtype=jnp.int32), global_shape=g_shape
+        ),
+        target_item_stats=TransportTensor(
+            jnp.array([[0.1, 0.2], [0.3, 0.4]], dtype=jnp.float32), global_shape=g_shape
+        ),
+    )
+    labels = LabelFeatures(
+        is_click=TransportTensor(
+            jnp.array([1, 0], dtype=jnp.int32), global_shape=g_shape
+        )
+    )
+    batch = UserBatch(active=active, passive=passive, labels=labels)
+
+    # 2. InputSPMD
+    with operator_context(static_args={}, rank=0, world_size=1, operator_ctx=ctx_input):
+        input_spmd = InputSPMD()
+        out_input = input_spmd.process(batch)
+
+        assert jnp.array_equal(
+            out_input.unique_user_ids.flat_values, jnp.array([100, 101])
+        )
+        assert jnp.array_equal(out_input.user_inv.flat_values, jnp.array([0, 1]))
+        assert jnp.array_equal(
+            out_input.unique_item_ids.flat_values, jnp.array([500, 501])
+        )
+        assert jnp.array_equal(out_input.item_inv.flat_values, jnp.array([0, 1]))
+
+    class UserTable(SparseEmbeddingSPMD):
+        pass
+
+    class ItemTable(SparseEmbeddingSPMD):
+        pass
+
+    # 3. User Table Lookup
+    with operator_context(static_args={}, rank=0, world_size=1, operator_ctx=ctx_user):
+        sparse_spmd_user = UserTable()
+        out_sparse_user = sparse_spmd_user.lookup(out_input.unique_user_ids)
+
+        local_ids_user = jnp.mod(jnp.array([100, 101]), 1000)
+        expected_emb_user = (jnp.ones((2, 3)) * 0.01) * local_ids_user[:, None]
+        assert jnp.allclose(
+            out_sparse_user.sparse_features.flat_values, expected_emb_user
+        )
+
+    # 4. Item Table Lookup
+    with operator_context(static_args={}, rank=0, world_size=1, operator_ctx=ctx_item):
+        sparse_spmd_item = ItemTable()
+        out_sparse_item = sparse_spmd_item.lookup(out_input.unique_item_ids)
+
+        local_ids_item = jnp.mod(jnp.array([500, 501]), 1000)
+        expected_emb_item = (jnp.ones((2, 3)) * 0.01) * local_ids_item[:, None]
+        assert jnp.allclose(
+            out_sparse_item.sparse_features.flat_values, expected_emb_item
+        )
+
+    # 5. DenseSPMD Forward
+    with operator_context(static_args={}, rank=0, world_size=1, operator_ctx=ctx_input):
+        dense_spmd = DenseSPMD()
+        out_dense = dense_spmd.forward(
+            emb1=out_sparse_user.sparse_features,
+            inv1=out_input.user_inv,
+            emb2=out_sparse_item.sparse_features,
+            inv2=out_input.item_inv,
+            dp_data=out_input.dp_data,
+        )
+
+        expected_f1_rec = expected_emb_user[out_input.user_inv.flat_values.reshape(-1)]
+        expected_f2_rec = expected_emb_item[out_input.item_inv.flat_values.reshape(-1)]
+        expected_pred = (
+            expected_f1_rec.sum()
+            + expected_f2_rec.sum()
+            + batch.passive.target_item_stats.flat_values.sum()
+        )
+        assert jnp.isclose(out_dense.prediction, expected_pred)
+
+    # 6. DenseSPMD Backward
+    with operator_context(static_args={}, rank=0, world_size=1, operator_ctx=ctx_input):
+        grads = dense_spmd.backward(out_dense)
+
+        g1_expected = jnp.ones((2, 3), dtype=jnp.float32) * 0.1
+        assert jnp.allclose(grads["grad1"], g1_expected)
+
+        g2_expected = jnp.ones((2, 3), dtype=jnp.float32) * 0.2
+        assert jnp.allclose(grads["grad2"], g2_expected)
+
+    # 7. SparseEmbeddingSPMD Update
+    with operator_context(static_args={}, rank=0, world_size=1, operator_ctx=ctx_user):
+        grad_tensor_user = TransportTensor(grads["grad1"])
+        sparse_spmd_user.update(grad_tensor_user)
+
+        updated_params_user = _instance_storage.instances[id(UserTable)].params
+        assert jnp.allclose(updated_params_user[100], 0.01 - 0.1 * 0.1)
+        assert jnp.allclose(updated_params_user[101], 0.01 - 0.1 * 0.1)
+
+    with operator_context(static_args={}, rank=0, world_size=1, operator_ctx=ctx_item):
+        grad_tensor_item = TransportTensor(grads["grad2"])
+        sparse_spmd_item.update(grad_tensor_item)
+
+        updated_params_item = _instance_storage.instances[id(ItemTable)].params
+        assert jnp.allclose(updated_params_item[500], 0.01 - 0.1 * 0.2)
+        assert jnp.allclose(updated_params_item[501], 0.01 - 0.1 * 0.2)

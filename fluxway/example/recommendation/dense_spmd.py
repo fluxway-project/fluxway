@@ -13,9 +13,9 @@ class DenseSPMD:
     @operator(
         name="forward",
         input_sharding={
-            "emb1": {"type": "dynamic", "axis": ["dp"]},
+            "emb1": {"type": "static", "axis": ["dp"]},
             "inv1": {"type": "static", "axis": ["dp"]},
-            "emb2": {"type": "dynamic", "axis": ["dp"]},
+            "emb2": {"type": "static", "axis": ["dp"]},
             "inv2": {"type": "static", "axis": ["dp"]},
             "dp_data": {"type": "static", "axis": ["dp"]},
         },
@@ -37,21 +37,24 @@ class DenseSPMD:
         dp_data: DPFeatures,
     ) -> DenseOutput:
         rank = self.rank  # type: ignore
+        print(
+            f"[DenseSPMD]forward rank={rank}, emb1:user_emb_unique={emb1.flat_values}, emb1.global_shape={emb1.global_shape}, emb2:item_emb_unique={emb2.flat_values}, emb2.global_shape={emb2.global_shape}, inv1={inv1.flat_values}, inv1.global_shape={inv1.global_shape}, inv2={inv2.flat_values}, inv2.global_shape={inv2.global_shape}"
+        )
 
         # Reconstructions using indexing
-        f1_rec = emb1[inv1]
+
+        print(
+            f"[DenseSPMD DEBUG] rank={self.rank}, emb1 shape={emb1.flat_values.shape}, inv1 shape={inv1.flat_values.shape}, inv1 values={inv1.flat_values}, emb1 values={emb1.flat_values}"
+        )
+        try:
+            f1_rec = emb1[inv1]
+        except Exception as e:
+            print(f"[DenseSPMD ERROR] rank={self.rank}, Failed emb1[inv1]: {repr(e)}")
+            raise e
         f2_rec = emb2[inv2]
 
         # Simple summation + dense stats
         prediction = f1_rec.sum() + f2_rec.sum() + dp_data.dense_stats.sum()
-
-        print(
-            f"[DenseSPMD] forward input rank={rank}, inv1={inv1.flat_values}, inv2={inv2.flat_values}"
-        )
-
-        print(
-            f"[DenseSPMD]forward output rank={rank}, emb1:user_emb_unique={emb1.flat_values}, emb1.global_shape={emb1.global_shape}, emb2:item_emb_unique={emb2.flat_values}, emb2.global_shape={emb2.global_shape}"
-        )
 
         return DenseOutput(
             prediction=prediction,
@@ -66,8 +69,8 @@ class DenseSPMD:
         name="backward",
         input_sharding={"context": {"type": "static", "axis": ["dp"]}},
         output_sharding={
-            "grad1": {"type": "mirror", "source": "forward.emb1"},
-            "grad2": {"type": "mirror", "source": "forward.emb2"},
+            "grad1": {"type": "mirror", "reference": "forward.emb1"},
+            "grad2": {"type": "mirror", "reference": "forward.emb2"},
         },
     )
     def backward(self, context: DenseOutput) -> dict:

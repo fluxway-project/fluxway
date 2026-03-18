@@ -469,3 +469,33 @@ def test_redundant_replenishment():
 
     assert spec.replica_size == 12
     assert set(spec.replica_axes or ()) == {"y", "z"}
+
+
+def test_replicated_responsibility_mapping():
+    """
+    Verify load-balanced M-to-N mapping for replicated data.
+    Ensures each receiver expects exactly ONE copy from a deterministic source.
+    """
+    # 3 source workers -> 6 destination workers
+    src_mesh = DeviceMesh(device_shape=(3,), axis_names=("x",))
+    dst_mesh = DeviceMesh(device_shape=(6,), axis_names=("y",))
+
+    # P() means fully replicated (e.g. scalar or weight replica)
+    spec = ShardingSpec.chunk(P())
+    src_layout = spec.bind(src_mesh)
+    dst_layout = spec.bind(dst_mesh)
+
+    # 1. Receiver Perspective: Each dst rank j should choose exactly one src rank i
+    for j in range(6):
+        producers = src_layout.resolve_producers(dst_layout, j)
+        expected_src = (j * 3) // 6
+        assert producers == [expected_src], (
+            f"Dst Rank {j} should receive only from Src Rank {expected_src}"
+        )
+
+    # 2. Sender Perspective: Each src rank i should be responsible for a subset of dst ranks
+    # Mapping: Src 0 -> Dst [0, 1], Src 1 -> Dst [2, 3], Src 2 -> Dst [4, 5]
+    assignment = {0: [0, 1], 1: [2, 3], 2: [4, 5]}
+    for i in range(3):
+        consumers = src_layout.resolve_consumers(dst_layout, i)
+        assert list(consumers) == assignment[i], f"Src Rank {i} responsibility mismatch"

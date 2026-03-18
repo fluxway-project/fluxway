@@ -32,7 +32,7 @@ async def test_embedding_forward_staleness_logic():
 
     # Define an operator with TolerantBarrier
     # Staleness = 2 means for step T, we need data from at least step T-2.
-    barrier_cfg = TolerantBarrierConfig(staleness={"weights": 2})
+    barrier_cfg = TolerantBarrierConfig(state_staleness={"weights": 2})
 
     # 1. Initialize Weights at step 0
     await mb.deposit_states("forward", step=0, names=["weights"], values=[np.zeros(10)])

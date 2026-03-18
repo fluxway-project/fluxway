@@ -81,29 +81,40 @@ class RecommendationReader(GrainReader):
         g_shape = (global_batch_size,)
 
         # 1. Active Features
+        from fluxway.common.index_descriptor import ContinuousIndex
+
+        origins = ContinuousIndex.chunk(0, global_batch_size)
+
         active = ActiveFeatures(
             user_id=TransportTensor.from_lists(
-                [s["user_id"] for s in samples], dtype=jnp.int32, global_shape=g_shape
+                [s["user_id"] for s in samples],
+                dtype=jnp.int32,
+                global_shape=g_shape,
+                origin_indices=origins,
             ),
             user_age_level=TransportTensor.from_lists(
                 [s["user_age_level"] for s in samples],
                 dtype=jnp.int32,
                 global_shape=g_shape,
+                origin_indices=origins,
             ),
             request_hour=TransportTensor.from_lists(
                 [s["request_hour"] for s in samples],
                 dtype=jnp.int32,
                 global_shape=g_shape,
+                origin_indices=origins,
             ),
             hist_click_item_seq=TransportTensor.from_lists(
                 [s["hist_click_item_seq"] for s in samples],
                 dtype=jnp.int32,
                 global_shape=g_shape,
+                origin_indices=origins,
             ),
             hist_seq_length=TransportTensor.from_lists(
                 [[s["hist_seq_length"]] for s in samples],
                 dtype=jnp.int32,
                 global_shape=g_shape,
+                origin_indices=origins,
             ),
         )
 
@@ -113,23 +124,29 @@ class RecommendationReader(GrainReader):
                 [s["target_item_id"] for s in samples],
                 dtype=jnp.int32,
                 global_shape=g_shape,
+                origin_indices=origins,
             ),
             target_item_category=TransportTensor.from_lists(
                 [s["target_item_category"] for s in samples],
                 dtype=jnp.int32,
                 global_shape=g_shape,
+                origin_indices=origins,
             ),
             target_item_stats=TransportTensor.from_lists(
                 [s["target_item_stats"] for s in samples],
                 dtype=jnp.float32,
                 global_shape=g_shape,
+                origin_indices=origins,
             ),
         )
 
         # 3. Label Features
         labels = LabelFeatures(
             is_click=TransportTensor.from_lists(
-                [s["is_click"] for s in samples], dtype=jnp.int32, global_shape=g_shape
+                [s["is_click"] for s in samples],
+                dtype=jnp.int32,
+                global_shape=g_shape,
+                origin_indices=origins,
             )
         )
 

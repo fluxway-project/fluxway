@@ -186,8 +186,8 @@ class TestOperatorMetaSerialization:
 
         meta = OperatorMeta(
             name="test_op",
-            input_arguments={ArgumentType.TENSOR.value: ["input"]},
-            output_arguments={ArgumentType.TENSOR.value: ["output"]},
+            input_arguments={ArgumentType.DATA.value: ["input"]},
+            output_arguments={ArgumentType.DATA.value: ["output"]},
         )
         my_op._flux_operator_meta = meta
 
