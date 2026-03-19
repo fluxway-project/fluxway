@@ -28,15 +28,18 @@ async def run_training(args):
 
     graph = FunctionalGraph()
 
-    #
-    #        reader (5 workers)
-    #           |
-    #       input_node (6 dp workers)
-    #      /           \
-    #  table1 (3)   table2 (4)
-    #      \           /
-    #        dense (6 dp workers)
-    #
+    r"""
+            reader
+              |
+          input_node
+        /     |      \
+      |       |        |
+    table1  table2     |
+      |       |        |
+      ------------------
+              |
+            dense
+    """
 
     reader_mesh = DeviceMesh(device_shape=(5,), axis_names=("worker",))
     input_mesh = DeviceMesh(device_shape=(6,), axis_names=("dp",))

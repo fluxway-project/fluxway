@@ -198,7 +198,6 @@ class BaseDataDistributor:
             )
             return
 
-        # >>> ALGEBRAIC PATH (Forward/Standard) <<<
         # 1. Extract Initial Routing Signal from Primary Tensor
         src_geometry_indices = primary.origin_indices
         if src_geometry_indices is None:
@@ -266,7 +265,11 @@ class BaseDataDistributor:
                 primary.global_shape is None
             )
             src_mesh_size = source.mesh.size if source.mesh else 1
-            if dst_shape is None or (is_fallback_shape and src_mesh_size > 1):
+            # axis=[] → source.partitions == {} → fully replicated; local_shape == global_shape is correct
+            is_src_replicated = not source.partitions
+            if dst_shape is None or (
+                is_fallback_shape and src_mesh_size > 1 and not is_src_replicated
+            ):
                 raise ValueError(
                     f"[Distributor] Static-to-Static routing requires a valid 'global_shape' to determine shard boundaries. "
                     f"TUUID: {self._format_tuuids(tuuid, tuuid_to_name)}. "
@@ -330,12 +333,16 @@ class BaseDataDistributor:
 
         global_shapes_list = [tt.global_shape for tt in tensors_to_pack]
 
-        if primary.shape == ():
+        is_src_replicated = source is not None and not source.partitions
+        if primary.shape == () or is_src_replicated:
             target_world_size = target.mesh.size if target and target.mesh else 1
             src_world_size = source.mesh.size if source and source.mesh else 1
 
-            # Replicated dispatch: i = floor(j * M / N)
-            # Each target j expects exactly one copy from a specific source i.
+            # Replicated dispatch: responsible_src = floor(j * N / M)
+            # Each target j receives exactly one copy from a designated source.
+            # N < M → broadcast (contiguous block per source)
+            # N > M → selection (only sources 0..M-1 send, others idle)
+            # N == M → 1:1 bijection
             targets_to_send = []
             for j in range(target_world_size):
                 responsible_src = (j * src_world_size) // target_world_size
@@ -345,10 +352,16 @@ class BaseDataDistributor:
             if not targets_to_send:
                 return
 
+            # Scalar payload has exactly 1 element; non-scalar carries actual length.
+            counts = (
+                [1] * len(payloads)
+                if primary.shape == ()
+                else [len(p) if hasattr(p, "__len__") else 1 for p in payloads]
+            )
             yield (
                 targets_to_send,
                 payloads,
-                [1] * len(payloads),
+                counts,
                 None,
                 global_shapes_list,
                 has_meta_tensor_state_list,

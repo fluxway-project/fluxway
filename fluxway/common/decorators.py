@@ -38,9 +38,16 @@ class PicklableThreadLocal(threading.local):
         pass
 
 
-# Thread-local storage for operator context and instances
+# Thread-local storage for operator execution context (per-call, must be thread-isolated)
 _operator_context = PicklableThreadLocal()
-_instance_storage = PicklableThreadLocal()
+
+# Process-wide storage for operator class instances.
+# Instances are created once (in SPMDWorker._pre_instantiate_operators, before the
+# async thread pool starts) and then read-only shared across threads. Using a plain
+# dict here is intentional: threading.local would hide the pre-instantiated entries
+# from the asyncio.to_thread() worker threads.
+_instance_storage_lock = threading.Lock()
+_instance_storage: Dict[int, Any] = {}
 
 
 @contextmanager
@@ -581,10 +588,6 @@ def _create_operator_wrapper(
 
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
-        # Get or create thread-local instance
-        if not hasattr(_instance_storage, "instances"):
-            _instance_storage.instances = {}
-
         # We need the class to instantiate it
         cls = getattr(wrapper, "_flux_spmd_class", None)
         if not cls:
@@ -599,13 +602,43 @@ def _create_operator_wrapper(
                 f"Fluxway Execution Error: Cannot instantiate class for operator '{name}'."
             )
 
-        instance_key = id(cls)  # different function in one class share one instance.
-        if instance_key not in _instance_storage.instances:
-            _instance_storage.instances[instance_key] = cls()
+        instance_key = id(cls)  # different operators in one class share one instance.
+        if instance_key not in _instance_storage:
+            with _instance_storage_lock:
+                if instance_key not in _instance_storage:  # double-checked locking
+                    ctx = get_current_context()
+                    rank = getattr(ctx, "rank", 0)
+                    world_size = getattr(ctx, "world_size", 1)
+                    static_args = getattr(ctx, "static_args", {}) or {}
 
-        instance = _instance_storage.instances[instance_key]
+                    try:
+                        init_sig = inspect.signature(cls.__init__)
+                        init_params = set(init_sig.parameters.keys()) - {"self"}
+                        has_var_keyword = any(
+                            p.kind == inspect.Parameter.VAR_KEYWORD
+                            for p in init_sig.parameters.values()
+                        )
+                        init_kwargs = (
+                            dict(static_args)
+                            if has_var_keyword
+                            else {
+                                k: v for k, v in static_args.items() if k in init_params
+                            }
+                        )
+                    except (ValueError, TypeError):
+                        init_kwargs = {}
 
-        # Inject runtime context into the class instance
+                    instance = cls.__new__(cls)
+                    instance.rank = rank
+                    instance.world_size = world_size
+                    instance.static_args = static_args
+                    instance.ctx = getattr(ctx, "operator_ctx", None)
+                    instance.__init__(**init_kwargs)
+                    _instance_storage[instance_key] = instance
+
+        instance = _instance_storage[instance_key]
+
+        # Update runtime context on each call (step/ctx can change per invocation)
         ctx = get_current_context()
         instance.static_args = getattr(ctx, "static_args", {})
         instance.rank = getattr(ctx, "rank", 0)

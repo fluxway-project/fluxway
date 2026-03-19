@@ -938,9 +938,11 @@ class Builder:
             list(tuuid_map.values()),
         )
 
-        # When a Static tensor flows into a larger mesh, the data must be large enough at
-        # runtime to cover all target workers. We can't know global_shape at build time,
-        # so emit a warning to catch the most common misconfiguration early.
+        # When a Static tensor flows from a smaller mesh to a larger one:
+        # - Source ops (interleaved virtual SPMD): round-robin scheduling covers all downstream
+        #   workers regardless of mesh size mismatch. No starving risk; emit INFO only.
+        # - Non-source ops: the tensor is split by mesh size, so the target workers may not
+        #   receive data if the batch is too small. Emit WARNING.
         for src_name, dst_name in tensor_map.items():
             s_spec = src_out_specs.get(src_name)
             t_spec = dst_in_specs.get(dst_name)
@@ -955,20 +957,36 @@ class Builder:
                 and dst_cfg.mesh is not None
                 and src_cfg.mesh.size < dst_cfg.mesh.size
             ):
-                logger.warning(
-                    "\n[Fluxway Config Warning] Static tensor '%s' "
-                    "(edge %s.%s -> %s.%s) flows from mesh(size=%d) to mesh(size=%d). "
-                    "Ensure the data size along every partitioned dimension is >= %d at "
-                    "runtime, otherwise some workers will starve silently.",
-                    src_name,
-                    source_node,
-                    source_op,
-                    target_node,
-                    target_op,
-                    src_cfg.mesh.size,
-                    dst_cfg.mesh.size,
-                    dst_cfg.mesh.size,
-                )
+                if is_source:
+                    logger.info(
+                        "Static tensor '%s' (edge %s.%s -> %s.%s) flows from "
+                        "mesh(size=%d) to mesh(size=%d). Source op uses interleaved "
+                        "virtual SPMD scheduling; all %d downstream workers will "
+                        "receive data in round-robin order.",
+                        src_name,
+                        source_node,
+                        source_op,
+                        target_node,
+                        target_op,
+                        src_cfg.mesh.size,
+                        dst_cfg.mesh.size,
+                        dst_cfg.mesh.size,
+                    )
+                else:
+                    logger.warning(
+                        "\n[Fluxway Config Warning] Static tensor '%s' "
+                        "(edge %s.%s -> %s.%s) flows from mesh(size=%d) to mesh(size=%d). "
+                        "Ensure the data size along every partitioned dimension is >= %d at "
+                        "runtime, otherwise some workers will starve silently.",
+                        src_name,
+                        source_node,
+                        source_op,
+                        target_node,
+                        target_op,
+                        src_cfg.mesh.size,
+                        dst_cfg.mesh.size,
+                        dst_cfg.mesh.size,
+                    )
 
     def build(self, name: str = "") -> Graph:
         """

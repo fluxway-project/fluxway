@@ -108,6 +108,12 @@ class SPMDWorker:
         self._mesh = config.mesh
         self._world_size = config.num_workers
 
+        # Eagerly instantiate operator classes before OperatorManager and before
+        # the Ray RPC loop starts. This is the earliest point where rank/world_size
+        # are known. cls.__init__ therefore runs before any JAX array deserialization
+        # can trigger the XLA backend.
+        self._pre_instantiate_operators(config, rank)
+
         self._op_manager = OperatorManager(config, rank, spmd_id)
 
         # Execution step counters {op_name: step} - tracks which step is being/was executed
@@ -209,6 +215,72 @@ class SPMDWorker:
         from fluxway.common.decorators import operator_context
 
         operator_context(self.config.static_args, self.rank, self._world_size)
+
+    # =========================================================================
+    # Operator Pre-Instantiation
+    # =========================================================================
+
+    @staticmethod
+    def _pre_instantiate_operators(config: "SPMDConfig", rank: int) -> None:
+        """Eagerly instantiate all SPMD operator class instances.
+
+        This runs inside SPMDWorker.__init__, before OperatorManager is created
+        and before the Ray RPC event loop starts. Operator classes get their
+        __init__ called while JAX's XLA backend is still uninitialised, which
+        allows users to call jax.distributed.initialize (or any other
+        per-process setup) safely from __init__ via self.rank / self.world_size.
+
+        The static_args declared for this SPMD node are filtered by each class's
+        __init__ signature and forwarded as keyword arguments, so users can
+        declare custom init parameters and have them populated from static_args.
+        """
+        import inspect as _inspect
+        from fluxway.common.decorators import (
+            operator_context,
+            _instance_storage,
+            _instance_storage_lock,
+            get_current_context,
+        )
+
+        world_size = config.num_workers
+        static_args = config.static_args or {}
+
+        seen: set = set()
+        with operator_context(
+            static_args=static_args, rank=rank, world_size=world_size
+        ):
+            ctx = get_current_context()
+            for op_fn in (config.operators or {}).values():
+                cls = getattr(op_fn, "_flux_spmd_class", None)
+                if cls is None or id(cls) in seen:
+                    continue
+                seen.add(id(cls))
+                if id(cls) in _instance_storage:
+                    continue
+
+                try:
+                    init_sig = _inspect.signature(cls.__init__)
+                    init_params = set(init_sig.parameters.keys()) - {"self"}
+                    has_var_keyword = any(
+                        p.kind == _inspect.Parameter.VAR_KEYWORD
+                        for p in init_sig.parameters.values()
+                    )
+                    init_kwargs = (
+                        dict(static_args)
+                        if has_var_keyword
+                        else {k: v for k, v in static_args.items() if k in init_params}
+                    )
+                except (ValueError, TypeError):
+                    init_kwargs = {}
+
+                instance = cls.__new__(cls)
+                instance.rank = rank
+                instance.world_size = world_size
+                instance.static_args = static_args
+                instance.ctx = getattr(ctx, "operator_ctx", None)
+                instance.__init__(**init_kwargs)
+                with _instance_storage_lock:
+                    _instance_storage[id(cls)] = instance
 
     # =========================================================================
     # Driver Handle Management

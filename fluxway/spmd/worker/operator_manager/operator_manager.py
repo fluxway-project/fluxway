@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set, Type, Tuple, TYPE_CHECKING
 from fluxway.common.utils.logging import get_logger
 import threading
-import inspect
+import inspect as _inspect
 
 from fluxway.common.types.configs import ArgumentType
 from fluxway.common.types.sharding import ShardingSpec, PhysicalLayout
@@ -836,7 +836,7 @@ class OperatorManager:
                 continue
 
             try:
-                sig = inspect.signature(operator)
+                sig = _inspect.signature(operator)
                 is_source = self.is_source_operator(op_name)
 
                 params_dict = {}
@@ -844,7 +844,7 @@ class OperatorManager:
                     if p_name in ("self", "cls"):
                         continue
                     param_type = param.annotation
-                    if param_type == inspect.Parameter.empty:
+                    if param_type == _inspect.Parameter.empty:
                         logger.warning(
                             f"Operator {op_name} parameter '{p_name}' has no type annotation"
                         )

@@ -36,10 +36,7 @@ class SparseEmbeddingSPMD:
             g_shape = (unique_ids.global_shape[0], self.embed_dim)
 
         output = TransportTensor(
-            embeddings,
-            origin_indices=unique_ids.origin_indices,
-            routing_indices=ids,
-            global_shape=g_shape,
+            embeddings, origin_indices=unique_ids.origin_indices, global_shape=g_shape
         )
         print(
             f"[SparseEmbeddingSPMD.lookup] rank={self.rank} step={step} "
