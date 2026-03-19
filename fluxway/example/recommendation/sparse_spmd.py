@@ -23,7 +23,7 @@ class SparseEmbeddingSPMD:
         },
         output_sharding={"sparse_features": {"type": "dynamic", "axis": ["shard"]}},
     )
-    def lookup(self, unique_ids: TransportTensor) -> LookupOutput:
+    def lookup(self, unique_ids: TransportTensor, **kwargs) -> LookupOutput:
         step = self.ctx.step
         ids = unique_ids.flat_values
         self._forward_ids_cache[step] = ids
@@ -51,7 +51,7 @@ class SparseEmbeddingSPMD:
             "grads": {"type": "mirror", "reference": "lookup.sparse_features"}
         },
     )
-    def update(self, grads: TransportTensor) -> None:
+    def update(self, grads: TransportTensor, **kwargs) -> None:
         step = self.ctx.step
         ids = self._forward_ids_cache.pop(step, None)
 

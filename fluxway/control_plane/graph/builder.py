@@ -66,6 +66,7 @@ class Builder:
         spmd_class: Type,
         description: str = "",
         mesh: Optional[DeviceMesh] = None,
+        **kwargs: Any,
     ) -> "Builder":
         """
         Add a node to the graph.
@@ -163,6 +164,8 @@ class Builder:
                 f"       class {spmd_class.__name__}:"
             )
 
+        spmd_config.static_args.update(kwargs)
+
         node = Node(
             name=name,
             description=description,
@@ -247,7 +250,7 @@ class Builder:
         all_static_args = {**reader_kwargs}
         if data_source is not None:
             all_static_args["data_source"] = data_source
-        node.static_args.update(all_static_args)
+        node.spmd_config.static_args.update(all_static_args)
 
         # Handle resource specification
         if resource:
@@ -1011,11 +1014,6 @@ class Builder:
                 raise ValueError(
                     f"Edge references non-existent target node: {edge.target_node}"
                 )
-
-        # Sync static_args to spmd_config
-        for node in self._nodes.values():
-            if node.static_args:
-                node.spmd_config.static_args.update(node.static_args)
 
         graph = Graph(name=name, nodes=self._nodes.copy(), edges=self._edges.copy())
 

@@ -82,6 +82,7 @@ class DenseSPMD:
         emb2: TransportTensor,
         inv2: TransportTensor,
         dp_data: DPFeatures,
+        **kwargs,
     ) -> dict:
         self._ensure_jax_init()
 
@@ -185,7 +186,7 @@ class DenseSPMD:
     @operator(
         name="update", input_sharding={"dense_grad": {"type": "static", "axis": []}}
     )
-    def update(self, dense_grad: TransportTensor) -> None:
+    def update(self, dense_grad: TransportTensor, **kwargs) -> None:
         step = self.ctx.step
         treedef = jtu.tree_structure(self.grad_accum)
         param_leaves = jtu.tree_leaves(nnx.state(self.model))

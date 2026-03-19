@@ -266,7 +266,6 @@ class Node(FluxwayBaseSchema):
     priority: Optional[ResourcePriority] = None  # Resource priority for allocation
     spmd_config: SPMDConfig = Field(default_factory=SPMDConfig)
     node_type: NodeType = NodeType.SPMD  # Node type: SPMD
-    static_args: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ArgumentType(str, Enum):

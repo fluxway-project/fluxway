@@ -49,9 +49,23 @@ async def run_training(args):
 
     reader = graph.node("TrainingReader", RecommendationReader, mesh=reader_mesh)
     input_node = graph.node("InputProcessor", InputSPMD, mesh=input_mesh)
-    table1 = graph.node("EmbeddingTable1", SparseEmbeddingSPMD, mesh=table1_mesh)
-    table2 = graph.node("EmbeddingTable2", SparseEmbeddingSPMD, mesh=table2_mesh)
-    dense = graph.node("DenseLayers", DenseSPMD, mesh=dense_mesh)
+    table1 = graph.node(
+        "EmbeddingTable1",
+        SparseEmbeddingSPMD,
+        mesh=table1_mesh,
+        vocab_size=2000,
+        embed_dim=16,
+    )
+    table2 = graph.node(
+        "EmbeddingTable2",
+        SparseEmbeddingSPMD,
+        mesh=table2_mesh,
+        vocab_size=2000,
+        embed_dim=16,
+    )
+    dense = graph.node(
+        "DenseLayers", DenseSPMD, mesh=dense_mesh, embed_dim=16, dense_stats_dim=2
+    )
 
     h_raw = reader.read()
     h_proc = input_node.process(h_raw)
