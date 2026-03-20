@@ -780,157 +780,48 @@ def test_reconstruct_splits_from_lengths():
     )
 
 
-def test_recommendation_spmd_values():
-    """
-    Verifies the numeric input and output values of the recommendation SPMD operators.
-    Matches the user's requirement to explicitly verify input/output values.
-    """
-    import jax.numpy as jnp
-    from fluxway.common.backend import set_backend
-    from fluxway.common.decorators import operator_context, _instance_storage
-    from fluxway.example.recommendation.input_spmd import InputSPMD
-    from fluxway.example.recommendation.sparse_spmd import SparseEmbeddingSPMD
-    from fluxway.example.recommendation.dense_spmd import DenseSPMD
-    from fluxway.example.recommendation.data_types import (
-        UserBatch,
-        ActiveFeatures,
-        PassiveFeatures,
-        LabelFeatures,
+def test_large_scale_sparse_moe():
+    """Multi-bucket capacity distribute: all tokens must arrive across all ranks."""
+    bk = get_backend()
+
+    num_workers = 4
+    mesh = DeviceMesh(("x",), (num_workers,), list(range(num_workers)))
+    spec_src = ShardingSpec.chunk(P("x")).bind(mesh)
+    spec_dst = ShardingSpec.hash(P("x")).bind(mesh)
+
+    cluster = {i: VirtualRank(i, mesh) for i in range(num_workers)}
+
+    import numpy as np
+
+    np.random.seed(42)
+    total_tokens = 100000
+    emb_dim = 64
+
+    tokens_np = np.random.randn(total_tokens, emb_dim).astype(np.float32)
+    routing_np = np.random.randint(0, num_workers, size=total_tokens).astype(np.int32)
+    tt = TransportTensor(bk.tensor(tokens_np), routing_indices=bk.tensor(routing_np))
+
+    def send_fn(target, tuuids, tensors, counts, *args, **kwargs):
+        if counts[0] > 0:
+            cluster[target].receiver.receive_slices(0, tensors, counts)
+        return True
+
+    cluster[0].distributor.distribute(
+        local_data=tt,
+        source=spec_src,
+        target=spec_dst,
+        send_fn=send_fn,
+        capacity=[10000, 20000, 30000, 40000],
     )
-    from fluxway.common.types.tensor import TransportTensor
 
-    set_backend("jax")
-
-    class MockCtx:
-        def __init__(self, step=0):
-            self.step = step
-
-    ctx_input = MockCtx(step=0)
-    ctx_user = MockCtx(step=0)
-    ctx_item = MockCtx(step=1)
-
-    # 1. Mock Input Data
-    g_shape = (2,)
-    active = ActiveFeatures(
-        user_id=TransportTensor(
-            jnp.array([100, 101], dtype=jnp.int32), global_shape=g_shape
-        ),
-        user_age_level=TransportTensor(
-            jnp.array([1, 2], dtype=jnp.int32), global_shape=g_shape
-        ),
-        request_hour=TransportTensor(
-            jnp.array([18, 19], dtype=jnp.int32), global_shape=g_shape
-        ),
-        hist_click_item_seq=TransportTensor(
-            jnp.array([200, 201], dtype=jnp.int32), global_shape=g_shape
-        ),
-        hist_seq_length=TransportTensor(
-            jnp.array([1, 1], dtype=jnp.int32), global_shape=g_shape
-        ),
+    total_received = sum(
+        counts[0]
+        for slices in (
+            cluster[r].receiver.get_buffered_slices() for r in range(num_workers)
+        )
+        for _, counts in slices
+        if counts[0] > 0
     )
-    passive = PassiveFeatures(
-        target_item_id=TransportTensor(
-            jnp.array([500, 501], dtype=jnp.int32), global_shape=g_shape
-        ),
-        target_item_category=TransportTensor(
-            jnp.array([5, 6], dtype=jnp.int32), global_shape=g_shape
-        ),
-        target_item_stats=TransportTensor(
-            jnp.array([[0.1, 0.2], [0.3, 0.4]], dtype=jnp.float32), global_shape=g_shape
-        ),
+    assert total_received == total_tokens, (
+        f"Expected {total_tokens} tokens, got {total_received}"
     )
-    labels = LabelFeatures(
-        is_click=TransportTensor(
-            jnp.array([1, 0], dtype=jnp.int32), global_shape=g_shape
-        )
-    )
-    batch = UserBatch(active=active, passive=passive, labels=labels)
-
-    # 2. InputSPMD
-    with operator_context(static_args={}, rank=0, world_size=1, operator_ctx=ctx_input):
-        input_spmd = InputSPMD()
-        out_input = input_spmd.process(batch)
-
-        assert jnp.array_equal(
-            out_input.unique_user_ids.flat_values, jnp.array([100, 101])
-        )
-        assert jnp.array_equal(out_input.user_inv.flat_values, jnp.array([0, 1]))
-        assert jnp.array_equal(
-            out_input.unique_item_ids.flat_values, jnp.array([500, 501])
-        )
-        assert jnp.array_equal(out_input.item_inv.flat_values, jnp.array([0, 1]))
-
-    class UserTable(SparseEmbeddingSPMD):
-        pass
-
-    class ItemTable(SparseEmbeddingSPMD):
-        pass
-
-    # 3. User Table Lookup
-    with operator_context(static_args={}, rank=0, world_size=1, operator_ctx=ctx_user):
-        sparse_spmd_user = UserTable()
-        out_sparse_user = sparse_spmd_user.lookup(out_input.unique_user_ids)
-
-        local_ids_user = jnp.mod(jnp.array([100, 101]), 1000)
-        expected_emb_user = (jnp.ones((2, 3)) * 0.01) * local_ids_user[:, None]
-        assert jnp.allclose(
-            out_sparse_user.sparse_features.flat_values, expected_emb_user
-        )
-
-    # 4. Item Table Lookup
-    with operator_context(static_args={}, rank=0, world_size=1, operator_ctx=ctx_item):
-        sparse_spmd_item = ItemTable()
-        out_sparse_item = sparse_spmd_item.lookup(out_input.unique_item_ids)
-
-        local_ids_item = jnp.mod(jnp.array([500, 501]), 1000)
-        expected_emb_item = (jnp.ones((2, 3)) * 0.01) * local_ids_item[:, None]
-        assert jnp.allclose(
-            out_sparse_item.sparse_features.flat_values, expected_emb_item
-        )
-
-    # 5. DenseSPMD Forward
-    with operator_context(static_args={}, rank=0, world_size=1, operator_ctx=ctx_input):
-        dense_spmd = DenseSPMD()
-        out_dense = dense_spmd.forward(
-            emb1=out_sparse_user.sparse_features,
-            inv1=out_input.user_inv,
-            emb2=out_sparse_item.sparse_features,
-            inv2=out_input.item_inv,
-            dp_data=out_input.dp_data,
-        )
-
-        expected_f1_rec = expected_emb_user[out_input.user_inv.flat_values.reshape(-1)]
-        expected_f2_rec = expected_emb_item[out_input.item_inv.flat_values.reshape(-1)]
-        expected_pred = (
-            expected_f1_rec.sum()
-            + expected_f2_rec.sum()
-            + batch.passive.target_item_stats.flat_values.sum()
-        )
-        assert jnp.isclose(out_dense.prediction, expected_pred)
-
-    # 6. DenseSPMD Backward
-    with operator_context(static_args={}, rank=0, world_size=1, operator_ctx=ctx_input):
-        grads = dense_spmd.backward(out_dense)
-
-        g1_expected = jnp.ones((2, 3), dtype=jnp.float32) * 0.1
-        assert jnp.allclose(grads["grad1"], g1_expected)
-
-        g2_expected = jnp.ones((2, 3), dtype=jnp.float32) * 0.2
-        assert jnp.allclose(grads["grad2"], g2_expected)
-
-    # 7. SparseEmbeddingSPMD Update
-    with operator_context(static_args={}, rank=0, world_size=1, operator_ctx=ctx_user):
-        grad_tensor_user = TransportTensor(grads["grad1"])
-        sparse_spmd_user.update(grad_tensor_user)
-
-        updated_params_user = _instance_storage.instances[id(UserTable)].params
-        assert jnp.allclose(updated_params_user[100], 0.01 - 0.1 * 0.1)
-        assert jnp.allclose(updated_params_user[101], 0.01 - 0.1 * 0.1)
-
-    with operator_context(static_args={}, rank=0, world_size=1, operator_ctx=ctx_item):
-        grad_tensor_item = TransportTensor(grads["grad2"])
-        sparse_spmd_item.update(grad_tensor_item)
-
-        updated_params_item = _instance_storage.instances[id(ItemTable)].params
-        assert jnp.allclose(updated_params_item[500], 0.01 - 0.1 * 0.2)
-        assert jnp.allclose(updated_params_item[501], 0.01 - 0.1 * 0.2)

@@ -53,6 +53,47 @@ from .mailbox import WorkerMailbox
 from .operator_manager import OperatorManager
 from .operator_manager.dispatcher import SKIPPED
 from fluxway.transport.communication import AsyncDataDistributor
+from fluxway.common.execution import compile
+
+
+@compile(static_argnums=())
+def _jit_sort_fused(values, origin_indices, routing_indices, receipt_tags):
+    backend = get_backend()
+    sort_idx = backend.argsort(origin_indices)
+    return (
+        backend.take(values, sort_idx),
+        backend.take(origin_indices, sort_idx),
+        backend.take(routing_indices, sort_idx),
+        backend.take(receipt_tags, sort_idx),
+        sort_idx,
+    )
+
+
+def _pad_tensor_to_power_of_2(tensor, original_length: int, cap: int, pad_value=0):
+    if cap == original_length:
+        return tensor
+    backend = get_backend()
+    pad_shape = list(backend.shape(tensor))
+    pad_shape[0] = cap - original_length
+    if pad_value == 0:
+        zeros = backend.zeros(tuple(pad_shape), dtype=backend.dtype(tensor))
+    else:
+        zeros = backend.full(tuple(pad_shape), pad_value, dtype=backend.dtype(tensor))
+    return backend.cat([tensor, zeros], dim=0)
+
+
+@compile(static_argnums=(1,))
+def _jit_reduce_scalars(stacked, op: str):
+    backend = get_backend()
+    if op == "sum":
+        return backend.sum(stacked)
+    if op == "mean":
+        return backend.mean(stacked)
+    if op == "min":
+        return backend.min(stacked)
+    if op == "max":
+        return backend.max(stacked)
+    raise ValueError(f"Unsupported reduction op: {op}")
 
 
 logger = get_logger(__name__)
@@ -1413,19 +1454,7 @@ class SPMDWorker:
             if hasattr(input_layout.reduce_op, "value")
             else str(input_layout.reduce_op)
         )
-        op = op.lower()
-
-        if op == "sum":
-            reduced = backend.sum(stacked)
-        elif op == "mean":
-            reduced = backend.mean(stacked)
-        elif op == "min":
-            reduced = backend.min(stacked)
-        elif op == "max":
-            reduced = backend.max(stacked)
-        else:
-            raise ValueError(f"Unsupported reduction op: {op}")
-
+        reduced = _jit_reduce_scalars(stacked, op.lower())
         return TransportTensor.from_tensor(reduced, global_shape=())
 
     def _assemble_dynamic_to_static_tensor(
@@ -1517,7 +1546,9 @@ class SPMDWorker:
         if routing_dim == 0:
             local_values = all_values[mask]
         else:
-            indices_to_take = backend.nonzero(mask).flatten()
+            indices_to_take = backend.nonzero(
+                mask, size=int(backend.shape(all_values)[routing_dim])
+            ).flatten()
             idx_tuple = [slice(None)] * len(local_shape)
             idx_tuple[routing_dim] = indices_to_take
             local_values = all_values[tuple(idx_tuple)]
@@ -1612,13 +1643,77 @@ class SPMDWorker:
 
         # DETERMINISTIC SORTING:
         if merged_origin_indices is not None:
-            sort_idx = backend.argsort(merged_origin_indices)
-            merged_values = backend.take(merged_values, sort_idx)
-            if merged_routing_indices is not None:
-                merged_routing_indices = backend.take(merged_routing_indices, sort_idx)
-            if merged_receipt is not None:
-                merged_receipt = merged_receipt[sort_idx]
-            merged_origin_indices = backend.take(merged_origin_indices, sort_idx)
+            # Evaluate receipt: Only materialized receipts need sorting
+            receipt_tags = None
+            if merged_receipt is not None and not merged_receipt.is_scalar():
+                receipt_tags = merged_receipt.sender_rank_tags
+
+            # Optimization Trick: Dummy Substitution
+            # Bypass JAX's inability to dynamically trace `None` by substituting missing
+            # components with a valid tensor. Computations on dummies will be eliminated by CSE.
+            dummy_routing = False
+            if merged_routing_indices is None:
+                merged_routing_indices = merged_origin_indices
+                dummy_routing = True
+
+            dummy_receipt = False
+            if receipt_tags is None:
+                receipt_tags = merged_origin_indices
+                dummy_receipt = True
+
+            # -------- CAPACITY PADDING TO REDUCE RECOMPILATION --------
+            # By bucketizing Ragged/variable sequence lengths up to the nearest powers of 2,
+            # we restrict JAX JIT from undergoing severe compilation storms.
+            backend = get_backend()
+            shape_merged = backend.shape(merged_values)
+            actual_len = shape_merged[0] if shape_merged else 0
+
+            cap = 1 << int(
+                np.ceil(
+                    np.log2(
+                        max(
+                            1,
+                            int(
+                                backend.item(actual_len)
+                                if hasattr(actual_len, "item")
+                                else actual_len
+                            ),
+                        )
+                    )
+                )
+            )
+
+            padded_values = _pad_tensor_to_power_of_2(
+                merged_values, actual_len, cap, pad_value=0
+            )
+            # Padded origin indices to positive infinity so they sort strictly to the end
+            padded_origin = _pad_tensor_to_power_of_2(
+                merged_origin_indices, actual_len, cap, pad_value=2147483647
+            )
+            padded_routing = _pad_tensor_to_power_of_2(
+                merged_routing_indices, actual_len, cap, pad_value=0
+            )
+            padded_tags = _pad_tensor_to_power_of_2(
+                receipt_tags, actual_len, cap, pad_value=0
+            )
+
+            sorted_values, sorted_origin, sorted_routing, sorted_tags, sort_idx = (
+                _jit_sort_fused(
+                    padded_values, padded_origin, padded_routing, padded_tags
+                )
+            )
+
+            # --- Unpad Outputs back to dynamic length ---
+            merged_values = sorted_values[:actual_len]
+            merged_origin_indices = sorted_origin[:actual_len]
+            merged_routing_indices = (
+                sorted_routing[:actual_len] if not dummy_routing else None
+            )
+
+            if merged_receipt is not None and not dummy_receipt:
+                merged_receipt = SymmetryReceipt(
+                    merged_receipt.world_size, sorted_tags[:actual_len]
+                )
 
         return TransportTensor(
             merged_values,

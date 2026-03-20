@@ -12,16 +12,18 @@ Completion tracking is event-driven, not polled:
 Zero-copy shard writing is supported via TransportReceiver delegation.
 """
 
-from fluxway.common.types.configs import BarrierConfig, TolerantBarrierConfig
 import asyncio
 import logging
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from fluxway.common.sync import ArrivalBarrier
-from fluxway.transport.communication import TransportReceiver
-from fluxway.common.types.tensor import TransportTensor, Scalar
+import numpy as np
+
 from fluxway.common.backend import get_backend
 from fluxway.common.index_descriptor import ContinuousIndex
+from fluxway.common.sync import ArrivalBarrier
+from fluxway.common.types.configs import BarrierConfig, TolerantBarrierConfig
+from fluxway.common.types.tensor import TransportTensor, Scalar
+from fluxway.transport.communication import TransportReceiver
 
 logger = logging.getLogger(__name__)
 
@@ -713,13 +715,25 @@ class WorkerMailbox:
                         f"Expected payload at cursor {cursor}, but total payloads is {len(payloads)}."
                     )
 
-            # Assemble nested splits if ragged
+            # Assemble nested splits if ragged.
+            # lengths_payload arrives as a host-level int32 array: either a numpy
+            # ndarray or a backend tensor that must be moved to host before cumsum.
+            # TransportTensor.nested_splits is typed List[np.ndarray], so we always
+            # produce a numpy array here — no GPU kernels involved.
             nested_splits = []
             if lengths_payload is not None:
-                cs = backend.cumsum(lengths_payload, dim=0)
-                zero = backend.zeros((1,), dtype=backend.int32())
-                splits = backend.cat([zero, cs], dim=0)
-                nested_splits = [splits]
+                if not hasattr(lengths_payload, "__len__"):
+                    raise TypeError(
+                        f"lengths_payload must be an array-like, got {type(lengths_payload)}"
+                    )
+                lengths_np = (
+                    lengths_payload
+                    if isinstance(lengths_payload, np.ndarray)
+                    else backend.to_numpy(lengths_payload)
+                )
+                nested_splits = [
+                    np.concatenate([np.zeros(1, dtype=np.int32), np.cumsum(lengths_np)])
+                ]
 
             # Create local receipt for the shard (Zero-Overhead: reconstructed locally)
             from fluxway.common.types.tensor import SymmetryReceipt
