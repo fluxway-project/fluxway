@@ -74,11 +74,10 @@ async def test_embedding_forward_staleness_logic():
 
 @pytest.mark.asyncio
 async def test_api_renames_in_synchronizer():
-    """Verify that WorkerSynchronizer works with the new 'max_worker_step_skew' name."""
-    from fluxway.spmd.driver.synchronizer.worker_sync import WorkerSynchronizer
+    """Verify that SPMDSynchronizer blocks workers correctly with MaxSkewSyncPolicy."""
+    from fluxway.spmd.driver.synchronizer import SPMDSynchronizer, MaxSkewSyncPolicy
 
-    # max_worker_step_skew=1
-    sync = WorkerSynchronizer("test", num_workers=2, max_worker_step_skew=1)
+    sync = SPMDSynchronizer("test", num_workers=2, sync_policy=MaxSkewSyncPolicy(1))
     blocked = []
     sync.set_callbacks(block_worker_op=lambda r, op: blocked.append(r))
 

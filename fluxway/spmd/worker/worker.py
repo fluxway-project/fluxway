@@ -1666,22 +1666,9 @@ class SPMDWorker:
             # we restrict JAX JIT from undergoing severe compilation storms.
             backend = get_backend()
             shape_merged = backend.shape(merged_values)
-            actual_len = shape_merged[0] if shape_merged else 0
+            actual_len: int = int(shape_merged[0]) if shape_merged else 0
 
-            cap = 1 << int(
-                np.ceil(
-                    np.log2(
-                        max(
-                            1,
-                            int(
-                                backend.item(actual_len)
-                                if hasattr(actual_len, "item")
-                                else actual_len
-                            ),
-                        )
-                    )
-                )
-            )
+            cap = 1 if actual_len <= 1 else 1 << (actual_len - 1).bit_length()
 
             padded_values = _pad_tensor_to_power_of_2(
                 merged_values, actual_len, cap, pad_value=0

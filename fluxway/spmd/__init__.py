@@ -4,15 +4,22 @@
 from ..common.utils.logging import ensure_logging_configured
 
 
-from .driver import SPMDDriver, SPMDSynchronizer, StatefulExecutor, SPMDMonitor
+from .driver import (
+    SPMDDriver,
+    SPMDSynchronizer,
+    SyncPolicy,
+    MaxSkewSyncPolicy,
+    SPMDMonitor,
+)
 from .worker import SPMDWorker
 
 __all__ = [
     "SPMDDriver",
     "SPMDMonitor",
     "SPMDSynchronizer",
+    "SyncPolicy",
+    "MaxSkewSyncPolicy",
     "SPMDWorker",
-    "StatefulExecutor",
     "ensure_logging_configured",
 ]
 

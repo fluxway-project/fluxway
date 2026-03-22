@@ -1,6 +1,5 @@
 """SPMD Synchronizer module."""
 
-from .synchronizer import SPMDSynchronizer
-from .worker_sync import WorkerSynchronizer
+from .spmd_sync import SPMDSynchronizer, SyncPolicy, MaxSkewSyncPolicy
 
-__all__ = ["SPMDSynchronizer", "WorkerSynchronizer"]
+__all__ = ["SPMDSynchronizer", "SyncPolicy", "MaxSkewSyncPolicy"]

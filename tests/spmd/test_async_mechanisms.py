@@ -6,7 +6,7 @@ These tests verify:
 2. max_inflight_steps: Limits step difference between connected SPMDs in the graph.
 """
 
-from fluxway.spmd.driver.synchronizer.worker_sync import WorkerSynchronizer
+from fluxway.spmd.driver.synchronizer import SPMDSynchronizer, MaxSkewSyncPolicy
 from fluxway.control_plane.async_manager.manager import AsyncStepManager
 from fluxway.common.types.configs import (
     Graph,
@@ -19,18 +19,20 @@ from fluxway.common.types.configs import (
 
 
 # =============================================================================
-# 1. Intra-SPMD: WorkerSynchronizer Tests
+# 1. Intra-SPMD: SPMDSynchronizer Tests
 # =============================================================================
 
 
 def test_worker_sync_skew_limit():
     """
-    Verify that WorkerSynchronizer blocks workers that exceed max_worker_step_skew.
+    Verify that SPMDSynchronizer blocks workers that exceed max_worker_step_skew.
     """
     num_workers = 3
     max_diff = 2
-    sync = WorkerSynchronizer(
-        spmd_id="test_spmd", num_workers=num_workers, max_worker_step_skew=max_diff
+    sync = SPMDSynchronizer(
+        spmd_id="test_spmd",
+        num_workers=num_workers,
+        sync_policy=MaxSkewSyncPolicy(max_diff),
     )
 
     blocked_workers = set()
@@ -89,8 +91,8 @@ def test_worker_sync_skew_limit():
 
 def test_worker_sync_controller_lock():
     """Verify that controller-requested locks work alongside drift locks."""
-    sync = WorkerSynchronizer(
-        spmd_id="test_spmd", num_workers=2, max_worker_step_skew=10
+    sync = SPMDSynchronizer(
+        spmd_id="test_spmd", num_workers=2, sync_policy=MaxSkewSyncPolicy(10)
     )
 
     blocked = []

@@ -1,17 +1,15 @@
 """SPMD Driver: Coordinates all workers within an SPMD."""
 
 from .driver import SPMDDriver
-from .synchronizer import SPMDSynchronizer
-from .stateful_executor import StatefulExecutor
+from .synchronizer import SPMDSynchronizer, SyncPolicy, MaxSkewSyncPolicy
 from .monitor import SPMDMonitor
 from .state_machine import DriverStateMachine
-from .synchronizer.worker_sync import WorkerSynchronizer
 
 __all__ = [
     "SPMDDriver",
     "SPMDSynchronizer",
-    "StatefulExecutor",
+    "SyncPolicy",
+    "MaxSkewSyncPolicy",
     "SPMDMonitor",
     "DriverStateMachine",
-    "WorkerSynchronizer",
 ]

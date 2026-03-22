@@ -36,9 +36,7 @@ from fluxway.common.types import (
 )
 from fluxway.common.utils import ensure_logging_configured
 from .state_machine import DriverStateMachine
-from .synchronizer import SPMDSynchronizer
-from .synchronizer.worker_sync import WorkerSynchronizer
-from .stateful_executor import StatefulExecutor
+from .synchronizer import SPMDSynchronizer, MaxSkewSyncPolicy
 from .monitor import SPMDMonitor
 
 from fluxway.common.utils.logging import get_logger
@@ -92,16 +90,12 @@ if RAY_AVAILABLE:
             # State machine
             self.state_machine = DriverStateMachine(self)
 
-            # Worker synchronizer
-            self.worker_synchronizer = WorkerSynchronizer(
+            self.spmd_synchronizer = SPMDSynchronizer(
                 spmd_id=spmd_id,
                 num_workers=config.num_workers,
-                max_worker_step_skew=config.max_worker_step_skew,
+                sync_policy=MaxSkewSyncPolicy(config.max_worker_step_skew),
             )
 
-            # Existing components
-            self.synchronizer = SPMDSynchronizer(spmd_id)
-            self.executor = StatefulExecutor(spmd_id)
             self.monitor = SPMDMonitor(spmd_id)
 
             # Worker handles
@@ -166,7 +160,7 @@ if RAY_AVAILABLE:
                 logger.debug(f"Initializing SPMD spmd_id={self.spmd_id}")
 
                 # Set up worker synchronizer callbacks
-                self.worker_synchronizer.set_callbacks(
+                self.spmd_synchronizer.set_callbacks(
                     on_spmd_op_completed=self._on_spmd_op_completed,
                     block_worker_op=self._block_worker_op,
                     unblock_worker_op=self._unblock_worker_op,
@@ -424,7 +418,7 @@ if RAY_AVAILABLE:
                 op_name: Operation name
                 step: Completed step number
             """
-            self.worker_synchronizer.report_worker_op_completed(rank, op_name, step)
+            self.spmd_synchronizer.report_worker_op_completed(rank, op_name, step)
 
         def _on_spmd_op_completed(self, spmd_id: str, op_name: str, step: int) -> None:
             """
@@ -448,24 +442,24 @@ if RAY_AVAILABLE:
 
         def block_op(self, op_name: str) -> None:
             """Block an op for all workers (called by Controller)."""
-            self.worker_synchronizer.block_spmd_op(op_name)
+            self.spmd_synchronizer.block_spmd_op(op_name)
 
         def unblock_op(self, op_name: str) -> None:
             """Unblock an op for all workers (called by Controller)."""
-            self.worker_synchronizer.unblock_spmd_op(op_name)
+            self.spmd_synchronizer.unblock_spmd_op(op_name)
 
         def set_allowed_step(self, op_name: str, step: int) -> None:
             """Set global watermark for an op (called by Controller)."""
-            self.worker_synchronizer.update_allowed_step(op_name, step)
+            self.spmd_synchronizer.update_allowed_step(op_name, step)
 
         def block_all_ops(self) -> None:
             """Block all ops for all workers."""
-            self.worker_synchronizer.block_all_ops()
+            self.spmd_synchronizer.block_all_ops()
             self.state_machine.trigger(DriverEvent.BLOCK_REQUESTED)
 
         def unblock_all_ops(self) -> None:
             """Unblock all ops for all workers."""
-            self.worker_synchronizer.unblock_all_ops()
+            self.spmd_synchronizer.unblock_all_ops()
             self.state_machine.trigger(DriverEvent.UNBLOCK_REQUESTED)
 
         def _block_worker_op(self, rank: int, op_name: str) -> None:
@@ -494,7 +488,7 @@ if RAY_AVAILABLE:
             """Block all workers (internal method)."""
             for rank, worker in self._worker_handles.items():
                 try:
-                    ops = list(self.worker_synchronizer.get_spmd_steps().keys())
+                    ops = list(self.spmd_synchronizer.get_spmd_steps().keys())
                     for op_name in ops:
                         worker.block_op.remote(op_name)
                 except Exception as e:
@@ -660,10 +654,10 @@ if RAY_AVAILABLE:
                 status=status,
                 state=self.state_machine.state,
                 error_message=self.state_machine.get_error_message(),
-                op_steps=self.worker_synchronizer.get_spmd_steps(),
+                op_steps=self.spmd_synchronizer.get_spmd_steps(),
                 num_workers=self.config.num_workers,
                 healthy_num_workers=healthy_count,
-                blocked_ops=self.worker_synchronizer.get_locked_ops(),
+                blocked_ops=self.spmd_synchronizer.get_locked_ops(),
                 workers_ready=self._workers_ready,
                 workers_running=self._workers_running,
                 is_downstream_busy=self._is_paused,
@@ -817,8 +811,8 @@ if RAY_AVAILABLE:
                 "state": self.state_machine.state.value,
                 "node_type": "spmd",  # Generic node type
                 "num_workers": self.config.num_workers,
-                "op_steps": self.worker_synchronizer.get_spmd_steps(),
-                "locked_ops": self.worker_synchronizer.get_locked_ops(),
+                "op_steps": self.spmd_synchronizer.get_spmd_steps(),
+                "locked_ops": self.spmd_synchronizer.get_locked_ops(),
                 "error_workers": self.state_machine.get_error_workers(),
             }
 
