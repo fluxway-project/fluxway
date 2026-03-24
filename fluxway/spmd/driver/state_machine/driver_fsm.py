@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Callable, Dict, Optional
 from fluxway.common.types import DriverState, DriverEvent
 
 if TYPE_CHECKING:
-    from ..driver import SPMDDriver
+    from fluxway.spmd.driver import SPMDDriver
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +46,13 @@ class DriverStateMachine:
         (DriverState.RECOVERING, DriverEvent.INIT_FAILED): DriverState.ERROR,
         (DriverState.RUNNING, DriverEvent.ALL_WORKERS_COMPLETED): DriverState.COMPLETED,
         (DriverState.RUNNING, DriverEvent.COMPLETE): DriverState.COMPLETED,
+        # Drain → Snapshot → Running
+        (DriverState.RUNNING, DriverEvent.DRAIN_REQUESTED): DriverState.DRAINING,
+        (DriverState.DRAINING, DriverEvent.DRAIN_COMPLETE): DriverState.SNAPSHOTTING,
+        (DriverState.DRAINING, DriverEvent.WORKER_ERROR): DriverState.ERROR,
+        (DriverState.SNAPSHOTTING, DriverEvent.SNAPSHOT_COMPLETE): DriverState.RUNNING,
+        (DriverState.SNAPSHOTTING, DriverEvent.SNAPSHOT_FAILED): DriverState.ERROR,
+        (DriverState.SNAPSHOTTING, DriverEvent.WORKER_ERROR): DriverState.ERROR,
     }
 
     def __init__(self, driver: "SPMDDriver"):
@@ -68,6 +75,8 @@ class DriverStateMachine:
             DriverState.READY: self._on_enter_ready,
             DriverState.RUNNING: self._on_enter_running,
             DriverState.BLOCKED: self._on_enter_blocked,
+            DriverState.DRAINING: self._on_enter_draining,
+            DriverState.SNAPSHOTTING: self._on_enter_snapshotting,
             DriverState.RECOVERING: self._on_enter_recovering,
             DriverState.COMPLETED: self._on_enter_completed,
             DriverState.ERROR: self._on_enter_error,
@@ -95,6 +104,16 @@ class DriverStateMachine:
         with self._lock:
             current = self._state
             key = (current, event)
+
+            # Guard: BLOCK/UNBLOCK must not interrupt drain or snapshot
+            if event in (
+                DriverEvent.BLOCK_REQUESTED,
+                DriverEvent.UNBLOCK_REQUESTED,
+            ) and current in (DriverState.DRAINING, DriverState.SNAPSHOTTING):
+                logger.warning(
+                    f"Ignoring {event} in {current} state spmd_id={self._driver.spmd_id}"
+                )
+                return False
 
             if key not in self._TRANSITIONS:
                 logger.debug(f"No transition for: {current} + {event}. Ignoring event.")
@@ -192,6 +211,14 @@ class DriverStateMachine:
         logger.warning(f"SPMD {self._driver.spmd_id} is blocked")
         # Block all workers
         self._driver._block_all_workers()
+
+    def _on_enter_draining(self) -> None:
+        """Called when entering DRAINING state."""
+        logger.debug(f"SPMD {self._driver.spmd_id} is draining to target step")
+
+    def _on_enter_snapshotting(self) -> None:
+        """Called when entering SNAPSHOTTING state."""
+        logger.debug(f"SPMD {self._driver.spmd_id} is snapshotting operator states")
 
     def _on_enter_recovering(self) -> None:
         """Called when entering RECOVERING state."""

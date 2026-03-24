@@ -164,7 +164,7 @@ class SPMDManager:
 
         try:
             # Import driver here to avoid circular imports
-            from ...spmd.driver import SPMDDriver
+            from fluxway.spmd.driver import SPMDDriver
 
             # Case to Any to satisfy static type checkers for Ray-specific calls (.remote, .options)
             spmd_driver_cls: Any = SPMDDriver

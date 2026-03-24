@@ -35,9 +35,10 @@ from fluxway.common.types import (
     WorkerHeartbeat,
 )
 from fluxway.common.utils import ensure_logging_configured
-from .state_machine import DriverStateMachine
-from .synchronizer import SPMDSynchronizer, MaxSkewSyncPolicy
-from .monitor import SPMDMonitor
+from fluxway.spmd.driver.state_machine import DriverStateMachine
+from fluxway.spmd.driver.synchronizer import SPMDSynchronizer, MaxSkewSyncPolicy
+from fluxway.spmd.driver.monitor import SPMDMonitor
+from fluxway.spmd.worker import SPMDWorker
 
 from fluxway.common.utils.logging import get_logger
 
@@ -196,7 +197,6 @@ if RAY_AVAILABLE:
 
         def _start_workers(self) -> None:
             """Start all worker actors."""
-            from ..worker import SPMDWorker
 
             # Get self handle for registering with workers
             self_handle = ray.get_runtime_context().current_actor
@@ -283,9 +283,9 @@ if RAY_AVAILABLE:
             logger.debug(f"Topology registration completed spmd_id={self.spmd_id}")
 
         def _restore_from_checkpoint(self, checkpoint_id: str) -> None:
-            """Restore state from checkpoint (placeholder)."""
-            logger.warning(
-                f"Checkpoint restore not implemented checkpoint_id={checkpoint_id} spmd_id={self.spmd_id}"
+            raise NotImplementedError(
+                "Checkpoint restore must be implemented by the caller via set_state(). "
+                f"checkpoint_id={checkpoint_id} spmd_id={self.spmd_id}"
             )
 
         # =====================================================================
@@ -299,10 +299,6 @@ if RAY_AVAILABLE:
             # Stop heartbeat
             self._stop_heartbeat()
 
-            # Save checkpoint if requested
-            if save_checkpoint:
-                self._save_checkpoint()
-
             # Stop all workers
             for rank, worker in self._worker_handles.items():
                 try:
@@ -312,9 +308,100 @@ if RAY_AVAILABLE:
                         f"Failed to stop worker rank={rank} error={e} spmd_id={self.spmd_id}"
                     )
 
-        def _save_checkpoint(self) -> None:
-            """Save checkpoint (placeholder)."""
-            logger.warning(f"Checkpoint save not implemented spmd_id={self.spmd_id}")
+        # =====================================================================
+        # Snapshot Orchestration (Drain → Snapshot → Resume)
+        # =====================================================================
+
+        def request_snapshot(self, snapshot_id: str, target_step: int) -> None:
+            """
+            Phase 1 of snapshot: drain all workers to target_step.
+
+            Transitions: RUNNING → DRAINING.
+
+            Order matters:
+              1. Fan-out set_drain_ceiling to all Workers first so that any
+                 worker about to execute step >= target_step will self-block
+                 synchronously in its own event loop — no async race.
+              2. Only then engage the Synchronizer drain fence, which is the
+                 ACK counter that fires _on_drain_complete once all workers
+                 have reported completion of their ceiling step.
+            """
+            if self.state_machine.state != DriverState.RUNNING:
+                raise RuntimeError(
+                    f"request_snapshot requires RUNNING state, "
+                    f"got {self.state_machine.state} spmd_id={self.spmd_id}"
+                )
+            self._current_snapshot_id = snapshot_id
+            self.state_machine.trigger(DriverEvent.DRAIN_REQUESTED)
+            # Step 1: workers self-block when they reach target_step
+            for worker in self._worker_handles.values():
+                worker.set_drain_ceiling.remote(target_step)
+            # Step 2: synchronizer starts counting ACKs toward on_drained callback
+            self.spmd_synchronizer.drain_to_step(
+                target_step=target_step, on_drained=self._on_drain_complete
+            )
+
+        def _on_drain_complete(self) -> None:
+            """
+            Phase 2 of snapshot: all workers have reached target_step.
+
+            Transitions: DRAINING → SNAPSHOTTING.
+            Collects worker states in parallel; caller must call resume()
+            after consuming the state dicts.
+            """
+            if self.state_machine.state != DriverState.DRAINING:
+                raise RuntimeError(
+                    f"_on_drain_complete requires DRAINING state, "
+                    f"got {self.state_machine.state} spmd_id={self.spmd_id}"
+                )
+            self.state_machine.trigger(DriverEvent.DRAIN_COMPLETE)
+            self._collect_worker_states()
+
+        def _collect_worker_states(self) -> None:
+            """
+            Parallel RPC to all workers to call get_state().
+
+            Returns futures dict {rank: ObjectRef[Dict]} to the controller
+            via report_snapshot_ready.  The controller is responsible for
+            ray.get()-ing the futures and deciding how to persist the state.
+            """
+            futures = {
+                rank: worker.get_state.remote()
+                for rank, worker in self._worker_handles.items()
+            }
+            if self.controller_handle is not None:
+                try:
+                    snapshot_id = getattr(self, "_current_snapshot_id", "default")
+                    self.controller_handle.receive_snapshot_states.remote(
+                        self.spmd_id, snapshot_id, futures
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Failed to report snapshot states error={e} spmd_id={self.spmd_id}"
+                    )
+                    self.state_machine.trigger(DriverEvent.SNAPSHOT_FAILED)
+
+        def resume(self) -> None:
+            """
+            Phase 3 of snapshot: clear drain ceiling and resume training.
+
+            Transitions: SNAPSHOTTING → RUNNING.
+            Must be called by the controller after snapshot data is consumed.
+
+            Order:
+              1. Synchronizer clears the ACK fence.
+              2. Fan-out clear_drain_ceiling to all Workers so they resume
+                 executing steps that were deferred behind the ceiling.
+            """
+            if self.state_machine.state != DriverState.SNAPSHOTTING:
+                raise RuntimeError(
+                    f"resume requires SNAPSHOTTING state, "
+                    f"got {self.state_machine.state} spmd_id={self.spmd_id}"
+                )
+            self.spmd_synchronizer.clear_drain()
+            for worker in self._worker_handles.values():
+                worker.clear_drain_ceiling.remote()
+            self.state_machine.trigger(DriverEvent.SNAPSHOT_COMPLETE)
 
         # =====================================================================
         # Worker Heartbeat Handling
@@ -369,7 +456,7 @@ if RAY_AVAILABLE:
                 from fluxway.common.types import WorkerStatus
 
                 all_running = all(
-                    hb.status == WorkerStatus.RUNNING
+                    hb.status in (WorkerStatus.RUNNING, WorkerStatus.BLOCKED)
                     for hb in self._worker_heartbeats.values()
                 )
                 if (
@@ -712,8 +799,6 @@ if RAY_AVAILABLE:
                 # Start new worker
                 bundle_idx = self.worker_bundle_indices[rank]
                 self_handle = ray.get_runtime_context().current_actor
-
-                from ..worker import SPMDWorker
 
                 if self.placement_group is not None:
                     worker = SPMDWorker.options(

@@ -22,7 +22,7 @@ from fluxway.common.types import ControllerState, ControllerEvent
 from fluxway.common.utils.logging import get_logger
 
 if TYPE_CHECKING:
-    from ..controller import ControllerActor
+    from fluxway.control_plane.controller import ControllerActor
 
 logger = get_logger(__name__)
 

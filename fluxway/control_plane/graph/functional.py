@@ -1,5 +1,5 @@
 from typing import Any, Callable, Dict, Optional, Type
-from .builder import Builder
+from fluxway.control_plane.graph.builder import Builder
 
 
 class OpHandle:

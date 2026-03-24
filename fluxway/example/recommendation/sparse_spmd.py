@@ -15,6 +15,13 @@ class SparseEmbeddingSPMD:
         self.params = jnp.ones((vocab_size, embed_dim)) * 0.01
         self._forward_ids_cache = {}
 
+    def save_state(self) -> dict:
+        return {"params": self.params}
+
+    def restore_state(self, state: dict) -> None:
+        if "params" in state:
+            self.params = state["params"]
+
     @operator(
         name="lookup",
         data_argument=["unique_ids"],

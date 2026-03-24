@@ -52,6 +52,12 @@ class RecommendationReader(GrainReader):
             static_args, rank, world_size, shard_index, shard_count
         )
 
+    def save_state(self) -> Dict[str, Any]:
+        return self.get_state()
+
+    def restore_state(self, state: Dict[str, Any]) -> None:
+        self.set_state(state)
+
     @operator(
         "read",
         output_sharding={

@@ -49,9 +49,9 @@ from fluxway.common.types.tensor import SymmetryReceipt
 from fluxway.common.utils import ensure_logging_configured
 from fluxway.common.utils.logging import get_logger
 from fluxway.rpc.protocol import DataPlaneCallable
-from .mailbox import WorkerMailbox
-from .operator_manager import OperatorManager
-from .operator_manager.dispatcher import SKIPPED
+from fluxway.spmd.worker.mailbox import WorkerMailbox
+from fluxway.spmd.worker.operator_manager import OperatorManager
+from fluxway.spmd.worker.operator_manager.dispatcher import SKIPPED
 from fluxway.transport.communication import AsyncDataDistributor
 from fluxway.common.execution import compile
 
@@ -224,6 +224,14 @@ class SPMDWorker:
         }
         for event in self._source_pause_events.values():
             event.set()  # Initially all sources are running
+
+        # Drain ceiling: blocks execution once step >= target_step.
+        # Set by Driver.request_snapshot() BEFORE drain_to_step() to avoid the
+        # async race condition where block_op RPC arrives after the worker has
+        # already consumed the ceiling step.
+        self._drain_ceiling: Optional[int] = None
+        self._drain_resume_event: asyncio.Event = asyncio.Event()
+        self._drain_resume_event.set()  # set = not draining
 
         # Expected topology counts for auto-start detection
         # Initialize to None to strictly wait for registration from driver
@@ -981,6 +989,14 @@ class SPMDWorker:
     async def _execute_operator(self, op_name: str, step: int) -> Any:
         """Execute an operator: assemble data, execute, send outputs."""
         try:
+            # --- Drain ceiling check (must come first, before any await that could yield) ---
+            # This is the Worker-side synchronous guard that prevents stepping past
+            # the snapshot target.  Unlike the Synchronizer-side block (which is
+            # async and can race), this check runs inside the Worker event loop
+            # before anything else, so it is race-free.
+            if self._drain_ceiling is not None and step >= self._drain_ceiling:
+                await self._drain_resume_event.wait()
+
             # --- Dispatcher Check: Should this rank execute this step? ---
             dispatcher = self._op_manager.get_dispatcher(op_name)
             if not dispatcher.should_execute(self.rank, self._world_size, step):
@@ -1787,14 +1803,14 @@ class SPMDWorker:
                     f"spmd_id={self.spmd_id} rank={self.rank}"
                 )
 
-        # # Cleanup Mirror Sharding Cache for very old steps
-        # old_steps = [
-        #     s
-        #     for s in self._step_tuuid_cache.keys()
-        #     if s < step - self.config.operator_metas[op_name].max_inflight_steps + 1
-        # ]
-        # for s in old_steps:
-        #     del self._step_tuuid_cache[s]
+        # Cleanup Mirror Sharding Cache for very old steps
+        old_steps = [
+            s
+            for s in self._step_tuuid_cache.keys()
+            if s < step - self.config.operator_metas[op_name].max_inflight_steps - 1
+        ]
+        for s in old_steps:
+            del self._step_tuuid_cache[s]
 
     # =========================================================================
     # Data Sending
@@ -2329,22 +2345,78 @@ class SPMDWorker:
     # =========================================================================
 
     def get_state(self) -> Dict[str, Any]:
-        """Get worker state for checkpointing."""
+        """Get worker state for snapshotting."""
         return {
             "spmd_id": self.spmd_id,
             "rank": self.rank,
             "current_steps": dict(self._current_steps),
             "static_args": self._op_manager.get_static_args(),
+            "operator_states": self._extract_operator_states(),
         }
 
+    def _extract_operator_states(self) -> Dict[str, Any]:
+        """Extract state from each SPMD class instance via save_state duck typing."""
+        from fluxway.common.decorators import _instance_storage, _instance_storage_lock
+
+        seen_cls_ids: set = set()
+        states: Dict[str, Any] = {}
+        for op_name, op_fn in (self.config.operators or {}).items():
+            cls = getattr(op_fn, "_flux_spmd_class", None)
+            if cls is None or id(cls) in seen_cls_ids:
+                continue
+            seen_cls_ids.add(id(cls))
+            with _instance_storage_lock:
+                instance = _instance_storage.get(id(cls))
+            if instance is None:
+                continue
+            if hasattr(instance, "save_state") and callable(instance.save_state):
+                states[op_name] = instance.save_state()
+        return states
+
     def set_state(self, state: Dict[str, Any]) -> None:
-        """Restore worker state from checkpoint."""
+        """Restore worker state from a snapshot."""
         if "current_steps" in state:
             for op_name, step in state["current_steps"].items():
                 self._current_steps[op_name] = step
         if "static_args" in state:
             for name, value in state["static_args"].items():
                 self._op_manager.set_static_arg(name, value)
+        if "operator_states" in state:
+            self._restore_operator_states(state["operator_states"])
+
+    def _restore_operator_states(self, states: Dict[str, Any]) -> None:
+        """Restore each SPMD class instance state via restore_state duck typing."""
+        from fluxway.common.decorators import _instance_storage, _instance_storage_lock
+
+        op_fn_by_name = dict(self.config.operators or {})
+        for op_name, op_state in states.items():
+            op_fn = op_fn_by_name.get(op_name)
+            if op_fn is None:
+                raise RuntimeError(
+                    f"Operator {op_name} not found in config during restore "
+                    f"spmd_id={self.spmd_id} rank={self.rank}"
+                )
+            cls = getattr(op_fn, "_flux_spmd_class", None)
+            if cls is None:
+                raise RuntimeError(
+                    f"Operator {op_name} has no _flux_spmd_class in config during restore "
+                    f"spmd_id={self.spmd_id} rank={self.rank}"
+                )
+            with _instance_storage_lock:
+                instance = _instance_storage.get(id(cls))
+            if instance is None:
+                raise RuntimeError(
+                    f"Operator {op_name} instance not found in _instance_storage during restore "
+                    f"spmd_id={self.spmd_id} rank={self.rank}"
+                )
+            if not (
+                hasattr(instance, "restore_state") and callable(instance.restore_state)
+            ):
+                raise TypeError(
+                    f"Operator {op_name} has saved state but does not implement restore_state() "
+                    f"spmd_id={self.spmd_id} rank={self.rank}"
+                )
+            instance.restore_state(op_state)
 
     # =========================================================================
     # Utility
@@ -2361,6 +2433,27 @@ class SPMDWorker:
     def is_running(self) -> bool:
         """Check if worker is running."""
         return self._running
+
+    # =========================================================================
+    # Drain Ceiling Control (called by Driver before drain_to_step)
+    # =========================================================================
+
+    def set_drain_ceiling(self, target_step: int) -> None:
+        """
+        Set the drain ceiling so that execution of step >= target_step is
+        deferred until clear_drain_ceiling() is called.
+
+        Must be called on all workers BEFORE SPMDSynchronizer.drain_to_step()
+        to eliminate the async race where a worker advances past target_step
+        before the block_op RPC arrives.
+        """
+        self._drain_ceiling = target_step
+        self._drain_resume_event.clear()
+
+    def clear_drain_ceiling(self) -> None:
+        """Remove the drain ceiling and let deferred executions proceed."""
+        self._drain_ceiling = None
+        self._drain_resume_event.set()
 
     # =========================================================================
     # Source Node Control

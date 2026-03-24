@@ -29,10 +29,10 @@ from fluxway.common.types import (
     PlacementStrategy,
     ResourcePriority,
 )
-from .pg_manager import PGManager
+from fluxway.control_plane.scheduler.pg_manager import PGManager
 
 if TYPE_CHECKING:
-    from ..spmd_manager import SPMDManager
+    from fluxway.control_plane.spmd_manager import SPMDManager
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +62,10 @@ class Scheduler:
         self._spmd_manager = spmd_manager
         self._pg_manager = PGManager()
         self._current_plan: Optional[PlacementPlan] = None
+
+    def set_spmd_manager(self, spmd_manager: "SPMDManager") -> None:
+        """Set the SPMD manager reference."""
+        self._spmd_manager = spmd_manager
 
     @property
     def spmd_manager(self) -> Optional["SPMDManager"]:

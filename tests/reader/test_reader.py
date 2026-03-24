@@ -64,14 +64,30 @@ async def test_reader_processor_data_flows():
         for _ in range(_MAX_POLL_ROUNDS):
             await asyncio.sleep(_POLL_INTERVAL_S)
             heartbeats = await controller.get_all_heartbeats.remote()
-            reader_steps = heartbeats.get(reader_id, {}).get("op_steps", {})
-            proc_steps = heartbeats.get(proc_id, {}).get("op_steps", {})
+            reader_steps = (
+                getattr(heartbeats.get(reader_id), "op_steps", {})
+                if heartbeats.get(reader_id)
+                else {}
+            )
+            proc_steps = (
+                getattr(heartbeats.get(proc_id), "op_steps", {})
+                if heartbeats.get(proc_id)
+                else {}
+            )
             if reader_steps.get("read", 0) > 0 and proc_steps.get("process", 0) > 0:
                 break
 
         heartbeats = await controller.get_all_heartbeats.remote()
-        reader_steps = heartbeats.get(reader_id, {}).get("op_steps", {})
-        proc_steps = heartbeats.get(proc_id, {}).get("op_steps", {})
+        reader_steps = (
+            getattr(heartbeats.get(reader_id), "op_steps", {})
+            if heartbeats.get(reader_id)
+            else {}
+        )
+        proc_steps = (
+            getattr(heartbeats.get(proc_id), "op_steps", {})
+            if heartbeats.get(proc_id)
+            else {}
+        )
 
         assert reader_steps.get("read", 0) > 0, (
             f"Reader {reader_id} never produced data. Heartbeat: {heartbeats.get(reader_id)}"

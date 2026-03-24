@@ -223,12 +223,12 @@ class Builder:
             **reader_kwargs: Additional configuration (batch_size, shuffle, etc.)
                              that will be passed to the reader as static_args.
         """
-        from ...reader.grain_reader import GrainReader
+        from fluxway.reader.grain_reader import GrainReader
         from fluxway.common.mesh import DeviceMesh
 
         reader_cls = reader_class or GrainReader
 
-        # 1. Establish parallel execution mesh BEFORE adding node
+        # Establish parallel execution mesh BEFORE adding node
         if mesh_shape and mesh_axis_names:
             reader_mesh = DeviceMesh(
                 device_shape=mesh_shape, axis_names=mesh_axis_names
@@ -239,11 +239,11 @@ class Builder:
                 device_shape=(num_workers,), axis_names=("worker",)
             )
 
-        # 2. Add as an SPMD node with the explicitly created mesh
+        # Add as an SPMD node with the explicitly created mesh
         # This triggers the mandatory mesh check in add_node
         self.add_node(name, reader_cls, description, mesh=reader_mesh)
 
-        # 3. Inject additional configuration
+        # Inject additional configuration
         node = self._nodes[name]
 
         # Merge data_source into static_args

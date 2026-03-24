@@ -6,7 +6,7 @@ including various datasource implementations.
 """
 
 # Ensure INFO logs are visible even when importing this subpackage directly.
-from ..common.utils.logging import ensure_logging_configured
+from fluxway.common.utils.logging import ensure_logging_configured
 
 
 from .base_reader import BaseReader

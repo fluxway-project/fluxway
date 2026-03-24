@@ -60,6 +60,17 @@ class DenseSPMD:
         )
         self._jax_initialized = True
 
+    def save_state(self) -> dict:
+        self._ensure_jax_init()
+        return {"model_state": nnx.state(self.model), "grad_accum": self.grad_accum}
+
+    def restore_state(self, state: dict) -> None:
+        self._ensure_jax_init()
+        if "model_state" in state:
+            nnx.update(self.model, state["model_state"])
+        if "grad_accum" in state:
+            self.grad_accum = state["grad_accum"]
+
     @operator(
         name="step",
         input_sharding={

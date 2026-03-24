@@ -2,11 +2,12 @@
 Standardized Reader implementation leveraging Google Grain.
 """
 
+import base64
 from typing import Any, Dict, Optional
 
 from fluxway.common.decorators import spmd, operator
 from fluxway.common.utils.logging import get_logger
-from .base_reader import BaseReader
+from fluxway.reader.base_reader import BaseReader
 
 logger = get_logger(__name__)
 
@@ -21,6 +22,12 @@ class GrainReader(BaseReader):
     """
     Standard Reader implementation using Google Grain.
 
+    The DataLoader and its iterator are created eagerly at instantiation time
+    (not lazily on the first ``read`` call).  This guarantees that
+    ``get_state`` / ``set_state`` always operate on a live iterator, which is
+    required for correct Grain-style checkpointing where state is a JSON-
+    serialisable index dict (``{"next_index": N}``) managed by the iterator.
+
     Supports Elastic Sharding via Logical Shard Pools.
     """
 
@@ -29,6 +36,14 @@ class GrainReader(BaseReader):
         self._dataloader = None
         self._iterator = None
         self._output_type = None
+
+        # The framework sets rank / world_size / static_args on `self` before
+        # calling __init__, so we can eagerly initialise the data pipeline here.
+        static_args = getattr(self, "static_args", None)
+        rank = getattr(self, "rank", None)
+        world_size = getattr(self, "world_size", 1)
+        if static_args is not None and rank is not None:
+            self._create_data_loader(static_args, rank, world_size)
 
     def _create_data_loader(
         self,
@@ -39,7 +54,11 @@ class GrainReader(BaseReader):
         shard_count: Optional[int] = None,
     ):
         """
-        Constructs the Google Grain DataLoader pipeline.
+        Construct the Grain DataLoader pipeline and create the iterator.
+
+        Sub-classes that override this method must call ``super()`` **or**
+        ensure ``self._iterator`` is set to a Grain ``DatasetIterator`` by the
+        time the method returns, so that ``get_state`` / ``set_state`` work.
 
         Args:
             shard_index: If provided, overrides rank for data sharding.
@@ -52,45 +71,32 @@ class GrainReader(BaseReader):
         if data_source is None:
             raise ValueError("GrainReader requires 'data_source' in static_args.")
 
-        # 1. Base Dataset
         dataset = grain.MapDataset.source(data_source)
-
-        transformations = static_args.get("transformations", [])
-        for tx in transformations:
+        for tx in static_args.get("transformations", []):
             dataset = dataset.map(tx)
 
-        # 2. logical sharding for elasticity
-        # If the user specifies num_logical_shards, we decouple rank from sharding.
         num_logical_shards = static_args.get("num_logical_shards")
-
         if shard_index is not None and shard_count is not None:
             s_idx, s_cnt = shard_index, shard_count
         elif num_logical_shards:
             s_cnt = num_logical_shards
-            # Map physical rank to one or more logical shards
-            # For simplicity, we assume 1 worker -> 1 logical shard or range
             s_idx = rank % num_logical_shards
         else:
             s_idx, s_cnt = rank, world_size
 
-        sampler = static_args.get("sampler")
-        if sampler is None:
-            num_records = len(data_source)
-            sampler = grain.IndexSampler(
-                num_records=num_records,
-                shard_options=grain.ShardOptions(
-                    shard_index=s_idx,
-                    shard_count=s_cnt,
-                    drop_remainder=static_args.get("drop_remainder", False),
-                ),
-                shuffle=static_args.get("shuffle", True),
-                seed=static_args.get("seed", 42),
-                num_epochs=static_args.get("num_epochs"),
-            )
+        sampler = static_args.get("sampler") or grain.IndexSampler(
+            num_records=len(data_source),
+            shard_options=grain.ShardOptions(
+                shard_index=s_idx,
+                shard_count=s_cnt,
+                drop_remainder=static_args.get("drop_remainder", False),
+            ),
+            shuffle=static_args.get("shuffle", True),
+            seed=static_args.get("seed", 42),
+            num_epochs=static_args.get("num_epochs"),
+        )
 
         self._output_type = static_args.get("output_data_type")
-
-        # DataLoader creation
         self._dataloader = grain.DataLoader(
             data_source=dataset,
             sampler=sampler,
@@ -99,7 +105,8 @@ class GrainReader(BaseReader):
         self._iterator = iter(self._dataloader)
 
         logger.info(
-            f"[spmd_id={getattr(self, 'spmd_id', 'unknown')}] Rank {rank} mapped to Logical Shard {s_idx}/{s_cnt}. "
+            f"[spmd_id={getattr(self, 'spmd_id', 'unknown')}] "
+            f"Rank {rank} mapped to Logical Shard {s_idx}/{s_cnt}. "
             f"Serving {len(sampler)} records."
         )
 
@@ -108,33 +115,53 @@ class GrainReader(BaseReader):
         return self.next_item()
 
     def next_item(self) -> Any:
-        rank = getattr(self, "rank", 0)
-        world_size = getattr(self, "world_size", 1)
-        static_args = getattr(self, "static_args", {})
-
         if self._iterator is None:
-            self._create_data_loader(static_args, rank, world_size)
-
-        try:
-            batch = next(self._iterator)
-            if self._output_type and not isinstance(batch, self._output_type):
-                if isinstance(batch, dict):
-                    return self._output_type(**batch)
-                return self._output_type(batch)
-            return batch
-        except StopIteration:
+            raise RuntimeError(
+                f"GrainReader (rank={getattr(self, 'rank', '?')}): iterator is not "
+                f"initialised.  This means _create_data_loader was not called during "
+                f"__init__.  Check that 'static_args', 'rank', and 'world_size' are "
+                f"injected by the framework before __init__ is called."
+            )
+        batch = next(self._iterator)
+        if batch is None:
             return None
-        except Exception as e:
-            logger.error(f"GrainReader pipeline failure: {e}")
-            raise
+        if self._output_type and not isinstance(batch, self._output_type):
+            if isinstance(batch, dict):
+                return self._output_type(**batch)
+            return self._output_type(batch)
+        return batch
+
+    _GRAIN_STATE_KEY = "__grain_iter_state__"
 
     def get_state(self) -> Dict[str, Any]:
-        """Returns the current state of the iterator for checkpointing."""
+        """
+        Return the iterator position as a framework-compatible dict.
+
+        Grain's ``DatasetIterator.get_state()`` returns ``bytes`` (a JSON
+        snapshot). We wrap it under ``_GRAIN_STATE_KEY`` so the dict-based
+        state protocol used by the framework can transport and round-trip it
+        without modification.
+        """
         if hasattr(self._iterator, "get_state"):
-            return self._iterator.get_state()
+            raw: bytes = self._iterator.get_state()
+            return {self._GRAIN_STATE_KEY: base64.b64encode(raw).decode()}
         return {}
 
-    def set_state(self, state: Dict[str, Any]):
-        """Restores the iterator state from a checkpoint."""
-        if hasattr(self._iterator, "set_state"):
-            self._iterator.set_state(state)
+    def set_state(self, state: Dict[str, Any]) -> None:
+        """
+        Restore the iterator to a previously saved position.
+
+        Raises ``TypeError`` when the iterator does not support ``set_state``
+        so that sub-classes that use a non-Grain iterator get an explicit
+        error instead of silently continuing from the wrong position.
+        """
+        if self._GRAIN_STATE_KEY not in state:
+            return
+        if not hasattr(self._iterator, "set_state"):
+            raise TypeError(
+                f"GrainReader (rank={getattr(self, 'rank', '?')}): the iterator "
+                f"{type(self._iterator)!r} does not implement set_state(). "
+                f"Override set_state() in your subclass to handle this iterator type."
+            )
+        raw = base64.b64decode(state[self._GRAIN_STATE_KEY].encode())
+        self._iterator.set_state(raw)

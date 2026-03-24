@@ -27,7 +27,7 @@ except ImportError:
     RAY_AVAILABLE = False
     ray = None  # type: ignore
 
-from ..common.types import (
+from fluxway.common.types import (
     AsyncStepConfig,
     ControllerEvent,
     ControllerState,
@@ -35,15 +35,16 @@ from ..common.types import (
     Graph,
     HeartbeatConfig,
 )
-from ..common.utils import ensure_logging_configured
-from ..common.utils.logging import get_logger
-from .monitor import Monitor
-from .scheduler import Scheduler
-from .spmd_manager import SPMDManager, SPMDHandle
-from .state_manager import StateManager
-from .heartbeat import HeartbeatManager
-from .state_machine import ControllerStateMachine
-from .async_manager import AsyncStepManager
+from fluxway.common.utils import ensure_logging_configured
+from fluxway.common.utils.logging import get_logger
+from fluxway.control_plane.monitor import Monitor
+from fluxway.control_plane.scheduler import Scheduler
+from fluxway.control_plane.spmd_manager import SPMDManager, SPMDHandle
+from fluxway.control_plane.state_manager import StateManager
+from fluxway.control_plane.heartbeat import HeartbeatManager
+from fluxway.control_plane.state_machine import ControllerStateMachine
+from fluxway.control_plane.async_manager import AsyncStepManager
+from fluxway.common.types import CheckpointConfig
 
 logger = get_logger(__name__)
 
@@ -74,6 +75,7 @@ if RAY_AVAILABLE:
             graph: Graph,
             heartbeat_config: Optional[HeartbeatConfig] = None,
             async_step_config: Optional[AsyncStepConfig] = None,
+            checkpoint_config: Optional[CheckpointConfig] = None,
         ):
             """
             Initialize Controller with configuration.
@@ -82,6 +84,7 @@ if RAY_AVAILABLE:
                 graph: The task graph defining SPMD nodes and edges
                 heartbeat_config: Heartbeat configuration
                 async_step_config: Async step configuration
+                checkpoint_config: Configuration for checkpointer backend
             """
             # Ray actors run in separate worker processes; ensure INFO logs are not dropped.
             ensure_logging_configured()
@@ -89,21 +92,14 @@ if RAY_AVAILABLE:
             self._graph = graph
             self._heartbeat_config = heartbeat_config or HeartbeatConfig()
             self._async_step_config = async_step_config or AsyncStepConfig()
+            self._checkpoint_config = checkpoint_config
 
-            # Initialize components
+            # Initialize components (some are initialized in initialize() now)
             self._monitor = Monitor()
             self._state_manager = StateManager()
-            self._spmd_manager = SPMDManager(controller_handle=None)
-            self._scheduler = Scheduler(spmd_manager=self._spmd_manager)
-
-            # Initialize heartbeat manager with async callbacks
-            self._heartbeat_manager = HeartbeatManager(
-                config=self._heartbeat_config,
-                on_all_ready=self._on_all_drivers_ready,
-                on_all_workers_running=self._on_all_workers_running,
-                on_driver_error=self._on_driver_error,
-                on_driver_recovered=self._on_driver_recovered,
-            )
+            self._scheduler = Scheduler(
+                spmd_manager=None
+            )  # SPMDManager set in initialize()
 
             # Initialize state machine
             self._state_machine = ControllerStateMachine(self)
@@ -118,6 +114,9 @@ if RAY_AVAILABLE:
 
             # Initialization flag
             self._initialized = False
+            self._spmd_manager: Optional[SPMDManager] = None
+            self._heartbeat_manager: Optional[HeartbeatManager] = None
+            self._checkpointer = None
 
             # Backpressure tracking
             self._busy_spmds: Dict[str, float] = {}  # {spmd_id: busy_worker_ratio}
@@ -164,9 +163,48 @@ if RAY_AVAILABLE:
                 True if initialization successful
             """
             try:
-                # Get self actor handle
+                # Create sub-components locally in the controller process
                 self_handle = ray.runtime_context.get_runtime_context().current_actor
-                self._spmd_manager.set_controller_handle(self_handle)
+                self._spmd_manager = SPMDManager(controller_handle=self_handle)
+                self._scheduler.set_spmd_manager(
+                    self._spmd_manager
+                )  # Set SPMDManager on scheduler
+
+                self._heartbeat_manager = HeartbeatManager(
+                    config=self._heartbeat_config,
+                    on_all_ready=self._on_all_drivers_ready,
+                    on_all_workers_running=self._on_all_workers_running,
+                    on_driver_error=self._on_driver_error,
+                    on_driver_recovered=self._on_driver_recovered,
+                )
+
+                if self._checkpoint_config is not None:
+                    if self._checkpoint_config.backend == "orbax":
+                        from fluxway.control_plane.checkpointer.orbax import (
+                            OrbaxCheckpointer,
+                        )
+
+                        self._checkpointer = OrbaxCheckpointer(
+                            self,
+                            ckpt_dir=self._checkpoint_config.ckpt_dir,
+                            interval_steps=self._checkpoint_config.interval_steps,
+                        )
+                    elif self._checkpoint_config.backend == "safetensors":
+                        from fluxway.control_plane.checkpointer.safetensors import (
+                            SafeTensorCheckpointer,
+                        )
+
+                        self._checkpointer = SafeTensorCheckpointer(
+                            self,
+                            ckpt_dir=self._checkpoint_config.ckpt_dir,
+                            interval_steps=self._checkpoint_config.interval_steps,
+                        )
+                    else:
+                        raise ValueError(
+                            f"Unknown checkpoint backend: {self._checkpoint_config.backend}"
+                        )
+
+                    self._checkpointer.start()
 
                 # Assign specific max_steps to each node based on global config and overrides
                 for node_id, node in self._graph.nodes.items():
@@ -227,8 +265,9 @@ if RAY_AVAILABLE:
 
         async def get_all_heartbeats(self) -> Dict[str, Any]:
             """Get all latest heartbeats from all SPMDs."""
-            heartbeats = await self._heartbeat_manager.get_all_heartbeats()
-            return {spmd_id: hb.as_dict() for spmd_id, hb in heartbeats.items()}
+            if self._heartbeat_manager is None:
+                return {}
+            return await self._heartbeat_manager.get_all_heartbeats()
 
         def is_initialized(self) -> bool:
             """Check if controller is initialized."""
@@ -248,6 +287,8 @@ if RAY_AVAILABLE:
             Returns:
                 SPMDHandle or None if not found
             """
+            if self._spmd_manager is None:
+                return None
             return self._spmd_manager.get_spmd_handle(spmd_id)
 
         # =====================================================================
@@ -261,6 +302,10 @@ if RAY_AVAILABLE:
             Args:
                 heartbeat: Driver heartbeat data
             """
+            if self._heartbeat_manager is None:
+                logger.warning("Heartbeat manager not initialized, dropping heartbeat.")
+                return
+
             # Route to heartbeat manager
             await self._heartbeat_manager.receive_heartbeat(heartbeat)
 
@@ -318,6 +363,11 @@ if RAY_AVAILABLE:
             self, spmd_id: str, op_name: str, allowed_step: int
         ) -> None:
             """Propagate global watermark to an SPMD Driver."""
+            if self._spmd_manager is None:
+                logger.error(
+                    f"SPMD manager not initialized, cannot set allowed_step for {spmd_id}.{op_name}"
+                )
+                return
             driver = self._spmd_manager.get_driver_handle(spmd_id)
             if driver is not None:
                 try:
@@ -329,6 +379,11 @@ if RAY_AVAILABLE:
 
         async def _lock_spmd_op(self, spmd_id: str, op_name: str) -> None:
             """Lock an SPMD's operation."""
+            if self._spmd_manager is None:
+                logger.error(
+                    f"SPMD manager not initialized, cannot lock {spmd_id}.{op_name}"
+                )
+                return
             driver = self._spmd_manager.get_driver_handle(spmd_id)
             if driver is not None:
                 try:
@@ -339,6 +394,11 @@ if RAY_AVAILABLE:
 
         async def _unlock_spmd_op(self, spmd_id: str, op_name: str) -> None:
             """Unlock an SPMD's operation."""
+            if self._spmd_manager is None:
+                logger.error(
+                    f"SPMD manager not initialized, cannot unlock {spmd_id}.{op_name}"
+                )
+                return
             driver = self._spmd_manager.get_driver_handle(spmd_id)
             if driver is not None:
                 try:
@@ -360,6 +420,12 @@ if RAY_AVAILABLE:
             - If downstream is busy (busy_worker_ratio > threshold), pause the reader
             - If downstream is no longer busy, resume the reader
             """
+            if self._spmd_manager is None:
+                logger.error(
+                    "SPMD manager not initialized, cannot enforce backpressure."
+                )
+                return
+
             # Source nodes are candidates for backpressure (e.g., readers)
             reader_nodes = self._source_nodes
 
@@ -390,6 +456,11 @@ if RAY_AVAILABLE:
             Args:
                 reader_id: Reader SPMD ID to pause
             """
+            if self._spmd_manager is None:
+                logger.error(
+                    f"SPMD manager not initialized, cannot pause reader {reader_id}."
+                )
+                return
             driver = self._spmd_manager.get_driver_handle(reader_id)
             if driver is not None:
                 try:
@@ -406,6 +477,11 @@ if RAY_AVAILABLE:
             Args:
                 reader_id: Reader SPMD ID to resume
             """
+            if self._spmd_manager is None:
+                logger.error(
+                    f"SPMD manager not initialized, cannot resume reader {reader_id}."
+                )
+                return
             driver = self._spmd_manager.get_driver_handle(reader_id)
             if driver is not None:
                 try:
@@ -446,6 +522,11 @@ if RAY_AVAILABLE:
                 step: Current step number
                 values: State values
             """
+            if self._spmd_manager is None:
+                logger.error(
+                    f"SPMD manager not initialized, cannot receive control argument for {target_spmd_id}."
+                )
+                return
             target_driver = self._spmd_manager.get_driver_handle(target_spmd_id)
             if target_driver is None:
                 logger.error(
@@ -463,6 +544,144 @@ if RAY_AVAILABLE:
                 )
             except Exception as e:
                 logger.error(f"Failed to forward control_arguments: {e}")
+
+        # =====================================================================
+        # Global Snapshotting
+        # =====================================================================
+
+        async def request_snapshot(self, snapshot_id: str, target_step: int) -> None:
+            """
+            Trigger a global snapshot across all SPMDs.
+            """
+            logger.info(
+                f"Controller requesting global snapshot {snapshot_id} at step {target_step}"
+            )
+            self._pending_snapshots = getattr(self, "_pending_snapshots", {})
+            if self._spmd_manager is None:
+                logger.error("SPMD manager not initialized, cannot request snapshot.")
+                return
+            all_spmd_ids = self._spmd_manager.get_all_spmd_ids()
+            self._pending_snapshots[snapshot_id] = {
+                "expected": len(all_spmd_ids),
+                "received": 0,
+                "states": {},
+            }
+
+            for spmd_id in all_spmd_ids:
+                driver = self._spmd_manager.get_driver_handle(spmd_id)
+                if driver is not None:
+                    driver.request_snapshot.remote(snapshot_id, target_step)
+
+        async def receive_snapshot_states(
+            self, spmd_id: str, snapshot_id: str, futures: Dict[int, Any]
+        ) -> None:
+            """
+            Receive snapshot states from a driver.
+            """
+            logger.info(
+                f"Controller received snapshot {snapshot_id} states from SPMD {spmd_id}"
+            )
+            self._pending_snapshots = getattr(self, "_pending_snapshots", {})
+            if snapshot_id not in self._pending_snapshots:
+                logger.warning(
+                    f"Received unknown snapshot {snapshot_id} from {spmd_id}"
+                )
+                return
+
+            try:
+                resolved_states = {}
+                ranks = list(futures.keys())
+                refs = list(futures.values())
+                results = await asyncio.gather(
+                    *[
+                        asyncio.wrap_future(r.future()) if hasattr(r, "future") else r
+                        for r in refs
+                    ]
+                )
+                for rank, res in zip(ranks, results, strict=True):
+                    resolved_states[rank] = res
+            except Exception as e:
+                logger.error(f"Failed to resolve snapshot futures for {spmd_id}: {e}")
+                return
+
+            snap_info = self._pending_snapshots[snapshot_id]
+            snap_info["states"][spmd_id] = resolved_states
+            snap_info["received"] += 1
+
+            if snap_info["received"] == snap_info["expected"]:
+                logger.info(
+                    f"Global snapshot {snapshot_id} complete. Aggregating to StateManager."
+                )
+                self._state_manager.save_snapshot(snapshot_id, snap_info["states"])
+
+                # Resume all drivers
+                if self._spmd_manager is not None:
+                    for s_id in self._spmd_manager.get_all_spmd_ids():
+                        driver = self._spmd_manager.get_driver_handle(s_id)
+                        if driver is not None:
+                            driver.resume.remote()
+
+        async def get_snapshot(self, snapshot_id: str) -> Optional[Dict[str, Any]]:
+            """Retrieve an aggregated snapshot, or None if not yet ready."""
+            try:
+                return self._state_manager.load_snapshot(snapshot_id)
+            except KeyError:
+                return None
+
+        async def restore_snapshot(
+            self, snapshot_id: str, states: Dict[str, Any]
+        ) -> None:
+            """
+            Restore a snapshot by interacting with drivers directly.
+            """
+            logger.info(f"Controller restoring snapshot {snapshot_id}")
+            self._state_manager.save_snapshot(snapshot_id, states)
+
+            # Pause everything
+            await self.block_all_spmds()
+
+            # Send state to workers
+            if self._spmd_manager is not None:
+                for spmd_id, rank_states in states.items():
+                    driver = self._spmd_manager.get_driver_handle(spmd_id)
+                    if driver is None:
+                        continue
+                    worker_handles = await driver.get_worker_handles.remote()
+                    tasks = []
+                    for rank, w_state in rank_states.items():
+                        rank_int = int(rank)
+                        if rank_int in worker_handles:
+                            tasks.append(
+                                worker_handles[rank_int].set_state.remote(w_state)
+                            )
+                    if tasks:
+                        await asyncio.gather(
+                            *[
+                                asyncio.wrap_future(t.future())
+                                if hasattr(t, "future")
+                                else t
+                                for t in tasks
+                            ]
+                        )
+
+            # Unpause
+            await self.unblock_all_spmds()
+            logger.info("Snapshot restored successfully")
+
+        async def restore_checkpoint(self, step: Optional[int] = None) -> Optional[int]:
+            """
+            User-facing API to trigger checkpoint restoration.
+            """
+            if self._checkpointer is None:
+                raise RuntimeError(
+                    "Checkpoint config was not provided during controller initialization"
+                )
+            return await self._checkpointer.restore(step)
+
+        async def stop_checkpointer(self) -> None:
+            """Gracefully stop background checkpointer loop."""
+            if self._checkpointer is not None:
+                await self._checkpointer.wait_until_finished()
 
         # =====================================================================
         # SPMD Error Handling
@@ -811,6 +1030,7 @@ async def create_controller(
     graph: Graph,
     heartbeat_config: Optional[HeartbeatConfig] = None,
     async_step_config: Optional[AsyncStepConfig] = None,
+    checkpoint_config: Optional[CheckpointConfig] = None,
     runtime_env: Optional[Dict[str, Any]] = None,
 ) -> Any:
     """
@@ -822,6 +1042,7 @@ async def create_controller(
         graph: The task graph built using Builder
         heartbeat_config: Optional heartbeat configuration
         async_step_config: Optional async step configuration
+        checkpoint_config: Optional checkpoint configuration
         runtime_env: Optional Ray runtime environment
 
     Returns:
@@ -838,6 +1059,7 @@ async def create_controller(
         graph=graph,
         heartbeat_config=heartbeat_config,
         async_step_config=async_step_config,
+        checkpoint_config=checkpoint_config,
     )
 
     # Initialize the actor

@@ -54,6 +54,8 @@ from .configs import (
     Control,
     DataFlow,
     ControlFlow,
+    # Checkpoint Types
+    CheckpointConfig,
 )
 
 # Sharding types: algebraic layer
@@ -118,6 +120,7 @@ __all__ = [
     "Control",
     "DataFlow",
     "ControlFlow",
+    "CheckpointConfig",
     "PartitionSpec",
     "P",
     "PartitionStrategy",

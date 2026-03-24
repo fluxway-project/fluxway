@@ -1,15 +1,13 @@
 """
-State Manager for global state management and checkpointing.
-
-Based on ARCHITECTURE.md Section 2.1.4
+State Manager for global state management and snapshot persistence.
 
 Responsibilities:
-- Unified state management: Aggregate all SPMD state info, provide query interface
-- Persistence strategy: Hold persistence strategy, trigger checkpoints via SPMD Manager
-- Support node state recovery: Manage state save before eviction and load after recovery
+- Aggregate snapshot states received from all SPMDs
+- Provide in-memory save/load interface (persistence backend is user responsibility)
+- Track SPMD runtime states for monitoring
 """
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from fluxway.common.types import GlobalState, SPMDState
 
@@ -18,145 +16,49 @@ class StateManager:
     """
     Global State Manager.
 
-    Manages training state aggregation, checkpointing, and recovery.
+    Stores snapshots keyed by snapshot_id.  The snapshot payload is a nested dict:
+        {spmd_id: {rank: worker_state_dict}}
 
-    State information:
-    - Training Metric Dict (current step, loss, auc, etc.)
-    - Profiler-level resource usage
-    - Checkpoint version and location
+    Persistence (writing to disk, GCS, etc.) is the caller's responsibility;
+    this class provides the in-memory aggregation layer only.
     """
 
     def __init__(self):
         self._global_state: GlobalState = GlobalState()
         self._spmd_states: Dict[str, SPMDState] = {}
-        self._checkpoints: Dict[str, List[str]] = {}  # spmd_id -> [checkpoint_ids]
+        self._snapshot_store: Dict[str, Dict[str, Dict[int, Dict[str, Any]]]] = {}
 
-    def save_checkpoint(self, checkpoint_id: str, state: GlobalState) -> None:
-        """
-        Save global checkpoint.
+    # =========================================================================
+    # Snapshot API (framework-level, no persistence)
+    # =========================================================================
 
-        Args:
-            checkpoint_id: Unique checkpoint identifier
-            state: Global state to save
+    def save_snapshot(
+        self, snapshot_id: str, spmd_states: Dict[str, Dict[int, Dict[str, Any]]]
+    ) -> None:
+        self._snapshot_store[snapshot_id] = spmd_states
 
-        TODO: Implement checkpoint serialization
-        TODO: Support incremental checkpoints
-        TODO: Support full checkpoints at key points (epoch end)
-        """
-        pass
+    def load_snapshot(self, snapshot_id: str) -> Dict[str, Dict[int, Dict[str, Any]]]:
+        if snapshot_id not in self._snapshot_store:
+            raise KeyError(f"Snapshot {snapshot_id!r} not found")
+        return self._snapshot_store[snapshot_id]
 
-    def load_checkpoint(self, checkpoint_id: str) -> GlobalState:
-        """
-        Load checkpoint.
+    def list_snapshots(self) -> List[str]:
+        return list(self._snapshot_store.keys())
 
-        Args:
-            checkpoint_id: Checkpoint to load
+    def delete_snapshot(self, snapshot_id: str) -> None:
+        if snapshot_id not in self._snapshot_store:
+            raise KeyError(f"Snapshot {snapshot_id!r} not found")
+        del self._snapshot_store[snapshot_id]
 
-        Returns:
-            Loaded global state
-
-        TODO: Implement checkpoint deserialization
-        TODO: Validate checkpoint integrity
-        """
-        pass
-
-    def get_latest_checkpoint(self, spmd_id: str) -> Optional[str]:
-        """
-        Get the latest checkpoint ID for an SPMD.
-
-        Args:
-            spmd_id: SPMD identifier
-
-        Returns:
-            Latest checkpoint ID or None
-
-        TODO: Implement checkpoint tracking
-        """
-        pass
-
-    def list_checkpoints(self, spmd_id: str) -> List[str]:
-        """
-        List all checkpoints for an SPMD.
-
-        Args:
-            spmd_id: SPMD identifier
-
-        Returns:
-            List of checkpoint IDs
-
-        TODO: Implement checkpoint listing
-        """
-        pass
-
-    def get_spmd_state(self, spmd_id: str) -> Optional[SPMDState]:
-        """
-        Get current state of an SPMD.
-
-        TODO: Implement state lookup
-        """
-        pass
+    # =========================================================================
+    # SPMD Runtime State
+    # =========================================================================
 
     def update_spmd_state(self, spmd_id: str, state: SPMDState) -> None:
-        """
-        Update SPMD state.
+        self._spmd_states[spmd_id] = state
 
-        Called by SPMD to report its current state.
-
-        TODO: Implement state update
-        TODO: Trigger metrics reporting (Tensorboard)
-        """
-        pass
+    def get_spmd_state(self, spmd_id: str) -> Optional[SPMDState]:
+        return self._spmd_states.get(spmd_id)
 
     def get_global_state(self) -> GlobalState:
-        """
-        Get current global state.
-
-        Aggregates state from all SPMDs.
-
-        TODO: Implement state aggregation
-        """
-        pass
-
-    def save_spmd_state(self, spmd_id: str, state: SPMDState) -> str:
-        """
-        Save SPMD state, return checkpoint ID.
-
-        Used for pre-eviction checkpointing.
-
-        Args:
-            spmd_id: SPMD identifier
-            state: State to save
-
-        Returns:
-            Generated checkpoint ID
-
-        TODO: Implement state serialization
-        TODO: Include parameters, optimizer state, RNG seeds
-        TODO: Ensure consistency guarantees
-        """
-        pass
-
-    def load_spmd_state(self, spmd_id: str, checkpoint_id: str) -> SPMDState:
-        """
-        Load SPMD state from checkpoint.
-
-        Args:
-            spmd_id: SPMD identifier
-            checkpoint_id: Checkpoint to load from
-
-        Returns:
-            Loaded SPMD state
-
-        TODO: Implement state deserialization
-        TODO: Support incremental and full recovery
-        """
-        pass
-
-    def delete_checkpoint(self, checkpoint_id: str) -> bool:
-        """
-        Delete a checkpoint.
-
-        TODO: Implement checkpoint deletion
-        TODO: Handle cleanup of old checkpoints
-        """
-        pass
+        return self._global_state

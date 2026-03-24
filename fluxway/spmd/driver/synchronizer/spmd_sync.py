@@ -98,6 +98,11 @@ class SPMDSynchronizer:
         self._block_worker_op: Optional[Callable[[int, str], None]] = None
         self._unblock_worker_op: Optional[Callable[[int, str], None]] = None
 
+        # Drain-to-step state (independent of _allowed_steps which is monotonically increasing)
+        self._drain_ceiling: Optional[int] = None
+        self._drain_on_drained: Optional[Callable[[], None]] = None
+        self._drain_acked_ops: set = set()  # ops where all workers reached ceiling
+
     def set_callbacks(
         self,
         on_spmd_op_completed: Optional[Callable[[str, str, int], None]] = None,
@@ -110,6 +115,7 @@ class SPMDSynchronizer:
 
     def report_worker_op_completed(self, rank: int, op_name: str, step: int) -> None:
         should_report = False
+        drain_complete = False
         with self._lock:
             if rank not in self._worker_steps:
                 logger.warning(f"Unknown worker rank {rank} reported op completion")
@@ -130,11 +136,31 @@ class SPMDSynchronizer:
                 logger.debug(f"SPMD {self.spmd_id} completed {op_name} step {step}")
                 should_report = step > old_spmd_step
 
+            # Drain ACK: Workers are self-blocked at _drain_ceiling by _drain_resume_event
+            # (set in set_drain_ceiling RPC before drain_to_step is called), so they
+            # only ever report completion up to ceiling-1.  Fire the callback once all
+            # known ops have every worker at ceiling-1.
+            if (
+                self._drain_ceiling is not None
+                and op_name not in self._drain_acked_ops
+                and self._all_workers_completed_step_internal(
+                    op_name, self._drain_ceiling - 1
+                )
+            ):
+                self._drain_acked_ops.add(op_name)
+                known_ops = set(self._spmd_steps.keys())
+                if self._drain_acked_ops >= known_ops and known_ops:
+                    drain_complete = True
+
         if should_report and self._on_spmd_op_completed:
             try:
                 self._on_spmd_op_completed(self.spmd_id, op_name, step)
             except Exception as e:
                 logger.error(f"Error reporting op completion: {e}")
+
+        if drain_complete and self._drain_on_drained:
+            callback = self._drain_on_drained
+            callback()
 
     def _check_worker_step_diff_internal(self, op_name: str) -> None:
         """Check worker step difference and enforce limits. Must hold lock when calling."""
@@ -182,6 +208,59 @@ class SPMDSynchronizer:
             self._worker_steps[r].get(op_name, 0) >= step
             for r in range(self.num_workers)
         )
+
+    # =========================================================================
+    # Drain-to-Step Control
+    # =========================================================================
+
+    @property
+    def is_draining(self) -> bool:
+        """True if a drain ceiling is active."""
+        with self._lock:
+            return self._drain_ceiling is not None
+
+    def drain_to_step(self, target_step: int, on_drained: Callable[[], None]) -> None:
+        """
+        Block all workers once they reach target_step, then call on_drained
+        when every known op's workers have all reached target_step.
+
+        Unlike update_allowed_step (which is monotonically increasing and
+        persists across drains), _drain_ceiling is a one-shot fence that is
+        cleared by clear_drain() after the snapshot is done.
+        """
+        drain_complete = False
+        with self._lock:
+            if self._drain_ceiling is not None:
+                raise RuntimeError(
+                    f"SPMD {self.spmd_id} is already draining to step "
+                    f"{self._drain_ceiling}; call clear_drain() first"
+                )
+            self._drain_ceiling = target_step
+            self._drain_on_drained = on_drained
+            self._drain_acked_ops = set()
+            logger.debug(f"Drain ceiling set to {target_step} spmd_id={self.spmd_id}")
+
+            # Instantly check if we are ALREADY drained
+            known_ops = set(self._spmd_steps.keys())
+            for op_name in known_ops:
+                if self._all_workers_completed_step_internal(op_name, target_step - 1):
+                    self._drain_acked_ops.add(op_name)
+
+            if known_ops and self._drain_acked_ops >= known_ops:
+                drain_complete = True
+
+        if drain_complete:
+            on_drained()
+
+    def clear_drain(self) -> None:
+        """Remove the drain ceiling and unblock workers so training resumes."""
+        with self._lock:
+            if self._drain_ceiling is None:
+                return
+            self._drain_ceiling = None
+            self._drain_on_drained = None
+            self._drain_acked_ops = set()
+            logger.debug(f"Drain cleared spmd_id={self.spmd_id}")
 
     # =========================================================================
     # SPMD-level Op Blocking (called by Controller)

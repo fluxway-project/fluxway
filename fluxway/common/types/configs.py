@@ -701,6 +701,8 @@ class DriverState(str, Enum):
     READY = "ready"  # Ready, waiting for Controller command
     RUNNING = "running"  # Running
     BLOCKED = "blocked"  # Blocked
+    DRAINING = "draining"  # Draining to target step before snapshot
+    SNAPSHOTTING = "snapshotting"  # Extracting operator states via save_state
     ERROR = "error"  # Error state
     RECOVERING = "recovering"  # Recovering
     COMPLETED = "completed"  # Completed
@@ -718,6 +720,10 @@ class DriverEvent(str, Enum):
     UNBLOCK_REQUESTED = "unblock_requested"
     ALL_WORKERS_COMPLETED = "all_workers_completed"
     COMPLETE = "complete"
+    DRAIN_REQUESTED = "drain_requested"
+    DRAIN_COMPLETE = "drain_complete"
+    SNAPSHOT_COMPLETE = "snapshot_complete"
+    SNAPSHOT_FAILED = "snapshot_failed"
 
 
 class WorkerHeartbeat(FluxwayBaseSchema):
@@ -761,6 +767,14 @@ class HeartbeatConfig(FluxwayBaseSchema):
     heartbeat_interval: float = 5.0  # Heartbeat interval (seconds)
     heartbeat_timeout: float = 15.0  # Heartbeat timeout (seconds)
     max_missed_heartbeats: int = 3  # Maximum missed heartbeats before error
+
+
+class CheckpointConfig(FluxwayBaseSchema):
+    """Configuration for checkpoint manager."""
+
+    backend: str  # "orbax" or "safetensors"
+    ckpt_dir: str
+    interval_steps: int
 
 
 class AsyncStepConfig(FluxwayBaseSchema):
