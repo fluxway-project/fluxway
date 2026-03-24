@@ -208,6 +208,10 @@ class SafeTensorCheckpointer(FluxwayCheckpointer):
 
         import safetensors  # noqa: F401 — validate dependency at construction
 
+        if max_to_keep <= 0:
+            raise ValueError(
+                f"SafeTensorCheckpointer: max_to_keep must be positive, got {max_to_keep}"
+            )
         self._max_to_keep = max_to_keep
 
     def list_steps(self) -> List[int]:

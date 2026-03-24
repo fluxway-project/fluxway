@@ -15,6 +15,7 @@ from typing import (
     TypeVar,
     Union,
     Tuple,
+    Literal,
 )
 
 from pydantic import BaseModel, Field, ConfigDict
@@ -772,7 +773,7 @@ class HeartbeatConfig(FluxwayBaseSchema):
 class CheckpointConfig(FluxwayBaseSchema):
     """Configuration for checkpoint manager."""
 
-    backend: str  # "orbax" or "safetensors"
+    backend: Literal["orbax", "safetensors"]
     ckpt_dir: str
     interval_steps: int
 

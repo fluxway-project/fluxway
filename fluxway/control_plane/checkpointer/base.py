@@ -12,6 +12,8 @@ import os
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
+from fluxway.common.types import DriverState
+
 logger = logging.getLogger(__name__)
 
 
@@ -146,6 +148,12 @@ class FluxwayCheckpointer(ABC):
 
             if stop_task in done:
                 snapshot_task.cancel()
+                try:
+                    await snapshot_task
+                except asyncio.CancelledError:
+                    logger.warning(
+                        f"FluxwayCheckpointer: snapshot task cancelled exception caught {snapshot_task.exception()}"
+                    )
                 break
 
             if snapshot_task.exception():
@@ -185,9 +193,6 @@ class FluxwayCheckpointer(ABC):
         logger.debug(
             "FluxwayCheckpointer: waiting for all drivers to reach RUNNING state..."
         )
-
-        from fluxway.common.types.configs import DriverState
-
         while True:
             heartbeats: dict = await self._controller.get_all_heartbeats()
             if heartbeats:

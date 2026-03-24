@@ -1807,7 +1807,7 @@ class SPMDWorker:
         old_steps = [
             s
             for s in self._step_tuuid_cache.keys()
-            if s < step - self.config.operator_metas[op_name].max_inflight_steps - 1
+            if s < step - self.config.operator_metas[op_name].max_inflight_steps + 1
         ]
         for s in old_steps:
             del self._step_tuuid_cache[s]
