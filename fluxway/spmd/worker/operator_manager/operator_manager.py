@@ -111,7 +111,7 @@ class OperatorManager:
         # Initialize per-operator dictionaries
         self._input_sharding: Dict[str, Dict[int, ShardingSpec]] = {}
         self._output_sharding: Dict[str, Dict[int, ShardingSpec]] = {}
-        self._expected_state_names: Dict[str, List[str]] = {}
+        self._expected_control_arg_names: Dict[str, List[str]] = {}
         self._expected_tensor_names: Dict[str, List[str]] = {}
         self._predecessor_topology: Dict[str, Dict[str, ResolvedTopologyInfo]] = {}
         self._successor_topology: Dict[str, Dict[str, ResolvedTopologyInfo]] = {}
@@ -127,7 +127,7 @@ class OperatorManager:
         for op_name in self._operators:
             self._input_sharding[op_name] = {}
             self._output_sharding[op_name] = {}
-            self._expected_state_names[op_name] = []
+            self._expected_control_arg_names[op_name] = []
             self._expected_tensor_names[op_name] = []
             self._predecessor_topology[op_name] = {}
             self._successor_topology[op_name] = {}
@@ -490,7 +490,7 @@ class OperatorManager:
             self._output_sharding[op_name] = self.get_output_sharding(op_name)
             self._register_sharding_specs(self._output_sharding[op_name])
 
-            self._expected_state_names[op_name] = list(
+            self._expected_control_arg_names[op_name] = list(
                 meta.get_arguments(is_output=False, arg_type=ArgumentType.CONTROL) or []
             )
             self._expected_tensor_names[op_name] = list(
@@ -528,14 +528,14 @@ class OperatorManager:
                     # Single primitive tensor
                     if (
                         p_name not in available_paths
-                        and p_name not in self._expected_state_names[op_name]
+                        and p_name not in self._expected_control_arg_names[op_name]
                     ):
                         raise ValueError(
                             f"[Fluxway Init Error] Operator '{op_name}' requires parameter '{p_name}', "
                             "but it's not in predecessor outputs, not in control states, "
                             "nor in static arguments.\n"
                             f"Available predecessor outputs: {sorted(available_paths)}\n"
-                            f"Registered control states: {self._expected_state_names[op_name]}\n"
+                            f"Registered control args: {self._expected_control_arg_names[op_name]}\n"
                             f"Static arguments: {list(self._static_args.keys())}"
                         )
 
@@ -931,9 +931,9 @@ class OperatorManager:
             return False
         return meta.barrier_config.type == BarrierType.PERIODIC
 
-    def get_expected_state_names(self, op_name: str) -> List[str]:
+    def get_expected_control_arg_names(self, op_name: str) -> List[str]:
         """Get expected state variable names."""
-        return list(self._expected_state_names.get(op_name, []))
+        return list(self._expected_control_arg_names.get(op_name, []))
 
     def get_expected_tensor_names(self, op_name: str) -> List[str]:
         """Get expected tensor variable names."""

@@ -35,7 +35,9 @@ async def test_embedding_forward_staleness_logic():
     barrier_cfg = TolerantBarrierConfig(state_staleness={"weights": 2})
 
     # 1. Initialize Weights at step 0
-    await mb.deposit_states("forward", step=0, names=["weights"], values=[np.zeros(10)])
+    await mb.deposit_control_arguments(
+        "forward", step=0, names=["weights"], values=[np.zeros(10)]
+    )
 
     # 2. Declare steps 0 to 4 for the forward operator
     for s in range(5):
@@ -61,7 +63,9 @@ async def test_embedding_forward_staleness_logic():
     assert not mb.is_step_ready("forward", 3)
 
     # 3. Supply Weights(1)
-    await mb.deposit_states("forward", step=1, names=["weights"], values=[np.ones(10)])
+    await mb.deposit_control_arguments(
+        "forward", step=1, names=["weights"], values=[np.ones(10)]
+    )
 
     # Now Step 3 should be ready (min required step is 3-2=1, and we have 1)
     assert mb.is_step_ready("forward", 3)

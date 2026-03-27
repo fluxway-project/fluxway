@@ -339,7 +339,7 @@ def test_step_barrier_fires_on_completion():
     b.tensor_arrived("emb")
     b.tensor_arrived("attn")
     assert not b.is_ready()  # state "lr" still missing
-    b.state_arrived("lr")
+    b.control_arg_arrived("lr")
     assert b.is_ready()
 
 
@@ -391,7 +391,7 @@ async def test_step_barrier_async_wait():
         await asyncio.sleep(0)
         b.tensor_arrived("x")
         await asyncio.sleep(0)
-        b.state_arrived("s")
+        b.control_arg_arrived("s")
 
     asyncio.create_task(arrive())
     await b.wait()
@@ -465,7 +465,9 @@ async def test_mailbox_wait_step_ready():
             meta_tensor_state_list=[0],
         )
         await asyncio.sleep(0)
-        await mb.deposit_states("compute", 5, names=["cfg"], values=[{"lr": 0.1}])
+        await mb.deposit_control_arguments(
+            "compute", 5, names=["cfg"], values=[{"lr": 0.1}]
+        )
 
     asyncio.create_task(feed())
     await mb.wait_step_ready("compute", step=5)
@@ -577,17 +579,17 @@ async def test_mailbox_no_barrier_without_declare():
 @pytest.mark.asyncio
 async def test_mailbox_state_put_get():
     mb = WorkerMailbox()
-    await mb.deposit_states("compute", 1, names=["lr"], values=[0.001])
-    assert await mb.has_state("compute", "lr", 1)
-    assert await mb.get_state("compute", "lr", 1) == 0.001
+    await mb.deposit_control_arguments("compute", 1, names=["lr"], values=[0.001])
+    assert await mb.has_control_argument("compute", "lr", 1)
+    assert await mb.get_control_argument("compute", "lr", 1) == 0.001
 
 
 @pytest.mark.asyncio
 async def test_mailbox_get_all_states():
     mb = WorkerMailbox()
-    await mb.deposit_states("compute", 0, names=["a"], values=[1])
-    await mb.deposit_states("compute", 0, names=["b"], values=[2])
-    states = await mb.get_all_states("compute", 0)
+    await mb.deposit_control_arguments("compute", 0, names=["a"], values=[1])
+    await mb.deposit_control_arguments("compute", 0, names=["b"], values=[2])
+    states = await mb.get_all_control_arguments("compute", 0)
     assert states == {"a": 1, "b": 2}
 
 
@@ -608,12 +610,16 @@ async def test_mailbox_periodic_state():
         barrier_config=PeriodicBarrierConfig(n=1),
     )
 
-    await mb.deposit_states("periodic_op", step=50, names=["s"], values=["v1"])
-    await mb.deposit_states("periodic_op", step=51, names=["s"], values=["v2"])
+    await mb.deposit_control_arguments(
+        "periodic_op", step=50, names=["s"], values=["v1"]
+    )
+    await mb.deposit_control_arguments(
+        "periodic_op", step=51, names=["s"], values=["v2"]
+    )
 
     assert ready_steps == [("periodic_op", 0), ("periodic_op", 1)]
-    assert await mb.get_state("periodic_op", "s", 0) == "v1"
-    assert await mb.get_state("periodic_op", "s", 1) == "v2"
+    assert await mb.get_control_argument("periodic_op", "s", 0) == "v1"
+    assert await mb.get_control_argument("periodic_op", "s", 1) == "v2"
 
 
 # ===========================================================================
@@ -739,8 +745,8 @@ async def test_mailbox_zero_copy_writes_into_buffer():
 @pytest.mark.asyncio
 async def test_mailbox_clear_step():
     mb = WorkerMailbox()
-    await mb.deposit_states("compute", 1, names=["s"], values=["x"])
-    await mb.deposit_states("compute", 2, names=["s"], values=["y"])
+    await mb.deposit_control_arguments("compute", 1, names=["s"], values=["x"])
+    await mb.deposit_control_arguments("compute", 2, names=["s"], values=["y"])
     tensor = TransportTensor.from_tensor(np.zeros(2))
     await mb.deposit_shards(
         "compute",
@@ -757,8 +763,8 @@ async def test_mailbox_clear_step():
 
     await mb.clear_step("compute", 1)
 
-    assert not await mb.has_state("compute", "s", 1)
-    assert await mb.has_state("compute", "s", 2)
+    assert not await mb.has_control_argument("compute", "s", 1)
+    assert await mb.has_control_argument("compute", "s", 2)
     assert await mb.get_tensor_shard_count("compute", 801, 1) == 0
     assert not mb.is_step_ready("compute", 1)  # barrier also cleared
 
@@ -767,7 +773,7 @@ async def test_mailbox_clear_step():
 async def test_mailbox_get_size():
     mb = WorkerMailbox()
     assert await mb.get_size() == 0
-    await mb.deposit_states("compute", 0, names=["s"], values=[None])
+    await mb.deposit_control_arguments("compute", 0, names=["s"], values=[None])
     tensor = TransportTensor.from_tensor(np.zeros(2))
     await mb.deposit_shards(
         "compute",

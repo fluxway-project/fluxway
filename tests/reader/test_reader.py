@@ -65,12 +65,12 @@ async def test_reader_processor_data_flows():
             await asyncio.sleep(_POLL_INTERVAL_S)
             heartbeats = await controller.get_all_heartbeats.remote()
             reader_steps = (
-                getattr(heartbeats.get(reader_id), "op_steps", {})
+                getattr(heartbeats.get(reader_id), "completed_step_count", {})
                 if heartbeats.get(reader_id)
                 else {}
             )
             proc_steps = (
-                getattr(heartbeats.get(proc_id), "op_steps", {})
+                getattr(heartbeats.get(proc_id), "completed_step_count", {})
                 if heartbeats.get(proc_id)
                 else {}
             )
@@ -79,12 +79,12 @@ async def test_reader_processor_data_flows():
 
         heartbeats = await controller.get_all_heartbeats.remote()
         reader_steps = (
-            getattr(heartbeats.get(reader_id), "op_steps", {})
+            getattr(heartbeats.get(reader_id), "completed_step_count", {})
             if heartbeats.get(reader_id)
             else {}
         )
         proc_steps = (
-            getattr(heartbeats.get(proc_id), "op_steps", {})
+            getattr(heartbeats.get(proc_id), "completed_step_count", {})
             if heartbeats.get(proc_id)
             else {}
         )

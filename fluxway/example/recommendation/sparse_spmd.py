@@ -1,3 +1,6 @@
+import pathlib
+
+import numpy as np
 import jax.numpy as jnp
 
 from fluxway.common.decorators import spmd, operator
@@ -15,12 +18,21 @@ class SparseEmbeddingSPMD:
         self.params = jnp.ones((vocab_size, embed_dim)) * 0.01
         self._forward_ids_cache = {}
 
-    def save_state(self) -> dict:
-        return {"params": self.params}
+    def save_state(self, ckpt_dir: str) -> dict:
+        # Each rank owns disjoint rows (hash-routed).  Save this rank's full
+        # params array so restore can merge all-rank contributions.
+        path = pathlib.Path(ckpt_dir) / f"sparse_rank_{self.rank}.npy"
+        np.save(str(path), np.asarray(self.params))
+        return {}
 
-    def restore_state(self, state: dict) -> None:
-        if "params" in state:
-            self.params = state["params"]
+    def restore_state(self, state: dict, ckpt_dir: str) -> None:
+        # Rows start at 0.01 and are updated by exactly one rank.
+        # sum(all_shards) - (N-1)*0.01 recovers the trained value per row.
+        shards = sorted(pathlib.Path(ckpt_dir).glob("sparse_rank_*.npy"))
+        if not shards:
+            raise FileNotFoundError(f"No sparse shards found in {ckpt_dir}")
+        merged = sum(jnp.asarray(np.load(str(p))) for p in shards)
+        self.params = merged - (len(shards) - 1) * 0.01
 
     @operator(
         name="lookup",
@@ -30,7 +42,7 @@ class SparseEmbeddingSPMD:
         },
         output_sharding={"sparse_features": {"type": "dynamic", "axis": ["shard"]}},
     )
-    def lookup(self, unique_ids: TransportTensor, **kwargs) -> LookupOutput:
+    def lookup(self, unique_ids: TransportTensor) -> LookupOutput:
         step = self.ctx.step
         ids = unique_ids.flat_values
         self._forward_ids_cache[step] = ids
@@ -58,7 +70,7 @@ class SparseEmbeddingSPMD:
             "grads": {"type": "mirror", "reference": "lookup.sparse_features"}
         },
     )
-    def update(self, grads: TransportTensor, **kwargs) -> None:
+    def update(self, grads: TransportTensor) -> None:
         step = self.ctx.step
         ids = self._forward_ids_cache.pop(step, None)
 

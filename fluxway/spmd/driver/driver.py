@@ -15,6 +15,7 @@ The SPMD Driver coordinates all workers within the SPMD:
 import asyncio
 import threading
 import time
+import pathlib
 from typing import Any, Dict, List, Optional
 
 try:
@@ -64,6 +65,7 @@ if RAY_AVAILABLE:
             worker_bundle_indices: List[int],
             controller_handle: Optional[Any],
             graph_topology: Dict[str, Any],
+            checkpoint_backend: Optional[Any] = None,
         ):
             """
             Initialize SPMD Driver.
@@ -75,8 +77,7 @@ if RAY_AVAILABLE:
                 worker_bundle_indices: Bundle indices for workers [1, 2, ..., n]
                 controller_handle: Reference to Controller (for callbacks)
                 graph_topology: Dict with 'predecessors' and 'successors' lists
-                node_type: Type of node (SPMD or READER)
-                reader_config: Reader configuration (required for READER nodes)
+                checkpoint_backend: Per-worker checkpoint backend instance (WorkerCheckpointBackend)
             """
             # Ray actors run in separate worker processes; ensure INFO logs are not dropped.
             ensure_logging_configured()
@@ -87,6 +88,7 @@ if RAY_AVAILABLE:
             self.worker_bundle_indices = worker_bundle_indices
             self.controller_handle = controller_handle
             self.graph_topology = graph_topology
+            self._checkpoint_backend = checkpoint_backend
 
             # State machine
             self.state_machine = DriverStateMachine(self)
@@ -130,6 +132,11 @@ if RAY_AVAILABLE:
             self._is_paused = False
             self._source_state: Optional[ReaderState] = ReaderState.INITIALIZING
 
+            # Pending snapshot state
+            self._pending_snapshot_id: Optional[str] = None
+            self._pending_target_step_count: Optional[int] = None
+            self._pending_ckpt_dir: Optional[str] = None
+
             logger.debug(
                 f"Driver initialized spmd_id={spmd_id} num_workers={config.num_workers}"
             )
@@ -170,9 +177,11 @@ if RAY_AVAILABLE:
                 # Start all worker actors
                 self._start_workers()
 
-                # Restore from checkpoint if provided
                 if checkpoint_id is not None:
-                    self._restore_from_checkpoint(checkpoint_id)
+                    raise NotImplementedError(
+                        "Checkpoint restore must go through Controller.restore_snapshot(). "
+                        f"checkpoint_id={checkpoint_id} spmd_id={self.spmd_id}"
+                    )
 
                 # Record init start time for timeout detection
                 self._init_start_time = time.time()
@@ -212,6 +221,7 @@ if RAY_AVAILABLE:
                         rank=rank,
                         spmd_id=self.spmd_id,
                         driver_handle=self_handle,
+                        checkpoint_backend=self._checkpoint_backend,
                     )
                 else:
                     worker = SPMDWorker.remote(
@@ -219,6 +229,7 @@ if RAY_AVAILABLE:
                         rank=rank,
                         spmd_id=self.spmd_id,
                         driver_handle=self_handle,
+                        checkpoint_backend=self._checkpoint_backend,
                     )
 
                 self._worker_handles[rank] = worker
@@ -282,16 +293,6 @@ if RAY_AVAILABLE:
 
             logger.debug(f"Topology registration completed spmd_id={self.spmd_id}")
 
-        def _restore_from_checkpoint(self, checkpoint_id: str) -> None:
-            raise NotImplementedError(
-                "Checkpoint restore must be implemented by the caller via set_state(). "
-                f"checkpoint_id={checkpoint_id} spmd_id={self.spmd_id}"
-            )
-
-        # =====================================================================
-        # Lifecycle Control
-        # =====================================================================
-
         def stop(self, save_checkpoint: bool = True) -> None:
             """Stop execution."""
             logger.debug(f"Stopping spmd_id={self.spmd_id}")
@@ -312,74 +313,103 @@ if RAY_AVAILABLE:
         # Snapshot Orchestration (Drain → Snapshot → Resume)
         # =====================================================================
 
-        def request_snapshot(self, snapshot_id: str, target_step: int) -> None:
-            """
-            Phase 1 of snapshot: drain all workers to target_step.
-
-            Transitions: RUNNING → DRAINING.
-
-            Order matters:
-              1. Fan-out set_drain_ceiling to all Workers first so that any
-                 worker about to execute step >= target_step will self-block
-                 synchronously in its own event loop — no async race.
-              2. Only then engage the Synchronizer drain fence, which is the
-                 ACK counter that fires _on_drain_complete once all workers
-                 have reported completion of their ceiling step.
-            """
-            if self.state_machine.state != DriverState.RUNNING:
+        def request_snapshot(
+            self, snapshot_id: str, target_count: int, ckpt_dir: str
+        ) -> None:
+            if self.state_machine.state not in (DriverState.RUNNING, DriverState.READY):
                 raise RuntimeError(
-                    f"request_snapshot requires RUNNING state, "
+                    f"request_snapshot requires RUNNING or READY state, "
                     f"got {self.state_machine.state} spmd_id={self.spmd_id}"
                 )
-            self._current_snapshot_id = snapshot_id
+            self._pending_snapshot_id = snapshot_id
+            self._pending_target_step_count = target_count
+            self._pending_ckpt_dir = ckpt_dir
             self.state_machine.trigger(DriverEvent.DRAIN_REQUESTED)
-            # Step 1: workers self-block when they reach target_step
             for worker in self._worker_handles.values():
-                worker.set_drain_ceiling.remote(target_step)
-            # Step 2: synchronizer starts counting ACKs toward on_drained callback
-            self.spmd_synchronizer.drain_to_step(
-                target_step=target_step, on_drained=self._on_drain_complete
+                worker.set_drain_target_count.remote(target_count)
+            self.spmd_synchronizer.drain_to_step_count(
+                target_count=target_count, on_drained=self._on_drain_complete
             )
 
         def _on_drain_complete(self) -> None:
-            """
-            Phase 2 of snapshot: all workers have reached target_step.
-
-            Transitions: DRAINING → SNAPSHOTTING.
-            Collects worker states in parallel; caller must call resume()
-            after consuming the state dicts.
-            """
             if self.state_machine.state != DriverState.DRAINING:
                 raise RuntimeError(
                     f"_on_drain_complete requires DRAINING state, "
                     f"got {self.state_machine.state} spmd_id={self.spmd_id}"
                 )
             self.state_machine.trigger(DriverEvent.DRAIN_COMPLETE)
-            self._collect_worker_states()
+            self._persist_worker_states()
 
-        def _collect_worker_states(self) -> None:
-            """
-            Parallel RPC to all workers to call get_state().
+        def _persist_worker_states(self) -> None:
+            spmd_dir = (
+                pathlib.Path(self._pending_ckpt_dir)
+                / str(self._pending_target_step_count)
+                / self.spmd_id
+            )
+            try:
+                force_write = getattr(self._checkpoint_backend, "_force_write", False)
+                if spmd_dir.exists() and any(spmd_dir.iterdir()):
+                    if not force_write:
+                        raise FileExistsError(
+                            f"Checkpoint directory {spmd_dir} already exists and is not empty. "
+                            "Set force_write=True in CheckpointConfig to overwrite."
+                        )
+                    else:
+                        import shutil
 
-            Returns futures dict {rank: ObjectRef[Dict]} to the controller
-            via report_snapshot_ready.  The controller is responsible for
-            ray.get()-ing the futures and deciding how to persist the state.
-            """
-            futures = {
-                rank: worker.get_state.remote()
+                        shutil.rmtree(spmd_dir, ignore_errors=True)
+
+                spmd_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                logger.error(
+                    f"Failed to create checkpoint directory {spmd_dir} error={e} spmd_id={self.spmd_id}"
+                )
+                self._clear_drain_and_fail()
+                return
+
+            metadata_futures = {
+                rank: worker.save_state_to_disk.remote(
+                    self._pending_ckpt_dir, self._pending_target_step_count
+                )
                 for rank, worker in self._worker_handles.items()
             }
-            if self.controller_handle is not None:
+            if self.controller_handle is None:
+                logger.error(
+                    f"controller_handle is None, cannot report snapshot metadata "
+                    f"spmd_id={self.spmd_id}"
+                )
+                self._clear_drain_and_fail()
+                return
+            try:
+                self.controller_handle.receive_snapshot_metadata.remote(
+                    self.spmd_id, self._pending_snapshot_id, metadata_futures
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to report snapshot metadata error={e} spmd_id={self.spmd_id}"
+                )
+                # Notify Controller so it can unblock its awaiting request_snapshot
+                # coroutine rather than hanging indefinitely on done_event.wait().
                 try:
-                    snapshot_id = getattr(self, "_current_snapshot_id", "default")
-                    self.controller_handle.receive_snapshot_states.remote(
-                        self.spmd_id, snapshot_id, futures
+                    self.controller_handle.report_snapshot_failed.remote(
+                        self.spmd_id, self._pending_snapshot_id
                     )
-                except Exception as e:
-                    logger.error(
-                        f"Failed to report snapshot states error={e} spmd_id={self.spmd_id}"
-                    )
-                    self.state_machine.trigger(DriverEvent.SNAPSHOT_FAILED)
+                except Exception:
+                    pass
+                self._clear_drain_and_fail()
+
+        def _clear_drain_and_fail(self) -> None:
+            """Unblock all drained Workers, then mark this Driver as failed.
+
+            Workers self-block in _execute_operator by await-ing _drain_resume_event.
+            If SNAPSHOT_FAILED fires without first clearing the drain, all Workers
+            remain permanently suspended because resume() requires SNAPSHOTTING state
+            and will raise in ERROR state.
+            """
+            self.spmd_synchronizer.clear_drain()
+            for worker in self._worker_handles.values():
+                worker.clear_drain_target_count.remote()
+            self.state_machine.trigger(DriverEvent.SNAPSHOT_FAILED)
 
         def resume(self) -> None:
             """
@@ -390,8 +420,8 @@ if RAY_AVAILABLE:
 
             Order:
               1. Synchronizer clears the ACK fence.
-              2. Fan-out clear_drain_ceiling to all Workers so they resume
-                 executing steps that were deferred behind the ceiling.
+              2. Fan-out clear_drain_target_count to all Workers so they resume
+                 executing steps that were deferred behind the target.
             """
             if self.state_machine.state != DriverState.SNAPSHOTTING:
                 raise RuntimeError(
@@ -400,8 +430,30 @@ if RAY_AVAILABLE:
                 )
             self.spmd_synchronizer.clear_drain()
             for worker in self._worker_handles.values():
-                worker.clear_drain_ceiling.remote()
+                worker.clear_drain_target_count.remote()
             self.state_machine.trigger(DriverEvent.SNAPSHOT_COMPLETE)
+
+        async def restore_from_disk(
+            self, rank_metadata_map: Dict[int, Dict[str, Any]]
+        ) -> None:
+            """
+            Fan out checkpoint restore to all workers in parallel.
+
+            Each Worker reads its own tensors directly from the shared filesystem.
+
+            Args:
+                rank_metadata_map: {rank: metadata_dict} where metadata_dict contains
+                                   ``backend`` and backend-specific path fields.
+            """
+            tasks = []
+            for rank, metadata in rank_metadata_map.items():
+                worker = self._worker_handles.get(rank)
+                if worker is None:
+                    raise RuntimeError(
+                        f"Worker rank {rank} not found spmd_id={self.spmd_id}"
+                    )
+                tasks.append(worker.load_state_from_disk.remote(metadata))
+            await asyncio.gather(*tasks)
 
         # =====================================================================
         # Worker Heartbeat Handling
@@ -421,7 +473,7 @@ if RAY_AVAILABLE:
             self._worker_heartbeat_times[rank] = time.time()
             logger.heartbeat(
                 f"Received worker heartbeat rank={rank} "
-                f"status={heartbeat.status.name} op_steps={heartbeat.op_steps} "
+                f"status={heartbeat.status.name} completed_count={heartbeat.completed_step_count} "
                 f"mailbox_full={heartbeat.mailbox_status.is_full if heartbeat.mailbox_status else False} "
                 f"spmd_id={self.spmd_id}"
             )
@@ -514,14 +566,9 @@ if RAY_AVAILABLE:
             Reports to Controller.
             """
             if self.controller_handle is not None:
-                try:
-                    self.controller_handle.report_op_completed.remote(
-                        spmd_id, op_name, step
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"Failed to report op completion to controller error={e} spmd_id={self.spmd_id}"
-                    )
+                self.controller_handle.report_op_completed.remote(
+                    spmd_id, op_name, step
+                )
 
         # =====================================================================
         # Op Blocking
@@ -741,7 +788,7 @@ if RAY_AVAILABLE:
                 status=status,
                 state=self.state_machine.state,
                 error_message=self.state_machine.get_error_message(),
-                op_steps=self.spmd_synchronizer.get_spmd_steps(),
+                completed_step_count=self.spmd_synchronizer.get_spmd_steps(),
                 num_workers=self.config.num_workers,
                 healthy_num_workers=healthy_count,
                 blocked_ops=self.spmd_synchronizer.get_locked_ops(),
@@ -758,7 +805,7 @@ if RAY_AVAILABLE:
                     f"Driver heartbeat sent status={status.name} "
                     f"state={heartbeat.state.name} "
                     f"healthy_workers={healthy_count}/{self.config.num_workers} "
-                    f"op_steps={heartbeat.op_steps} "
+                    f"completed_count={heartbeat.completed_step_count} "
                     f"busy_ratio={self._busy_worker_ratio:.2f} "
                     f"spmd_id={self.spmd_id}"
                 )
@@ -810,6 +857,7 @@ if RAY_AVAILABLE:
                         rank=rank,
                         spmd_id=self.spmd_id,
                         driver_handle=self_handle,
+                        checkpoint_backend=self._checkpoint_backend,
                     )
                 else:
                     worker = SPMDWorker.remote(
@@ -817,6 +865,7 @@ if RAY_AVAILABLE:
                         rank=rank,
                         spmd_id=self.spmd_id,
                         driver_handle=self_handle,
+                        checkpoint_backend=self._checkpoint_backend,
                     )
 
                 self._worker_handles[rank] = worker
@@ -896,7 +945,7 @@ if RAY_AVAILABLE:
                 "state": self.state_machine.state.value,
                 "node_type": "spmd",  # Generic node type
                 "num_workers": self.config.num_workers,
-                "op_steps": self.spmd_synchronizer.get_spmd_steps(),
+                "completed_step_count": self.spmd_synchronizer.get_spmd_steps(),
                 "locked_ops": self.spmd_synchronizer.get_locked_ops(),
                 "error_workers": self.state_machine.get_error_workers(),
             }

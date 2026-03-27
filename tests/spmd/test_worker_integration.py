@@ -71,18 +71,18 @@ async def test_worker_receive_shards_dispatches_to_mailbox(worker_config):
 
 @pytest.mark.asyncio
 async def test_worker_receive_control_dispatches_to_mailbox(worker_config):
-    """Verify that receive_control correctly calls deposit_states on the mailbox."""
+    """Verify that receive_control correctly calls deposit_control_arguments on the mailbox."""
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
     cls = cls.modified_class if cls else SPMDWorker
     worker = cls(worker_config, rank=0, spmd_id="test_spmd")
 
-    worker._mailbox.deposit_states = AsyncMock()
+    worker._mailbox.deposit_control_arguments = AsyncMock()
     worker._ensure_step_declared = lambda *a, **kw: None
 
     await worker.receive_control(op_name="test_op", step=3, names=["lr"], values=[0.01])
 
-    worker._mailbox.deposit_states.assert_called_once()
-    _, kwargs = worker._mailbox.deposit_states.call_args
-    assert kwargs.get("names") == ["lr"] or worker._mailbox.deposit_states.call_args[0][
-        2:4
-    ] == (["lr"], [0.01])
+    worker._mailbox.deposit_control_arguments.assert_called_once()
+    _, kwargs = worker._mailbox.deposit_control_arguments.call_args
+    assert kwargs.get("names") == [
+        "lr"
+    ] or worker._mailbox.deposit_control_arguments.call_args[0][2:4] == (["lr"], [0.01])

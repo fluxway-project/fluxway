@@ -1,3 +1,5 @@
+import json
+import pathlib
 import jax.numpy as jnp
 from typing import Any, Dict, Optional
 
@@ -51,12 +53,7 @@ class RecommendationReader(GrainReader):
         super()._create_data_loader(
             static_args, rank, world_size, shard_index, shard_count
         )
-
-    def save_state(self) -> Dict[str, Any]:
-        return self.get_state()
-
-    def restore_state(self, state: Dict[str, Any]) -> None:
-        self.set_state(state)
+        self._completed_steps = 0
 
     @operator(
         "read",
@@ -80,7 +77,9 @@ class RecommendationReader(GrainReader):
         if not samples:
             return None
 
-        logical_world = self.ctx.logical_world_size if hasattr(self, "ctx") else 1
+        self._completed_steps += 1
+
+        logical_world = self.world_size if hasattr(self, "world_size") else 1
         global_batch_size = batch_size * logical_world
         g_shape = (global_batch_size,)
         origins = ContinuousIndex.chunk(0, global_batch_size)
@@ -149,3 +148,46 @@ class RecommendationReader(GrainReader):
         )
 
         return UserBatch(active=active, passive=passive, labels=labels)
+
+    def save_state(self, ckpt_dir: str) -> Dict[str, Any]:
+        shard_count = getattr(self, "world_size", 1)
+        static_args = getattr(self, "static_args", {})
+        path = pathlib.Path(ckpt_dir) / f"reader_rank_{self.rank}_of_{shard_count}.json"
+        with open(path, "w") as f:
+            json.dump(
+                {
+                    "completed_steps": getattr(self, "_completed_steps", 0),
+                    "batch_size": static_args.get("batch_size", 24),
+                },
+                f,
+            )
+        return {}
+
+    def restore_state(self, state: Dict[str, Any], ckpt_dir: str) -> None:
+        # completed_steps is identical across all ranks, so take the max.
+        # Pair it with the saved batch_size to get the exact items-per-rank to skip,
+        # regardless of the new world_size or batch_size.
+        completed_steps = 0
+        saved_batch_size = None
+        for p in sorted(pathlib.Path(ckpt_dir).glob("reader_rank_*_of_*.json")):
+            with open(p) as f:
+                data = json.load(f)
+            steps = data.get("completed_steps", 0)
+            if steps > completed_steps:
+                completed_steps = steps
+                saved_batch_size = data.get("batch_size")
+
+        new_shard_count = getattr(self, "world_size", 1)
+        static_args = getattr(self, "static_args", {})
+        if saved_batch_size is None:
+            saved_batch_size = static_args.get("batch_size", 24)
+
+        per_rank_skip = completed_steps * saved_batch_size
+
+        self._create_data_loader(
+            static_args, getattr(self, "rank", 0), new_shard_count
+        )
+        for _ in range(per_rank_skip):
+            self.next_item()
+
+        self._completed_steps = completed_steps

@@ -1,265 +1,183 @@
 """
-SafeTensorCheckpointer: safetensors-backed implementation of FluxwayCheckpointer.
+Per-Worker safetensors serialization utilities.
 
-Designed for PyTorch backends; also supports JAX and NumPy arrays via implicit
-numpy conversion.
-
-State structure from workers: {spmd_id: {rank: {field: value}}}
-
-Values can be:
-  - JAX arrays / nnx.State pytrees  → flattened via jax.tree_util, stored in .safetensors
-  - PyTorch tensors                  → stored in .safetensors
-  - NumPy arrays                     → stored in .safetensors
-  - Python scalars / dicts / lists   → stored in meta.json as "non-tensor" metadata
-
-Each checkpoint step is written to ``<ckpt_dir>/<step>/``:
-  model.safetensors   — flattened array leaves
-  meta.json           — key structure + non-tensor fields
+Called inside Worker Ray Actor processes (not the Controller).
+Tensors are stored in a ``.safetensors`` file; non-tensor metadata
+(scalars, strings, lists) is stored in a companion ``.meta.json`` sidecar.
 """
 
 import json
-import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
+import asyncio
 import numpy as np
 
-from fluxway.control_plane.checkpointer.base import FluxwayCheckpointer
+from fluxway.control_plane.checkpointer.backend import WorkerCheckpointBackend
 
-# Separator that cannot appear in spmd_id, rank, or field names
-_SEP = "\x00"
+_SEP = "\x00"  # Separator for composite keys; cannot appear in field names
+
+
+class SafeTensorsBackend(WorkerCheckpointBackend, backend_name="safetensors"):
+    """safetensors tensors + JSON sidecar."""
+
+    def __init__(self, force_write: bool = False):
+        self._force_write = force_write
+
+    async def save(self, state, ckpt_dir, spmd_id, rank, step):
+        base = Path(ckpt_dir) / str(step)
+        tensors_path = str(base / f"{spmd_id}.safetensors")
+        meta_path = str(base / f"{spmd_id}.meta.json")
+
+        if not self._force_write:
+            if Path(tensors_path).exists() or Path(meta_path).exists():
+                raise FileExistsError(
+                    f"Checkpoint files already exist for spmd_id={spmd_id} step={step} "
+                    f"in {base}. Set force_write=True in CheckpointConfig to overwrite."
+                )
+
+        await asyncio.to_thread(save_worker_state, state, tensors_path, meta_path)
+        return {
+            "ckpt_dir": str(base / spmd_id),
+            "tensors_path": tensors_path,
+            "meta_path": meta_path,
+        }
+
+    async def load(self, metadata):
+        return await asyncio.to_thread(
+            load_worker_state, metadata["tensors_path"], metadata["meta_path"]
+        )
+
+    def finalize(self) -> None:
+        pass  # SafeTensors writes are fully synchronous; nothing to drain.
 
 
 def _try_jax_flatten(value: Any) -> Optional[Dict[str, np.ndarray]]:
-    """
-    If ``value`` is a JAX pytree (including nnx.State), flatten it to
-    {leaf_path_str: ndarray}.  Returns None if JAX is not available or the
-    value is not a JAX pytree.
-    """
     try:
         import jax
-
-        leaves_with_paths = jax.tree_util.tree_leaves_with_path(value)
-        if not leaves_with_paths:
-            return None
-        result = {}
-        for path, leaf in leaves_with_paths:
-            path_str = "/".join(
-                str(p.key) if hasattr(p, "key") else str(p) for p in path
-            )
-            result[path_str] = np.asarray(leaf)
-        return result
-    except Exception:
+    except ImportError:
         return None
 
-
-def _to_numpy(value: Any) -> np.ndarray:
-    """Convert a single array to NumPy. Raises TypeError for unsupported types."""
-    if isinstance(value, np.ndarray):
-        return value
-    # JAX
-    if hasattr(value, "__jax_array__") or type(value).__module__.startswith("jax"):
-        return np.asarray(value)
-    # PyTorch
-    if hasattr(value, "detach"):
-        return value.detach().cpu().numpy()
-    raise TypeError(
-        f"SafeTensorCheckpointer: unsupported array type {type(value)!r}. "
-        f"Supported: JAX arrays, NumPy arrays, PyTorch tensors."
-    )
+    leaves_with_paths = jax.tree_util.tree_leaves_with_path(value)
+    if not leaves_with_paths:
+        return None
+    result = {}
+    for path, leaf in leaves_with_paths:
+        path_str = "/".join(str(p.key) if hasattr(p, "key") else str(p) for p in path)
+        result[path_str] = np.asarray(leaf)
+    return result
 
 
-def _is_array_like(value: Any) -> bool:
-    """True if value is a raw array (not a pytree container)."""
-    if isinstance(value, (np.ndarray, list, int, float, bool, str, dict, type(None))):
-        return False
-    if hasattr(value, "detach") or hasattr(value, "__jax_array__"):
-        return True
-    module = type(value).__module__
-    return module.startswith("jax") or module.startswith("numpy")
-
-
-def _flatten_state(
-    state: Dict[str, Any],
+def _flatten_worker_state(
+    state: Dict[str, Any], prefix: str = ""
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
-    """
-    Recursively flatten nested state to:
-      - flat_tensors: {composite_key: ndarray}  for safetensors
-      - meta_fields:  {composite_key: value}    for JSON (non-tensor leaves)
-
-    composite_key format: "{spmd_id}\\x00{rank}\\x00{field}[\\x00{pytree_path}]"
-    """
+    """Flatten state dict into (flat_tensors, meta_fields), recursing into nested dicts."""
     flat_tensors: Dict[str, np.ndarray] = {}
     meta_fields: Dict[str, Any] = {}
 
-    for spmd_id, rank_states in state.items():
-        for rank, fields in rank_states.items():
-            for field_key, value in fields.items():
-                prefix = f"{spmd_id}{_SEP}{rank}{_SEP}{field_key}"
+    for field_key, value in state.items():
+        key = f"{prefix}{_SEP}{field_key}" if prefix else field_key
 
-                if isinstance(value, np.ndarray):
-                    # Plain NumPy — store directly
-                    flat_tensors[prefix] = value
-                elif hasattr(value, "detach"):
-                    # PyTorch tensor
-                    flat_tensors[prefix] = value.detach().cpu().numpy()
-                elif hasattr(value, "__jax_array__") or (
-                    not isinstance(
-                        value, (int, float, bool, str, dict, list, type(None))
-                    )
-                    and type(value).__module__.startswith("jax")
-                ):
-                    # Raw JAX DeviceArray — convert directly
-                    flat_tensors[prefix] = np.asarray(value)
+        if isinstance(value, np.ndarray):
+            flat_tensors[key] = value
+        elif hasattr(value, "detach"):  # PyTorch tensor
+            flat_tensors[key] = value.detach().cpu().numpy()
+        elif hasattr(value, "__jax_array__") or (
+            not isinstance(value, (int, float, bool, str, dict, list, type(None)))
+            and type(value).__module__.startswith("jax")
+        ):
+            flat_tensors[key] = np.asarray(value)
+        elif isinstance(value, dict):
+            if not value:
+                meta_fields[key] = {}
+            else:
+                inner_tensors, inner_meta = _flatten_worker_state(value, prefix=key)
+                flat_tensors.update(inner_tensors)
+                meta_fields.update(inner_meta)
+        else:
+            # Primitives must be checked before _try_jax_flatten: JAX treats
+            # Python scalars as traceable leaves, producing an empty-path entry.
+            if isinstance(
+                value, (int, float, bool, str, bytes, list, tuple, type(None))
+            ):
+                meta_fields[key] = value
+            else:
+                jax_leaves = _try_jax_flatten(value)
+                if jax_leaves is not None and len(jax_leaves) > 0:
+                    for path_str, arr in jax_leaves.items():
+                        flat_tensors[f"{key}{_SEP}{path_str}"] = arr
                 else:
-                    # Try JAX pytree flatten (handles nnx.State and other JAX containers).
-                    # Never call on plain Python types — they are valid JAX pytree leaves
-                    # but produce spurious empty-path entries.
-                    is_python_primitive = isinstance(
-                        value,
-                        (int, float, bool, str, bytes, dict, list, tuple, type(None)),
+                    raise TypeError(
+                        f"_flatten_worker_state: non-serializable value at key '{key}': "
+                        f"{type(value)!r}. Only NumPy/JAX/PyTorch arrays, JAX pytrees, "
+                        f"and JSON-compatible primitives (int, float, bool, str, list, "
+                        f"dict, None) are supported."
                     )
-                    if not is_python_primitive:
-                        jax_leaves = _try_jax_flatten(value)
-                        if jax_leaves is not None and len(jax_leaves) > 0:
-                            for path_str, arr in jax_leaves.items():
-                                flat_tensors[f"{prefix}{_SEP}{path_str}"] = arr
-                            continue
-                    # Non-tensor: Python scalar, dict, list — goes to JSON
-                    meta_fields[prefix] = value
 
     return flat_tensors, meta_fields
 
 
-def _unflatten_state(
-    flat_tensors: Dict[str, Any], meta_fields: Dict[str, Any], key_map: Dict[str, Dict]
-) -> Dict[str, Dict[int, Dict[str, Any]]]:
-    """
-    Reconstruct the nested state dict from flat safetensors + JSON metadata.
+def _unflatten_worker_state(
+    flat_tensors: Dict[str, Any], meta_fields: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Reconstruct state dict from flat tensors + JSON metadata."""
 
-    ``key_map`` (from meta.json) records for each composite_key whether its
-    value was a plain tensor, a JAX pytree leaf, or a non-tensor field.
-    """
+    def _set_nested(d: dict, parts: list, value: Any) -> None:
+        for part in parts[:-1]:
+            d = d.setdefault(part, {})
+        leaf = parts[-1]
+        existing = d.get(leaf)
+        # Merge sibling keys that share a parent (pytree group dicts)
+        if isinstance(existing, dict) and isinstance(value, dict):
+            existing.update(value)
+        else:
+            d[leaf] = value
+
     state: Dict[str, Any] = {}
 
-    def _set_nested(spmd_id, rank, field_key, value):
-        state.setdefault(spmd_id, {}).setdefault(rank, {})[field_key] = value
+    for key, arr in flat_tensors.items():
+        parts = key.split(_SEP)
+        _set_nested(state, parts, arr)
 
-    # Group pytree leaves back together
-    pytree_groups: Dict[str, Dict[str, np.ndarray]] = {}
-
-    for composite_key, arr in flat_tensors.items():
-        parts = composite_key.split(_SEP)
-        if len(parts) == 3:
-            spmd_id, rank_str, field_key = parts
-            _set_nested(spmd_id, int(rank_str), field_key, arr)
-        elif len(parts) == 4:
-            spmd_id, rank_str, field_key, path_str = parts
-            prefix = f"{spmd_id}{_SEP}{rank_str}{_SEP}{field_key}"
-            pytree_groups.setdefault(prefix, {})[path_str] = arr
-        else:
-            raise ValueError(
-                f"SafeTensorCheckpointer: unexpected key format {composite_key!r}"
-            )
-
-    # Restore pytree groups — return as plain dict of numpy arrays;
-    # DenseSPMD.restore_state calls nnx.update which accepts numpy arrays.
-    for prefix, leaves in pytree_groups.items():
-        parts = prefix.split(_SEP)
-        spmd_id, rank_str, field_key = parts
-        # Build a flat key->array dict that nnx.update accepts
-        _set_nested(spmd_id, int(rank_str), field_key, leaves)
-
-    # Non-tensor fields
-    for composite_key, value in meta_fields.items():
-        parts = composite_key.split(_SEP)
-        if len(parts) != 3:
-            raise ValueError(
-                f"SafeTensorCheckpointer: unexpected meta key format {composite_key!r}"
-            )
-        spmd_id, rank_str, field_key = parts
-        _set_nested(spmd_id, int(rank_str), field_key, value)
+    for key, val in meta_fields.items():
+        parts = key.split(_SEP)
+        _set_nested(state, parts, val)
 
     return state
 
 
-class SafeTensorCheckpointer(FluxwayCheckpointer):
+def save_worker_state(state: Dict[str, Any], tensors_path: str, meta_path: str) -> None:
+    from safetensors.numpy import save_file
+
+    flat_tensors, meta_fields = _flatten_worker_state(state)
+    Path(tensors_path).parent.mkdir(parents=True, exist_ok=True)
+    if flat_tensors:
+        save_file(flat_tensors, tensors_path)
+    with open(meta_path, "w") as f:
+        json.dump(meta_fields, f)
+
+
+def load_worker_state(tensors_path: str, meta_path: str) -> Dict[str, Any]:
     """
-    Saves and loads Fluxway snapshots using the ``safetensors`` format.
-
-    Compatible with JAX (including nnx.State pytrees), NumPy, and PyTorch arrays.
-    Non-tensor data (e.g. reader dataset position) is stored in a JSON sidecar.
-
-    Each checkpoint step is written to ``<ckpt_dir>/<step>/``:
-      model.safetensors — flattened array leaves
-      meta.json         — key structure + non-tensor metadata
+    Deserialize one Worker's state dict from disk.
 
     Args:
-        controller:     Ray remote handle returned by ``create_controller``.
-        ckpt_dir:       Root directory for checkpoints.
-        interval_steps: Steps between successive automatic checkpoints.
-        max_to_keep:    Maximum number of on-disk checkpoints to retain.
+        tensors_path: Absolute path to the ``.safetensors`` file.
+        meta_path:    Absolute path to the ``.meta.json`` sidecar.
+
+    Returns:
+        State dict suitable for ``Worker.load_state_from_disk()``.
     """
+    from safetensors.numpy import load_file
 
-    def __init__(
-        self, controller, ckpt_dir: str, *, interval_steps: int, max_to_keep: int = 2
-    ) -> None:
-        super().__init__(controller, ckpt_dir, interval_steps=interval_steps)
+    flat_tensors: Dict[str, np.ndarray] = {}
+    if Path(tensors_path).exists():
+        flat_tensors = load_file(tensors_path)
 
-        import safetensors  # noqa: F401 — validate dependency at construction
+    if not Path(meta_path).exists():
+        raise FileNotFoundError(f"Checkpoint metadata not found: {meta_path}")
 
-        if max_to_keep <= 0:
-            raise ValueError(
-                f"SafeTensorCheckpointer: max_to_keep must be positive, got {max_to_keep}"
-            )
-        self._max_to_keep = max_to_keep
+    with open(meta_path) as f:
+        meta_fields = json.load(f)
 
-    def list_steps(self) -> List[int]:
-        root = Path(self._ckpt_dir)
-        if not root.exists():
-            return []
-        return sorted(
-            int(d.name) for d in root.iterdir() if d.is_dir() and d.name.isdigit()
-        )
-
-    def _persist(self, step: int, state: Dict[str, Any]) -> None:
-        from safetensors.numpy import save_file
-
-        step_dir = Path(self._ckpt_dir) / str(step)
-        step_dir.mkdir(parents=True, exist_ok=True)
-
-        flat_tensors, meta_fields = _flatten_state(state)
-        save_file(flat_tensors, str(step_dir / "model.safetensors"))
-
-        with open(step_dir / "meta.json", "w") as f:
-            json.dump(meta_fields, f)
-
-        self._evict_old_checkpoints()
-
-    def _load(self, step: int) -> Dict[str, Any]:
-        from safetensors.numpy import load_file
-
-        step_dir = Path(self._ckpt_dir) / str(step)
-        tensor_path = step_dir / "model.safetensors"
-        meta_path = step_dir / "meta.json"
-
-        if not tensor_path.exists():
-            raise FileNotFoundError(
-                f"SafeTensorCheckpointer: checkpoint file not found: {tensor_path}"
-            )
-        if not meta_path.exists():
-            raise FileNotFoundError(
-                f"SafeTensorCheckpointer: metadata file not found: {meta_path}"
-            )
-
-        flat_tensors = load_file(str(tensor_path))
-        with open(meta_path) as f:
-            meta_fields = json.load(f)
-
-        return _unflatten_state(flat_tensors, meta_fields, key_map={})
-
-    def _evict_old_checkpoints(self) -> None:
-        """Remove oldest checkpoint directories exceeding max_to_keep."""
-        steps = self.list_steps()
-        for old_step in steps[: -self._max_to_keep]:
-            shutil.rmtree(Path(self._ckpt_dir) / str(old_step))
+    return _unflatten_worker_state(flat_tensors, meta_fields)

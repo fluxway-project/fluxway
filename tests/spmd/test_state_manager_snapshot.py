@@ -12,14 +12,14 @@ def _make_payload() -> dict:
             0: {
                 "spmd_id": "spmd_a",
                 "rank": 0,
-                "current_steps": {"op": 5},
+                "completed_step_count": {"op": 5},
                 "static_args": {},
                 "operator_states": {},
             },
             1: {
                 "spmd_id": "spmd_a",
                 "rank": 1,
-                "current_steps": {"op": 5},
+                "completed_step_count": {"op": 5},
                 "static_args": {},
                 "operator_states": {},
             },

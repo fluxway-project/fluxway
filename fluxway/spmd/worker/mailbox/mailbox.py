@@ -48,7 +48,7 @@ class StepBarrier:
         "_op_name",
         "_step",
         "_tensor_barriers",
-        "_state_barriers",
+        "_control_arg_barriers",
         "_combined",
         "_periodic",
     )
@@ -68,7 +68,7 @@ class StepBarrier:
             u: ArrivalBarrier(count, periodic=periodic)
             for u, count in expected_tensors.items()
         }
-        self._state_barriers: Dict[str, ArrivalBarrier] = {
+        self._control_arg_barriers: Dict[str, ArrivalBarrier] = {
             name: ArrivalBarrier(1, periodic=periodic) for name in expected_states
         }
         # Combined completion event (one-shot mode only)
@@ -110,9 +110,11 @@ class StepBarrier:
             )
         return False
 
-    def state_arrived(self, name: str, current_step: Optional[int] = None) -> bool:
+    def control_arg_arrived(
+        self, name: str, current_step: Optional[int] = None
+    ) -> bool:
         """Record state data arriving for `name`. Returns True if barrier just fired."""
-        barrier = self._state_barriers.get(name)
+        barrier = self._control_arg_barriers.get(name)
         if barrier is not None:
             fired = barrier.arrive()
             step_to_log = current_step if current_step is not None else self._step
@@ -124,7 +126,7 @@ class StepBarrier:
             return self._check(current_step=current_step)
         else:
             logger.warning(
-                f"[StepBarrier {self._op_name}:{self._step}] UNEXPECTED STATE: name={name}, expected={list(self._state_barriers.keys())}"
+                f"[StepBarrier {self._op_name}:{self._step}] UNEXPECTED STATE: name={name}, expected={list(self._control_arg_barriers.keys())}"
             )
         return False
 
@@ -139,9 +141,11 @@ class StepBarrier:
             return self._check(current_step=current_step)
         return False
 
-    def satisfy_state(self, name: str, current_step: Optional[int] = None) -> bool:
+    def satisfy_control_arg(
+        self, name: str, current_step: Optional[int] = None
+    ) -> bool:
         """Force a state barrier to be satisfied."""
-        barrier = self._state_barriers.get(name)
+        barrier = self._control_arg_barriers.get(name)
         if barrier is not None and not barrier.is_done():
             # Force the ArrivalBarrier to be done by simulating arrivals
             remaining = barrier._n - barrier._count
@@ -158,7 +162,7 @@ class StepBarrier:
         if self._combined.is_set():
             return False
         tensors_ok = all(b.is_done() for b in self._tensor_barriers.values())
-        states_ok = all(b.is_done() for b in self._state_barriers.values())
+        states_ok = all(b.is_done() for b in self._control_arg_barriers.values())
 
         step_to_log = current_step if current_step is not None else self._step
 
@@ -171,7 +175,9 @@ class StepBarrier:
         waiting_tensors = [
             n for n, b in self._tensor_barriers.items() if not b.is_done()
         ]
-        waiting_states = [n for n, b in self._state_barriers.items() if not b.is_done()]
+        waiting_states = [
+            n for n, b in self._control_arg_barriers.items() if not b.is_done()
+        ]
         logger.debug(
             f"[StepBarrier {self._op_name}:{step_to_log}] NOT READY: waiting_tensors={waiting_tensors}, waiting_states={waiting_states}"
         )
@@ -211,7 +217,7 @@ class WorkerMailbox:
 
     def __init__(self) -> None:
         # Control plane
-        self._state_data: Dict[str, Dict[str, Dict[int, Any]]] = {}
+        self._control_arg_data: Dict[str, Dict[str, Dict[int, Any]]] = {}
 
         # Data plane (buffered path)
         self._tensor_slots: Dict[
@@ -236,7 +242,7 @@ class WorkerMailbox:
         self._staleness_config: Dict[str, Dict[Any, int]] = {}
         # Expected counts for satisfying staleness: {op_name: {name_or_uuid: expected_count}}
         self._expected_tensor_counts: Dict[str, Dict[int, int]] = {}
-        self._expected_state_names: Dict[str, List[str]] = {}
+        self._expected_control_arg_names: Dict[str, List[str]] = {}
         # Retrieval policy for tolerant params: {op_name: {name_or_uuid: policy_string}}
         self._retrieval_policy: Dict[str, Dict[Any, str]] = {}
 
@@ -272,7 +278,7 @@ class WorkerMailbox:
         """
         Declare the expected arrivals for a step.
 
-        Must be called before the first deposit_shards() / deposit_states() for
+        Must be called before the first deposit_shards() / deposit_control_arguments() for
         that step.  If not called, deposit_* operations still work but no
         barrier fires.
 
@@ -306,7 +312,7 @@ class WorkerMailbox:
 
             self._staleness_config[op_name] = staleness_dict
             self._expected_tensor_counts[op_name] = expected_tensors
-            self._expected_state_names[op_name] = expected_states
+            self._expected_control_arg_names[op_name] = expected_states
             self._barrier_configs[op_name] = barrier_config
 
             # Currently apply one policy per operator for all its staleness configs
@@ -332,7 +338,9 @@ class WorkerMailbox:
                 # Ensure each ArrivalBarrier inside StepBarrier uses the correct n
                 for b in self._periodic_barriers[op_name]._tensor_barriers.values():
                     b._n = n
-                for b in self._periodic_barriers[op_name]._state_barriers.values():
+                for b in self._periodic_barriers[
+                    op_name
+                ]._control_arg_barriers.values():
                     b._n = n
 
                 self._periodic_steps[op_name] = 0
@@ -381,11 +389,11 @@ class WorkerMailbox:
             elif isinstance(ident, str) and ident in expected_states:
                 found_valid = False
                 for k in range(step, max(-1, step - max_staleness - 1), -1):
-                    if k in self._state_data.get(op_name, {}).get(ident, {}):
+                    if k in self._control_arg_data.get(op_name, {}).get(ident, {}):
                         found_valid = True
                         break
                 if found_valid:
-                    barrier.satisfy_state(ident)
+                    barrier.satisfy_control_arg(ident)
 
         # Check if any data for THIS EXACT step has already arrived.
         # This prevents progress loss if declare_step is called after some deposit_* calls.
@@ -399,8 +407,8 @@ class WorkerMailbox:
                         barrier.tensor_arrived(tuuid)
         # Check for states
         for name in expected_states:
-            if step in self._state_data.get(op_name, {}).get(name, {}):
-                barrier.state_arrived(name)
+            if step in self._control_arg_data.get(op_name, {}).get(name, {}):
+                barrier.control_arg_arrived(name)
 
         # In case expected counts are all zero the barrier is already ready
         if barrier.is_ready() and self._on_ready:
@@ -410,7 +418,7 @@ class WorkerMailbox:
     # Control plane — state data
     # ------------------------------------------------------------------
 
-    async def deposit_states(
+    async def deposit_control_arguments(
         self, op_name: str, step: int, names: List[str], values: List[Any]
     ) -> None:
         """Cache state data and notify the step barrier."""
@@ -429,11 +437,11 @@ class WorkerMailbox:
 
             any_fired = False
             for name, data in zip(names, values, strict=True):  # type: ignore
-                self._state_data.setdefault(op_name, {}).setdefault(name, {})[
+                self._control_arg_data.setdefault(op_name, {}).setdefault(name, {})[
                     actual_step
                 ] = data
                 if barrier is not None:
-                    if barrier.state_arrived(name, current_step=actual_step):
+                    if barrier.control_arg_arrived(name, current_step=actual_step):
                         any_fired = True
 
                 # Check if this state satisfies any FUTURE barriers that tolerate staleness
@@ -442,7 +450,7 @@ class WorkerMailbox:
                     for s in range(actual_step + 1, actual_step + staleness + 1):
                         future_barrier = self._barriers.get(op_name, {}).get(s)
                         if future_barrier is not None:
-                            fired_future = future_barrier.satisfy_state(
+                            fired_future = future_barrier.satisfy_control_arg(
                                 name, current_step=s
                             )
                             if fired_future and self._on_ready:
@@ -454,15 +462,20 @@ class WorkerMailbox:
                 if self._on_ready:
                     self._on_ready(op_name, actual_step)
         logger.debug(
-            "Mailbox deposit_states: op=%s names=%s step=%d", op_name, names, step
+            "Mailbox deposit_control_arguments: op=%s names=%s step=%d",
+            op_name,
+            names,
+            step,
         )
 
-    async def get_state(self, op_name: str, name: str, step: int) -> Optional[Any]:
+    async def get_control_argument(
+        self, op_name: str, name: str, step: int
+    ) -> Optional[Any]:
         async with self._lock:
             staleness = self._staleness_config.get(op_name, {}).get(name, 0)
             if staleness > 0:
                 policy = self._retrieval_policy.get(op_name, {}).get(name, "latest")
-                step_dict = self._state_data.get(op_name, {}).get(name, {})
+                step_dict = self._control_arg_data.get(op_name, {}).get(name, {})
                 valid_steps = [
                     k
                     for k in range(max(0, step - staleness), step + 1)
@@ -472,12 +485,14 @@ class WorkerMailbox:
                     best_k = valid_steps[0] if policy == "oldest" else valid_steps[-1]
                     return step_dict[best_k]
 
-            return self._state_data.get(op_name, {}).get(name, {}).get(step)
+            return self._control_arg_data.get(op_name, {}).get(name, {}).get(step)
 
-    async def get_all_states(self, op_name: str, step: int) -> Dict[str, Any]:
+    async def get_all_control_arguments(
+        self, op_name: str, step: int
+    ) -> Dict[str, Any]:
         async with self._lock:
             result = {}
-            for name, step_dict in self._state_data.get(op_name, {}).items():
+            for name, step_dict in self._control_arg_data.get(op_name, {}).items():
                 staleness = self._staleness_config.get(op_name, {}).get(name, 0)
                 if staleness > 0:
                     policy = self._retrieval_policy.get(op_name, {}).get(name, "latest")
@@ -497,9 +512,9 @@ class WorkerMailbox:
                     result[name] = step_dict[step]
             return result
 
-    async def has_state(self, op_name: str, name: str, step: int) -> bool:
+    async def has_control_argument(self, op_name: str, name: str, step: int) -> bool:
         async with self._lock:
-            return step in self._state_data.get(op_name, {}).get(name, {})
+            return step in self._control_arg_data.get(op_name, {}).get(name, {})
 
     # ------------------------------------------------------------------
     # Data plane — tensor shards
@@ -993,20 +1008,20 @@ class WorkerMailbox:
                     if not step_dict:
                         del self._zc_receivers[op_name][name]
 
-            if op_name in self._state_data:
-                for name, step_dict in list(self._state_data[op_name].items()):
+            if op_name in self._control_arg_data:
+                for name, step_dict in list(self._control_arg_data[op_name].items()):
                     staleness = self._staleness_config.get(op_name, {}).get(name, 0)
                     clear_target = step - staleness
                     step_dict.pop(clear_target, None)
                     if not step_dict:
-                        del self._state_data[op_name][name]
+                        del self._control_arg_data[op_name][name]
 
             if op_name in self._barriers:
                 self._barriers[op_name].pop(step, None)
 
     async def clear_all(self) -> None:
         async with self._lock:
-            self._state_data.clear()
+            self._control_arg_data.clear()
             self._tensor_slots.clear()
             self._zc_receivers.clear()
             self._barriers.clear()
@@ -1022,7 +1037,7 @@ class WorkerMailbox:
     def _get_size_lock_free(self) -> int:
         """Internal helper to compute size without acquiring lock."""
         size = 0
-        for op_name_dict in self._state_data.values():
+        for op_name_dict in self._control_arg_data.values():
             for step_dict in op_name_dict.values():
                 size += len(step_dict)
         for op_name_dict in self._tensor_slots.values():

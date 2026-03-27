@@ -15,7 +15,6 @@ from typing import (
     TypeVar,
     Union,
     Tuple,
-    Literal,
 )
 
 from pydantic import BaseModel, Field, ConfigDict
@@ -732,7 +731,9 @@ class WorkerHeartbeat(FluxwayBaseSchema):
 
     rank: int
     timestamp: float
-    op_steps: Dict[str, int] = Field(default_factory=dict)  # op_type.name -> step
+    completed_step_count: Dict[str, int] = Field(
+        default_factory=dict
+    )  # op_type.name -> completed count
     status: WorkerStatus = WorkerStatus.RUNNING
     error_message: Optional[str] = None
     telemetry: Optional["WorkerTelemetry"] = None
@@ -747,9 +748,9 @@ class DriverHeartbeat(FluxwayBaseSchema):
     status: DriverStatus = DriverStatus.HEALTHY
     state: DriverState = DriverState.INITIALIZING
     error_message: Optional[str] = None
-    op_steps: Dict[str, int] = Field(
+    completed_step_count: Dict[str, int] = Field(
         default_factory=dict
-    )  # op_type.name -> spmd-level step
+    )  # op_type.name -> completed step count
     num_workers: int = 0
     healthy_num_workers: int = 0
     blocked_ops: List[str] = Field(default_factory=list)
@@ -773,9 +774,10 @@ class HeartbeatConfig(FluxwayBaseSchema):
 class CheckpointConfig(FluxwayBaseSchema):
     """Configuration for checkpoint manager."""
 
-    backend: Literal["orbax", "safetensors"]
+    backend: str  # Validated at runtime by WorkerCheckpointBackend.create()
     ckpt_dir: str
     interval_steps: int
+    force_write: bool = False  # Force write even if directory already exists
 
 
 class AsyncStepConfig(FluxwayBaseSchema):
@@ -804,7 +806,9 @@ class SPMDOpStep(FluxwayBaseSchema):
     """SPMD operation step tracking."""
 
     spmd_id: str
-    op_steps: Dict[str, int] = Field(default_factory=dict)  # op_name -> step
+    completed_step_count: Dict[str, int] = Field(
+        default_factory=dict
+    )  # op_name -> completed count
 
 
 class OpLockState(FluxwayBaseSchema):

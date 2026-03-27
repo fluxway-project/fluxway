@@ -17,6 +17,7 @@ Implemented as a Ray Actor for async operation.
 
 import asyncio
 import functools
+import os
 import time
 from typing import Any, Dict, List, Optional
 
@@ -52,7 +53,14 @@ logger = get_logger(__name__)
 def require_manager(manager_attr: str):
     """
     Decorator to ensure that a manager component is initialized before calling
-    the method. Raises RuntimeError if it's None.
+    the method.
+
+    Two cases when the manager attribute is None:
+    - Controller not yet initialized (_initialized=False): transient startup race,
+      the caller (driver) will retry on the next heartbeat cycle. Log a warning
+      and return without raising so the fire-and-forget ObjectRef is not lost silently.
+    - Controller already initialized (_initialized=True): this is a post-init bug;
+      raise RuntimeError unconditionally.
     """
 
     def decorator(func):
@@ -61,8 +69,14 @@ def require_manager(manager_attr: str):
             @functools.wraps(func)
             async def async_wrapper(self, *args, **kwargs):
                 if getattr(self, manager_attr) is None:
+                    if not self._initialized:
+                        logger.warning(
+                            f"{func.__name__} called before controller initialized, dropping"
+                        )
+                        return
                     raise RuntimeError(
-                        f"{manager_attr.strip('_')} is not initialized when calling {func.__name__}"
+                        f"{manager_attr.strip('_')} is None after initialization "
+                        f"when calling {func.__name__}"
                     )
                 return await func(self, *args, **kwargs)
 
@@ -72,8 +86,14 @@ def require_manager(manager_attr: str):
             @functools.wraps(func)
             def sync_wrapper(self, *args, **kwargs):
                 if getattr(self, manager_attr) is None:
+                    if not self._initialized:
+                        logger.warning(
+                            f"{func.__name__} called before controller initialized, dropping"
+                        )
+                        return
                     raise RuntimeError(
-                        f"{manager_attr.strip('_')} is not initialized when calling {func.__name__}"
+                        f"{manager_attr.strip('_')} is None after initialization "
+                        f"when calling {func.__name__}"
                     )
                 return func(self, *args, **kwargs)
 
@@ -135,18 +155,16 @@ if RAY_AVAILABLE:
             self._async_step_config = async_step_config or AsyncStepConfig()
             self._checkpoint_config = checkpoint_config
 
-            # Initialize components (some are initialized in initialize() now)
             self._monitor = Monitor()
             self._state_manager = StateManager()
-            self._scheduler = Scheduler(
-                spmd_manager=None
-            )  # SPMDManager set in initialize()
-
-            # Initialize state machine
+            self._scheduler = Scheduler(spmd_manager=None)
             self._state_machine = ControllerStateMachine(self)
-
-            # Initialize async step manager
             self._async_step_manager = AsyncStepManager(graph, self._async_step_config)
+            # snapshot_id → {expected, received, metadata, event}
+            self._pending_snapshots: Dict[str, Any] = {}
+
+            self._checkpoint_task: Optional[asyncio.Task] = None
+            self._last_checkpointed_step: int = 0
 
             # Track source nodes (entry points)
             self._source_nodes = (
@@ -220,32 +238,23 @@ if RAY_AVAILABLE:
                 )
 
                 if self._checkpoint_config is not None:
-                    if self._checkpoint_config.backend == "orbax":
-                        from fluxway.control_plane.checkpointer.orbax import (
-                            OrbaxCheckpointer,
-                        )
+                    from fluxway.control_plane.checkpointer import (
+                        FluxwayCheckpointer,
+                        WorkerCheckpointBackend,
+                    )
 
-                        self._checkpointer = OrbaxCheckpointer(
-                            self,
-                            ckpt_dir=self._checkpoint_config.ckpt_dir,
-                            interval_steps=self._checkpoint_config.interval_steps,
+                    self._checkpointer = FluxwayCheckpointer(
+                        self,
+                        ckpt_dir=self._checkpoint_config.ckpt_dir,
+                        interval_steps=self._checkpoint_config.interval_steps,
+                        force_write=self._checkpoint_config.force_write,
+                    )
+                    self._spmd_manager.set_checkpoint_backend(
+                        WorkerCheckpointBackend.create(
+                            self._checkpoint_config.backend,
+                            force_write=self._checkpoint_config.force_write,
                         )
-                    elif self._checkpoint_config.backend == "safetensors":
-                        from fluxway.control_plane.checkpointer.safetensors import (
-                            SafeTensorCheckpointer,
-                        )
-
-                        self._checkpointer = SafeTensorCheckpointer(
-                            self,
-                            ckpt_dir=self._checkpoint_config.ckpt_dir,
-                            interval_steps=self._checkpoint_config.interval_steps,
-                        )
-                    else:
-                        raise ValueError(
-                            f"Unknown checkpoint backend: {self._checkpoint_config.backend}"
-                        )
-
-                    self._checkpointer.start()
+                    )
 
                 # Assign specific max_steps to each node based on global config and overrides
                 for node_id, node in self._graph.nodes.items():
@@ -345,10 +354,10 @@ if RAY_AVAILABLE:
             # Route to heartbeat manager
             await self._heartbeat_manager.receive_heartbeat(heartbeat)
 
-            # Update async step manager with op steps
-            if heartbeat.op_steps:
-                self._async_step_manager.report_op_steps(
-                    heartbeat.spmd_id, heartbeat.op_steps
+            # Update async step manager with completed count
+            if heartbeat.completed_step_count:
+                self._async_step_manager.report_completed_count(
+                    heartbeat.spmd_id, heartbeat.completed_step_count
                 )
 
             # Check and enforce step limits
@@ -364,8 +373,9 @@ if RAY_AVAILABLE:
         # Op Completion Interface (called by drivers)
         # =====================================================================
 
+        @require_spmd_manager
         async def report_op_completed(
-            self, spmd_id: str, op_name: str, step: int
+            self, spmd_id: str, op_name: str, completed_count: int
         ) -> None:
             """
             Receive op completion report from a driver.
@@ -373,10 +383,13 @@ if RAY_AVAILABLE:
             Args:
                 spmd_id: SPMD identifier
                 op_name: Operation name
-                step: Completed step number
+                completed_count: Completed count (number of steps finished)
             """
-            self._async_step_manager.report_op_completed(spmd_id, op_name, step)
+            self._async_step_manager.report_op_completed(
+                spmd_id, op_name, completed_count
+            )
             await self._check_and_enforce_step_limits()
+            await self._maybe_trigger_checkpoint(completed_count)
 
         async def _check_and_enforce_step_limits(self) -> None:
             """Check step differences and apply lock/unlock actions."""
@@ -387,13 +400,49 @@ if RAY_AVAILABLE:
                 )
                 return
 
-            # Enforce step difference limits via global watermarks
             for (
                 spmd_id,
                 op_name,
                 allowed_step,
             ) in self._async_step_manager.check_and_enforce_limits():
                 await self._set_spmd_allowed_step(spmd_id, op_name, allowed_step)
+
+        async def _maybe_trigger_checkpoint(self, completed_count: int) -> None:
+            """
+            Event-driven proactive checkpoint trigger.
+
+            A checkpoint is scheduled only when every SPMD's every op has
+            completed at least `next_ckpt` steps, ensuring the snapshot is globally
+            consistent with drain_to_step_count mechanism.
+            """
+            if self._checkpointer is None:
+                return
+            if self._checkpoint_task is not None and not self._checkpoint_task.done():
+                return
+
+            interval = self._checkpointer.interval_steps
+            next_ckpt = self._last_checkpointed_step + interval
+            if completed_count < next_ckpt:
+                return
+
+            # Advance the watermark before launching the task so that a
+            # persistent failure (e.g. disk full) skips this boundary and
+            # moves on to the next, rather than retrying the same boundary on
+            # every subsequent report_op_completed call.
+            self._last_checkpointed_step = next_ckpt
+
+            async def do_ckpt(boundary: int) -> None:
+                logger.info(
+                    f"Proactively scheduled checkpoint boundary at count {boundary}"
+                )
+                try:
+                    await self._checkpointer.save(boundary)
+                except Exception as e:
+                    logger.error(
+                        f"Checkpoint at step {boundary} failed and will be skipped: {e}"
+                    )
+
+            self._checkpoint_task = asyncio.create_task(do_ckpt(next_ckpt))
 
         @require_spmd_manager
         async def _set_spmd_allowed_step(
@@ -557,118 +606,188 @@ if RAY_AVAILABLE:
         # =====================================================================
 
         @require_spmd_manager
-        async def request_snapshot(self, snapshot_id: str, target_step: int) -> None:
+        async def request_snapshot(
+            self, snapshot_id: str, target_count: int, ckpt_dir: str
+        ) -> Dict[str, Any]:
             """
-            Trigger a global snapshot across all SPMDs.
+            Trigger a global snapshot and block until all Workers have persisted
+            their state and all Drivers have reported metadata back.
+
+            Returns the assembled manifest directly — no polling required.
             """
             logger.info(
-                f"Controller requesting global snapshot {snapshot_id} at step {target_step}"
+                f"Requesting global snapshot '{snapshot_id}' at step {target_count}"
             )
-            self._pending_snapshots = getattr(self, "_pending_snapshots", {})
             all_spmd_ids = self._spmd_manager.get_all_spmd_ids()
+            if not all_spmd_ids:
+                return {}
+
+            # validate all drivers exist BEFORE registering the snapshot entry
+            # and before dispatching any RPCs.
+            drivers: Dict[str, Any] = {}
+            for spmd_id in all_spmd_ids:
+                driver = self._spmd_manager.get_driver_handle(spmd_id)
+                if driver is None:
+                    raise RuntimeError(
+                        f"request_snapshot: driver for spmd_id '{spmd_id}' not found. "
+                        f"Cannot perform partial snapshot — aborting to prevent corrupt manifest."
+                    )
+                drivers[spmd_id] = driver
+
+            # Register the accounting entry, then dispatch — all drivers confirmed.
+            done_event = asyncio.Event()
             self._pending_snapshots[snapshot_id] = {
                 "expected": len(all_spmd_ids),
                 "received": 0,
-                "states": {},
+                "reported": set(),  # idempotent guard: each spmd_id counted at most once
+                "metadata": {},
+                "errors": [],
+                "ckpt_dir": ckpt_dir,
+                "event": done_event,
             }
+            for spmd_id, driver in drivers.items():
+                driver.request_snapshot.remote(snapshot_id, target_count, ckpt_dir)
 
-            for spmd_id in all_spmd_ids:
-                driver = self._spmd_manager.get_driver_handle(spmd_id)
-                if driver is not None:
-                    driver.request_snapshot.remote(snapshot_id, target_step)
+            snapshot_timeout = int(
+                os.environ.get("FLUXWAY_SNAPSHOT_TIMEOUT_SECS", "600")
+            )
+            try:
+                await asyncio.wait_for(done_event.wait(), timeout=snapshot_timeout)
+            except asyncio.TimeoutError as err:
+                self._pending_snapshots.pop(snapshot_id, None)
+                raise RuntimeError(
+                    f"Snapshot '{snapshot_id}' timed out after {snapshot_timeout}s. "
+                    f"A Driver may have crashed without calling report_snapshot_failed. "
+                    f"Set FLUXWAY_SNAPSHOT_TIMEOUT_SECS to adjust."
+                ) from err
+
+            snap_info = self._pending_snapshots.pop(snapshot_id)
+            if snap_info["errors"]:
+                raise RuntimeError(
+                    f"Snapshot '{snapshot_id}' failed for SPMDs: {snap_info['errors']}. "
+                    f"Refusing to persist incomplete manifest."
+                )
+            manifest = {
+                sid: {str(rank): m for rank, m in per_rank.items()}
+                for sid, per_rank in snap_info["metadata"].items()
+            }
+            return manifest
 
         @require_spmd_manager
-        async def receive_snapshot_states(
-            self, spmd_id: str, snapshot_id: str, futures: Dict[int, Any]
+        async def receive_snapshot_metadata(
+            self, spmd_id: str, snapshot_id: str, metadata_futures: Dict[int, Any]
         ) -> None:
-            """
-            Receive snapshot states from a driver.
-            """
-            logger.info(
-                f"Controller received snapshot {snapshot_id} states from SPMD {spmd_id}"
-            )
-            self._pending_snapshots = getattr(self, "_pending_snapshots", {})
-            if snapshot_id not in self._pending_snapshots:
+            snap_info = self._pending_snapshots.get(snapshot_id)
+            if snap_info is None:
                 logger.warning(
-                    f"Received unknown snapshot {snapshot_id} from {spmd_id}"
+                    f"Received metadata for unknown snapshot '{snapshot_id}'"
                 )
                 return
+
+            # Idempotency guard: a Driver may call both receive_snapshot_metadata
+            # (which fails partway) and report_snapshot_failed.  Only the first
+            # call for a given spmd_id is counted to prevent received > expected.
+            if spmd_id in snap_info["reported"]:
+                logger.warning(
+                    f"receive_snapshot_metadata: duplicate report from '{spmd_id}' "
+                    f"for snapshot '{snapshot_id}' — ignoring"
+                )
+                return
+            snap_info["reported"].add(spmd_id)
 
             try:
-                resolved_states = {}
-                ranks = list(futures.keys())
-                refs = list(futures.values())
-                results = await asyncio.gather(
-                    *[
-                        asyncio.wrap_future(r.future()) if hasattr(r, "future") else r
-                        for r in refs
-                    ]
-                )
-                for rank, res in zip(ranks, results, strict=True):
-                    resolved_states[rank] = res
+                ranks = list(metadata_futures.keys())
+                refs = list(metadata_futures.values())
+                results = await asyncio.gather(*refs)
+                resolved = dict(zip(ranks, results, strict=True))
             except Exception as e:
-                logger.error(f"Failed to resolve snapshot futures for {spmd_id}: {e}")
+                logger.error(f"Failed to resolve snapshot metadata for {spmd_id}: {e}")
+                snap_info["errors"].append(spmd_id)
+                snap_info["received"] += 1
+                if snap_info["received"] == snap_info["expected"]:
+                    snap_info["event"].set()
                 return
 
-            snap_info = self._pending_snapshots[snapshot_id]
-            snap_info["states"][spmd_id] = resolved_states
+            snap_info["metadata"][spmd_id] = resolved
             snap_info["received"] += 1
 
             if snap_info["received"] == snap_info["expected"]:
-                logger.info(
-                    f"Global snapshot {snapshot_id} complete. Aggregating to StateManager."
-                )
-                self._state_manager.save_snapshot(snapshot_id, snap_info["states"])
-
-                # Resume all drivers
+                logger.info(f"Snapshot '{snapshot_id}' complete — resuming all Drivers")
                 for s_id in self._spmd_manager.get_all_spmd_ids():
                     driver = self._spmd_manager.get_driver_handle(s_id)
                     if driver is not None:
                         driver.resume.remote()
+                snap_info["event"].set()
 
-        async def get_snapshot(self, snapshot_id: str) -> Optional[Dict[str, Any]]:
-            """Retrieve an aggregated snapshot, or None if not yet ready."""
-            try:
-                return self._state_manager.load_snapshot(snapshot_id)
-            except KeyError:
-                return None
+        async def report_snapshot_failed(self, spmd_id: str, snapshot_id: str) -> None:
+            """Unblock request_snapshot when a Driver triggers SNAPSHOT_FAILED.
+
+            Called by a Driver that encountered an unrecoverable error during
+            persistence and could not (or failed to) deliver metadata via
+            receive_snapshot_metadata.  Advances the received counter so the
+            Controller's done_event is eventually set rather than waiting forever.
+            """
+            snap_info = self._pending_snapshots.get(snapshot_id)
+            if snap_info is None:
+                logger.warning(
+                    f"report_snapshot_failed: unknown snapshot '{snapshot_id}' from {spmd_id}"
+                )
+                return
+
+            # Same idempotency guard as receive_snapshot_metadata.
+            if spmd_id in snap_info["reported"]:
+                logger.warning(
+                    f"report_snapshot_failed: duplicate report from '{spmd_id}' "
+                    f"for snapshot '{snapshot_id}' — ignoring"
+                )
+                return
+            snap_info["reported"].add(spmd_id)
+
+            logger.error(
+                f"Snapshot '{snapshot_id}' failed for SPMD '{spmd_id}' — marking as error"
+            )
+            snap_info["errors"].append(spmd_id)
+            snap_info["received"] += 1
+            if snap_info["received"] == snap_info["expected"]:
+                snap_info["event"].set()
 
         @require_spmd_manager
         async def restore_snapshot(
-            self, snapshot_id: str, states: Dict[str, Any]
+            self, snapshot_id: str, manifest: Dict[str, Any]
         ) -> None:
             """
-            Restore a snapshot by interacting with drivers directly.
+            Restore a snapshot: each Driver loads its Workers' tensors from disk directly.
+
+            Args:
+                snapshot_id: Snapshot identifier for bookkeeping.
+                manifest:    {spmd_id: {str(rank): metadata_dict}} where metadata_dict
+                             contains ``backend`` and backend-specific path fields.
             """
             logger.info(f"Controller restoring snapshot {snapshot_id}")
-            self._state_manager.save_snapshot(snapshot_id, states)
+            self._state_manager.save_snapshot(snapshot_id, manifest)
 
-            # Pause everything
             await self.block_all_spmds()
 
-            # Send state to workers
-            for spmd_id, rank_states in states.items():
-                driver = self._spmd_manager.get_driver_handle(spmd_id)
-                if driver is None:
-                    continue
-                worker_handles = await driver.get_worker_handles.remote()
-                tasks = []
-                for rank, w_state in rank_states.items():
-                    rank_int = int(rank)
-                    if rank_int in worker_handles:
-                        tasks.append(worker_handles[rank_int].set_state.remote(w_state))
-                if tasks:
-                    await asyncio.gather(
-                        *[
-                            asyncio.wrap_future(t.future())
-                            if hasattr(t, "future")
-                            else t
-                            for t in tasks
-                        ]
+            try:
+                restore_tasks = []
+                for spmd_id, rank_metadata_map_str in manifest.items():
+                    driver = self._spmd_manager.get_driver_handle(spmd_id)
+                    if driver is None:
+                        raise RuntimeError(
+                            f"restore_snapshot: driver for spmd_id '{spmd_id}' not found. "
+                            f"Cannot perform partial restore — aborting to prevent split-brain."
+                        )
+                    rank_metadata_map = {
+                        int(k): v for k, v in rank_metadata_map_str.items()
+                    }
+                    restore_tasks.append(
+                        driver.restore_from_disk.remote(rank_metadata_map)
                     )
+                if restore_tasks:
+                    await asyncio.gather(*restore_tasks)
+            finally:
+                await self.unblock_all_spmds()
 
-            # Unpause
-            await self.unblock_all_spmds()
             logger.info("Snapshot restored successfully")
 
         async def restore_checkpoint(self, step: Optional[int] = None) -> Optional[int]:
@@ -682,9 +801,16 @@ if RAY_AVAILABLE:
             return await self._checkpointer.restore(step)
 
         async def stop_checkpointer(self) -> None:
-            """Gracefully stop background checkpointer loop."""
-            if self._checkpointer is not None:
-                await self._checkpointer.wait_until_finished()
+            """Await any in-flight checkpoint to completion before shutdown.
+
+            Waiting (rather than cancelling) guarantees the last auto-checkpoint
+            boundary is persisted.  do_ckpt() catches all exceptions internally,
+            so this await never raises.  The upper wait bound is
+            FLUXWAY_SNAPSHOT_TIMEOUT_SECS (default 600 s).
+            """
+            if self._checkpoint_task is not None and not self._checkpoint_task.done():
+                await self._checkpoint_task
+            self._checkpoint_task = None
 
         # =====================================================================
         # SPMD Error Handling
@@ -744,10 +870,7 @@ if RAY_AVAILABLE:
 
             if tasks:
                 try:
-                    await asyncio.gather(
-                        *[asyncio.wrap_future(t.future()) for t in tasks],
-                        return_exceptions=True,
-                    )
+                    await asyncio.gather(*tasks, return_exceptions=True)
                 except Exception as e:
                     logger.error(f"Error blocking SPMDs: {e}")
 
@@ -764,10 +887,7 @@ if RAY_AVAILABLE:
 
             if tasks:
                 try:
-                    await asyncio.gather(
-                        *[asyncio.wrap_future(t.future()) for t in tasks],
-                        return_exceptions=True,
-                    )
+                    await asyncio.gather(*tasks, return_exceptions=True)
                 except Exception as e:
                     logger.error(f"Error unblocking SPMDs: {e}")
 
@@ -890,9 +1010,7 @@ if RAY_AVAILABLE:
 
             if fetch_tasks:
                 try:
-                    results = await asyncio.gather(
-                        *[asyncio.wrap_future(t.future()) for t in fetch_tasks]
-                    )
+                    results = await asyncio.gather(*fetch_tasks)
                     for spmd_id, worker_map in zip(  # type: ignore
                         spmd_ids_to_fetch, results, strict=True
                     ):

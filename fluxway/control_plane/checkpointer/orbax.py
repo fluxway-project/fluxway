@@ -1,67 +1,73 @@
 """
-OrbaxCheckpointer: Orbax-backed implementation of FluxwayCheckpointer.
+Per-Worker Orbax serialization utilities.
 
-Designed for JAX backends. Handles nnx.State pytrees natively via Orbax's
-StandardSave/StandardRestore which understands JAX pytrees.
-
-Integer rank keys are preserved by passing the original state structure as the
-``target`` to StandardRestore, so keys are never coerced to strings.
+OrbaxBackend uses StandardCheckpointHandler directly with the async_save API,
+so all I/O runs natively in the Ray worker's uvloop without any nested event loops.
 """
 
-from typing import Any, Dict, List
+import asyncio
+from pathlib import Path
+from typing import Any, Dict
 
-from fluxway.control_plane.checkpointer.base import FluxwayCheckpointer
+from etils import epath
+
+from fluxway.control_plane.checkpointer.backend import WorkerCheckpointBackend
 
 
-class OrbaxCheckpointer(FluxwayCheckpointer):
-    """
-    Saves and loads Fluxway snapshots using Orbax CheckpointManager.
+class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
+    """Orbax StandardCheckpointHandler"""
 
-    JAX arrays and nnx.State pytrees are serialized natively.
-    Integer rank keys in the state dict are preserved correctly on restore.
+    def __init__(self, force_write: bool = False):
+        self._handler = None
+        self._force_write = force_write
 
-    Args:
-        controller:     Ray remote handle returned by ``create_controller``.
-        ckpt_dir:       Root directory for checkpoints.
-        interval_steps: Steps between successive automatic checkpoints.
-        max_to_keep:    Maximum number of checkpoints to retain on disk.
-    """
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._handler = None
 
-    def __init__(
-        self, controller, ckpt_dir: str, *, interval_steps: int, max_to_keep: int = 2
-    ) -> None:
-        super().__init__(controller, ckpt_dir, interval_steps=interval_steps)
+    def _get_handler(self):
+        if self._handler is None:
+            import orbax.checkpoint as ocp
 
+            self._handler = ocp.StandardCheckpointHandler()
+        return self._handler
+
+    async def save(
+        self, state: Dict[str, Any], ckpt_dir: str, spmd_id: str, rank: int, step: int
+    ) -> Dict[str, Any]:
         import orbax.checkpoint as ocp
 
-        options = ocp.CheckpointManagerOptions(
-            max_to_keep=max_to_keep, create=True, enable_async_checkpointing=False
+        final_path = Path(ckpt_dir) / str(step) / spmd_id
+        tmp_path = final_path.parent / (final_path.name + ".orbax-checkpoint-tmp")
+
+        await asyncio.to_thread(tmp_path.mkdir, parents=True, exist_ok=True)
+
+        handler = self._get_handler()
+        commit_futures = (
+            await handler.async_save(
+                epath.Path(tmp_path), args=ocp.args.StandardSave(state)
+            )
+            or []
         )
-        self._mngr = ocp.CheckpointManager(self._ckpt_dir, options=options)
-        # Cache: step -> state pytree structure for use as restore target.
-        # We keep this in memory so that after saving we can restore with the
-        # correct structure (preserving integer rank keys and nnx.State types).
-        self._saved_states: Dict[int, Any] = {}
 
-    def list_steps(self) -> List[int]:
-        return sorted(self._mngr.all_steps())
+        await asyncio.gather(*[asyncio.to_thread(f.result) for f in commit_futures])
 
-    def _persist(self, step: int, state: Dict[str, Any]) -> None:
-        import orbax.checkpoint as ocp
+        if rank == 0:
+            await asyncio.to_thread(handler.finalize, epath.Path(tmp_path))
+            await asyncio.to_thread(tmp_path.rename, final_path)
 
-        self._mngr.save(step, args=ocp.args.StandardSave(state))
-        self._mngr.wait_until_finished()
-        # Cache the structure for a correct restore target later
-        self._saved_states[step] = state
+        return {"ckpt_dir": str(final_path)}
 
-    def _load(self, step: int) -> Dict[str, Any]:
-        import orbax.checkpoint as ocp
+    async def load(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        ckpt_path = epath.Path(metadata["ckpt_dir"])
+        handler = self._get_handler()
+        return await asyncio.to_thread(handler.restore, ckpt_path)
 
-        # Use the cached target structure if available so that integer rank
-        # keys and nnx.State pytree types are preserved exactly.
-        # If not in cache (e.g. process restart), restore without target and
-        # let the worker's restore_state() handle any type conversions.
-        target = self._saved_states.get(step)
-        if target is not None:
-            return self._mngr.restore(step, args=ocp.args.StandardRestore(target))
-        return self._mngr.restore(step, args=ocp.args.StandardRestore())
+    def finalize(self) -> None:
+        # All I/O in save() is fully awaited before returning; nothing pending.
+        pass
+
+    def close(self) -> None:
+        if self._handler:
+            self._handler.close()
+            self._handler = None

@@ -13,7 +13,12 @@ from .heartbeat import HeartbeatManager
 from .state_machine import ControllerStateMachine
 from .async_manager import AsyncStepManager
 from .controller import Controller, create_controller
-from .checkpointer import FluxwayCheckpointer, OrbaxCheckpointer, SafeTensorCheckpointer
+from .checkpointer import (
+    FluxwayCheckpointer,
+    WorkerCheckpointBackend,
+    SafeTensorsBackend,
+    OrbaxBackend,
+)
 
 try:
     from .controller import ControllerActor
@@ -36,8 +41,9 @@ __all__ = [
     "ControllerActor",
     "create_controller",
     "FluxwayCheckpointer",
-    "OrbaxCheckpointer",
-    "SafeTensorCheckpointer",
+    "WorkerCheckpointBackend",
+    "SafeTensorsBackend",
+    "OrbaxBackend",
 ]
 
 ensure_logging_configured()

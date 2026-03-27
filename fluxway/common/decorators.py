@@ -38,6 +38,31 @@ class PicklableThreadLocal(threading.local):
         pass
 
 
+class _PicklableLock:
+    """A threading.Lock wrapper that survives pickle (Ray serialization).
+
+    On deserialization a fresh lock is created in the new process.
+    This is correct because _instance_storage is per-process, so each
+    process needs its own lock — not a shared one.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+
+    def __enter__(self):
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, *args):
+        self._lock.release()
+
+    def __getstate__(self):
+        return {}
+
+    def __setstate__(self, state):
+        self._lock = threading.Lock()
+
+
 # Thread-local storage for operator execution context (per-call, must be thread-isolated)
 _operator_context = PicklableThreadLocal()
 
@@ -46,7 +71,7 @@ _operator_context = PicklableThreadLocal()
 # async thread pool starts) and then read-only shared across threads. Using a plain
 # dict here is intentional: threading.local would hide the pre-instantiated entries
 # from the asyncio.to_thread() worker threads.
-_instance_storage_lock = threading.Lock()
+_instance_storage_lock = _PicklableLock()
 _instance_storage: Dict[int, Any] = {}
 
 
@@ -605,7 +630,7 @@ def _create_operator_wrapper(
         instance_key = id(cls)  # different operators in one class share one instance.
         if instance_key not in _instance_storage:
             with _instance_storage_lock:
-                if instance_key not in _instance_storage:  # double-checked locking
+                if instance_key not in _instance_storage:
                     ctx = get_current_context()
                     rank = getattr(ctx, "rank", 0)
                     world_size = getattr(ctx, "world_size", 1)
@@ -637,14 +662,11 @@ def _create_operator_wrapper(
                     _instance_storage[instance_key] = instance
 
         instance = _instance_storage[instance_key]
-
-        # Update runtime context on each call (step/ctx can change per invocation)
         ctx = get_current_context()
         instance.static_args = getattr(ctx, "static_args", {})
         instance.rank = getattr(ctx, "rank", 0)
         instance.world_size = getattr(ctx, "world_size", 1)
         instance.ctx = getattr(ctx, "operator_ctx", None)
-
         return func(instance, *args, **kwargs)
 
     def set_spmd_class(cls):

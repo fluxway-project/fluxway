@@ -104,10 +104,15 @@ class SPMDManager:
         self._reverse_topology: Dict[
             str, List[str]
         ] = {}  # spmd_id -> upstream spmd_ids
+        self._checkpoint_backend: Optional[Any] = None
 
     def set_controller_handle(self, controller_handle: Any) -> None:
         """Set the controller handle for driver callbacks."""
         self._controller_handle = controller_handle
+
+    def set_checkpoint_backend(self, backend: Any) -> None:
+        """Set the per-worker checkpoint backend to forward to all Drivers."""
+        self._checkpoint_backend = backend
 
     def register_spmd(self, spmd_id: str, handle: SPMDHandle) -> None:
         """
@@ -191,6 +196,7 @@ class SPMDManager:
                     or list(range(1, config.num_workers + 1)),
                     controller_handle=self._controller_handle,
                     graph_topology=graph_topology,
+                    checkpoint_backend=self._checkpoint_backend,
                 )
             else:
                 # No placement group - for testing or mock scenarios
@@ -202,6 +208,7 @@ class SPMDManager:
                     or list(range(1, config.num_workers + 1)),
                     controller_handle=self._controller_handle,
                     graph_topology=graph_topology,
+                    checkpoint_backend=self._checkpoint_backend,
                 )
 
             handle.set_driver_handle(driver)

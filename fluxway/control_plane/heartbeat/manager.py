@@ -187,7 +187,7 @@ class HeartbeatManager:
             f"Received heartbeat spmd_id={spmd_id} status={heartbeat.status.name} "
             f"state={heartbeat.state.name} timestamp={heartbeat.timestamp:.3f} "
             f"healthy_workers={heartbeat.healthy_num_workers}/{heartbeat.num_workers} "
-            f"op_steps={heartbeat.op_steps} workers_ready={heartbeat.workers_ready}"
+            f"completed_count={heartbeat.completed_step_count} workers_ready={heartbeat.workers_ready}"
         )
 
     async def _call_ready_callback(self) -> None:

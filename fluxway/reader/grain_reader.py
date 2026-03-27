@@ -24,7 +24,7 @@ class GrainReader(BaseReader):
 
     The DataLoader and its iterator are created eagerly at instantiation time
     (not lazily on the first ``read`` call).  This guarantees that
-    ``get_state`` / ``set_state`` always operate on a live iterator, which is
+    ``save_state`` / ``restore_state`` always operate on a live iterator, which is
     required for correct Grain-style checkpointing where state is a JSON-
     serialisable index dict (``{"next_index": N}``) managed by the iterator.
 
@@ -58,7 +58,7 @@ class GrainReader(BaseReader):
 
         Sub-classes that override this method must call ``super()`` **or**
         ensure ``self._iterator`` is set to a Grain ``DatasetIterator`` by the
-        time the method returns, so that ``get_state`` / ``set_state`` work.
+        time the method returns, so that ``save_state`` / ``restore_state`` work.
 
         Args:
             shard_index: If provided, overrides rank for data sharding.
@@ -122,7 +122,7 @@ class GrainReader(BaseReader):
                 f"__init__.  Check that 'static_args', 'rank', and 'world_size' are "
                 f"injected by the framework before __init__ is called."
             )
-        batch = next(self._iterator)
+        batch = next(self._iterator, None)
         if batch is None:
             return None
         if self._output_type and not isinstance(batch, self._output_type):
@@ -133,7 +133,7 @@ class GrainReader(BaseReader):
 
     _GRAIN_STATE_KEY = "__grain_iter_state__"
 
-    def get_state(self) -> Dict[str, Any]:
+    def save_state(self) -> Dict[str, Any]:
         """
         Return the iterator position as a framework-compatible dict.
 
@@ -147,7 +147,7 @@ class GrainReader(BaseReader):
             return {self._GRAIN_STATE_KEY: base64.b64encode(raw).decode()}
         return {}
 
-    def set_state(self, state: Dict[str, Any]) -> None:
+    def restore_state(self, state: Dict[str, Any]) -> None:
         """
         Restore the iterator to a previously saved position.
 

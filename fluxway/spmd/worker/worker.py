@@ -23,37 +23,44 @@ import asyncio
 from collections import defaultdict
 import logging
 import time
+import inspect
+from pathlib import Path
 
 import numpy as np
 
 import ray
 
+from fluxway.common.backend import get_backend
+from fluxway.common.decorators import (
+    operator_context,
+    _instance_storage,
+    _instance_storage_lock,
+    get_current_context,
+)
+from fluxway.common.execution import compile
 from fluxway.common.types import (
     SPMDConfig,
     WorkerHeartbeat,
     WorkerStatus,
     WorkerTelemetry,
 )
-from fluxway.common.index_descriptor import IndexDescriptor
-from fluxway.common.types.tensor import TransportTensor
+from fluxway.common.types.configs import MailboxStatus
+from fluxway.common.types.tensor import SymmetryReceipt, TransportTensor
 from fluxway.common.types.sharding import (
     ShardingSpec,
     PhysicalLayout,
     ReferentialRouting,
 )
-from fluxway.common.utils.tree import tree_flatten, tree_unflatten
-from typing import Any, Dict, List, Optional, Tuple, Type, get_type_hints
-from fluxway.common.backend import get_backend
-from fluxway.common.types.configs import MailboxStatus
-from fluxway.common.types.tensor import SymmetryReceipt
+from fluxway.common.index_descriptor import IndexDescriptor
 from fluxway.common.utils import ensure_logging_configured
 from fluxway.common.utils.logging import get_logger
+from fluxway.common.utils.tree import tree_flatten, tree_unflatten
 from fluxway.rpc.protocol import DataPlaneCallable
 from fluxway.spmd.worker.mailbox import WorkerMailbox
 from fluxway.spmd.worker.operator_manager import OperatorManager
 from fluxway.spmd.worker.operator_manager.dispatcher import SKIPPED
 from fluxway.transport.communication import AsyncDataDistributor
-from fluxway.common.execution import compile
+from typing import Any, Dict, List, Optional, Tuple, Type, get_type_hints
 
 
 @compile(static_argnums=())
@@ -121,6 +128,7 @@ class SPMDWorker:
         rank: int,
         spmd_id: str = "",
         driver_handle: Optional[Any] = None,
+        checkpoint_backend: Optional[Any] = None,
     ):
         """
         Initialize worker.
@@ -142,6 +150,13 @@ class SPMDWorker:
         self.spmd_id = spmd_id or ""
         self._running = False
 
+        # Pluggable per-worker checkpoint serialization. Defaults to OrbaxBackend.
+        if checkpoint_backend is None:
+            from fluxway.control_plane.checkpointer import OrbaxBackend
+
+            checkpoint_backend = OrbaxBackend()
+        self._checkpoint_backend = checkpoint_backend
+
         # Driver handle for callbacks (Control Plane - Native Ray)
         self._driver_handle: Optional[Any] = driver_handle
 
@@ -157,8 +172,8 @@ class SPMDWorker:
 
         self._op_manager = OperatorManager(config, rank, spmd_id)
 
-        # Execution step counters {op_name: step} - tracks which step is being/was executed
-        self._current_steps: Dict[str, int] = dict.fromkeys(
+        # Completed step counters {op_name: count} - tracks how many steps were executed
+        self._completed_step_count: Dict[str, int] = dict.fromkeys(
             self.config.operators if self.config else {}, 0
         )
 
@@ -225,11 +240,8 @@ class SPMDWorker:
         for event in self._source_pause_events.values():
             event.set()  # Initially all sources are running
 
-        # Drain ceiling: blocks execution once step >= target_step.
-        # Set by Driver.request_snapshot() BEFORE drain_to_step() to avoid the
-        # async race condition where block_op RPC arrives after the worker has
-        # already consumed the ceiling step.
-        self._drain_ceiling: Optional[int] = None
+        # Drain-to-step state
+        self._drain_target_count: Optional[int] = None
         self._drain_resume_event: asyncio.Event = asyncio.Event()
         self._drain_resume_event.set()  # set = not draining
 
@@ -261,9 +273,12 @@ class SPMDWorker:
         self._start_run_loop()
 
         # Inject operator context for this thread
-        from fluxway.common.decorators import operator_context
-
         operator_context(self.config.static_args, self.rank, self._world_size)
+
+    def __del__(self):
+        # Ensure background I/O is complete (e.g. Orbax AsyncCheckpointer)
+        if hasattr(self, "_checkpoint_backend") and self._checkpoint_backend:
+            self._checkpoint_backend.finalize()
 
     # =========================================================================
     # Operator Pre-Instantiation
@@ -284,12 +299,6 @@ class SPMDWorker:
         declare custom init parameters and have them populated from static_args.
         """
         import inspect as _inspect
-        from fluxway.common.decorators import (
-            operator_context,
-            _instance_storage,
-            _instance_storage_lock,
-            get_current_context,
-        )
 
         world_size = config.num_workers
         static_args = config.static_args or {}
@@ -328,8 +337,7 @@ class SPMDWorker:
                 instance.static_args = static_args
                 instance.ctx = getattr(ctx, "operator_ctx", None)
                 instance.__init__(**init_kwargs)
-                with _instance_storage_lock:
-                    _instance_storage[id(cls)] = instance
+                _instance_storage[id(cls)] = instance
 
     # =========================================================================
     # Driver Handle Management
@@ -574,17 +582,17 @@ class SPMDWorker:
             values: State data values
         """
         # Normal mode: step-ordered execution
-        exec_step = self._current_steps.get(op_name, 0)
+        completed_step_count = self._completed_step_count.get(op_name, 0)
 
         # Drop stale data (data for steps already executed)
         # Note: periodic ops don't have stale steps as they use virtual sequence
         is_periodic = (
             self._op_manager.is_periodic_trigger(op_name) if self._op_manager else False
         )
-        if not is_periodic and step < exec_step:
+        if not is_periodic and step < completed_step_count:
             logger.warning(
                 f"Dropped stale state data op={op_name} names={names} "
-                f"step={step} exec_step={exec_step} spmd_id={self.spmd_id} rank={self.rank}"
+                f"step={step} completed_step_count={completed_step_count} spmd_id={self.spmd_id} rank={self.rank}"
             )
             return
 
@@ -597,7 +605,7 @@ class SPMDWorker:
         )
 
         # Cache in mailbox — barrier fires on_ready automatically
-        await self._mailbox.deposit_states(
+        await self._mailbox.deposit_control_arguments(
             op_name, step=step, names=names, values=values
         )
 
@@ -724,7 +732,7 @@ class SPMDWorker:
             else {}
         )
         expected_states = (
-            self._op_manager.get_expected_state_names(op_name)
+            self._op_manager.get_expected_control_arg_names(op_name)
             if self._op_manager
             else []
         )
@@ -840,21 +848,21 @@ class SPMDWorker:
 
                 if not is_periodic:
                     # Normal mode: verify step matches current expected execution step
-                    exec_step = self._current_steps[op_name]
-                    if step < exec_step:
+                    completed_count = self._completed_step_count[op_name]
+                    if step < completed_count:
                         # Truly stale task (already executed), drop it
                         logger.warning(
                             f"Stale task dropped op={op_name} "
-                            f"task_step={step} exec_step={exec_step} spmd_id={self.spmd_id} rank={self.rank}"
+                            f"task_step={step} completed_count={completed_count} spmd_id={self.spmd_id} rank={self.rank}"
                         )
                         continue
-                    elif step > exec_step:
+                    elif step > completed_count:
                         # Future task (arrived early), hold for later execution
                         async with self._pending_lock:
                             self._pending_future_steps[op_name].append(step)
                         logger.debug(
                             f"Future task held op={op_name} "
-                            f"task_step={step} exec_step={exec_step} spmd_id={self.spmd_id} rank={self.rank}"
+                            f"task_step={step} completed_count={completed_count} spmd_id={self.spmd_id} rank={self.rank}"
                         )
                         continue
 
@@ -865,7 +873,7 @@ class SPMDWorker:
                 await self._advance_step(op_name, result=result)
 
             except asyncio.CancelledError:
-                logger.debug(
+                logger.info(
                     f"Run loop cancelled spmd_id={self.spmd_id} rank={self.rank}"
                 )
                 break
@@ -989,12 +997,19 @@ class SPMDWorker:
     async def _execute_operator(self, op_name: str, step: int) -> Any:
         """Execute an operator: assemble data, execute, send outputs."""
         try:
-            # --- Drain ceiling check (must come first, before any await that could yield) ---
-            # This is the Worker-side synchronous guard that prevents stepping past
-            # the snapshot target.  Unlike the Synchronizer-side block (which is
-            # async and can race), this check runs inside the Worker event loop
-            # before anything else, so it is race-free.
-            if self._drain_ceiling is not None and step >= self._drain_ceiling:
+            # Drain self-block: `step` is the 0-indexed task sequence number that is
+            # about to execute.  When step N is about to run, exactly N steps have
+            # already been completed (completed_step_count == N).  Therefore blocking
+            # at step >= target_count guarantees that workers halt only after completing
+            # exactly target_count steps, which is when the Synchronizer's ACK fires.
+            if (
+                self._drain_target_count is not None
+                and step >= self._drain_target_count
+            ):
+                logger.debug(
+                    f"Self-blocking due to drain target={self._drain_target_count} "
+                    f"task_step={step} spmd_id={self.spmd_id} rank={self.rank}"
+                )
                 await self._drain_resume_event.wait()
 
             # --- Dispatcher Check: Should this rank execute this step? ---
@@ -1074,8 +1089,8 @@ class SPMDWorker:
 
     async def _assemble_input(self, op_name: str, step: int) -> Any:
         static_args = self._op_manager.get_static_args()
-        expected_state_names = self._op_manager.get_expected_state_names(op_name)
-        all_states = await self._mailbox.get_all_states(op_name, step)
+        expected_state_names = self._op_manager.get_expected_control_arg_names(op_name)
+        all_states = await self._mailbox.get_all_control_arguments(op_name, step)
         state_args = {
             name: all_states[name]
             for name in expected_state_names
@@ -1137,7 +1152,9 @@ class SPMDWorker:
                 input_kwargs[p_name] = p_leaves[0]
 
         final_args = {}
-        final_args.update(static_args)
+        for p_name in input_types:
+            if p_name in static_args:
+                final_args[p_name] = static_args[p_name]
         final_args.update(state_args)
         final_args.update(input_kwargs)
         return final_args
@@ -1174,69 +1191,6 @@ class SPMDWorker:
             if index < len(tensor_list):
                 flat.append((key, tensor_list[index]))
         return flat
-
-    async def _assemble_tensor(
-        self,
-        op_name: str,
-        tuuid: int,
-        step: int,
-        shards: Dict[Any, List[TransportTensor]],
-    ) -> TransportTensor:
-        """Assemble tensor shards into a complete TransportTensor."""
-        # Note: Input layout is now retrieved as a PhysicalLayout bound to current mesh
-        input_layout = self._op_manager._resolve_input_spec(op_name, tuuid)
-        predecessor_topology = self._op_manager.get_predecessor_topology(op_name)
-
-        if input_layout is None or input_layout.is_content_addressable:
-            # Fallback or dynamic: merge all shards
-            return self._assemble_to_dynamic_tensor(
-                op_name, tuuid, step, shards, predecessor_topology
-            )
-
-        # Check for dynamic predecessors
-        has_dynamic_predecessor = any(
-            (spec := p.tuuid_sharding.get(tuuid)) is not None
-            and spec.is_content_addressable
-            for p in predecessor_topology.values()
-        )
-
-        if has_dynamic_predecessor:
-            return self._assemble_dynamic_to_static_tensor(
-                op_name, tuuid, step, shards, input_layout, predecessor_topology
-            )
-        else:
-            return await self._assemble_static_to_static_tensor(
-                op_name, tuuid, step, shards, input_layout, predecessor_topology
-            )
-
-    def _filter_shards_by_routing(
-        self,
-        op_name: str,
-        tuuid: int,
-        step: int,
-        shards_dict: Dict[Any, List[TransportTensor]],
-        predecessor_topology: Dict[str, Any],
-    ) -> List[TransportTensor]:
-        """
-        Filters shards from mailbox based on analytical or fallback routing.
-        """
-        filtered_shards = []
-        for pre_spmd_id, pre_info in predecessor_topology.items():
-            # Only query predecessors that actually provide this TUUID.
-            if tuuid not in pre_info.tuuid_sharding:
-                continue
-
-            # Unified resolution (handles interleave, etc.)
-            producer_ranks = self._op_manager.resolve_tensor_producers(
-                op_name, tuuid, pre_spmd_id, self.rank, step=step
-            )
-
-            for rank in producer_ranks:
-                key = (pre_spmd_id, rank)
-                if key in shards_dict:
-                    found = self._flatten_shards({key: shards_dict[key]}, index=0)
-                    filtered_shards.extend(found)
-        return filtered_shards
 
     def _normalize_and_cat_shards(self, tensor_list: List[Any], dim: int = 0) -> Any:
         """
@@ -1379,6 +1333,69 @@ class SPMDWorker:
     # =========================================================================
     # Tensor Assembly
     # =========================================================================
+
+    async def _assemble_tensor(
+        self,
+        op_name: str,
+        tuuid: int,
+        step: int,
+        shards: Dict[Any, List["TransportTensor"]],
+    ) -> "TransportTensor":
+        """Assemble tensor shards into a complete TransportTensor."""
+        # Note: Input layout is now retrieved as a PhysicalLayout bound to current mesh
+        input_layout = self._op_manager._resolve_input_spec(op_name, tuuid)
+        predecessor_topology = self._op_manager.get_predecessor_topology(op_name)
+
+        if input_layout is None or input_layout.is_content_addressable:
+            # Fallback or dynamic: merge all shards
+            return self._assemble_to_dynamic_tensor(
+                op_name, tuuid, step, shards, predecessor_topology
+            )
+
+        # Check for dynamic predecessors
+        has_dynamic_predecessor = any(
+            (spec := p.tuuid_sharding.get(tuuid)) is not None
+            and spec.is_content_addressable
+            for p in predecessor_topology.values()
+        )
+
+        if has_dynamic_predecessor:
+            return self._assemble_dynamic_to_static_tensor(
+                op_name, tuuid, step, shards, input_layout, predecessor_topology
+            )
+        else:
+            return await self._assemble_static_to_static_tensor(
+                op_name, tuuid, step, shards, input_layout, predecessor_topology
+            )
+
+    def _filter_shards_by_routing(
+        self,
+        op_name: str,
+        tuuid: int,
+        step: int,
+        shards_dict: Dict[Any, List[TransportTensor]],
+        predecessor_topology: Dict[str, Any],
+    ) -> List[TransportTensor]:
+        """
+        Filters shards from mailbox based on analytical or fallback routing.
+        """
+        filtered_shards = []
+        for pre_spmd_id, pre_info in predecessor_topology.items():
+            # Only query predecessors that actually provide this TUUID.
+            if tuuid not in pre_info.tuuid_sharding:
+                continue
+
+            # Unified resolution (handles interleave, etc.)
+            producer_ranks = self._op_manager.resolve_tensor_producers(
+                op_name, tuuid, pre_spmd_id, self.rank, step=step
+            )
+
+            for rank in producer_ranks:
+                key = (pre_spmd_id, rank)
+                if key in shards_dict:
+                    found = self._flatten_shards({key: shards_dict[key]}, index=0)
+                    filtered_shards.extend(found)
+        return filtered_shards
 
     async def _assemble_static_to_static_tensor(
         self,
@@ -1729,39 +1746,48 @@ class SPMDWorker:
         )
 
     async def _advance_step(self, op_name: str, result: Any = "not_none") -> None:
-        """Advance execution step counter for an operator."""
-        old_step = self._current_steps[op_name]
-        self._current_steps[op_name] += 1
-        new_step = self._current_steps[op_name]
+        """
+        Advance session progress after completing a step.
+        Explicitly differentiates between Count (Progress Watermark) and Index (Task Sequence).
+        """
+        # 1. Update completed step count: One step just finished.
+        self._completed_step_count[op_name] += 1
+        completed_step_count = self._completed_step_count[op_name]
+
         logger.debug(
-            f"Step advanced op={op_name} {old_step}->{new_step} spmd_id={self.spmd_id} rank={self.rank}"
+            f"Step completed op={op_name} total_count={completed_step_count} "
+            f"spmd_id={self.spmd_id} rank={self.rank}"
         )
+
+        # 2. Schedule next task: The index of the next task equals the number of already finished tasks.
+        # e.g., Finished Step Index 0 -> Completed Step Count 1 -> Next Task Index 1.
+        next_step_index = completed_step_count
 
         # If it's a source operator, automatically trigger the next step
         if self._op_manager.is_source_operator(op_name):
             # Check for global step limit (max_steps)
             max_steps = self.config.max_steps
-            if max_steps is not None and new_step >= max_steps:
+            if max_steps is not None and completed_step_count >= max_steps:
                 logger.debug(
                     f"Source op reached max_steps stopping op={op_name} max_steps={max_steps} "
                     f"spmd_id={self.spmd_id} rank={self.rank}"
                 )
-                # Do NOT enqueue new_step + 1, effectively stopping the pulse
+                # Max steps reached, do NOT enqueue next task.
             elif result is not None or result is SKIPPED:
                 # Wait if paused by backpressure
                 if op_name in self._source_pause_events:
                     await self._source_pause_events[op_name].wait()
 
                 asyncio.create_task(
-                    self._enqueue(op_name, new_step)
-                )  # Use new_step for next step
+                    self._enqueue(op_name, next_step_index)
+                )  # Use index for the next task
             else:
                 logger.debug(
                     f"Source op finished op={op_name} spmd_id={self.spmd_id} rank={self.rank}"
                 )
 
-        # Report op completion to driver (here new_step means water level)
-        self._report_op_completed(op_name, new_step)
+        # 3. Report definitive completed count to Driver for synchronization/drain.
+        self._report_op_completed(op_name, completed_step_count)
 
         # Check if this op is in periodic_trigger mode
         is_periodic = (
@@ -1772,9 +1798,9 @@ class SPMDWorker:
             # Normal mode: re-enqueue pending future tasks that match the new step
             async with self._pending_lock:
                 pending = self._pending_future_steps[op_name]
-                to_enqueue = [s for s in pending if s == new_step]
+                to_enqueue = [s for s in pending if s == next_step_index]
                 self._pending_future_steps[op_name] = [
-                    s for s in pending if s != new_step
+                    s for s in pending if s != next_step_index
                 ]
 
             for s in to_enqueue:
@@ -1789,19 +1815,13 @@ class SPMDWorker:
             step: Completed step number
         """
         if self._driver_handle is not None:
-            try:
-                logger.debug(
-                    f"Reporting op completion op={op_name} step={step} "
-                    f"spmd_id={self.spmd_id} rank={self.rank}"
-                )
-                self._driver_handle.report_worker_op_completed.remote(
-                    self.rank, op_name, step
-                )
-            except Exception as e:
-                logger.error(
-                    f"Failed to report op completion error={e} "
-                    f"spmd_id={self.spmd_id} rank={self.rank}"
-                )
+            logger.debug(
+                f"Reporting op completion op={op_name} step={step} "
+                f"spmd_id={self.spmd_id} rank={self.rank}"
+            )
+            self._driver_handle.report_worker_op_completed.remote(
+                self.rank, op_name, step
+            )
 
         # Cleanup Mirror Sharding Cache for very old steps
         old_steps = [
@@ -2130,32 +2150,23 @@ class SPMDWorker:
 
         return cls(**kwargs)
 
-    def _extract_states(self, data: Any, state_names: List[str]) -> Dict[str, Any]:
-        """
-        Extract named state values from output data using generic attribute access.
+    def _extract_control_arguments(
+        self, data: Any, state_names: List[str]
+    ) -> Dict[str, Any]:
+        """Extract named control argument values from operator output data."""
+        args: Dict[str, Any] = {}
 
-        Args:
-            data: Output data from operator execution
-            state_names: List of state variable names to extract
-
-        Returns:
-            Dictionary of {state_name: state_value}
-        """
-        states: Dict[str, Any] = {}
-
-        # Try getattr protocol
         for name in state_names:
             val = getattr(data, name, None)
             if val is not None:
-                states[name] = val
+                args[name] = val
 
-        # Fallback to dict access
-        if len(states) < len(state_names) and isinstance(data, dict):
+        if len(args) < len(state_names) and isinstance(data, dict):
             for name in state_names:
-                if name not in states and name in data:
-                    states[name] = data[name]
+                if name not in args and name in data:
+                    args[name] = data[name]
 
-        return states
+        return args
 
     # =========================================================================
     # Static Arguments
@@ -2301,7 +2312,7 @@ class SPMDWorker:
         heartbeat = WorkerHeartbeat(
             rank=self.rank,
             timestamp=time.time(),
-            op_steps=dict(self._current_steps),
+            completed_step_count=dict(self._completed_step_count),
             status=status,
             error_message=self._last_error,
             telemetry=self._collect_telemetry(),
@@ -2312,7 +2323,7 @@ class SPMDWorker:
             self._driver_handle.receive_worker_heartbeat.remote(self.rank, heartbeat)
             logger.heartbeat(
                 f"Worker heartbeat sent status={status.name} "
-                f"op_steps={heartbeat.op_steps} mailbox_full={mailbox_status.is_full} "
+                f"completed_step_count={heartbeat.completed_step_count} mailbox_full={mailbox_status.is_full} "
                 f"spmd_id={self.spmd_id} rank={self.rank}"
             )
         except Exception as e:
@@ -2341,23 +2352,85 @@ class SPMDWorker:
         return WorkerTelemetry(worker_id=f"{self.spmd_id}_{self.rank}")
 
     # =========================================================================
-    # State Management
+    # State Persistence (checkpoint I/O)
     # =========================================================================
 
-    def get_state(self) -> Dict[str, Any]:
-        """Get worker state for snapshotting."""
-        return {
-            "spmd_id": self.spmd_id,
-            "rank": self.rank,
-            "current_steps": dict(self._current_steps),
-            "static_args": self._op_manager.get_static_args(),
-            "operator_states": self._extract_operator_states(),
-        }
+    async def save_state_to_disk(self, ckpt_dir: str, step: int) -> Dict[str, Any]:
+        """
+        Persist this worker's state to disk and return lightweight path metadata.
 
-    def _extract_operator_states(self) -> Dict[str, Any]:
-        """Extract state from each SPMD class instance via save_state duck typing."""
-        from fluxway.common.decorators import _instance_storage, _instance_storage_lock
+        The persisted state comprises:
+        - ``operator_states``: the dict returned by each operator's ``save_state()``
+        - ``completed_step_count``: current per-op training progress
+        - ``static_args``: current control-plane arguments
 
+        Returns:
+            Backend-specific path metadata plus ``completed_step_count`` for the
+            Controller manifest (so it can record per-worker progress without
+            reading from disk).
+        """
+        # Snapshot completed_step_count on the calling coroutine before entering
+        # the thread; the returned metadata must be consistent with what was persisted.
+        completed_step_count_snapshot = dict(self._completed_step_count)
+        static_args_snapshot = self._op_manager.get_static_args()
+
+        spmd_dir = str(Path(ckpt_dir) / str(step) / self.spmd_id)
+        operator_states = self._call_operator_save_state(spmd_dir)
+
+        state = {"operator_states": operator_states}
+
+        if operator_states:
+            metadata = await self._checkpoint_backend.save(
+                state, ckpt_dir, self.spmd_id, self.rank, step
+            )
+        else:
+            metadata = {}
+
+        # completed_step_count and static_args live in the manifest (Controller side) only;
+        # keeping them out of the on-disk blob avoids double-storage, avoids Orbax type errors,
+        # and prevents race conditions across multiple workers without JAX distributed.
+        metadata["completed_step_count"] = completed_step_count_snapshot
+        metadata["static_args"] = static_args_snapshot
+
+        logger.debug(
+            f"State saved to disk spmd_id={self.spmd_id} rank={self.rank} step={step}"
+        )
+        return metadata
+
+    async def load_state_from_disk(self, metadata: Dict[str, Any]) -> None:
+        """Restore this worker's state from disk using previously returned path metadata."""
+        if "completed_step_count" not in metadata:
+            raise RuntimeError(
+                f"load_state_from_disk: 'completed_step_count' missing from metadata "
+                f"for spmd_id={self.spmd_id} rank={self.rank}. "
+                f"The manifest may be corrupt or was produced by an incompatible version."
+            )
+        for op_name, count in metadata["completed_step_count"].items():
+            self._completed_step_count[op_name] = count
+
+        if "static_args" not in metadata:
+            raise RuntimeError(
+                f"load_state_from_disk: 'static_args' missing from metadata "
+                f"for spmd_id={self.spmd_id} rank={self.rank}. "
+            )
+        for name, value in metadata["static_args"].items():
+            self._op_manager.set_static_arg(name, value)
+
+        if "ckpt_dir" not in metadata:
+            logger.debug(
+                f"No on-disk state for spmd_id={self.spmd_id} rank={self.rank}, skipping backend load"
+            )
+            return
+
+        state = await self._checkpoint_backend.load(metadata)
+
+        ckpt_dir = metadata["ckpt_dir"]
+        if "operator_states" in state:
+            self._call_operator_restore_state(state["operator_states"], ckpt_dir)
+        logger.debug(f"State loaded from disk spmd_id={self.spmd_id} rank={self.rank}")
+
+    def _call_operator_save_state(self, ckpt_dir: str) -> Dict[str, Any]:
+        """Call save_state() on each operator instance and collect results."""
         seen_cls_ids: set = set()
         states: Dict[str, Any] = {}
         for op_name, op_fn in (self.config.operators or {}).items():
@@ -2370,26 +2443,18 @@ class SPMDWorker:
             if instance is None:
                 continue
             if hasattr(instance, "save_state") and callable(instance.save_state):
-                states[op_name] = instance.save_state()
+                if "ckpt_dir" in inspect.signature(instance.save_state).parameters:
+                    states[op_name] = instance.save_state(ckpt_dir=ckpt_dir)
+                else:
+                    states[op_name] = instance.save_state()
         return states
 
-    def set_state(self, state: Dict[str, Any]) -> None:
-        """Restore worker state from a snapshot."""
-        if "current_steps" in state:
-            for op_name, step in state["current_steps"].items():
-                self._current_steps[op_name] = step
-        if "static_args" in state:
-            for name, value in state["static_args"].items():
-                self._op_manager.set_static_arg(name, value)
-        if "operator_states" in state:
-            self._restore_operator_states(state["operator_states"])
-
-    def _restore_operator_states(self, states: Dict[str, Any]) -> None:
-        """Restore each SPMD class instance state via restore_state duck typing."""
-        from fluxway.common.decorators import _instance_storage, _instance_storage_lock
-
+    def _call_operator_restore_state(
+        self, operator_states: Dict[str, Any], ckpt_dir: str
+    ) -> None:
+        """Call restore_state() on each operator instance with its persisted state."""
         op_fn_by_name = dict(self.config.operators or {})
-        for op_name, op_state in states.items():
+        for op_name, op_state in operator_states.items():
             op_fn = op_fn_by_name.get(op_name)
             if op_fn is None:
                 raise RuntimeError(
@@ -2409,14 +2474,11 @@ class SPMDWorker:
                     f"Operator {op_name} instance not found in _instance_storage during restore "
                     f"spmd_id={self.spmd_id} rank={self.rank}"
                 )
-            if not (
-                hasattr(instance, "restore_state") and callable(instance.restore_state)
-            ):
-                raise TypeError(
-                    f"Operator {op_name} has saved state but does not implement restore_state() "
-                    f"spmd_id={self.spmd_id} rank={self.rank}"
-                )
-            instance.restore_state(op_state)
+            if hasattr(instance, "restore_state") and callable(instance.restore_state):
+                if "ckpt_dir" in inspect.signature(instance.restore_state).parameters:
+                    instance.restore_state(op_state, ckpt_dir=ckpt_dir)
+                else:
+                    instance.restore_state(op_state)
 
     # =========================================================================
     # Utility
@@ -2424,7 +2486,7 @@ class SPMDWorker:
 
     def get_current_step(self, op_name: str) -> int:
         """Get current step for an operator name."""
-        return self._current_steps[op_name]
+        return self._completed_step_count[op_name]
 
     def get_rank(self) -> int:
         """Get this worker's rank."""
@@ -2435,25 +2497,24 @@ class SPMDWorker:
         return self._running
 
     # =========================================================================
-    # Drain Ceiling Control (called by Driver before drain_to_step)
+    # Drain Control (called by Driver before drain_to_step_count)
     # =========================================================================
 
-    def set_drain_ceiling(self, target_step: int) -> None:
+    def set_drain_target_count(self, target_count: int) -> None:
         """
-        Set the drain ceiling so that execution of step >= target_step is
-        deferred until clear_drain_ceiling() is called.
-
-        Must be called on all workers BEFORE SPMDSynchronizer.drain_to_step()
-        to eliminate the async race where a worker advances past target_step
-        before the block_op RPC arrives.
+        Request worker to self-block once 'target_count' steps are finished.
         """
-        self._drain_ceiling = target_step
+        self._drain_target_count = target_count
         self._drain_resume_event.clear()
+        logger.debug(
+            f"Drain target set to {target_count} spmd_id={self.spmd_id} rank={self.rank}"
+        )
 
-    def clear_drain_ceiling(self) -> None:
-        """Remove the drain ceiling and let deferred executions proceed."""
-        self._drain_ceiling = None
+    def clear_drain_target_count(self) -> None:
+        """Remove the drain target and let deferred executions proceed."""
+        self._drain_target_count = None
         self._drain_resume_event.set()
+        logger.debug(f"Drain target cleared spmd_id={self.spmd_id} rank={self.rank}")
 
     # =========================================================================
     # Source Node Control

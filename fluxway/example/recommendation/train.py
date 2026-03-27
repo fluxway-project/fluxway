@@ -120,11 +120,11 @@ async def run_training(args):
 
 def main():
     parser = argparse.ArgumentParser(description="Fluxway Recommendation Example")
-    parser.add_argument("--steps", type=int, default=5, help="Number of steps to run")
+    parser.add_argument("--steps", type=int, default=10, help="Number of steps to run")
     parser.add_argument(
         "--checkpoint-interval",
         type=int,
-        default=10,
+        default=2,
         dest="checkpoint_interval",
         help="Save a checkpoint every N steps",
     )

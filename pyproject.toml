@@ -7,7 +7,7 @@ name = "fluxway"
 version = "0.1.0"
 description = "Fluxway: A Flexible Large-scale Unified eXchange for maximizing Workload Accelerated Yield across heterogeneous compute clusters"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = {text = "See LICENSE file"}
 authors = [
     {name = "Fluxway Contributors"}
@@ -24,15 +24,16 @@ classifiers = [
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 
 dependencies = [
+    "pydantic",
+    "uvloop",
     "numpy>=1.20.0",
     "ray>=2.0.0",
 ]
@@ -46,10 +47,13 @@ dev = [
     "mypy>=0.950",
 ]
 torch = [
-    "torch>=1.12.0",
+    "torch>=2.00.0",
+    "safetensor",
 ]
 jax = [
     "jax>=0.4.0",
+    "orbax",
+    "grain",
 ]
 
 [project.urls]
@@ -65,8 +69,7 @@ fluxway = ["py.typed"]
 
 [tool.ruff]
 line-length = 88
-extend-exclude = [
-]
+extend-exclude = []
 
 [tool.ruff.lint]
 extend-select = ["I", "B", "Q", "C4", "W"]
@@ -109,10 +112,10 @@ skip-magic-trailing-comma = true
 
 [tool.black]
 line-length = 100
-target-version = ['py39', 'py310', 'py311']
+target-version = ['py311', 'py312', 'py313']
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false

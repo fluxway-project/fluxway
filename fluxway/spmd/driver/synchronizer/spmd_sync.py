@@ -73,13 +73,13 @@ class SPMDSynchronizer:
         self.num_workers = num_workers
         self.sync_policy = sync_policy or MaxSkewSyncPolicy()
 
-        # Worker-level step tracking: rank -> {op_name -> step}
-        self._worker_steps: Dict[int, Dict[str, int]] = {
+        # Worker-level completed count tracking: rank -> {op_name -> count}
+        self._worker_completed_count: Dict[int, Dict[str, int]] = {
             rank: {} for rank in range(num_workers)
         }
 
-        # SPMD-level steps (minimum completed by all workers)
-        self._spmd_steps: Dict[str, int] = {}
+        # SPMD-level completed count (minimum count reached by all workers)
+        self._spmd_completed_count: Dict[str, int] = {}
 
         # Op lock states (controller-requested)
         self._op_locked: Dict[str, bool] = {}
@@ -98,8 +98,8 @@ class SPMDSynchronizer:
         self._block_worker_op: Optional[Callable[[int, str], None]] = None
         self._unblock_worker_op: Optional[Callable[[int, str], None]] = None
 
-        # Drain-to-step state (independent of _allowed_steps which is monotonically increasing)
-        self._drain_ceiling: Optional[int] = None
+        # Drain parameters
+        self._drain_target_count: Optional[int] = None
         self._drain_on_drained: Optional[Callable[[], None]] = None
         self._drain_acked_ops: set = set()  # ops where all workers reached ceiling
 
@@ -113,71 +113,86 @@ class SPMDSynchronizer:
         self._block_worker_op = block_worker_op
         self._unblock_worker_op = unblock_worker_op
 
-    def report_worker_op_completed(self, rank: int, op_name: str, step: int) -> None:
+    def report_worker_op_completed(
+        self, rank: int, op_name: str, completed_count: int
+    ) -> None:
         should_report = False
         drain_complete = False
+        callback = None
         with self._lock:
-            if rank not in self._worker_steps:
+            if rank not in self._worker_completed_count:
                 logger.warning(f"Unknown worker rank {rank} reported op completion")
                 return
 
-            old_step = self._worker_steps[rank].get(op_name, 0)
-            self._worker_steps[rank][op_name] = max(old_step, step)
-
-            logger.debug(
-                f"Worker {rank} completed {op_name} step {step} in SPMD {self.spmd_id}"
+            old_count = self._worker_completed_count[rank].get(op_name, 0)
+            self._worker_completed_count[rank][op_name] = max(
+                old_count, completed_count
             )
 
-            self._check_worker_step_diff_internal(op_name)
+            logger.debug(
+                f"Worker {rank} reached {op_name} total_count {completed_count} in SPMD {self.spmd_id}"
+            )
 
-            if self._all_workers_completed_step_internal(op_name, step):
-                old_spmd_step = self._spmd_steps.get(op_name, 0)
-                self._spmd_steps[op_name] = step
-                logger.debug(f"SPMD {self.spmd_id} completed {op_name} step {step}")
-                should_report = step > old_spmd_step
+            self._check_worker_skew_internal(op_name)
 
-            # Drain ACK: Workers are self-blocked at _drain_ceiling by _drain_resume_event
-            # (set in set_drain_ceiling RPC before drain_to_step is called), so they
-            # only ever report completion up to ceiling-1.  Fire the callback once all
-            # known ops have every worker at ceiling-1.
+            if self._all_workers_reached_count_internal(op_name, completed_count):
+                old_spmd_count = self._spmd_completed_count.get(op_name, 0)
+                self._spmd_completed_count[op_name] = completed_count
+                logger.debug(
+                    f"SPMD {self.spmd_id} reached {op_name} total_count {completed_count}"
+                )
+                should_report = completed_count > old_spmd_count
+
+            # Drain ACK: All workers have fully completed the requested number of steps.
+            # They are now idle at the START of step index == _drain_target_count.
             if (
-                self._drain_ceiling is not None
+                self._drain_target_count is not None
                 and op_name not in self._drain_acked_ops
-                and self._all_workers_completed_step_internal(
-                    op_name, self._drain_ceiling - 1
+                and self._all_workers_reached_count_internal(
+                    op_name, self._drain_target_count
                 )
             ):
                 self._drain_acked_ops.add(op_name)
-                known_ops = set(self._spmd_steps.keys())
+                known_ops = set(self._spmd_completed_count.keys())
                 if self._drain_acked_ops >= known_ops and known_ops:
                     drain_complete = True
+                    # Clear immediately so subsequent completions cannot re-fire the callback.
+                    callback = self._drain_on_drained
+                    self._drain_on_drained = None
 
         if should_report and self._on_spmd_op_completed:
             try:
-                self._on_spmd_op_completed(self.spmd_id, op_name, step)
+                self._on_spmd_op_completed(self.spmd_id, op_name, completed_count)
             except Exception as e:
                 logger.error(f"Error reporting op completion: {e}")
 
-        if drain_complete and self._drain_on_drained:
-            callback = self._drain_on_drained
+        if drain_complete and callback:
             callback()
 
-    def _check_worker_step_diff_internal(self, op_name: str) -> None:
-        """Check worker step difference and enforce limits. Must hold lock when calling."""
-        steps = [self._worker_steps[r].get(op_name, 0) for r in range(self.num_workers)]
-        max_step = max(steps)
-        min_step = min(steps)
+    def _check_worker_skew_internal(self, op_name: str) -> None:
+        """Check worker count skew and enforce limits. Must hold lock when calling."""
+        counts = [
+            self._worker_completed_count[r].get(op_name, 0)
+            for r in range(self.num_workers)
+        ]
+        max_count = max(counts)
+        min_count = min(counts)
 
-        allowed_step = self._allowed_steps.get(op_name)
+        allowed_limit = self._allowed_steps.get(op_name)
 
         for rank in range(self.num_workers):
-            worker_step = self._worker_steps[rank].get(op_name, 0)
+            worker_count = self._worker_completed_count[rank].get(op_name, 0)
 
             should_block_policy = self.sync_policy.evaluate(
-                self._worker_steps, self.num_workers, rank, op_name, max_step, min_step
+                self._worker_completed_count,
+                self.num_workers,
+                rank,
+                op_name,
+                max_count,
+                min_count,
             )
             should_block_global = (
-                allowed_step is not None and worker_step > allowed_step
+                allowed_limit is not None and worker_count > allowed_limit
             )
 
             if (should_block_policy or should_block_global) or self._op_locked.get(
@@ -191,7 +206,7 @@ class SPMDSynchronizer:
                         else ("global" if should_block_global else "controller")
                     )
                     logger.debug(
-                        f"Blocking rank {rank} {op_name} (step {worker_step}, reason={reason})"
+                        f"Blocking rank {rank} {op_name} (count {worker_count}, reason={reason})"
                     )
                     if self._block_worker_op:
                         self._block_worker_op(rank, op_name)
@@ -202,10 +217,10 @@ class SPMDSynchronizer:
                     if self._unblock_worker_op:
                         self._unblock_worker_op(rank, op_name)
 
-    def _all_workers_completed_step_internal(self, op_name: str, step: int) -> bool:
-        """Check if all workers completed the given step. Must hold lock."""
+    def _all_workers_reached_count_internal(self, op_name: str, count: int) -> bool:
+        """Check if all workers have reached the given count. Must hold lock."""
         return all(
-            self._worker_steps[r].get(op_name, 0) >= step
+            self._worker_completed_count[r].get(op_name, 0) >= count
             for r in range(self.num_workers)
         )
 
@@ -217,47 +232,50 @@ class SPMDSynchronizer:
     def is_draining(self) -> bool:
         """True if a drain ceiling is active."""
         with self._lock:
-            return self._drain_ceiling is not None
+            return self._drain_target_count is not None
 
-    def drain_to_step(self, target_step: int, on_drained: Callable[[], None]) -> None:
+    def drain_to_step_count(
+        self, target_count: int, on_drained: Callable[[], None]
+    ) -> None:
         """
-        Block all workers once they reach target_step, then call on_drained
-        when every known op's workers have all reached target_step.
-
-        Unlike update_allowed_step (which is monotonically increasing and
-        persists across drains), _drain_ceiling is a one-shot fence that is
-        cleared by clear_drain() after the snapshot is done.
+        Request the SPMD to drain until every worker has COMPLETED exactly 'target_count' steps.
         """
         drain_complete = False
         with self._lock:
-            if self._drain_ceiling is not None:
+            if self._drain_target_count is not None:
                 raise RuntimeError(
-                    f"SPMD {self.spmd_id} is already draining to step "
-                    f"{self._drain_ceiling}; call clear_drain() first"
+                    f"SPMD {self.spmd_id} is already draining to count "
+                    f"{self._drain_target_count}; call clear_drain() first"
                 )
-            self._drain_ceiling = target_step
+            self._drain_target_count = target_count
             self._drain_on_drained = on_drained
             self._drain_acked_ops = set()
-            logger.debug(f"Drain ceiling set to {target_step} spmd_id={self.spmd_id}")
+            logger.debug(f"Drain target set to {target_count} spmd_id={self.spmd_id}")
 
             # Instantly check if we are ALREADY drained
-            known_ops = set(self._spmd_steps.keys())
+            known_ops = set(self._spmd_completed_count.keys())
             for op_name in known_ops:
-                if self._all_workers_completed_step_internal(op_name, target_step - 1):
+                if self._all_workers_reached_count_internal(op_name, target_count):
                     self._drain_acked_ops.add(op_name)
 
-            if known_ops and self._drain_acked_ops >= known_ops:
+            # Require at least one op to have been registered before declaring
+            # drain complete.  An empty known_ops means no work has started at
+            # all; calling on_drained at that point would produce a premature
+            # empty snapshot.  This is consistent with the guard in
+            # report_worker_op_completed.
+            if self._drain_acked_ops >= known_ops and known_ops:
                 drain_complete = True
+                self._drain_on_drained = None
 
         if drain_complete:
             on_drained()
 
     def clear_drain(self) -> None:
-        """Remove the drain ceiling and unblock workers so training resumes."""
+        """Remove the drain target and unblock workers so training resumes."""
         with self._lock:
-            if self._drain_ceiling is None:
+            if self._drain_target_count is None:
                 return
-            self._drain_ceiling = None
+            self._drain_target_count = None
             self._drain_on_drained = None
             self._drain_acked_ops = set()
             logger.debug(f"Drain cleared spmd_id={self.spmd_id}")
@@ -295,13 +313,13 @@ class SPMDSynchronizer:
 
     def block_all_ops(self) -> None:
         with self._lock:
-            ops = list(self._spmd_steps.keys())
+            ops = list(self._spmd_completed_count.keys())
         for op_name in ops:
             self.block_spmd_op(op_name)
 
     def unblock_all_ops(self) -> None:
         with self._lock:
-            ops = list(self._spmd_steps.keys())
+            ops = list(self._spmd_completed_count.keys())
         for op_name in ops:
             self.unblock_spmd_op(op_name)
 
@@ -317,7 +335,7 @@ class SPMDSynchronizer:
                 logger.debug(
                     f"SPMD {self.spmd_id} {op_name} allowed_step updated: {old_step} -> {step}"
                 )
-                self._check_worker_step_diff_internal(op_name)
+                self._check_worker_skew_internal(op_name)
 
     # =========================================================================
     # Step Query
@@ -325,19 +343,21 @@ class SPMDSynchronizer:
 
     def get_spmd_steps(self) -> Dict[str, int]:
         with self._lock:
-            return dict(self._spmd_steps)
+            return dict(self._spmd_completed_count)
 
     def get_spmd_step(self, op_name: str) -> int:
         with self._lock:
-            return self._spmd_steps.get(op_name, 0)
+            return self._spmd_completed_count.get(op_name, 0)
 
     def get_worker_step(self, rank: int, op_name: str) -> int:
         with self._lock:
-            return self._worker_steps.get(rank, {}).get(op_name, 0)
+            return self._worker_completed_count.get(rank, {}).get(op_name, 0)
 
     def get_all_worker_steps(self) -> Dict[int, Dict[str, int]]:
         with self._lock:
-            return {rank: dict(ops) for rank, ops in self._worker_steps.items()}
+            return {
+                rank: dict(ops) for rank, ops in self._worker_completed_count.items()
+            }
 
     def get_locked_ops(self) -> List[str]:
         with self._lock:
@@ -350,7 +370,7 @@ class SPMDSynchronizer:
     def reset(self) -> None:
         with self._lock:
             for rank in range(self.num_workers):
-                self._worker_steps[rank].clear()
+                self._worker_completed_count[rank].clear()
                 self._worker_op_locked[rank].clear()
-            self._spmd_steps.clear()
+            self._spmd_completed_count.clear()
             self._op_locked.clear()

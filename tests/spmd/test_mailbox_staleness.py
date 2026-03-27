@@ -45,7 +45,7 @@ async def test_mailbox_staleness_state_fallback():
     mb = WorkerMailbox()
 
     mb.declare_step("op", step=5, expected_tensors={}, expected_states=["state"])
-    await mb.deposit_states("op", 5, ["state"], [{"val": 5}])
+    await mb.deposit_control_arguments("op", 5, ["state"], [{"val": 5}])
     assert mb.is_step_ready("op", 5)
 
     config = TolerantBarrierConfig(
@@ -60,7 +60,7 @@ async def test_mailbox_staleness_state_fallback():
     )
     assert mb.is_step_ready("op", 8)
 
-    state_val = await mb.get_state("op", "state", 8)
+    state_val = await mb.get_control_argument("op", "state", 8)
     assert state_val == {"val": 5}
 
 
@@ -69,7 +69,7 @@ async def test_mailbox_clear_step_respects_staleness():
     """Verify clear_step preserves data if it's within the maximum configured staleness."""
     mb = WorkerMailbox()
 
-    await mb.deposit_states("op", 1, ["s"], ["val1"])
+    await mb.deposit_control_arguments("op", 1, ["s"], ["val1"])
     mb.declare_step("op", step=1, expected_tensors={}, expected_states=["s"])
 
     config = TolerantBarrierConfig(state_staleness={"s": 1})
@@ -78,7 +78,7 @@ async def test_mailbox_clear_step_respects_staleness():
     )
 
     await mb.clear_step("op", 2)
-    assert not await mb.has_state("op", "s", 1)
+    assert not await mb.has_control_argument("op", "s", 1)
 
 
 @pytest.mark.asyncio
