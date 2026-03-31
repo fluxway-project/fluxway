@@ -371,6 +371,8 @@ class OperatorMeta(FluxwayBaseSchema):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     name: str
+    owner_class_qualname: str = ""
+    owner_class_module: str = ""
 
     is_source: Optional[bool] = None  # Explicitly mark as source (producer)
     # Whether this is an interleaved source.

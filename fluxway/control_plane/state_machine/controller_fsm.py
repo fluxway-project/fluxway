@@ -241,6 +241,14 @@ class ControllerStateMachine:
         except Exception as e:
             logger.error(f"Failed to start heartbeat monitoring: {e}")
 
+        # Prevent discarded events: Check if operations were already completed during restoration (PENDING state).
+        # We perform this check upon entering RUNNING state to safely trigger completion.
+        if self._controller._async_step_manager.is_all_completed():
+            logger.debug(
+                "wait_for_completion detected all operators completed upon entering RUNNING, transitioning"
+            )
+            await self.trigger_event(ControllerEvent.ALL_DRIVERS_COMPLETED)
+
     async def _on_enter_blocked(self) -> None:
         """
         Called when entering BLOCKED state.
@@ -273,6 +281,8 @@ class ControllerStateMachine:
         logger.debug("Controller entering COMPLETED state")
 
         try:
+            if hasattr(self._controller, "stop_checkpointer"):
+                await self._controller.stop_checkpointer()
             await self._controller._cleanup_all_spmds()
         except Exception as e:
             logger.error(f"Failed to cleanup SPMDs: {e}")

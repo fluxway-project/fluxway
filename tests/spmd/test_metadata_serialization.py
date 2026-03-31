@@ -16,10 +16,11 @@ Background:
     rather than relying on function attributes.
 """
 
+import importlib.util
+import os
 import pickle
 import subprocess
 import sys
-import os
 import tempfile
 
 import pytest
@@ -32,6 +33,13 @@ from fluxway.common.types.configs import (
     EdgeShardingInfo,
     ArgumentType,
 )
+from fluxway.common.decorators import (
+    operator,
+    spmd,
+    _instance_storage,
+    _resolve_owner_class,
+)
+from fluxway.spmd.worker.worker import SPMDWorker
 
 
 def dummy_my_function():
@@ -81,9 +89,6 @@ test_function.meta = {"key": "default_value"}
             module_path = f.name
 
         try:
-            # Main process: load module and modify attribute
-            import importlib.util
-
             spec = importlib.util.spec_from_file_location("test_module", module_path)
             test_module = importlib.util.module_from_spec(spec)
             sys.modules["test_module"] = test_module
@@ -156,6 +161,25 @@ def dummy_op(x):
     return x
 
 
+@operator(name="free_step", static_argument=["x"])
+def _free_step_operator(self, x):
+    return x
+
+
+@spmd(mesh_axis_names=("dp",), mesh_axis_shapes=(2,))
+class _ResolvableModel:
+    @operator(name="forward", static_argument=["x"])
+    def forward(self, x):
+        return x
+
+
+@spmd(mesh_axis_names=("dp",), mesh_axis_shapes=(1,))
+class _InstantiableModel:
+    @operator(name="run", static_argument=["x"])
+    def run(self, x):
+        return x
+
+
 class TestOperatorMetaSerialization:
     """Tests for OperatorMeta serialization in SPMDConfig using actual types."""
 
@@ -212,6 +236,64 @@ class TestOperatorMetaSerialization:
         assert restored.operator_metas["test_op"].input_pre_sharding["SourceSPMD"][
             0
         ].tuuid_sharding == {123: "sharded_spec"}
+
+
+class TestOwnerClassResolution:
+    """Tests verifying that owner class info survives pickle and resolves correctly."""
+
+    def test_free_function_operator_meta_has_empty_owner_fields(self):
+        meta = _free_step_operator._fluxway_operator_meta
+        assert meta.owner_class_qualname == ""
+        assert meta.owner_class_module == ""
+
+    def test_class_method_operator_meta_records_owner_info(self):
+        @spmd(mesh_axis_names=("dp",), mesh_axis_shapes=(2,))
+        class MyModel:
+            @operator(name="train_step", static_argument=["x"])
+            def train_step(self, x):
+                return x
+
+        config = MyModel.get_spmd_config()
+        meta = config.operator_metas["train_step"]
+        assert "MyModel" in meta.owner_class_qualname
+        assert meta.owner_class_module == __name__
+
+    def test_resolve_owner_class_returns_same_object(self):
+        config = _ResolvableModel.get_spmd_config()
+        meta = config.operator_metas["forward"]
+        resolved = _resolve_owner_class(
+            meta.owner_class_module, meta.owner_class_qualname
+        )
+        assert resolved is _ResolvableModel
+
+    def test_resolve_owner_class_is_stable_across_calls(self):
+        config = _ResolvableModel.get_spmd_config()
+        meta = config.operator_metas["forward"]
+        first = _resolve_owner_class(meta.owner_class_module, meta.owner_class_qualname)
+        second = _resolve_owner_class(
+            meta.owner_class_module, meta.owner_class_qualname
+        )
+        assert first is second
+
+    def test_owner_info_survives_pickle(self):
+        config = _ResolvableModel.get_spmd_config()
+        restored_config = pickle.loads(pickle.dumps(config))
+
+        meta = restored_config.operator_metas["forward"]
+        assert meta.owner_class_qualname != ""
+        assert meta.owner_class_module != ""
+
+    def test_pre_instantiate_operators_uses_owner_meta(self):
+        config = _InstantiableModel.get_spmd_config()
+
+        _instance_storage.clear()
+        SPMDWorker._pre_instantiate_operators(config, rank=0)
+
+        cls = _resolve_owner_class(
+            config.operator_metas["run"].owner_class_module,
+            config.operator_metas["run"].owner_class_qualname,
+        )
+        assert id(cls) in _instance_storage
 
 
 if __name__ == "__main__":

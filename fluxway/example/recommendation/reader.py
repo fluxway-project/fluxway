@@ -184,9 +184,7 @@ class RecommendationReader(GrainReader):
 
         per_rank_skip = completed_steps * saved_batch_size
 
-        self._create_data_loader(
-            static_args, getattr(self, "rank", 0), new_shard_count
-        )
+        self._create_data_loader(static_args, getattr(self, "rank", 0), new_shard_count)
         for _ in range(per_rank_skip):
             self.next_item()
 

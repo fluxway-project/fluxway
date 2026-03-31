@@ -33,9 +33,9 @@ import ray
 from fluxway.common.backend import get_backend
 from fluxway.common.decorators import (
     operator_context,
-    _instance_storage,
-    _instance_storage_lock,
     get_current_context,
+    get_instance_storage,
+    _resolve_owner_class,
 )
 from fluxway.common.execution import compile
 from fluxway.common.types import (
@@ -308,12 +308,17 @@ class SPMDWorker:
             static_args=static_args, rank=rank, world_size=world_size
         ):
             ctx = get_current_context()
-            for op_fn in (config.operators or {}).values():
-                cls = getattr(op_fn, "_flux_spmd_class", None)
+            storage, lock = get_instance_storage()
+            for op_meta in (config.operator_metas or {}).values():
+                if not op_meta.owner_class_qualname:
+                    continue
+                cls = _resolve_owner_class(
+                    op_meta.owner_class_module, op_meta.owner_class_qualname
+                )
                 if cls is None or id(cls) in seen:
                     continue
                 seen.add(id(cls))
-                if id(cls) in _instance_storage:
+                if id(cls) in storage:
                     continue
 
                 try:
@@ -337,7 +342,7 @@ class SPMDWorker:
                 instance.static_args = static_args
                 instance.ctx = getattr(ctx, "operator_ctx", None)
                 instance.__init__(**init_kwargs)
-                _instance_storage[id(cls)] = instance
+                storage[id(cls)] = instance
 
     # =========================================================================
     # Driver Handle Management
@@ -2407,6 +2412,18 @@ class SPMDWorker:
             )
         for op_name, count in metadata["completed_step_count"].items():
             self._completed_step_count[op_name] = count
+            # Actively notify the Driver of the rebuilt step to prevent sync disparities
+            self._report_op_completed(op_name, count)
+
+            # Re-trigger source operators from their restored step count
+            if self._op_manager.is_source_operator(op_name):
+                max_steps = self.config.max_steps
+                if max_steps is None or count < max_steps:
+                    logger.info(
+                        f"Auto-triggering source op for restored step {count} op={op_name} "
+                        f"spmd_id={self.spmd_id} rank={self.rank}"
+                    )
+                    asyncio.create_task(self._enqueue(op_name, count))
 
         if "static_args" not in metadata:
             raise RuntimeError(
@@ -2433,13 +2450,18 @@ class SPMDWorker:
         """Call save_state() on each operator instance and collect results."""
         seen_cls_ids: set = set()
         states: Dict[str, Any] = {}
-        for op_name, op_fn in (self.config.operators or {}).items():
-            cls = getattr(op_fn, "_flux_spmd_class", None)
+        storage, lock = get_instance_storage()
+        for op_name, op_meta in (self.config.operator_metas or {}).items():
+            if not op_meta.owner_class_qualname:
+                continue
+            cls = _resolve_owner_class(
+                op_meta.owner_class_module, op_meta.owner_class_qualname
+            )
             if cls is None or id(cls) in seen_cls_ids:
                 continue
             seen_cls_ids.add(id(cls))
-            with _instance_storage_lock:
-                instance = _instance_storage.get(id(cls))
+            with lock:
+                instance = storage.get(id(cls))
             if instance is None:
                 continue
             if hasattr(instance, "save_state") and callable(instance.save_state):
@@ -2453,22 +2475,24 @@ class SPMDWorker:
         self, operator_states: Dict[str, Any], ckpt_dir: str
     ) -> None:
         """Call restore_state() on each operator instance with its persisted state."""
-        op_fn_by_name = dict(self.config.operators or {})
+        storage, lock = get_instance_storage()
         for op_name, op_state in operator_states.items():
-            op_fn = op_fn_by_name.get(op_name)
-            if op_fn is None:
+            op_meta = (self.config.operator_metas or {}).get(op_name)
+            if op_meta is None:
                 raise RuntimeError(
                     f"Operator {op_name} not found in config during restore "
                     f"spmd_id={self.spmd_id} rank={self.rank}"
                 )
-            cls = getattr(op_fn, "_flux_spmd_class", None)
+            cls = _resolve_owner_class(
+                op_meta.owner_class_module, op_meta.owner_class_qualname
+            )
             if cls is None:
                 raise RuntimeError(
-                    f"Operator {op_name} has no _flux_spmd_class in config during restore "
+                    f"Operator '{op_name}' failed to resolve class "
                     f"spmd_id={self.spmd_id} rank={self.rank}"
                 )
-            with _instance_storage_lock:
-                instance = _instance_storage.get(id(cls))
+            with lock:
+                instance = storage.get(id(cls))
             if instance is None:
                 raise RuntimeError(
                     f"Operator {op_name} instance not found in _instance_storage during restore "

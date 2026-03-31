@@ -25,20 +25,20 @@ class SafeTensorsBackend(WorkerCheckpointBackend, backend_name="safetensors"):
         self._force_write = force_write
 
     async def save(self, state, ckpt_dir, spmd_id, rank, step):
-        base = Path(ckpt_dir) / str(step)
-        tensors_path = str(base / f"{spmd_id}.safetensors")
-        meta_path = str(base / f"{spmd_id}.meta.json")
+        base = Path(ckpt_dir) / str(step) / spmd_id / f"worker_{rank}"
+        tensors_path = str(base / "safetensors_state.safetensors")
+        meta_path = str(base / "safetensors_state.meta.json")
 
         if not self._force_write:
             if Path(tensors_path).exists() or Path(meta_path).exists():
                 raise FileExistsError(
-                    f"Checkpoint files already exist for spmd_id={spmd_id} step={step} "
-                    f"in {base}. Set force_write=True in CheckpointConfig to overwrite."
+                    f"Checkpoint files already exist for spmd_id={spmd_id} step={step}. "
+                    f"Set force_write=True in CheckpointConfig to overwrite."
                 )
 
         await asyncio.to_thread(save_worker_state, state, tensors_path, meta_path)
         return {
-            "ckpt_dir": str(base / spmd_id),
+            "ckpt_dir": str(base),
             "tensors_path": tensors_path,
             "meta_path": meta_path,
         }

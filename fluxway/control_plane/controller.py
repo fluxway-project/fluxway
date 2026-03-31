@@ -415,6 +415,10 @@ if RAY_AVAILABLE:
             completed at least `next_ckpt` steps, ensuring the snapshot is globally
             consistent with drain_to_step_count mechanism.
             """
+            # Prevent fast-starting operators from triggering global checkpoints before
+            # all drivers are fully compiled and initialized across the cluster.
+            if not self._state_machine.is_running():
+                return
             if self._checkpointer is None:
                 return
             if self._checkpoint_task is not None and not self._checkpoint_task.done():
@@ -753,17 +757,23 @@ if RAY_AVAILABLE:
 
         @require_spmd_manager
         async def restore_snapshot(
-            self, snapshot_id: str, manifest: Dict[str, Any]
+            self, snapshot_id: str, step: int, manifest: Dict[str, Any]
         ) -> None:
             """
             Restore a snapshot: each Driver loads its Workers' tensors from disk directly.
 
             Args:
                 snapshot_id: Snapshot identifier for bookkeeping.
+                step:        The logical step count of this snapshot.
                 manifest:    {spmd_id: {str(rank): metadata_dict}} where metadata_dict
                              contains ``backend`` and backend-specific path fields.
             """
-            logger.info(f"Controller restoring snapshot {snapshot_id}")
+            logger.info(f"Controller restoring snapshot {snapshot_id} (step {step})")
+
+            # Important: update the baseline *before* waking up workers,
+            # so their `report_op_completed` pulses don't trigger a nested checkpoint.
+            self._last_checkpointed_step = step
+
             self._state_manager.save_snapshot(snapshot_id, manifest)
 
             await self.block_all_spmds()
@@ -798,7 +808,9 @@ if RAY_AVAILABLE:
                 raise RuntimeError(
                     "Checkpoint config was not provided during controller initialization"
                 )
-            return await self._checkpointer.restore(step)
+
+            restored_step = await self._checkpointer.restore(step)
+            return restored_step
 
         async def stop_checkpointer(self) -> None:
             """Await any in-flight checkpoint to completion before shutdown.

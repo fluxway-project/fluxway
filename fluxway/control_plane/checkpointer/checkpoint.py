@@ -121,7 +121,7 @@ class FluxwayCheckpointer:
                 f"_load({step}) returned empty — checkpoint may be corrupt."
             )
         snapshot_id = f"restore_{step}_{next(self._snapshot_counter)}"
-        await self._controller.restore_snapshot(snapshot_id, manifest)
+        await self._controller.restore_snapshot(snapshot_id, step, manifest)
         logger.info(f"Checkpoint step {step} restored.")
         return step
 
@@ -133,16 +133,40 @@ class FluxwayCheckpointer:
         """Write the manifest that maps spmd_id/rank to Worker-written path metadata."""
         step_dir = Path(self._ckpt_dir) / str(step)
         manifest_path = step_dir / "manifest.json"
+
+        # 1. Deduplicate and commit (rename) all orbax temporary directories safely
+        renamed_paths = set()
+        for spmd_id, ranks in manifest.items():
+            for rank, meta in ranks.items():
+                if "orbax_tmp_path" in meta and "orbax_final_path" in meta:
+                    o_tmp = Path(meta["orbax_tmp_path"])
+                    o_final = Path(meta["orbax_final_path"])
+
+                    if str(o_final) not in renamed_paths:
+                        if o_tmp.exists() and not o_final.exists():
+                            o_tmp.rename(o_final)
+                            renamed_paths.add(str(o_final))
+                        elif o_tmp.exists() and o_final.exists():
+                            if self._force_write:
+                                shutil.rmtree(o_final)
+                                o_tmp.rename(o_final)
+                                renamed_paths.add(str(o_final))
+                            else:
+                                raise FileExistsError(
+                                    f"Orbax checkpoint directory already exists at {o_final}. "
+                                    "Set force_write=True to overwrite."
+                                )
+
         if manifest_path.exists() and not self._force_write:
             raise FileExistsError(
                 f"Checkpoint step {step} already exists at {manifest_path}. "
                 "Set force_write=True in CheckpointConfig to overwrite."
             )
         step_dir.mkdir(parents=True, exist_ok=True)
-        tmp_path = step_dir / "manifest.json.tmp"
-        with open(tmp_path, "w") as f:
+        tmp_man = step_dir / "manifest.json.tmp"
+        with open(tmp_man, "w") as f:
             json.dump(manifest, f)
-        tmp_path.rename(manifest_path)
+        tmp_man.rename(manifest_path)
         self._evict_old_checkpoints()
 
     def _load(self, step: int) -> Dict[str, Any]:

@@ -89,7 +89,7 @@ async def run_training(args):
     task_graph = graph.compile("End-to-End_Training_Flow")
     print(f"[Fluxway] Graph compiled. Nodes: {list(task_graph.nodes.keys())}")
 
-    async_step_config = AsyncStepConfig(max_steps=args.steps)
+    async_step_config = AsyncStepConfig(max_steps=args.max_steps)
     checkpoint_config = CheckpointConfig(
         backend="orbax",
         ckpt_dir="/tmp/fluxway_recsys_ckpt",
@@ -107,7 +107,7 @@ async def run_training(args):
     if restored_step is not None:
         print(f"[Fluxway] Resumed from checkpoint at step {restored_step}.")
 
-    print(f"[Fluxway] Running to reach total {args.steps} steps …")
+    print(f"[Fluxway] Running to reach total {args.max_steps} steps …")
     completed = await controller.wait_for_completion.remote()
 
     await controller.stop_checkpointer.remote()
@@ -120,7 +120,9 @@ async def run_training(args):
 
 def main():
     parser = argparse.ArgumentParser(description="Fluxway Recommendation Example")
-    parser.add_argument("--steps", type=int, default=10, help="Number of steps to run")
+    parser.add_argument(
+        "--max-steps", type=int, default=10, help="Max number of steps to run"
+    )
     parser.add_argument(
         "--checkpoint-interval",
         type=int,
