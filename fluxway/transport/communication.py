@@ -398,9 +398,11 @@ class BaseDataDistributor:
         static_shapes_tuple = tuple(static_shapes)
 
         (
-            padded_buffers_lists,  # List of (padded_data, padded_lengths)
-            counts_per_payload,  # List of count tensors [item_count or flat_count]
-            send_counts,  # item_counts (dim0 row counts)
+            flat_buffers_lists,
+            counts_per_payload,
+            offsets_per_payload,
+            send_counts,
+            send_offsets,
             dest_devices,
             replication_factor,
             sort_indices,
@@ -423,8 +425,13 @@ class BaseDataDistributor:
             src_index_desc=primary.topology,
         )
 
+        # Materialise per-device send counts/offsets on the host once.  These are the
+        # minimal scalars needed to slice the flat buffers; the heavy tensor data stays
+        # on-device until the Python slice below.
         counts_host = np.array(send_counts).flatten()
-        offsets_host = np.cumsum(counts_host) - counts_host
+        offsets_host = np.array(send_offsets).flatten()
+        counts_per_payload_host = [np.array(c).flatten() for c in counts_per_payload]
+        offsets_per_payload_host = [np.array(o).flatten() for o in offsets_per_payload]
 
         def _get_slice_compact_desc_params(device_id):
             slice_compact_desc_params: List[Optional[List[int]]] = []
@@ -445,35 +452,38 @@ class BaseDataDistributor:
             return slice_compact_desc_params
 
         def _get_flat_payloads_for_rank(device_id):
+            """Slice this device's segment out of each O(N) flat buffer.
+
+            flat_buffers_lists holds globally-reordered 1-D arrays.  Each device's
+            data occupies a contiguous window [offset, offset+count), so a single
+            Python slice replaces the former vmap-padded 2-D matrix indexing.
+            """
             p_flat = []
             c_flat = []
             p_idx = 0
             c_idx = 0
             for meta_state in has_meta_tensor_state_list:
-                # [Optimization Node]
-                # TODO(He Jia): Currently performing host-side eager slicing to strip JIT-induced
-                # padding (item_cap). This ensures receiver shape fidelity without triggering
-                # JAX dimension re-tracing. Future optimization should leverage low-level
-                # pointer slicing (e.g. via NCCL/C++ kernels) to avoid this eager JAX Python overhead.
-
-                p_data, p_len = padded_buffers_lists[p_idx]
-                count = int(counts_per_payload[c_idx][device_id])
-                p_flat.append(p_data[device_id][:count])
+                p_data, p_len = flat_buffers_lists[p_idx]
+                offset = int(offsets_per_payload_host[c_idx][device_id])
+                count = int(counts_per_payload_host[c_idx][device_id])
+                p_flat.append(p_data[offset : offset + count])
                 c_flat.append(count)
 
-                if p_len is not None:
-                    count_len = int(counts_per_payload[c_idx + 1][device_id])
-                    p_flat.append(p_len[device_id][:count_len])
+                if p_len is not None:  # ragged: also slice the item-length array
+                    len_offset = int(offsets_per_payload_host[c_idx + 1][device_id])
+                    count_len = int(counts_per_payload_host[c_idx + 1][device_id])
+                    p_flat.append(p_len[len_offset : len_offset + count_len])
                     c_flat.append(count_len)
                     c_idx += 1
 
                 p_idx += 1
                 c_idx += 1
 
-                if meta_state & 2:
-                    p_data, _ = padded_buffers_lists[p_idx]
-                    count = int(counts_per_payload[c_idx][device_id])
-                    p_flat.append(p_data[device_id][:count])
+                if meta_state & 2:  # materialized origin indices
+                    p_data, _ = flat_buffers_lists[p_idx]
+                    offset = int(offsets_per_payload_host[c_idx][device_id])
+                    count = int(counts_per_payload_host[c_idx][device_id])
+                    p_flat.append(p_data[offset : offset + count])
                     c_flat.append(count)
                     p_idx += 1
                     c_idx += 1
@@ -1028,12 +1038,14 @@ def _jit_plan_and_pack(
     src_spec: Optional[Any] = None,
     src_index_desc: Optional[Any] = None,
 ):
-    """JIT-compiled kernel for planning and sequence packing.
+    """JIT-compiled kernel: compute routing plan and reorder payloads.
 
-    static_shapes: (item_capacity, payload0_flat_cap, payload1_flat_cap, ...)
+    Returns O(N) flat reordered arrays together with per-device (offsets, counts)
+    vectors.  The caller slices each device's window directly from the flat buffer,
+    avoiding the O(W*N) vmap-padded intermediate that the previous implementation
+    produced.
     """
     backend = get_backend()
-    item_cap = static_shapes[0]
 
     # 1. Compute Plan
     (sort_indices, dest_devices, send_counts, target_num_workers, replica_size) = (
@@ -1054,50 +1066,34 @@ def _jit_plan_and_pack(
         )
     )
 
-    # Determine sending offsets by cumulative sum
     cs = backend.cumsum(send_counts, dim=0)
     zero = backend.zeros((1,), dtype=backend.int32())
     send_offsets = backend.cat([zero, cs[:-1]], dim=0)
 
-    # 2. Flatten and Gather Masked Sequences for each payload
-    padded_buffers_lists = []
+    # 2. Reorder data per payload — O(N) flat reorder, no vmap padding
+    flat_buffers_lists = []
     counts_per_payload = []
+    offsets_per_payload = []
 
     for i in range(len(payloads_tuple)):
         data = payloads_tuple[i]
         lengths = nested_length_list[i]
         is_ragged = lengths is not None
 
-        flat_cap = static_shapes[i + 1]
-
         if not is_ragged:
             # --- Dense Path ---
+            # A single gather reorders all rows into send order.  No padding needed:
+            # the caller extracts each device's slice via [offset:offset+count].
             reordered_data = backend.take(data, sort_indices)
-
-            # Pad buffer to ensure safety for vmap slice-out
-            dtype_data = backend.dtype(reordered_data)
-            pad_amount = item_cap  # Safe margin
-            pad_shape = (pad_amount,) + backend.shape(reordered_data)[1:]
-            padded_reordered = backend.cat(
-                [reordered_data, backend.zeros(pad_shape, dtype=dtype_data)], dim=0
-            )
-
-            def pack_data_for_rank(offset, count, padded_reordered=padded_reordered):
-                ndim = len(backend.shape(padded_reordered))
-                start_indices = (offset,) + (0,) * (ndim - 1)
-                slice_sizes = (item_cap,) + backend.shape(padded_reordered)[1:]
-                return backend.dynamic_slice(
-                    padded_reordered, start_indices, slice_sizes
-                )
-
-            padded_data = backend.vmap(pack_data_for_rank)(send_offsets, send_counts)
-            padded_lengths = None
-
+            flat_buffers_lists.append((reordered_data, None))
             counts_per_payload.append(send_counts)
+            offsets_per_payload.append(send_offsets)
 
         else:
             # --- Ragged Path ---
-            # Gather flat_values using item-to-element mapping
+            # flat_cap is a static upper bound on total flat elements (required by
+            # repeat_interleave so XLA knows the output size at trace time).
+            flat_cap = static_shapes[i + 1]
             item_offsets_orig = backend.cat([zero, backend.cumsum(lengths)[:-1]], dim=0)
             reordered_item_starts = backend.take(item_offsets_orig, sort_indices)
             reordered_item_lengths = backend.take(lengths, sort_indices)
@@ -1107,81 +1103,39 @@ def _jit_plan_and_pack(
             )
 
             num_items = backend.shape(reordered_item_lengths)[0]
-            # Create a segmentation map: which item does each flat element belong to?
-            # We use flat_cap (the static buffer size) to ensure JIT friendliness.
             item_ids = backend.repeat_interleave(
                 backend.arange(0, num_items, dtype=backend.int32()),
                 reordered_item_lengths,
                 total_repeat_length=flat_cap,
             )
 
-            # Calculate inner offsets: iota - start_of_that_item_in_reordered_flat
             iota = backend.arange(0, flat_cap, dtype=backend.int32())
             reordered_flat_starts = backend.take(reordered_flat_offsets, item_ids)
             inner_offsets = iota - reordered_flat_starts
 
-            # Map back to original flat positions
             orig_item_starts = backend.take(reordered_item_starts, item_ids)
             flat_indices = orig_item_starts + inner_offsets
 
             reordered_data = backend.take(data, flat_indices)
-
-            # Map item-level send info to element-level send info
             send_flat_offsets = backend.take(reordered_flat_offsets, send_offsets)
 
-            # Pad buffer to ensure safety for vmap slice-out
-            dtype_data = backend.dtype(reordered_data)
-            pad_shape = (flat_cap,) + backend.shape(reordered_data)[1:]
-            padded_reordered = backend.cat(
-                [reordered_data, backend.zeros(pad_shape, dtype=dtype_data)], dim=0
-            )
-
-            def pack_flat_data_for_rank(
-                offset, flat_cap=flat_cap, padded_reordered=padded_reordered
-            ):
-                ndim = len(backend.shape(padded_reordered))
-                start_indices = (offset,) + (0,) * (ndim - 1)
-                slice_sizes = (flat_cap,) + backend.shape(padded_reordered)[1:]
-                return backend.dynamic_slice(
-                    padded_reordered, start_indices, slice_sizes
-                )
-
-            padded_data = backend.vmap(pack_flat_data_for_rank)(send_flat_offsets)
-
-            # Correctly handle item-level lengths
-            reordered_lengths = reordered_item_lengths
-            dtype_len = backend.dtype(reordered_lengths)
-            pad_shape_len = (item_cap,) + backend.shape(reordered_lengths)[1:]
-            padded_reordered_len = backend.cat(
-                [reordered_lengths, backend.zeros(pad_shape_len, dtype=dtype_len)],
-                dim=0,
-            )
-
-            def pack_len_for_rank(offset, padded_reordered_len=padded_reordered_len):
-                start_indices = (offset,)
-                slice_sizes = (item_cap,)
-                return backend.dynamic_slice(
-                    padded_reordered_len, start_indices, slice_sizes
-                )
-
-            padded_lengths = backend.vmap(pack_len_for_rank)(send_offsets)
-
-            # Flat counts for ragged values
-            reordered_flat_lengths = reordered_item_lengths
-            flat_cs = backend.cat([zero, backend.cumsum(reordered_flat_lengths)], dim=0)
+            flat_cs = backend.cat([zero, backend.cumsum(reordered_item_lengths)], dim=0)
             send_flat_counts = backend.take(
                 flat_cs, send_offsets + send_counts
             ) - backend.take(flat_cs, send_offsets)
 
+            flat_buffers_lists.append((reordered_data, reordered_item_lengths))
             counts_per_payload.append(send_flat_counts)
-            counts_per_payload.append(send_counts)  # for lengths
-
-        padded_buffers_lists.append((padded_data, padded_lengths))
+            offsets_per_payload.append(send_flat_offsets)
+            counts_per_payload.append(send_counts)
+            offsets_per_payload.append(send_offsets)
 
     return (
-        padded_buffers_lists,
+        flat_buffers_lists,
         counts_per_payload,
+        offsets_per_payload,
         send_counts,
+        send_offsets,
         dest_devices,
         replica_size,
         sort_indices,
