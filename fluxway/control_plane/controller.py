@@ -417,6 +417,7 @@ if RAY_AVAILABLE:
 
             interval = self._checkpointer.interval_steps
             next_ckpt = self._last_checkpointed_step + interval
+            # Only first op completion triggers checkpoint
             if completed_count < next_ckpt:
                 return
 
@@ -649,6 +650,9 @@ if RAY_AVAILABLE:
             try:
                 await asyncio.wait_for(done_event.wait(), timeout=snapshot_timeout)
             except asyncio.TimeoutError as err:
+                for d in drivers.values():
+                    if d:
+                        d._clear_drain_and_fail.remote()
                 self._pending_snapshots.pop(snapshot_id, None)
                 raise RuntimeError(
                     f"Snapshot '{snapshot_id}' timed out after {snapshot_timeout}s. "
@@ -658,6 +662,10 @@ if RAY_AVAILABLE:
 
             snap_info = self._pending_snapshots.pop(snapshot_id)
             if snap_info["errors"]:
+                for d in drivers.values():
+                    if d:
+                        d._clear_drain_and_fail.remote()
+
                 raise RuntimeError(
                     f"Snapshot '{snapshot_id}' failed for SPMDs: {snap_info['errors']}. "
                     f"Refusing to persist incomplete manifest."
@@ -971,6 +979,45 @@ if RAY_AVAILABLE:
             Triggers: TOPOLOGY_REGISTERING → RUNNING → start heartbeat monitoring
             """
             logger.debug("All workers are running after topology registration")
+
+            # Workers auto-start as soon as topology registration completes, which
+            # can be well before the controller transitions to RUNNING.  Any steps
+            # executed in that window are invisible to _maybe_trigger_checkpoint
+            # (blocked by the is_running() guard), so _last_checkpointed_step would
+            # remain 0 while actual progress is far ahead.  When the first post-RUNNING
+            # report_op_completed arrives it would fire a checkpoint at boundary=interval
+            # even though workers are already at step 200+, producing a checkpoint
+            # directory named "50" that actually contains step-200 model state.
+            #
+            # Fix: align the watermark to the floor-division of the minimum observed
+            # progress so the first real checkpoint fires at the next clean boundary
+            # after where workers actually are.
+            if self._checkpointer is not None:
+                interval = self._checkpointer.interval_steps
+                all_steps = self._async_step_manager.get_all_spmd_steps()
+                if all_steps:
+                    min_count = (
+                        min(
+                            count
+                            for spmd_step in all_steps.values()
+                            for count in spmd_step.completed_step_count.values()
+                            if count > 0
+                        )
+                        if any(
+                            spmd_step.completed_step_count
+                            for spmd_step in all_steps.values()
+                        )
+                        else 0
+                    )
+                    aligned = (min_count // interval) * interval
+                    if aligned > self._last_checkpointed_step:
+                        logger.info(
+                            f"Aligning checkpoint watermark from {self._last_checkpointed_step} "
+                            f"to {aligned} (workers already at min_count={min_count} "
+                            f"during startup window)"
+                        )
+                        self._last_checkpointed_step = aligned
+
             await self._state_machine.trigger_event(
                 ControllerEvent.ALL_SPMDS_TOPOLOGY_READY
             )

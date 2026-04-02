@@ -4,7 +4,7 @@ import logging
 import os
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +38,7 @@ class FluxwayCheckpointer:
         interval_steps: int,
         force_write: bool = False,
         max_to_keep: int = 2,
-        validate_deps: Optional[callable] = None,
+        validate_deps: Optional[Callable] = None,
     ) -> None:
         if interval_steps < 1:
             raise ValueError(f"interval_steps must be >= 1, got {interval_steps}")

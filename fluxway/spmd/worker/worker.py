@@ -196,10 +196,8 @@ class SPMDWorker:
             op_name: [] for op_name in (self.config.operators if self.config else {})
         }
 
-        self._pending_lock = asyncio.Lock()
-
         # Priority queue: asyncio.PriorityQueue with (priority, step, op_name)
-        # We can extract priority from OperatorMeta
+        # Can extract priority from OperatorMeta
         self._execution_queue: asyncio.PriorityQueue[Tuple[int, int, str]] = (
             asyncio.PriorityQueue()
         )
@@ -224,7 +222,11 @@ class SPMDWorker:
         self._heartbeat_running: bool = False
         self._heartbeat_task: Optional[asyncio.Task] = None
 
-        # Error tracking
+        # Tracks tasks currently sitting in _execution_queue to prevent double-scheduling.
+        # Removed when dequeued (whether to execute, pending_blocked, or pending_future).
+        self._in_op_step_queue: set = set()
+
+        # State tracking
         self._last_error: Optional[str] = None
 
         # Run loop synchronization
@@ -503,10 +505,11 @@ class SPMDWorker:
             f"Source operators identified ops={source_ops} spmd_id={self.spmd_id} rank={self.rank}"
         )
         for op_name in source_ops:
+            target_step = self._completed_step_count.get(op_name, 0)
             logger.info(
-                f"Auto-triggering source op for step 0 op={op_name} spmd_id={self.spmd_id} rank={self.rank}"
+                f"Auto-triggering source op for step {target_step} op={op_name} spmd_id={self.spmd_id} rank={self.rank}"
             )
-            await self._enqueue(op_name, 0)
+            await self._enqueue(op_name, target_step)
 
     # =========================================================================
     # Op-Level Blocking
@@ -528,11 +531,10 @@ class SPMDWorker:
         """
         self._op_runnable[op_name].set()
 
-        # Re-enqueue pending tasks
-        async with self._pending_lock:
-            for step in self._pending_blocked[op_name]:
-                await self._enqueue(op_name, step)
-            self._pending_blocked[op_name].clear()
+        pending = self._pending_blocked[op_name]
+        self._pending_blocked[op_name] = []
+        for step in pending:
+            await self._enqueue(op_name, step)
 
         logger.debug(
             f"Op unblocked op={op_name} spmd_id={self.spmd_id} rank={self.rank}"
@@ -771,6 +773,14 @@ class SPMDWorker:
         """Enqueue a task for execution."""
         from fluxway.common.types.configs import OperatorMeta
 
+        key = (op_name, step)
+        if key in self._in_op_step_queue:
+            logger.debug(
+                f"Idempotency guard: already in queue op={op_name} step={step}"
+            )
+            return
+        self._in_op_step_queue.add(key)
+
         logger.debug(
             f"Enqueue called op={op_name} step={step} spmd_id={self.spmd_id} rank={self.rank}"
         )
@@ -821,6 +831,7 @@ class SPMDWorker:
                     f"Waiting for next task in execution queue spmd_id={self.spmd_id} rank={self.rank}"
                 )
                 priority, step, op_name = await self._execution_queue.get()
+                self._in_op_step_queue.discard((op_name, step))
                 logger.debug(
                     f"Execution loop picked up task op={op_name} step={step} priority={priority} "
                     f"spmd_id={self.spmd_id} rank={self.rank}"
@@ -831,11 +842,9 @@ class SPMDWorker:
                     self._execution_queue.task_done()
                     break
 
-                # Check if this op is blocked
                 if not self._op_runnable[op_name].is_set():
                     # Hold in pending queue instead of re-enqueueing
-                    async with self._pending_lock:
-                        self._pending_blocked[op_name].append(step)
+                    self._pending_blocked[op_name].append(step)
                     logger.debug(
                         f"Op blocked in queue op={op_name} step={step} spmd_id={self.spmd_id} rank={self.rank}"
                     )
@@ -863,8 +872,7 @@ class SPMDWorker:
                         continue
                     elif step > completed_count:
                         # Future task (arrived early), hold for later execution
-                        async with self._pending_lock:
-                            self._pending_future_steps[op_name].append(step)
+                        self._pending_future_steps[op_name].append(step)
                         logger.debug(
                             f"Future task held op={op_name} "
                             f"task_step={step} completed_count={completed_count} spmd_id={self.spmd_id} rank={self.rank}"
@@ -1755,7 +1763,6 @@ class SPMDWorker:
         Advance session progress after completing a step.
         Explicitly differentiates between Count (Progress Watermark) and Index (Task Sequence).
         """
-        # 1. Update completed step count: One step just finished.
         self._completed_step_count[op_name] += 1
         completed_step_count = self._completed_step_count[op_name]
 
@@ -1764,7 +1771,7 @@ class SPMDWorker:
             f"spmd_id={self.spmd_id} rank={self.rank}"
         )
 
-        # 2. Schedule next task: The index of the next task equals the number of already finished tasks.
+        # Schedule next task: The index of the next task equals the number of already finished tasks.
         # e.g., Finished Step Index 0 -> Completed Step Count 1 -> Next Task Index 1.
         next_step_index = completed_step_count
 
@@ -1791,7 +1798,7 @@ class SPMDWorker:
                     f"Source op finished op={op_name} spmd_id={self.spmd_id} rank={self.rank}"
                 )
 
-        # 3. Report definitive completed count to Driver for synchronization/drain.
+        # Report definitive completed count to Driver for synchronization/drain.
         self._report_op_completed(op_name, completed_step_count)
 
         # Check if this op is in periodic_trigger mode
@@ -1801,12 +1808,11 @@ class SPMDWorker:
 
         if not is_periodic:
             # Normal mode: re-enqueue pending future tasks that match the new step
-            async with self._pending_lock:
-                pending = self._pending_future_steps[op_name]
-                to_enqueue = [s for s in pending if s == next_step_index]
-                self._pending_future_steps[op_name] = [
-                    s for s in pending if s != next_step_index
-                ]
+            pending = self._pending_future_steps[op_name]
+            to_enqueue = [s for s in pending if s == next_step_index]
+            self._pending_future_steps[op_name] = [
+                s for s in pending if s != next_step_index
+            ]
 
             for s in to_enqueue:
                 await self._enqueue(op_name, s)
@@ -2412,7 +2418,6 @@ class SPMDWorker:
             )
         for op_name, count in metadata["completed_step_count"].items():
             self._completed_step_count[op_name] = count
-
             # Re-trigger source operators from their restored step count
             if self._op_manager.is_source_operator(op_name):
                 max_steps = self.config.max_steps

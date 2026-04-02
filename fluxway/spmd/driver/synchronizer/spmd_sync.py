@@ -98,6 +98,8 @@ class SPMDSynchronizer:
         self._block_worker_op: Optional[Callable[[int, str], None]] = None
         self._unblock_worker_op: Optional[Callable[[int, str], None]] = None
 
+        self._expected_ops: set = set()
+
         # Drain parameters
         self._drain_target_count: Optional[int] = None
         self._drain_on_drained: Optional[Callable[[], None]] = None
@@ -110,6 +112,13 @@ class SPMDSynchronizer:
                 for op_name, count in metadata.get("completed_step_count", {}).items():
                     old_count = self._worker_completed_count[rank].get(op_name, 0)
                     self._worker_completed_count[rank][op_name] = max(old_count, count)
+
+                    # Initialize _allowed_steps to prevent premature skew-blocking immediately after restore
+                    if (
+                        op_name not in self._allowed_steps
+                        or self._allowed_steps[op_name] < count
+                    ):
+                        self._allowed_steps[op_name] = count
 
             if not self.num_workers:
                 return
@@ -128,6 +137,33 @@ class SPMDSynchronizer:
                     logger.debug(
                         f"SPMD {self.spmd_id} initialized {op_name} total_count {min_count} from manifest"
                     )
+
+    def register_expected_ops(self, ops: List[str]) -> None:
+        """Register statically known operators to properly anchor drain ceilings.
+        Can be called additively to prepare for Eager Mode dynamic scheduling.
+        """
+        with self._lock:
+            self._expected_ops.update(ops)
+
+    def register_expected_op(self, op: str) -> None:
+        """Register a single dynamically dispatched operator for Eager Mode."""
+        with self._lock:
+            self._expected_ops.add(op)
+
+    def _active_ops_for_drain(self) -> set:
+        """Drain denominator: expected ops that have actually been executed.
+
+        An op present in ``_expected_ops`` but never reported (e.g. skipped by
+        Dispatcher for every rank, or a conditional Eager op that never ran on
+        this SPMD) must not block drain completion.  Only ops that have reached
+        ``_spmd_completed_count`` -- meaning at least one worker completed at
+        least one step -- are included.
+
+        Must be called while holding ``_lock``.
+        """
+        if self._expected_ops:
+            return self._expected_ops & set(self._spmd_completed_count.keys())
+        return set(self._spmd_completed_count.keys())
 
     def set_callbacks(
         self,
@@ -179,7 +215,7 @@ class SPMDSynchronizer:
                 )
             ):
                 self._drain_acked_ops.add(op_name)
-                known_ops = set(self._spmd_completed_count.keys())
+                known_ops = self._active_ops_for_drain()
                 if self._drain_acked_ops >= known_ops and known_ops:
                     drain_complete = True
                     # Clear immediately so subsequent completions cannot re-fire the callback.
@@ -279,7 +315,7 @@ class SPMDSynchronizer:
             logger.debug(f"Drain target set to {target_count} spmd_id={self.spmd_id}")
 
             # Instantly check if we are ALREADY drained
-            known_ops = set(self._spmd_completed_count.keys())
+            known_ops = self._active_ops_for_drain()
             for op_name in known_ops:
                 if self._all_workers_reached_count_internal(op_name, target_count):
                     self._drain_acked_ops.add(op_name)

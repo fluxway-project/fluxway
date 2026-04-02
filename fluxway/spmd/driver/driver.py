@@ -98,6 +98,15 @@ if RAY_AVAILABLE:
                 num_workers=config.num_workers,
                 sync_policy=MaxSkewSyncPolicy(config.max_worker_step_skew),
             )
+            # Add known ops dynamically from config
+            if hasattr(config, "operator_metas") and config.operator_metas:
+                self.spmd_synchronizer.register_expected_ops(
+                    list(config.operator_metas.keys())
+                )
+            elif hasattr(config, "operators") and config.operators:
+                self.spmd_synchronizer.register_expected_ops(
+                    list(config.operators.keys())
+                )
 
             self.monitor = SPMDMonitor(spmd_id)
 
@@ -313,7 +322,7 @@ if RAY_AVAILABLE:
         # Snapshot Orchestration (Drain → Snapshot → Resume)
         # =====================================================================
 
-        def request_snapshot(
+        async def request_snapshot(
             self, snapshot_id: str, target_count: int, ckpt_dir: str
         ) -> None:
             if self.state_machine.state not in (DriverState.RUNNING, DriverState.READY):
@@ -325,8 +334,12 @@ if RAY_AVAILABLE:
             self._pending_target_step_count = target_count
             self._pending_ckpt_dir = ckpt_dir
             self.state_machine.trigger(DriverEvent.DRAIN_REQUESTED)
-            for worker in self._worker_handles.values():
-                worker.set_drain_target_count.remote(target_count)
+            await asyncio.gather(
+                *[
+                    worker.set_drain_target_count.remote(target_count)
+                    for worker in self._worker_handles.values()
+                ]
+            )
             self.spmd_synchronizer.drain_to_step_count(
                 target_count=target_count, on_drained=self._on_drain_complete
             )
@@ -341,6 +354,15 @@ if RAY_AVAILABLE:
             self._persist_worker_states()
 
         def _persist_worker_states(self) -> None:
+            if (
+                self._pending_ckpt_dir is None
+                or self._pending_target_step_count is None
+            ):
+                logger.error(
+                    f"Failed to persist worker states: pending_ckpt_dir or pending_target_step_count is not set. spmd_id={self.spmd_id}"
+                )
+                self._clear_drain_and_fail()
+                return
             spmd_dir = (
                 pathlib.Path(self._pending_ckpt_dir)
                 / str(self._pending_target_step_count)
@@ -401,6 +423,10 @@ if RAY_AVAILABLE:
             self.spmd_synchronizer.clear_drain()
             for worker in self._worker_handles.values():
                 worker.clear_drain_target_count.remote()
+            if self.controller_handle and self._pending_snapshot_id:
+                self.controller_handle.report_snapshot_failed.remote(
+                    self.spmd_id, self._pending_snapshot_id
+                )
             self.state_machine.trigger(DriverEvent.SNAPSHOT_FAILED)
 
         def resume(self) -> None:
