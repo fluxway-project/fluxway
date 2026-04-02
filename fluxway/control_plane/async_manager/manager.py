@@ -68,22 +68,6 @@ class AsyncStepManager:
                 spmd_progress.completed_step_count.get(op_name, 0), completed_count
             )
 
-    def report_completed_count(
-        self, spmd_id: str, completed_count: Dict[str, int]
-    ) -> None:
-        """
-        Report all completed counts for an SPMD (from heartbeat).
-        """
-        with self._lock:
-            if spmd_id not in self._spmd_steps:
-                self._spmd_steps[spmd_id] = SPMDOpStep(spmd_id=spmd_id)
-
-            spmd_progress = self._spmd_steps[spmd_id]
-            for op_name, count in completed_count.items():
-                spmd_progress.completed_step_count[op_name] = max(
-                    spmd_progress.completed_step_count.get(op_name, 0), count
-                )
-
     def check_and_enforce_limits(self) -> List[Tuple[str, str, int]]:
         """
         Calculate the allowed step for each operator based on topology and limits.

@@ -862,6 +862,34 @@ class JAXViewWrapper:
         self._apply_slicing(desc)
         return desc
 
+    @property
+    def _sliced_arr(self):
+        if not hasattr(self, "_cached_sliced_arr"):
+            self._cached_sliced_arr = self.arr[self.slices]
+        return self._cached_sliced_arr
+
+    @property
+    def shape(self):
+        return self._sliced_arr.shape
+
+    @property
+    def dtype(self):
+        return self.arr.dtype
+
+    def __jax_array__(self):
+        return self._sliced_arr
+
+    def __array__(self, *args, **kwargs):
+        import numpy as np
+
+        return np.asarray(self._sliced_arr, *args, **kwargs)
+
+    def __dlpack__(self, stream=None):
+        return self._sliced_arr.__dlpack__(stream=stream)
+
+    def __dlpack_device__(self):
+        return self._sliced_arr.__dlpack_device__()
+
     def _apply_slicing(self, desc):
         shape = desc["shape"]
         strides = desc.get("strides")

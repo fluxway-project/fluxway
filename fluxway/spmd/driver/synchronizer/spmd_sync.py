@@ -11,7 +11,7 @@ Responsibilities:
 import logging
 import threading
 from abc import ABC, abstractmethod
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 
 logger = logging.getLogger(__name__)
@@ -102,6 +102,32 @@ class SPMDSynchronizer:
         self._drain_target_count: Optional[int] = None
         self._drain_on_drained: Optional[Callable[[], None]] = None
         self._drain_acked_ops: set = set()  # ops where all workers reached ceiling
+
+    def load_step_counts(self, rank_metadata_map: Dict[int, Dict[str, Any]]) -> None:
+        """Load step counts directly from metadata, skipping callback to avoid RPC storms."""
+        with self._lock:
+            for rank, metadata in rank_metadata_map.items():
+                for op_name, count in metadata.get("completed_step_count", {}).items():
+                    old_count = self._worker_completed_count[rank].get(op_name, 0)
+                    self._worker_completed_count[rank][op_name] = max(old_count, count)
+
+            if not self.num_workers:
+                return
+
+            all_ops = set()
+            for rank_ops in self._worker_completed_count.values():
+                all_ops.update(rank_ops.keys())
+
+            for op_name in all_ops:
+                min_count = min(
+                    self._worker_completed_count[r].get(op_name, 0)
+                    for r in range(self.num_workers)
+                )
+                if min_count > self._spmd_completed_count.get(op_name, 0):
+                    self._spmd_completed_count[op_name] = min_count
+                    logger.debug(
+                        f"SPMD {self.spmd_id} initialized {op_name} total_count {min_count} from manifest"
+                    )
 
     def set_callbacks(
         self,

@@ -2412,8 +2412,6 @@ class SPMDWorker:
             )
         for op_name, count in metadata["completed_step_count"].items():
             self._completed_step_count[op_name] = count
-            # Actively notify the Driver of the rebuilt step to prevent sync disparities
-            self._report_op_completed(op_name, count)
 
             # Re-trigger source operators from their restored step count
             if self._op_manager.is_source_operator(op_name):

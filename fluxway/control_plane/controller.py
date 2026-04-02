@@ -354,15 +354,6 @@ if RAY_AVAILABLE:
             # Route to heartbeat manager
             await self._heartbeat_manager.receive_heartbeat(heartbeat)
 
-            # Update async step manager with completed count
-            if heartbeat.completed_step_count:
-                self._async_step_manager.report_completed_count(
-                    heartbeat.spmd_id, heartbeat.completed_step_count
-                )
-
-            # Check and enforce step limits
-            await self._check_and_enforce_step_limits()
-
             # Update busy status for backpressure
             self._busy_spmds[heartbeat.spmd_id] = heartbeat.busy_worker_ratio
 
@@ -775,6 +766,19 @@ if RAY_AVAILABLE:
             self._last_checkpointed_step = step
 
             self._state_manager.save_snapshot(snapshot_id, manifest)
+
+            # Hydrate Control Plane metadata synchronously from manifest before unblocking
+            # to guarantee step watermarks are correct before any worker executes.
+            for spmd_id, rank_map_str in manifest.items():
+                for metadata in rank_map_str.values():
+                    for op_name, count in metadata.get(
+                        "completed_step_count", {}
+                    ).items():
+                        self._async_step_manager.report_op_completed(
+                            spmd_id, op_name, count
+                        )
+
+            await self._check_and_enforce_step_limits()
 
             await self.block_all_spmds()
 

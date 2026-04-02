@@ -373,6 +373,11 @@ if RAY_AVAILABLE:
                 )
                 for rank, worker in self._worker_handles.items()
             }
+            # Submit snapshot metadata to controller.
+            # This is a fire-and-forget remote call. In Ray, `.remote()` does not block
+            # and will not raise network/actor-dead errors synchronously.
+            # Synchronous exceptions here only indicate local programmatic bugs (e.g. TypeError)
+            # and should fail-fast directly rather than being swallowed by generic exception handlers.
             if self.controller_handle is None:
                 logger.error(
                     f"controller_handle is None, cannot report snapshot metadata "
@@ -380,23 +385,10 @@ if RAY_AVAILABLE:
                 )
                 self._clear_drain_and_fail()
                 return
-            try:
-                self.controller_handle.receive_snapshot_metadata.remote(
-                    self.spmd_id, self._pending_snapshot_id, metadata_futures
-                )
-            except Exception as e:
-                logger.error(
-                    f"Failed to report snapshot metadata error={e} spmd_id={self.spmd_id}"
-                )
-                # Notify Controller so it can unblock its awaiting request_snapshot
-                # coroutine rather than hanging indefinitely on done_event.wait().
-                try:
-                    self.controller_handle.report_snapshot_failed.remote(
-                        self.spmd_id, self._pending_snapshot_id
-                    )
-                except Exception:
-                    pass
-                self._clear_drain_and_fail()
+
+            self.controller_handle.receive_snapshot_metadata.remote(
+                self.spmd_id, self._pending_snapshot_id, metadata_futures
+            )
 
         def _clear_drain_and_fail(self) -> None:
             """Unblock all drained Workers, then mark this Driver as failed.
@@ -445,6 +437,8 @@ if RAY_AVAILABLE:
                 rank_metadata_map: {rank: metadata_dict} where metadata_dict contains
                                    ``backend`` and backend-specific path fields.
             """
+            self.spmd_synchronizer.load_step_counts(rank_metadata_map)
+
             tasks = []
             for rank, metadata in rank_metadata_map.items():
                 worker = self._worker_handles.get(rank)
