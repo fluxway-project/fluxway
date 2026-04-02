@@ -651,50 +651,47 @@ class SPMDWorker:
         )
         global_shapes = global_shapes if global_shapes is not None else [None] * num
 
-        # Group by operator using node-local TUUID dispatch table
-        op_to_indices = {}  # {op_name: [idx_in_bundle, ...]}
-        for i, u in enumerate(tuuids):
-            ops = self._op_manager.get_operators_for_tuuid(u)
-            for op_name in ops:
-                if op_name not in op_to_indices:
-                    op_to_indices[op_name] = []
-                op_to_indices[op_name].append(i)
-
-        watermark = 0
-        # Pre-parse the flat RPC list into per-TUUID bundles based on meta_state
-        # This allows us to correctly pick shards for different operators.
-        per_tuuid_payloads = []
-        per_tuuid_counts = []
+        op_bundles: Dict[str, Tuple[list, list, list, list, list, list]] = {}
         cursor = 0
-        for i, u in enumerate(tuuids):
+        for i in range(num):
+            u = tuuids[i]
             meta_state = meta_tensor_state_list[i]
+
             n_elements = 1
-            if meta_state & 1:  # Ragged
+            if meta_state & 1:
                 n_elements += 1
-            if meta_state & 2:  # Materialized Index
+            if meta_state & 2:
                 n_elements += 1
 
-            per_tuuid_payloads.append(payloads[cursor : cursor + n_elements])
-            per_tuuid_counts.append(counts[cursor : cursor + n_elements])
+            tuuid_payloads = payloads[cursor : cursor + n_elements]
+            tuuid_counts = counts[cursor : cursor + n_elements]
             cursor += n_elements
 
-        for op_name, indices in op_to_indices.items():
+            ops = self._op_manager.get_operators_for_tuuid(u)
+            for op_name in ops:
+                if op_name not in op_bundles:
+                    op_bundles[op_name] = ([], [], [], [], [], [])
+                bundle = op_bundles[op_name]
+                bundle[0].append(u)
+                bundle[1].extend(tuuid_payloads)
+                bundle[2].extend(tuuid_counts)
+                bundle[3].append(global_shapes[i])
+                bundle[4].append(meta_state)
+                bundle[5].append(
+                    slice_compact_desc_params[i] if slice_compact_desc_params else None
+                )
+
+        watermark = 0
+        for op_name, (
+            sub_uuids,
+            sub_payloads,
+            sub_counts,
+            sub_shapes,
+            sub_meta,
+            sub_compact,
+        ) in op_bundles.items():
             self._ensure_step_declared(op_name, step)
 
-            # Extract subsets for this operator
-            sub_uuids = [tuuids[i] for i in indices]
-            sub_shapes = [global_shapes[i] for i in indices]
-            sub_meta = [meta_tensor_state_list[i] for i in indices]
-
-            # Re-flatten the payloads/counts for this specific operator's shards
-            sub_payloads = []
-            sub_counts = []
-            for i in indices:
-                sub_payloads.extend(per_tuuid_payloads[i])
-                sub_counts.extend(per_tuuid_counts[i])
-
-            # Automatic lookup for sender world size based on topology or eager mesh
-            # Assume first TUUID in subset is representative of the sender's world size for this edge
             sender_world_size = self._op_manager.get_sender_world_size(
                 op_name, sender_id, sub_uuids[0]
             )
@@ -715,10 +712,8 @@ class SPMDWorker:
                 sub_counts,
                 sub_shapes,
                 meta_tensor_state_list=sub_meta,
-                slice_compact_desc_params=[
-                    slice_compact_desc_params[i] for i in indices
-                ]
-                if slice_compact_desc_params
+                slice_compact_desc_params=sub_compact
+                if any(c is not None for c in sub_compact)
                 else None,
             )
         return watermark

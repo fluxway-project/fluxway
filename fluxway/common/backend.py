@@ -294,6 +294,13 @@ class TensorBackend(ABC):
         """
         pass
 
+    @property
+    def supports_zero_copy_view(self) -> bool:
+        return False
+
+    def get_contiguous_view(self, tensor: Any, offset: int, count: int) -> Any:
+        return tensor[offset : offset + count]
+
 
 class TorchBackend(TensorBackend):
     def __init__(self):
@@ -583,6 +590,13 @@ class TorchBackend(TensorBackend):
         x[indices] = values
         return x
 
+    @property
+    def supports_zero_copy_view(self) -> bool:
+        return True
+
+    def get_contiguous_view(self, tensor: Any, offset: int, count: int) -> Any:
+        return tensor[offset : offset + count]
+
 
 class JaxBackend(TensorBackend):
     def __init__(self):
@@ -840,6 +854,13 @@ class JaxBackend(TensorBackend):
     def index_update(self, x: Any, indices: Any, values: Any) -> Any:
         return x.at[indices].set(values)
 
+    @property
+    def supports_zero_copy_view(self) -> bool:
+        return True
+
+    def get_contiguous_view(self, tensor: Any, offset: int, count: int) -> Any:
+        return JAXViewWrapper(tensor, slice(offset, offset + count))
+
 
 class JAXViewWrapper:
     def __init__(self, arr, slices):
@@ -856,9 +877,17 @@ class JAXViewWrapper:
 
     @property
     def __array_interface__(self):
-        if not hasattr(self.arr, "__array_interface__"):
+        if hasattr(self.arr, "__array_interface__"):
+            desc = self.arr.__array_interface__.copy()
+        elif hasattr(self.arr, "unsafe_buffer_pointer"):
+            desc = {
+                "shape": self.arr.shape,
+                "typestr": self.arr.dtype.str,
+                "data": (self.arr.unsafe_buffer_pointer(), False),
+                "version": 3,
+            }
+        else:
             raise AttributeError
-        desc = self.arr.__array_interface__.copy()
         self._apply_slicing(desc)
         return desc
 

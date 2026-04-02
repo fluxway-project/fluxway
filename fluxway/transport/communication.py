@@ -451,12 +451,18 @@ class BaseDataDistributor:
                     slice_compact_desc_params.append(None)
             return slice_compact_desc_params
 
+        backend = get_backend()
+
         def _get_flat_payloads_for_rank(device_id):
             """Slice this device's segment out of each O(N) flat buffer.
 
             flat_buffers_lists holds globally-reordered 1-D arrays.  Each device's
             data occupies a contiguous window [offset, offset+count), so a single
-            Python slice replaces the former vmap-padded 2-D matrix indexing.
+            backend.get_contiguous_view call extracts the view.
+
+            On backends with DMA support (NCCL/UCX), the returned view exposes
+            __cuda_array_interface__ without any data copy; on Ray the default
+            implementation falls back to a plain Python slice.
             """
             p_flat = []
             c_flat = []
@@ -466,13 +472,15 @@ class BaseDataDistributor:
                 p_data, p_len = flat_buffers_lists[p_idx]
                 offset = int(offsets_per_payload_host[c_idx][device_id])
                 count = int(counts_per_payload_host[c_idx][device_id])
-                p_flat.append(p_data[offset : offset + count])
+                p_flat.append(backend.get_contiguous_view(p_data, offset, count))
                 c_flat.append(count)
 
                 if p_len is not None:  # ragged: also slice the item-length array
                     len_offset = int(offsets_per_payload_host[c_idx + 1][device_id])
                     count_len = int(counts_per_payload_host[c_idx + 1][device_id])
-                    p_flat.append(p_len[len_offset : len_offset + count_len])
+                    p_flat.append(
+                        backend.get_contiguous_view(p_len, len_offset, count_len)
+                    )
                     c_flat.append(count_len)
                     c_idx += 1
 
@@ -483,7 +491,7 @@ class BaseDataDistributor:
                     p_data, _ = flat_buffers_lists[p_idx]
                     offset = int(offsets_per_payload_host[c_idx][device_id])
                     count = int(counts_per_payload_host[c_idx][device_id])
-                    p_flat.append(p_data[offset : offset + count])
+                    p_flat.append(backend.get_contiguous_view(p_data, offset, count))
                     c_flat.append(count)
                     p_idx += 1
                     c_idx += 1
