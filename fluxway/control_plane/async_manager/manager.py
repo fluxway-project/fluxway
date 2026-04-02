@@ -50,6 +50,9 @@ class AsyncStepManager:
         # Op lock states: (spmd_id, op_type) -> OpLockState
         self._lock_states: Dict[Tuple[str, str], OpLockState] = {}
 
+        # Cache for last issued allowed steps to optimize Controller RPCs
+        self._last_allowed_steps: Dict[Tuple[str, str], int] = {}
+
         # Lock for thread safety
         self._lock = threading.Lock()
 
@@ -129,25 +132,15 @@ class AsyncStepManager:
                     if self._config.max_steps is not None:
                         allowed_step = min(allowed_step, self._config.max_steps)
 
-                    updates.append((node_id, op_name, allowed_step))
+                    cache_key = (node_id, op_name)
+                    if (
+                        cache_key not in self._last_allowed_steps
+                        or allowed_step > self._last_allowed_steps[cache_key]
+                    ):
+                        self._last_allowed_steps[cache_key] = allowed_step
+                        updates.append((node_id, op_name, allowed_step))
 
         return updates
-
-    def is_all_completed(self) -> bool:
-        """Check if all operators in all SPMDs have reached max_steps."""
-        if self._config.max_steps is None:
-            return False
-
-        with self._lock:
-            for spmd_id, node in self._graph.nodes.items():
-                spmd_step = self._spmd_steps.get(spmd_id)
-                if not spmd_step or not spmd_step.completed_step_count:
-                    return False
-
-                for op_name, count in spmd_step.completed_step_count.items():
-                    if count < self._config.max_steps:
-                        return False
-        return True
 
     def _is_locked(self, spmd_id: str, op_name: str) -> bool:
         """Check if an op is locked (must hold lock)."""

@@ -57,6 +57,10 @@ class ControllerStateMachine:
         ): ControllerState.BLOCKED,
         (
             ControllerState.BLOCKED,
+            ControllerEvent.DRIVER_ERROR,
+        ): ControllerState.BLOCKED,
+        (
+            ControllerState.BLOCKED,
             ControllerEvent.DRIVER_RECOVERED,
         ): ControllerState.RUNNING,
         (
@@ -105,6 +109,7 @@ class ControllerStateMachine:
 
         # Track error information
         self._error_spmds: Dict[str, str] = {}  # spmd_id -> error_message
+        self._restarting_spmds: set = set()
 
     @property
     def state(self) -> ControllerState:
@@ -147,7 +152,13 @@ class ControllerStateMachine:
                 spmd_id = kwargs.get("spmd_id")
                 if spmd_id and spmd_id in self._error_spmds:
                     del self._error_spmds[spmd_id]
+                if spmd_id and spmd_id in self._restarting_spmds:
+                    self._restarting_spmds.remove(spmd_id)
                 logger.debug(f"Driver recovered: {spmd_id}")
+
+                if current == ControllerState.BLOCKED and self._error_spmds:
+                    # Do not transition if there are still errors
+                    return True
 
             # Perform state transition
             old_state = self._state
@@ -238,8 +249,14 @@ class ControllerStateMachine:
         try:
             await self._controller._heartbeat_manager.start_monitoring_async()
             logger.debug("Heartbeat timeout monitoring started")
+            # If Drain strategy is configured, issue the first drain target to trigger execution
+            has_trigger = getattr(self._controller, "_issue_initial_drain", None)
+            if has_trigger:
+                await self._controller._issue_initial_drain()
         except Exception as e:
-            logger.error(f"Failed to start heartbeat monitoring: {e}")
+            logger.error(
+                f"Failed to start heartbeat monitoring or issue initial drain: {e}"
+            )
 
         # Prevent discarded events: Check if operations were already completed during restoration (PENDING state).
         # We perform this check upon entering RUNNING state to safely trigger completion.
@@ -267,10 +284,14 @@ class ControllerStateMachine:
         error_spmds = list(self._error_spmds.keys())
 
         for spmd_id in error_spmds:
+            if spmd_id in self._restarting_spmds:
+                continue
+            self._restarting_spmds.add(spmd_id)
             try:
                 await self._controller.restart_spmd(spmd_id)
             except Exception as e:
                 logger.error(f"Failed to restart SPMD {spmd_id}: {e}")
+                self._restarting_spmds.discard(spmd_id)
 
     async def _on_enter_completed(self) -> None:
         """
@@ -309,4 +330,5 @@ class ControllerStateMachine:
         async with self._lock:
             self._state = ControllerState.INITIALIZING
             self._error_spmds.clear()
+            self._restarting_spmds.clear()
         logger.debug("Controller state machine reset")

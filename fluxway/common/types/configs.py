@@ -163,8 +163,10 @@ class SPMDConfig(FluxwayBaseSchema):
         0  # Max allowed step diff between workers in a mesh (intra-SPMD sync)
     )
     # Global step limit for the SPMD. If set, source operators will self-terminate
-    # after reaching this step count.
     max_steps: Optional[int] = None
+
+    # If true, worker will block identically at step=0 until a drain target is provided.
+    requires_drain_at_startup: bool = False
 
     @property
     def num_workers(self) -> int:
@@ -693,6 +695,7 @@ class ControllerEvent(str, Enum):
     DRIVER_ERROR = "driver_error"  # Driver heartbeat timeout or error
     DRIVER_RECOVERED = "driver_recovered"  # Abnormal driver recovered
     ALL_DRIVERS_COMPLETED = "all_drivers_completed"  # All drivers report completion
+    ALL_DRIVERS_DRAINED = "all_drivers_drained"  # All drivers reached DRAINED state
     RECOVERY_FAILED = "recovery_failed"  # Recovery failed
 
 
@@ -703,7 +706,8 @@ class DriverState(str, Enum):
     READY = "ready"  # Ready, waiting for Controller command
     RUNNING = "running"  # Running
     BLOCKED = "blocked"  # Blocked
-    DRAINING = "draining"  # Draining to target step before snapshot
+    DRAINING = "draining"  # Draining to target step
+    DRAINED = "drained"  # Reached the drain target step
     SNAPSHOTTING = "snapshotting"  # Extracting operator states via save_state
     ERROR = "error"  # Error state
     RECOVERING = "recovering"  # Recovering
@@ -724,6 +728,7 @@ class DriverEvent(str, Enum):
     COMPLETE = "complete"
     DRAIN_REQUESTED = "drain_requested"
     DRAIN_COMPLETE = "drain_complete"
+    SNAPSHOT_REQUESTED = "snapshot_requested"
     SNAPSHOT_COMPLETE = "snapshot_complete"
     SNAPSHOT_FAILED = "snapshot_failed"
 

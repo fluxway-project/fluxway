@@ -244,8 +244,10 @@ class SPMDWorker:
 
         # Drain-to-step state
         self._drain_target_count: Optional[int] = None
-        self._drain_resume_event: asyncio.Event = asyncio.Event()
-        self._drain_resume_event.set()  # set = not draining
+        self._drain_cond: asyncio.Condition = asyncio.Condition()
+        if self.config and getattr(self.config, "requires_drain_at_startup", False):
+            # Block at step 0 until Controller issues the initial drain target!
+            self._drain_target_count = 0
 
         # Expected topology counts for auto-start detection
         # Initialize to None to strictly wait for registration from driver
@@ -1015,15 +1017,16 @@ class SPMDWorker:
             # already been completed (completed_step_count == N).  Therefore blocking
             # at step >= target_count guarantees that workers halt only after completing
             # exactly target_count steps, which is when the Synchronizer's ACK fires.
-            if (
-                self._drain_target_count is not None
-                and step >= self._drain_target_count
-            ):
-                logger.debug(
-                    f"Self-blocking due to drain target={self._drain_target_count} "
-                    f"task_step={step} spmd_id={self.spmd_id} rank={self.rank}"
-                )
-                await self._drain_resume_event.wait()
+            async with self._drain_cond:
+                while (
+                    self._drain_target_count is not None
+                    and step >= self._drain_target_count
+                ):
+                    logger.debug(
+                        f"Self-blocking due to drain target={self._drain_target_count} "
+                        f"task_step={step} spmd_id={self.spmd_id} rank={self.rank}"
+                    )
+                    await self._drain_cond.wait()
 
             # --- Dispatcher Check: Should this rank execute this step? ---
             dispatcher = self._op_manager.get_dispatcher(op_name)
@@ -2527,21 +2530,25 @@ class SPMDWorker:
     # Drain Control (called by Driver before drain_to_step_count)
     # =========================================================================
 
-    def set_drain_target_count(self, target_count: int) -> None:
+    async def set_drain_target_count(self, target_count: int) -> None:
         """
         Request worker to self-block once 'target_count' steps are finished.
         """
-        self._drain_target_count = target_count
-        self._drain_resume_event.clear()
-        logger.debug(
-            f"Drain target set to {target_count} spmd_id={self.spmd_id} rank={self.rank}"
-        )
+        async with self._drain_cond:
+            self._drain_target_count = target_count
+            self._drain_cond.notify_all()
+            logger.debug(
+                f"Drain target set to {target_count} spmd_id={self.spmd_id} rank={self.rank}"
+            )
 
-    def clear_drain_target_count(self) -> None:
+    async def clear_drain_target_count(self) -> None:
         """Remove the drain target and let deferred executions proceed."""
-        self._drain_target_count = None
-        self._drain_resume_event.set()
-        logger.debug(f"Drain target cleared spmd_id={self.spmd_id} rank={self.rank}")
+        async with self._drain_cond:
+            self._drain_target_count = None
+            self._drain_cond.notify_all()
+            logger.debug(
+                f"Drain target cleared spmd_id={self.spmd_id} rank={self.rank}"
+            )
 
     # =========================================================================
     # Source Node Control

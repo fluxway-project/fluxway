@@ -322,17 +322,13 @@ if RAY_AVAILABLE:
         # Snapshot Orchestration (Drain → Snapshot → Resume)
         # =====================================================================
 
-        async def request_snapshot(
-            self, snapshot_id: str, target_count: int, ckpt_dir: str
-        ) -> None:
+        async def request_drain(self, target_count: int, reason: str = "") -> None:
             if self.state_machine.state not in (DriverState.RUNNING, DriverState.READY):
                 raise RuntimeError(
-                    f"request_snapshot requires RUNNING or READY state, "
+                    f"request_drain requires RUNNING or READY state, "
                     f"got {self.state_machine.state} spmd_id={self.spmd_id}"
                 )
-            self._pending_snapshot_id = snapshot_id
             self._pending_target_step_count = target_count
-            self._pending_ckpt_dir = ckpt_dir
             self.state_machine.trigger(DriverEvent.DRAIN_REQUESTED)
             await asyncio.gather(
                 *[
@@ -344,6 +340,20 @@ if RAY_AVAILABLE:
                 target_count=target_count, on_drained=self._on_drain_complete
             )
 
+        async def request_snapshot(
+            self, snapshot_id: str, target_count: int, ckpt_dir: str
+        ) -> None:
+            if self.state_machine.state != DriverState.DRAINED:
+                raise RuntimeError(
+                    f"request_snapshot requires DRAINED state, "
+                    f"got {self.state_machine.state} spmd_id={self.spmd_id}"
+                )
+            self.state_machine.trigger(DriverEvent.SNAPSHOT_REQUESTED)
+            self._pending_snapshot_id = snapshot_id
+            self._pending_target_step_count = target_count
+            self._pending_ckpt_dir = ckpt_dir
+            self._persist_worker_states()
+
         def _on_drain_complete(self) -> None:
             if self.state_machine.state != DriverState.DRAINING:
                 raise RuntimeError(
@@ -351,7 +361,8 @@ if RAY_AVAILABLE:
                     f"got {self.state_machine.state} spmd_id={self.spmd_id}"
                 )
             self.state_machine.trigger(DriverEvent.DRAIN_COMPLETE)
-            self._persist_worker_states()
+            if self.controller_handle is not None:
+                self.controller_handle.report_driver_drained.remote(self.spmd_id)
 
         def _persist_worker_states(self) -> None:
             if (
@@ -441,9 +452,12 @@ if RAY_AVAILABLE:
               2. Fan-out clear_drain_target_count to all Workers so they resume
                  executing steps that were deferred behind the target.
             """
-            if self.state_machine.state != DriverState.SNAPSHOTTING:
+            if self.state_machine.state not in (
+                DriverState.SNAPSHOTTING,
+                DriverState.DRAINED,
+            ):
                 raise RuntimeError(
-                    f"resume requires SNAPSHOTTING state, "
+                    f"resume requires SNAPSHOTTING or DRAINED state, "
                     f"got {self.state_machine.state} spmd_id={self.spmd_id}"
                 )
             self.spmd_synchronizer.clear_drain()

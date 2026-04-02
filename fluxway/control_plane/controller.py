@@ -46,6 +46,7 @@ from fluxway.control_plane.heartbeat import HeartbeatManager
 from fluxway.control_plane.state_machine import ControllerStateMachine
 from fluxway.control_plane.async_manager import AsyncStepManager
 from fluxway.common.types import CheckpointConfig
+from fluxway.common.types.drain import DrainStrategy, GraphModeDrainStrategy
 
 logger = get_logger(__name__)
 
@@ -171,11 +172,14 @@ if RAY_AVAILABLE:
                 graph.source_nodes if graph.source_nodes else self._find_source_nodes()
             )
 
-            # Initialization flag
             self._initialized = False
             self._spmd_manager: Optional[SPMDManager] = None
             self._heartbeat_manager: Optional[HeartbeatManager] = None
             self._checkpointer = None
+            self._drain_strategy: Optional[DrainStrategy] = None
+            self._last_requested_drain_target: int = 0
+            self._last_completed_drain_target: int = 0
+            self._drained_drivers: set = set()
 
             # Backpressure tracking
             self._busy_spmds: Dict[str, float] = {}  # {spmd_id: busy_worker_ratio}
@@ -255,6 +259,9 @@ if RAY_AVAILABLE:
                             force_write=self._checkpoint_config.force_write,
                         )
                     )
+                    self._drain_strategy = GraphModeDrainStrategy(
+                        interval_steps=self._checkpoint_config.interval_steps
+                    )
 
                 # Assign specific max_steps to each node based on global config and overrides
                 for node_id, node in self._graph.nodes.items():
@@ -264,6 +271,9 @@ if RAY_AVAILABLE:
                     if limit is not None:
                         node.spmd_config.max_steps = limit
                         logger.debug(f"Assigned max_steps={limit} to node {node_id}")
+
+                    if self._drain_strategy is not None:
+                        node.spmd_config.requires_drain_at_startup = True
 
                 # Register SPMDs for heartbeat monitoring
                 for node_name in self._graph.nodes:
@@ -380,16 +390,9 @@ if RAY_AVAILABLE:
                 spmd_id, op_name, completed_count
             )
             await self._check_and_enforce_step_limits()
-            await self._maybe_trigger_checkpoint(completed_count)
 
         async def _check_and_enforce_step_limits(self) -> None:
             """Check step differences and apply lock/unlock actions."""
-            if self._async_step_manager.is_all_completed():
-                logger.debug("All operators reached max_steps, triggering completion")
-                await self._state_machine.trigger_event(
-                    ControllerEvent.ALL_DRIVERS_COMPLETED
-                )
-                return
 
             for (
                 spmd_id,
@@ -398,47 +401,92 @@ if RAY_AVAILABLE:
             ) in self._async_step_manager.check_and_enforce_limits():
                 await self._set_spmd_allowed_step(spmd_id, op_name, allowed_step)
 
-        async def _maybe_trigger_checkpoint(self, completed_count: int) -> None:
-            """
-            Event-driven proactive checkpoint trigger.
+        async def report_driver_drained(self, spmd_id: str) -> None:
+            """Called by a driver when it has successfully drained to the target."""
+            self._drained_drivers.add(spmd_id)
+            if len(self._drained_drivers) == len(self._graph.nodes):
+                logger.debug("All drivers have reached the drain target")
+                await self._on_all_drivers_drained()
 
-            A checkpoint is scheduled only when every SPMD's every op has
-            completed at least `next_ckpt` steps, ensuring the snapshot is globally
-            consistent with drain_to_step_count mechanism.
-            """
-            # Prevent fast-starting operators from triggering global checkpoints before
-            # all drivers are fully compiled and initialized across the cluster.
-            if not self._state_machine.is_running():
-                return
-            if self._checkpointer is None:
-                return
-            if self._checkpoint_task is not None and not self._checkpoint_task.done():
-                return
-
-            interval = self._checkpointer.interval_steps
-            next_ckpt = self._last_checkpointed_step + interval
-            # Only first op completion triggers checkpoint
-            if completed_count < next_ckpt:
-                return
-
-            # Advance the watermark before launching the task so that a
-            # persistent failure (e.g. disk full) skips this boundary and
-            # moves on to the next, rather than retrying the same boundary on
-            # every subsequent report_op_completed call.
-            self._last_checkpointed_step = next_ckpt
-
-            async def do_ckpt(boundary: int) -> None:
-                logger.info(
-                    f"Proactively scheduled checkpoint boundary at count {boundary}"
+        async def _issue_initial_drain(self) -> None:
+            """Issues the very first drain target to unlock workers at step 0."""
+            if self._drain_strategy is not None:
+                initial_target = self._drain_strategy.get_initial_drain_target(
+                    self._last_requested_drain_target
                 )
-                try:
-                    await self._checkpointer.save(boundary)
-                except Exception as e:
-                    logger.error(
-                        f"Checkpoint at step {boundary} failed and will be skipped: {e}"
-                    )
+                if initial_target is not None:
+                    logger.info(f"Issuing initial drain target: {initial_target}")
+                    await self._schedule_drain(initial_target)
 
-            self._checkpoint_task = asyncio.create_task(do_ckpt(next_ckpt))
+        async def _schedule_drain(self, target: int) -> None:
+            """Broadcast a new drain target to all drivers."""
+            max_steps = getattr(self._async_step_manager._config, "max_steps", None)
+            if max_steps is not None:
+                target = min(target, max_steps)
+
+            self._last_requested_drain_target = target
+            driver_tasks = []
+            for spmd_id in self._graph.nodes.keys():
+                driver = self._spmd_manager.get_driver_handle(spmd_id)
+                if driver:
+                    driver_tasks.append(driver.request_drain.remote(target))
+            if driver_tasks:
+                await asyncio.gather(*driver_tasks)
+
+        async def _on_all_drivers_drained(self) -> None:
+            """Triggered when all drivers are blocked at the designated drain target."""
+            self._drained_drivers.clear()
+            if self._checkpointer is not None:
+                # Issue snapshot
+                async def do_ckpt(boundary: int) -> None:
+                    logger.info(f"Checkpointer executing snapshot at count {boundary}")
+                    try:
+                        await self._checkpointer.save(boundary)
+                    except Exception as e:
+                        logger.error(f"Checkpoint save failed: {e}")
+                    finally:
+                        # Always release drain and schedule the next iteration
+                        await self._resume_and_schedule_next_drain()
+                        await self._check_and_enforce_step_limits()
+
+                self._checkpoint_task = asyncio.create_task(
+                    do_ckpt(self._last_requested_drain_target)
+                )
+            else:
+                # No checkpointer configured.
+                # In future 'eager' mode, this would notify the caller.
+                await self._resume_and_schedule_next_drain()
+                await self._check_and_enforce_step_limits()
+
+        async def _resume_and_schedule_next_drain(self) -> None:
+            self._last_completed_drain_target = self._last_requested_drain_target
+            max_steps = getattr(self._async_step_manager._config, "max_steps", None)
+
+            if max_steps is not None and self._last_completed_drain_target >= max_steps:
+                logger.debug(
+                    "Final drain completed (reached max_steps), triggering completion"
+                )
+                await self._state_machine.trigger_event(
+                    ControllerEvent.ALL_DRIVERS_COMPLETED
+                )
+                return
+
+            # 1. Clear drain / Snapshot completed
+            futures = []
+            for spmd_id in self._graph.nodes.keys():
+                driver = self._spmd_manager.get_driver_handle(spmd_id)
+                if driver is not None:
+                    futures.append(driver.resume.remote())
+            if futures:
+                await asyncio.gather(*futures, return_exceptions=True)
+
+            # 2. Schedule next drain
+            if self._drain_strategy is not None:
+                next_target = self._drain_strategy.get_next_drain_target(
+                    self._last_requested_drain_target
+                )
+                if next_target is not None:
+                    await self._schedule_drain(next_target)
 
         @require_spmd_manager
         async def _set_spmd_allowed_step(
@@ -715,11 +763,7 @@ if RAY_AVAILABLE:
             snap_info["received"] += 1
 
             if snap_info["received"] == snap_info["expected"]:
-                logger.info(f"Snapshot '{snapshot_id}' complete — resuming all Drivers")
-                for s_id in self._spmd_manager.get_all_spmd_ids():
-                    driver = self._spmd_manager.get_driver_handle(s_id)
-                    if driver is not None:
-                        driver.resume.remote()
+                logger.info(f"Snapshot '{snapshot_id}' complete")
                 snap_info["event"].set()
 
         async def report_snapshot_failed(self, spmd_id: str, snapshot_id: str) -> None:
@@ -772,6 +816,7 @@ if RAY_AVAILABLE:
             # Important: update the baseline *before* waking up workers,
             # so their `report_op_completed` pulses don't trigger a nested checkpoint.
             self._last_checkpointed_step = step
+            self._last_requested_drain_target = step
 
             self._state_manager.save_snapshot(snapshot_id, manifest)
 
@@ -947,7 +992,7 @@ if RAY_AVAILABLE:
             pg_info = self._scheduler.pg_manager.get_pg_info(spmd_id)
 
             # Restart SPMD
-            handle = self._spmd_manager.restore_spmd(
+            handle = await self._spmd_manager.restore_spmd(
                 spmd_id=spmd_id,
                 config=node.spmd_config,
                 placement_group=pg_info.get("pg") if pg_info else None,
@@ -1033,12 +1078,10 @@ if RAY_AVAILABLE:
             """Callback when a driver recovers."""
             logger.debug(f"Driver {spmd_id} recovered")
 
-            # Check if all error drivers have recovered
-            error_spmds = self._state_machine.get_error_spmds()
-            if not error_spmds:
-                await self._state_machine.trigger_event(
-                    ControllerEvent.DRIVER_RECOVERED, spmd_id=spmd_id
-                )
+            # Trigger FSM, the FSM will decide if it needs to transition
+            await self._state_machine.trigger_event(
+                ControllerEvent.DRIVER_RECOVERED, spmd_id=spmd_id
+            )
 
         # =====================================================================
         # Internal Methods for State Machine

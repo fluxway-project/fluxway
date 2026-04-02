@@ -28,13 +28,28 @@ class TestSnapshotHappyPath:
         fsm.trigger(DriverEvent.DRAIN_REQUESTED)
         assert fsm.state == DriverState.DRAINING
 
-    def test_draining_to_snapshotting(self):
+    def test_draining_to_drained(self):
         fsm, _ = _make_fsm()
         fsm.trigger(DriverEvent.DRAIN_REQUESTED)
         fsm.trigger(DriverEvent.DRAIN_COMPLETE)
+        assert fsm.state == DriverState.DRAINED
+
+    def test_drained_to_snapshotting(self):
+        fsm, _ = _make_fsm()
+        fsm.trigger(DriverEvent.DRAIN_REQUESTED)
+        fsm.trigger(DriverEvent.DRAIN_COMPLETE)
+        fsm.trigger(DriverEvent.SNAPSHOT_REQUESTED)
         assert fsm.state == DriverState.SNAPSHOTTING
 
     def test_snapshotting_to_running(self):
+        fsm, _ = _make_fsm()
+        fsm.trigger(DriverEvent.DRAIN_REQUESTED)
+        fsm.trigger(DriverEvent.DRAIN_COMPLETE)
+        fsm.trigger(DriverEvent.SNAPSHOT_REQUESTED)
+        fsm.trigger(DriverEvent.SNAPSHOT_COMPLETE)
+        assert fsm.state == DriverState.RUNNING
+
+    def test_drained_to_running_no_snapshot(self):
         fsm, _ = _make_fsm()
         fsm.trigger(DriverEvent.DRAIN_REQUESTED)
         fsm.trigger(DriverEvent.DRAIN_COMPLETE)
@@ -53,6 +68,7 @@ class TestSnapshotErrorPaths:
         fsm, _ = _make_fsm()
         fsm.trigger(DriverEvent.DRAIN_REQUESTED)
         fsm.trigger(DriverEvent.DRAIN_COMPLETE)
+        fsm.trigger(DriverEvent.SNAPSHOT_REQUESTED)
         fsm.trigger(DriverEvent.WORKER_ERROR, rank=0, error="crash")
         assert fsm.state == DriverState.ERROR
 
@@ -60,6 +76,7 @@ class TestSnapshotErrorPaths:
         fsm, _ = _make_fsm()
         fsm.trigger(DriverEvent.DRAIN_REQUESTED)
         fsm.trigger(DriverEvent.DRAIN_COMPLETE)
+        fsm.trigger(DriverEvent.SNAPSHOT_REQUESTED)
         fsm.trigger(DriverEvent.SNAPSHOT_FAILED)
         assert fsm.state == DriverState.ERROR
 
@@ -83,6 +100,7 @@ class TestBlockGuard:
         fsm, _ = _make_fsm()
         fsm.trigger(DriverEvent.DRAIN_REQUESTED)
         fsm.trigger(DriverEvent.DRAIN_COMPLETE)
+        fsm.trigger(DriverEvent.SNAPSHOT_REQUESTED)
         result = fsm.trigger(DriverEvent.BLOCK_REQUESTED)
         assert result is False
         assert fsm.state == DriverState.SNAPSHOTTING
@@ -91,6 +109,7 @@ class TestBlockGuard:
         fsm, _ = _make_fsm()
         fsm.trigger(DriverEvent.DRAIN_REQUESTED)
         fsm.trigger(DriverEvent.DRAIN_COMPLETE)
+        fsm.trigger(DriverEvent.SNAPSHOT_REQUESTED)
         result = fsm.trigger(DriverEvent.UNBLOCK_REQUESTED)
         assert result is False
         assert fsm.state == DriverState.SNAPSHOTTING

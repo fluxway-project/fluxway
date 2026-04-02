@@ -140,13 +140,14 @@ def test_async_manager_edge_limit():
     manager.report_op_completed("A", op_a, 2)
     updates = manager.check_and_enforce_limits()
     # A is at 2, B is at 0. diff=2. allowed_step = B(0) + limit(2) = 2.
-    assert ("A", op_a, 2) in updates
+    # Cached, should not return update
+    assert not any(u for u in updates if u[0] == "A" and u[1] == op_a)
 
     # 3. A moves to step 3
     manager.report_op_completed("A", op_a, 3)
     updates = manager.check_and_enforce_limits()
-    # Still allowed_step = 2.
-    assert ("A", op_a, 2) in updates
+    # Still allowed_step = 2, cached.
+    assert not any(u for u in updates if u[0] == "A" and u[1] == op_a)
 
     # 4. B moves to step 1
     manager.report_op_completed("B", op_b, 1)
@@ -180,5 +181,5 @@ def test_async_manager_global_limit():
 
     manager.report_op_completed("N", "run", 5)
     updates = manager.check_and_enforce_limits()
-    assert ("N", "run", 5) in [u for u in updates if u[0] == "N"]
-    assert manager.is_all_completed()
+    # Limit hasn't changed, should be empty
+    assert not any(u for u in updates if u[0] == "N" and u[1] == "run")

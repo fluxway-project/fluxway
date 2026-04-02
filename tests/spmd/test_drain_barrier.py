@@ -157,11 +157,10 @@ class TestWorkerDrainTarget:
         raw_cls = _ActorCls.__ray_actor_class__
         stub = types.SimpleNamespace(
             _drain_target_count=None,
-            _drain_resume_event=asyncio.Event(),
+            _drain_cond=asyncio.Condition(),
             spmd_id="test_spmd",
             rank=0,
         )
-        stub._drain_resume_event.set()
         stub.set_drain_target_count = types.MethodType(
             raw_cls.set_drain_target_count, stub
         )
@@ -170,31 +169,31 @@ class TestWorkerDrainTarget:
         )
         return stub
 
-    def test_set_drain_target_updates_state(self):
+    @pytest.mark.asyncio
+    async def test_set_drain_target_updates_state(self):
         w = self._make_stub()
-        w.set_drain_target_count(42)
+        await w.set_drain_target_count(42)
         assert w._drain_target_count == 42
-        assert not w._drain_resume_event.is_set()
 
-    def test_clear_drain_resets_state(self):
+    @pytest.mark.asyncio
+    async def test_clear_drain_resets_state(self):
         w = self._make_stub()
-        w.set_drain_target_count(42)
-        w.clear_drain_target_count()
+        await w.set_drain_target_count(42)
+        await w.clear_drain_target_count()
         assert w._drain_target_count is None
-        assert w._drain_resume_event.is_set()
 
-    def test_set_overrides_previous_target(self):
+    @pytest.mark.asyncio
+    async def test_set_overrides_previous_target(self):
         w = self._make_stub()
-        w.set_drain_target_count(10)
-        w.set_drain_target_count(20)
+        await w.set_drain_target_count(10)
+        await w.set_drain_target_count(20)
         assert w._drain_target_count == 20
-        assert not w._drain_resume_event.is_set()
 
-    def test_clear_is_idempotent(self):
+    @pytest.mark.asyncio
+    async def test_clear_is_idempotent(self):
         w = self._make_stub()
-        w.clear_drain_target_count()
+        await w.clear_drain_target_count()
         assert w._drain_target_count is None
-        assert w._drain_resume_event.is_set()
 
 
 class TestDrainEdgeCases:
