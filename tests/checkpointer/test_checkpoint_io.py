@@ -151,24 +151,26 @@ class TestSaveLoadWorkerState:
 
 
 class TestSafeTensorsBackend:
-    def test_round_trip(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_round_trip(self, tmp_path):
         backend = SafeTensorsBackend()
         state = _make_state()
-        metadata = backend.save(state, str(tmp_path), "spmd_a", rank=0, step=5)
+        metadata = await backend.save(state, str(tmp_path), "spmd_a", rank=0, step=5)
         assert "tensors_path" in metadata
         assert "meta_path" in metadata
-        loaded = backend.load(metadata)
+        loaded = await backend.load(metadata)
         assert loaded["step"] == state["step"]
         np.testing.assert_array_equal(loaded["weights"], state["weights"])
 
-    def test_multiple_ranks_do_not_overwrite(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_multiple_ranks_do_not_overwrite(self, tmp_path):
         backend = SafeTensorsBackend()
         state_r0 = {"v": np.array([0.0], dtype=np.float32)}
         state_r1 = {"v": np.array([1.0], dtype=np.float32)}
-        meta0 = backend.save(state_r0, str(tmp_path), "spmd_a", rank=0, step=1)
-        meta1 = backend.save(state_r1, str(tmp_path), "spmd_a", rank=1, step=1)
-        loaded0 = backend.load(meta0)
-        loaded1 = backend.load(meta1)
+        meta0 = await backend.save(state_r0, str(tmp_path), "spmd_a", rank=0, step=1)
+        meta1 = await backend.save(state_r1, str(tmp_path), "spmd_a", rank=1, step=1)
+        loaded0 = await backend.load(meta0)
+        loaded1 = await backend.load(meta1)
         np.testing.assert_array_equal(loaded0["v"], state_r0["v"])
         np.testing.assert_array_equal(loaded1["v"], state_r1["v"])
 
@@ -177,10 +179,11 @@ class TestSafeTensorsBackend:
         restored = pickle.loads(pickle.dumps(backend))
         assert isinstance(restored, SafeTensorsBackend)
 
-    def test_load_missing_metadata_raises(self):
+    @pytest.mark.asyncio
+    async def test_load_missing_metadata_raises(self):
         backend = SafeTensorsBackend()
         with pytest.raises(FileNotFoundError):
-            backend.load(
+            await backend.load(
                 {
                     "tensors_path": "/nonexistent/path.safetensors",
                     "meta_path": "/nonexistent/path.meta.json",
@@ -209,11 +212,17 @@ class TestBackendRegistry:
 
     def test_custom_backend_self_registers(self):
         class _TestBackend(WorkerCheckpointBackend, backend_name="_test_only_"):
-            def save(self, state, ckpt_dir, spmd_id, rank, step):
+            def __init__(self, force_write: bool = False):
+                pass
+
+            async def save(self, state, ckpt_dir, spmd_id, rank, step):
                 return {}
 
-            def load(self, metadata):
+            async def load(self, metadata):
                 return {}
+
+            def finalize(self):
+                pass
 
         b = WorkerCheckpointBackend.create("_test_only_")
         assert isinstance(b, _TestBackend)
@@ -227,11 +236,11 @@ class TestBackendRegistry:
 class _CapturingBackend(WorkerCheckpointBackend, backend_name="_capturing_"):
     """Records calls without touching the filesystem."""
 
-    def __init__(self):
+    def __init__(self, force_write: bool = False):
         self.saved_states = []
         self.load_return = {}
 
-    def save(self, state, ckpt_dir, spmd_id, rank, step):
+    async def save(self, state, ckpt_dir, spmd_id, rank, step):
         self.saved_states.append(
             {
                 "state": state,
@@ -243,8 +252,11 @@ class _CapturingBackend(WorkerCheckpointBackend, backend_name="_capturing_"):
         )
         return {"_captured": True}
 
-    def load(self, metadata):
+    async def load(self, metadata):
         return self.load_return
+
+    def finalize(self):
+        pass
 
 
 class TestWorkerCheckpointContract:
@@ -257,7 +269,8 @@ class TestWorkerCheckpointContract:
     and load_state_from_disk actually do — without invoking the Ray actor.
     """
 
-    def test_save_collects_state_and_calls_backend(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_save_collects_state_and_calls_backend(self, tmp_path):
         backend = _CapturingBackend()
         operator_states = {"embed": {"w": np.array([1.0], dtype=np.float32)}}
         completed_step_count = {"embed": 10, "lookup": 10}
@@ -267,7 +280,7 @@ class TestWorkerCheckpointContract:
             "operator_states": operator_states,
             "completed_step_count": completed_step_count,
         }
-        metadata = backend.save(
+        metadata = await backend.save(
             state, str(tmp_path), spmd_id="spmd_test", rank=0, step=10
         )
         metadata["completed_step_count"] = dict(completed_step_count)
@@ -279,7 +292,8 @@ class TestWorkerCheckpointContract:
         assert "operator_states" in call["state"]
         assert metadata["completed_step_count"] == {"embed": 10, "lookup": 10}
 
-    def test_load_restores_completed_step_count(self):
+    @pytest.mark.asyncio
+    async def test_load_restores_completed_step_count(self):
         backend = _CapturingBackend()
         backend.load_return = {
             "operator_states": {"embed": {"w": 99}},
@@ -288,7 +302,7 @@ class TestWorkerCheckpointContract:
         completed_step_count = {"embed": 10, "lookup": 10}
 
         # Replicate the load_state_from_disk contract
-        state = backend.load({"_captured": True})
+        state = await backend.load({"_captured": True})
         for op_name, step in state["completed_step_count"].items():
             completed_step_count[op_name] = step
 

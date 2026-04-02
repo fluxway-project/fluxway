@@ -48,7 +48,7 @@ dev = [
 ]
 torch = [
     "torch>=2.00.0",
-    "safetensor",
+    "safetensors",
 ]
 jax = [
     "jax>=0.4.0",
