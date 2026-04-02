@@ -651,7 +651,7 @@ class SPMDWorker:
         )
         global_shapes = global_shapes if global_shapes is not None else [None] * num
 
-        op_bundles: Dict[str, Tuple[list, list, list, list, list, list]] = {}
+        op_bundles: Dict[str, Dict[str, List[Any]]] = {}
         cursor = 0
         for i in range(num):
             u = tuuids[i]
@@ -670,26 +670,32 @@ class SPMDWorker:
             ops = self._op_manager.get_operators_for_tuuid(u)
             for op_name in ops:
                 if op_name not in op_bundles:
-                    op_bundles[op_name] = ([], [], [], [], [], [])
+                    op_bundles[op_name] = {
+                        "uuids": [],
+                        "payloads": [],
+                        "counts": [],
+                        "shapes": [],
+                        "meta": [],
+                        "compact": [],
+                    }
                 bundle = op_bundles[op_name]
-                bundle[0].append(u)
-                bundle[1].extend(tuuid_payloads)
-                bundle[2].extend(tuuid_counts)
-                bundle[3].append(global_shapes[i])
-                bundle[4].append(meta_state)
-                bundle[5].append(
+                bundle["uuids"].append(u)
+                bundle["payloads"].extend(tuuid_payloads)
+                bundle["counts"].extend(tuuid_counts)
+                bundle["shapes"].append(global_shapes[i])
+                bundle["meta"].append(meta_state)
+                bundle["compact"].append(
                     slice_compact_desc_params[i] if slice_compact_desc_params else None
                 )
 
         watermark = 0
-        for op_name, (
-            sub_uuids,
-            sub_payloads,
-            sub_counts,
-            sub_shapes,
-            sub_meta,
-            sub_compact,
-        ) in op_bundles.items():
+        for op_name, bundle in op_bundles.items():
+            sub_uuids = bundle["uuids"]
+            sub_payloads = bundle["payloads"]
+            sub_counts = bundle["counts"]
+            sub_shapes = bundle["shapes"]
+            sub_meta = bundle["meta"]
+            sub_compact = bundle["compact"]
             self._ensure_step_declared(op_name, step)
 
             sender_world_size = self._op_manager.get_sender_world_size(

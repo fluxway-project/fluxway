@@ -20,7 +20,6 @@ from tests.reader.helper_nodes import MockDataSource, SimpleProcessor, TypedGrai
 
 os.environ["FLUXWAY_BACKEND"] = "jax"
 
-_RUNTIME_ENV = {"working_dir": "."}
 _DATA_SIZE = 10
 _POLL_INTERVAL_S = 1.0
 _MAX_POLL_ROUNDS = 30
@@ -29,7 +28,7 @@ _MAX_POLL_ROUNDS = 30
 @pytest.fixture(scope="module", autouse=True)
 def ray_session():
     if not ray.is_initialized():
-        ray.init(ignore_reinit_error=True, log_to_driver=True, runtime_env=_RUNTIME_ENV)
+        ray.init(ignore_reinit_error=True, log_to_driver=True)
     yield
     # Ray is intentionally kept alive across tests in this module to avoid
     # repeated cluster startup cost.
@@ -59,7 +58,7 @@ async def test_reader_processor_data_flows():
     reader_id = next(n for n in task_graph.nodes if "Reader" in n)
     proc_id = next(n for n in task_graph.nodes if "Processor" in n)
 
-    controller = await create_controller(task_graph, runtime_env=_RUNTIME_ENV)
+    controller = await create_controller(task_graph)
     try:
         for _ in range(_MAX_POLL_ROUNDS):
             await asyncio.sleep(_POLL_INTERVAL_S)

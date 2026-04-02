@@ -221,7 +221,7 @@ if RAY_AVAILABLE:
 
             for rank, bundle_idx in enumerate(self.worker_bundle_indices):
                 if self.placement_group is not None:
-                    worker = SPMDWorker.options(
+                    worker = SPMDWorker.options(  # type: ignore[attr-defined]
                         placement_group=self.placement_group,
                         placement_group_bundle_index=bundle_idx,
                         name=f"spmd_worker_{self.spmd_id}_{rank}",
@@ -882,7 +882,7 @@ if RAY_AVAILABLE:
                 self_handle = ray.get_runtime_context().current_actor
 
                 if self.placement_group is not None:
-                    worker = SPMDWorker.options(
+                    worker = SPMDWorker.options(  # type: ignore[attr-defined]
                         placement_group=self.placement_group,
                         placement_group_bundle_index=bundle_idx,
                         name=f"spmd_worker_{self.spmd_id}_{rank}_recovered",

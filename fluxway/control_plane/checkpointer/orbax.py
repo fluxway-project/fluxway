@@ -37,30 +37,27 @@ def _split_hybrid_state(state: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str
             pass
 
         if isinstance(obj, dict):
-            g, l = {}, {}
+            global_part, local_part = {}, {}
             for k, v in obj.items():
                 gv, lv = _split(v)
                 if gv is not _EMPTY:
-                    g[k] = gv
+                    global_part[k] = gv
                 if lv is not _EMPTY:
-                    l[k] = lv
-            return (g or _EMPTY), (l or _EMPTY)
+                    local_part[k] = lv
+            return (global_part or _EMPTY), (local_part or _EMPTY)
 
-        if isinstance(obj, (jax.Array, jax.ShapeDtypeStruct)):
-            if hasattr(obj, "sharding") and isinstance(
-                obj.sharding, jax.sharding.SingleDeviceSharding
-            ):
-                from orbax.checkpoint.utils import (
-                    fully_replicated_host_local_array_to_global_array,
-                )
-
-                obj = fully_replicated_host_local_array_to_global_array(obj)
+        if isinstance(obj, (jax.Array, jax.ShapeDtypeStruct)) and not (
+            hasattr(obj, "sharding")
+            and isinstance(obj.sharding, jax.sharding.SingleDeviceSharding)
+        ):
             return obj, _EMPTY
 
         return _EMPTY, obj
 
-    g, l = _split(state)
-    return (g if g is not _EMPTY else {}), (l if l is not _EMPTY else {})
+    global_state, local_state = _split(state)
+    return (global_state if global_state is not _EMPTY else {}), (
+        local_state if local_state is not _EMPTY else {}
+    )
 
 
 def _deep_merge(d1: dict, d2: dict) -> dict:
