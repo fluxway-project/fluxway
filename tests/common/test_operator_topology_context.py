@@ -6,6 +6,7 @@ from fluxway.common.decorators import (
 )
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.types.configs import SPMDConfig
+from fluxway.spmd.worker.operator_manager import OperatorManager
 from fluxway.spmd.worker.worker import SPMDWorker
 
 
@@ -76,7 +77,7 @@ def test_operator_wrapper_sets_topology_fields_on_instance():
 
 def test_preinstantiate_operator_sets_topology_fields_in_init():
     _clear_operator_instance()
-    meta = getattr(TopologyAwareOperator.inspect, "_fluxway_operator_meta")
+    meta = TopologyAwareOperator.inspect._fluxway_operator_meta
     config = SPMDConfig(
         mesh=DeviceMesh(axis_names=("dp",), device_shape=(8,)),
         operators={"inspect": TopologyAwareOperator.inspect},
@@ -100,3 +101,26 @@ def test_preinstantiate_operator_sets_topology_fields_in_init():
     assert instance.local_world_size == 4
     assert instance.node_rank == 0
     assert instance.num_nodes == 2
+
+
+def test_operator_manager_execute_preserves_topology_fields():
+    _clear_operator_instance()
+    meta = TopologyAwareOperator.inspect._fluxway_operator_meta
+    config = SPMDConfig(
+        mesh=DeviceMesh(axis_names=("dp",), device_shape=(8,)),
+        operators={"inspect": TopologyAwareOperator.inspect},
+        operator_metas={"inspect": meta},
+    )
+    manager = OperatorManager(
+        config,
+        rank=3,
+        spmd_id="spmd-a",
+        local_rank=1,
+        local_world_size=4,
+        node_rank=0,
+        num_nodes=2,
+    )
+
+    result = manager.execute("inspect", step=0)
+
+    assert result == (3, 8, 1, 4, 0, 2)

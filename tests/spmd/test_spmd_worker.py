@@ -367,8 +367,26 @@ def test_worker_setup_and_start_initializes_runtime(monkeypatch):
     calls = {"preinstantiate": [], "heartbeat": 0, "run_loop": 0}
 
     class FakeOperatorManager:
-        def __init__(self, config, rank, spmd_id):
-            self.payload = (config, rank, spmd_id)
+        def __init__(
+            self,
+            config,
+            rank,
+            spmd_id,
+            *,
+            local_rank=None,
+            local_world_size=None,
+            node_rank=0,
+            num_nodes=1,
+        ):
+            self.payload = (
+                config,
+                rank,
+                spmd_id,
+                local_rank,
+                local_world_size,
+                node_rank,
+                num_nodes,
+            )
 
         def is_source_operator(self, op_name):
             return False
@@ -425,7 +443,7 @@ def test_worker_setup_and_start_initializes_runtime(monkeypatch):
     assert worker.local_world_size == 3
     assert worker.node_rank == 0
     assert worker.num_nodes == 2
-    assert worker._op_manager.payload[1:] == (2, "spmd-a")
+    assert worker._op_manager.payload[1:] == (2, "spmd-a", 1, 3, 0, 2)
 
 
 # ===========================================================================

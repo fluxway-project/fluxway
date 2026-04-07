@@ -251,7 +251,7 @@ if RAY_AVAILABLE:
                 for rank, worker in self._worker_handles.items()
             }
             node_id_values = ray.get(list(node_id_refs.values()))
-            node_ids = dict(zip(node_id_refs.keys(), node_id_values))
+            node_ids = dict(zip(node_id_refs.keys(), node_id_values, strict=True))
             rank_info = self._compute_rank_info(node_ids)
 
             for rank, worker in self._worker_handles.items():

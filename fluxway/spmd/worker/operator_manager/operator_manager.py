@@ -89,7 +89,17 @@ class OperatorManager:
     - Handler management is NOT here (handled by Worker)
     """
 
-    def __init__(self, config: "SPMDConfig", rank: int, spmd_id: str = ""):
+    def __init__(
+        self,
+        config: "SPMDConfig",
+        rank: int,
+        spmd_id: str = "",
+        *,
+        local_rank: Optional[int] = None,
+        local_world_size: Optional[int] = None,
+        node_rank: int = 0,
+        num_nodes: int = 1,
+    ):
         """
         Initialize OperatorManager.
 
@@ -103,6 +113,10 @@ class OperatorManager:
         self._rank = rank
         self._world_size = config.num_workers
         self._spmd_id = spmd_id
+        self._local_rank = local_rank
+        self._local_world_size = local_world_size
+        self._node_rank = node_rank
+        self._num_nodes = num_nodes
 
         # Register operators
         # Register operators dynamically from config
@@ -1206,6 +1220,10 @@ class OperatorManager:
                 rank=self._rank,
                 world_size=self._world_size,
                 operator_ctx=logical_ctx,
+                local_rank=self._local_rank,
+                local_world_size=self._local_world_size,
+                node_rank=self._node_rank,
+                num_nodes=self._num_nodes,
             ):
                 if self.is_source_operator(op_name):
                     return operator()

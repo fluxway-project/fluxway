@@ -377,7 +377,15 @@ class SPMDWorker:
             node_rank=node_rank,
             num_nodes=num_nodes,
         )
-        self._op_manager = OperatorManager(self.config, self.rank, self.spmd_id)
+        self._op_manager = OperatorManager(
+            self.config,
+            self.rank,
+            self.spmd_id,
+            local_rank=local_rank,
+            local_world_size=local_world_size,
+            node_rank=node_rank,
+            num_nodes=num_nodes,
+        )
         self._source_pause_events = {
             op_name: asyncio.Event()
             for op_name in (self.config.operators if self.config else {})
