@@ -96,17 +96,29 @@ def operator_context(
     rank: int,
     world_size: int,
     operator_ctx: Optional[Any] = None,
+    local_rank: Optional[int] = None,
+    local_world_size: Optional[int] = None,
+    node_rank: int = 0,
+    num_nodes: int = 1,
 ):
     """Context manager to inject operator runtime context into current thread."""
     prev_static = getattr(_operator_context, "static_args", {})
     prev_rank = getattr(_operator_context, "rank", 0)
     prev_world = getattr(_operator_context, "world_size", 1)
     prev_operator_ctx = getattr(_operator_context, "operator_ctx", None)
+    prev_local_rank = getattr(_operator_context, "local_rank", None)
+    prev_local_world_size = getattr(_operator_context, "local_world_size", None)
+    prev_node_rank = getattr(_operator_context, "node_rank", 0)
+    prev_num_nodes = getattr(_operator_context, "num_nodes", 1)
 
     _operator_context.static_args = static_args
     _operator_context.rank = rank
     _operator_context.world_size = world_size
     _operator_context.operator_ctx = operator_ctx
+    _operator_context.local_rank = local_rank
+    _operator_context.local_world_size = local_world_size
+    _operator_context.node_rank = node_rank
+    _operator_context.num_nodes = num_nodes
     try:
         yield _operator_context
     finally:
@@ -114,6 +126,10 @@ def operator_context(
         _operator_context.rank = prev_rank
         _operator_context.world_size = prev_world
         _operator_context.operator_ctx = prev_operator_ctx
+        _operator_context.local_rank = prev_local_rank
+        _operator_context.local_world_size = prev_local_world_size
+        _operator_context.node_rank = prev_node_rank
+        _operator_context.num_nodes = prev_num_nodes
 
 
 def get_current_context():
@@ -668,6 +684,10 @@ def _create_operator_wrapper(
                     instance = cls.__new__(cls)
                     instance.rank = rank
                     instance.world_size = world_size
+                    instance.local_rank = getattr(ctx, "local_rank", None)
+                    instance.local_world_size = getattr(ctx, "local_world_size", None)
+                    instance.node_rank = getattr(ctx, "node_rank", 0)
+                    instance.num_nodes = getattr(ctx, "num_nodes", 1)
                     instance.static_args = static_args
                     instance.ctx = getattr(ctx, "operator_ctx", None)
                     instance.__init__(**init_kwargs)
@@ -678,6 +698,10 @@ def _create_operator_wrapper(
         instance.static_args = getattr(ctx, "static_args", {})
         instance.rank = getattr(ctx, "rank", 0)
         instance.world_size = getattr(ctx, "world_size", 1)
+        instance.local_rank = getattr(ctx, "local_rank", None)
+        instance.local_world_size = getattr(ctx, "local_world_size", None)
+        instance.node_rank = getattr(ctx, "node_rank", 0)
+        instance.num_nodes = getattr(ctx, "num_nodes", 1)
         instance.ctx = getattr(ctx, "operator_ctx", None)
         return func(instance, *args, **kwargs)
 

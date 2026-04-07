@@ -100,11 +100,19 @@ def compile(func: Optional[Callable] = None, **kwargs):
     elif backend_name == "torch":
         import torch
 
-        # Set default mode to reduce-overhead if not provided, per user request
-        if "mode" not in kwargs:
-            kwargs["mode"] = "reduce-overhead"
+        # JAX call sites may pass options like static_argnums; torch.compile does
+        # not accept those, so keep only parameters from torch.compile's API.
+        torch_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key in {"backend", "disable", "dynamic", "fullgraph", "mode", "options"}
+        }
 
-        return torch.compile(func, **kwargs)
+        # Set default mode to reduce-overhead if not provided, per user request
+        if "mode" not in torch_kwargs:
+            torch_kwargs["mode"] = "reduce-overhead"
+
+        return torch.compile(func, **torch_kwargs)
 
     else:
         # No-op for other backends (e.g. numpy?)

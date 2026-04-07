@@ -163,14 +163,12 @@ class SPMDWorker:
         # Mesh from config
         self._mesh = config.mesh
         self._world_size = config.num_workers
+        self.local_rank: Optional[int] = None
+        self.local_world_size: Optional[int] = None
+        self.node_rank: Optional[int] = None
+        self.num_nodes: Optional[int] = None
 
-        # Eagerly instantiate operator classes before OperatorManager and before
-        # the Ray RPC loop starts. This is the earliest point where rank/world_size
-        # are known. cls.__init__ therefore runs before any JAX array deserialization
-        # can trigger the XLA backend.
-        self._pre_instantiate_operators(config, rank)
-
-        self._op_manager = OperatorManager(config, rank, spmd_id)
+        self._op_manager: Optional[OperatorManager] = None
 
         # Completed step counters {op_name: count} - tracks how many steps were executed
         self._completed_step_count: Dict[str, int] = dict.fromkeys(
@@ -234,13 +232,7 @@ class SPMDWorker:
         self._run_task: Optional[asyncio.Task] = None
 
         # Source operator pause control
-        self._source_pause_events: Dict[str, asyncio.Event] = {
-            op_name: asyncio.Event()
-            for op_name in (self.config.operators if self.config else {})
-            if self._op_manager.is_source_operator(op_name)
-        }
-        for event in self._source_pause_events.values():
-            event.set()  # Initially all sources are running
+        self._source_pause_events: Dict[str, asyncio.Event] = {}
 
         # Drain-to-step state
         self._drain_target_count: Optional[int] = None
@@ -269,16 +261,6 @@ class SPMDWorker:
 
         logger.debug(f"Worker initialized spmd_id={spmd_id} rank={rank}")
 
-        # Start heartbeat if driver_handle is provided
-        if self._driver_handle is not None:
-            self._start_heartbeat()
-
-        # Start the run loop in background (will block until start() is called)
-        self._start_run_loop()
-
-        # Inject operator context for this thread
-        operator_context(self.config.static_args, self.rank, self._world_size)
-
     def __del__(self):
         # Ensure background I/O is complete (e.g. Orbax AsyncCheckpointer)
         if hasattr(self, "_checkpoint_backend") and self._checkpoint_backend:
@@ -289,7 +271,15 @@ class SPMDWorker:
     # =========================================================================
 
     @staticmethod
-    def _pre_instantiate_operators(config: "SPMDConfig", rank: int) -> None:
+    def _pre_instantiate_operators(
+        config: "SPMDConfig",
+        rank: int,
+        *,
+        local_rank: Optional[int] = None,
+        local_world_size: Optional[int] = None,
+        node_rank: Optional[int] = None,
+        num_nodes: Optional[int] = None,
+    ) -> None:
         """Eagerly instantiate all SPMD operator class instances.
 
         This runs inside SPMDWorker.__init__, before OperatorManager is created
@@ -309,7 +299,13 @@ class SPMDWorker:
 
         seen: set = set()
         with operator_context(
-            static_args=static_args, rank=rank, world_size=world_size
+            static_args=static_args,
+            rank=rank,
+            world_size=world_size,
+            local_rank=local_rank,
+            local_world_size=local_world_size,
+            node_rank=0 if node_rank is None else node_rank,
+            num_nodes=1 if num_nodes is None else num_nodes,
         ):
             ctx = get_current_context()
             storage, lock = get_instance_storage()
@@ -343,6 +339,10 @@ class SPMDWorker:
                 instance = cls.__new__(cls)
                 instance.rank = rank
                 instance.world_size = world_size
+                instance.local_rank = local_rank
+                instance.local_world_size = local_world_size
+                instance.node_rank = 0 if node_rank is None else node_rank
+                instance.num_nodes = 1 if num_nodes is None else num_nodes
                 instance.static_args = static_args
                 instance.ctx = getattr(ctx, "operator_ctx", None)
                 instance.__init__(**init_kwargs)
@@ -351,6 +351,44 @@ class SPMDWorker:
     # =========================================================================
     # Driver Handle Management
     # =========================================================================
+
+    def get_node_id(self) -> str:
+        """Return the current Ray node identifier for topology-aware startup."""
+        return ray.get_runtime_context().get_node_id()
+
+    def setup_and_start(
+        self,
+        local_rank: int,
+        local_world_size: int,
+        node_rank: int,
+        num_nodes: int,
+    ) -> None:
+        """Finish topology-aware startup after the driver has all worker node IDs."""
+        self.local_rank = local_rank
+        self.local_world_size = local_world_size
+        self.node_rank = node_rank
+        self.num_nodes = num_nodes
+
+        self._pre_instantiate_operators(
+            self.config,
+            self.rank,
+            local_rank=local_rank,
+            local_world_size=local_world_size,
+            node_rank=node_rank,
+            num_nodes=num_nodes,
+        )
+        self._op_manager = OperatorManager(self.config, self.rank, self.spmd_id)
+        self._source_pause_events = {
+            op_name: asyncio.Event()
+            for op_name in (self.config.operators if self.config else {})
+            if self._op_manager.is_source_operator(op_name)
+        }
+        for event in self._source_pause_events.values():
+            event.set()
+
+        if self._driver_handle is not None:
+            self._start_heartbeat()
+        self._start_run_loop()
 
     def set_driver_handle(self, driver_handle: Any) -> None:
         """

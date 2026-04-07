@@ -62,6 +62,10 @@ def apply_fn(state, grad):
     return state
 
 
+def _worker_cls():
+    return SPMDWorker.__ray_metadata__.modified_class
+
+
 # ===========================================================================
 # ArrivalBarrier — shared primitive
 # ===========================================================================
@@ -322,6 +326,106 @@ def test_transport_receiver_zero_copy_per_sender():
     wc = receiver.get_written_counts()
     assert wc[0] == [3], f"rank-0 written_counts={wc[0]}"
     assert wc[1] == [2], f"rank-1 written_counts={wc[1]}"
+
+
+def test_worker_phase_one_does_not_start_runtime(monkeypatch):
+    mesh = DeviceMesh(axis_names=("dp",), device_shape=(1,))
+    config = _make_config(mesh, "compute")
+    worker_cls = _worker_cls()
+    started = {"heartbeat": 0, "run_loop": 0}
+
+    monkeypatch.setattr(
+        worker_cls,
+        "_start_heartbeat",
+        lambda self: started.__setitem__("heartbeat", started["heartbeat"] + 1),
+    )
+    monkeypatch.setattr(
+        worker_cls,
+        "_start_run_loop",
+        lambda self: started.__setitem__("run_loop", started["run_loop"] + 1),
+    )
+
+    worker = worker_cls(
+        config=config,
+        rank=0,
+        spmd_id="spmd-a",
+        driver_handle=object(),
+        checkpoint_backend=MagicMock(),
+    )
+
+    assert started == {"heartbeat": 0, "run_loop": 0}
+    assert worker.local_rank is None
+    assert worker.local_world_size is None
+    assert worker.node_rank is None
+    assert worker.num_nodes is None
+
+
+def test_worker_setup_and_start_initializes_runtime(monkeypatch):
+    mesh = DeviceMesh(axis_names=("dp",), device_shape=(1,))
+    config = _make_config(mesh, "compute")
+    worker_cls = _worker_cls()
+    calls = {"preinstantiate": [], "heartbeat": 0, "run_loop": 0}
+
+    class FakeOperatorManager:
+        def __init__(self, config, rank, spmd_id):
+            self.payload = (config, rank, spmd_id)
+
+        def is_source_operator(self, op_name):
+            return False
+
+    monkeypatch.setattr(
+        worker_cls,
+        "_pre_instantiate_operators",
+        staticmethod(
+            lambda config, rank, **kwargs: calls["preinstantiate"].append(
+                (rank, kwargs)
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        worker_cls,
+        "_start_heartbeat",
+        lambda self: calls.__setitem__("heartbeat", calls["heartbeat"] + 1),
+    )
+    monkeypatch.setattr(
+        worker_cls,
+        "_start_run_loop",
+        lambda self: calls.__setitem__("run_loop", calls["run_loop"] + 1),
+    )
+    monkeypatch.setattr(
+        "fluxway.spmd.worker.worker.OperatorManager",
+        FakeOperatorManager,
+    )
+
+    worker = worker_cls(
+        config=config,
+        rank=2,
+        spmd_id="spmd-a",
+        driver_handle=object(),
+        checkpoint_backend=MagicMock(),
+    )
+    worker.setup_and_start(
+        local_rank=1, local_world_size=3, node_rank=0, num_nodes=2
+    )
+
+    assert calls["preinstantiate"] == [
+        (
+            2,
+            {
+                "local_rank": 1,
+                "local_world_size": 3,
+                "node_rank": 0,
+                "num_nodes": 2,
+            },
+        )
+    ]
+    assert calls["heartbeat"] == 1
+    assert calls["run_loop"] == 1
+    assert worker.local_rank == 1
+    assert worker.local_world_size == 3
+    assert worker.node_rank == 0
+    assert worker.num_nodes == 2
+    assert worker._op_manager.payload[1:] == (2, "spmd-a")
 
 
 # ===========================================================================

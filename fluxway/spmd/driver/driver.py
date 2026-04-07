@@ -13,6 +13,7 @@ The SPMD Driver coordinates all workers within the SPMD:
 """
 
 import asyncio
+from collections import defaultdict
 import threading
 import time
 import pathlib
@@ -245,9 +246,46 @@ if RAY_AVAILABLE:
                 self._recovery_attempts[rank] = 0
                 logger.debug(f"Started worker rank={rank} spmd_id={self.spmd_id}")
 
+            node_id_refs = {
+                rank: worker.get_node_id.remote()
+                for rank, worker in self._worker_handles.items()
+            }
+            node_id_values = ray.get(list(node_id_refs.values()))
+            node_ids = dict(zip(node_id_refs.keys(), node_id_values))
+            rank_info = self._compute_rank_info(node_ids)
+
+            for rank, worker in self._worker_handles.items():
+                worker.setup_and_start.remote(**rank_info[rank])
+
             logger.debug(
                 f"All workers started worker_count={len(self._worker_handles)} spmd_id={self.spmd_id}"
             )
+
+        def _compute_rank_info(
+            self, node_ids: Dict[int, str]
+        ) -> Dict[int, Dict[str, int]]:
+            node_groups: Dict[str, List[int]] = defaultdict(list)
+            for rank, node_id in node_ids.items():
+                node_groups[node_id].append(rank)
+
+            for ranks in node_groups.values():
+                ranks.sort()
+
+            sorted_nodes = sorted(node_groups, key=lambda node_id: node_groups[node_id][0])
+            node_to_rank = {
+                node_id: node_rank for node_rank, node_id in enumerate(sorted_nodes)
+            }
+
+            return {
+                rank: {
+                    "local_rank": local_rank,
+                    "local_world_size": len(ranks),
+                    "node_rank": node_to_rank[node_id],
+                    "num_nodes": len(sorted_nodes),
+                }
+                for node_id, ranks in node_groups.items()
+                for local_rank, rank in enumerate(ranks)
+            }
 
         def get_worker_handles(self) -> Dict[int, Any]:
             """Get all worker handles for topology registration."""
