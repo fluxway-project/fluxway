@@ -11,6 +11,7 @@ from .data_types import UserBatch, ActiveFeatures, PassiveFeatures, LabelFeature
 
 
 @spmd_source(
+    resource={"num_cpus": 1, "memory_gb": 1},
     mesh_axis_names=("worker",),
     mesh_axis_shapes=(1,),
     interleaved=True,

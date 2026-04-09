@@ -8,7 +8,7 @@ from fluxway.common.types.tensor import TransportTensor
 from .data_types import LookupOutput
 
 
-@spmd(mesh_axis_names=("shard",), mesh_axis_shapes=(4,))
+@spmd(resource={"num_cpus": 1, "memory_gb": 1}, mesh_axis_names=("shard",), mesh_axis_shapes=(4,))
 class SparseEmbeddingSPMD:
     """Generic sharded embedding table with forward lookup and gradient-based update."""
 

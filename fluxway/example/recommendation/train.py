@@ -24,9 +24,6 @@ from fluxway.example.recommendation.dense_spmd import DenseSPMD
 async def run_training(args):
     runtime_env = {"env_vars": {"CUDA_VISIBLE_DEVICES": "", "JAX_PLATFORMS": "cpu"}}
 
-    if not ray.is_initialized():
-        ray.init(ignore_reinit_error=True, runtime_env=runtime_env)
-
     graph = FunctionalGraph()
 
     r"""

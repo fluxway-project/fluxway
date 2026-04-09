@@ -12,7 +12,7 @@ def hash_routing(tensor, mesh):
     return jnp.mod(val, mesh.size)
 
 
-@spmd(mesh_axis_names=("dp",), mesh_axis_shapes=(2,))
+@spmd(resource={"num_cpus": 1, "memory_gb": 1}, mesh_axis_names=("dp",), mesh_axis_shapes=(2,))
 class InputSPMD:
     """Deduplicates features and routes them to respective embedding tables."""
 
