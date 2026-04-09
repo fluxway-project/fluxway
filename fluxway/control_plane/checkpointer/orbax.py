@@ -117,17 +117,22 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
             local_final_path = (
                 Path(ckpt_dir) / str(step) / spmd_id / f"worker_{rank}_local_orbax"
             )
-            local_tmp_path = local_final_path.with_suffix(".tmp")
 
             await asyncio.to_thread(
-                local_tmp_path.parent.mkdir, parents=True, exist_ok=True
+                local_final_path.parent.mkdir, parents=True, exist_ok=True
             )
 
             def _write_local():
                 local_handler = ocp.PyTreeCheckpointHandler()
                 ckptr = ocp.Checkpointer(local_handler)
-                ckptr.save(local_tmp_path, args=ocp.args.PyTreeSave(local_state_np))
-                local_tmp_path.rename(local_final_path)
+                # Orbax Checkpointer.save already guarantees atomic commit for the
+                # destination directory, so writing to the final path avoids an
+                # extra rename race in our wrapper.
+                ckptr.save(
+                    local_final_path,
+                    force=self._force_write,
+                    args=ocp.args.PyTreeSave(local_state_np),
+                )
 
             await asyncio.to_thread(_write_local)
             metadata["orbax_local_dir"] = str(local_final_path)
