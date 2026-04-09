@@ -7,8 +7,6 @@ os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 import asyncio
 import argparse
 
-import ray
-
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.types.configs import AsyncStepConfig
 from fluxway.control_plane.graph.functional import FunctionalGraph
@@ -19,6 +17,23 @@ from fluxway.example.recommendation.reader import RecommendationReader
 from fluxway.example.recommendation.input_spmd import InputSPMD
 from fluxway.example.recommendation.sparse_spmd import SparseEmbeddingSPMD
 from fluxway.example.recommendation.dense_spmd import DenseSPMD
+
+
+async def _print_resource_allocation_summary(controller):
+    summary = await controller.get_resource_allocation_summary.remote()
+    if not summary:
+        print("[Fluxway] Controller resource summary is empty.")
+        return
+
+    print("[Fluxway] Controller resource summary:")
+    for spmd_id in sorted(summary):
+        item = summary[spmd_id]
+        print(
+            f"  - {spmd_id}: bundles={item['bundle_count']} "
+            f"workers={item['worker_count']} total_cpu={item['total_cpu']} "
+            f"total_memory_gb={item['total_memory_gb']} "
+            f"driver={item['driver_bundle']} worker={item['worker_bundle']}"
+        )
 
 
 async def run_training(args):
@@ -99,6 +114,7 @@ async def run_training(args):
         checkpoint_config=checkpoint_config,
         runtime_env=runtime_env,
     )
+    await _print_resource_allocation_summary(controller)
 
     restored_step = await controller.restore_checkpoint.remote()
     if restored_step is not None:

@@ -310,3 +310,53 @@ class PGManager:
             "worker_resource": self._spmd_to_resource.get(spmd_id),
             "driver_resource": self._spmd_to_driver_resource.get(spmd_id),
         }
+
+    def get_resource_allocation_summary(
+        self, spmd_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return a stable, human-readable resource summary for one SPMD."""
+        worker_resource = self._spmd_to_resource.get(spmd_id)
+        if worker_resource is None:
+            return None
+
+        worker_count = self._spmd_to_num_workers.get(spmd_id, 1)
+        driver_resource = self._spmd_to_driver_resource.get(
+            spmd_id, DriverResourceSpec()
+        )
+
+        driver_bundle = self._driver_resource_to_bundle(driver_resource)
+        worker_bundle = self._resource_to_bundle(worker_resource)
+
+        return {
+            "spmd_id": spmd_id,
+            "worker_count": worker_count,
+            "bundle_count": worker_count + 1,
+            "driver_bundle": self._bundle_summary(driver_bundle),
+            "worker_bundle": self._bundle_summary(worker_bundle),
+            "total_cpu": driver_bundle.get("CPU", 0.0)
+            + worker_bundle.get("CPU", 0.0) * worker_count,
+            "total_gpu": driver_bundle.get("GPU", 0.0)
+            + worker_bundle.get("GPU", 0.0) * worker_count,
+            "total_memory_gb": (
+                driver_bundle.get("memory", 0.0)
+                + worker_bundle.get("memory", 0.0) * worker_count
+            )
+            / (1024 * 1024 * 1024),
+            "placement_group_ready": spmd_id in self._spmd_to_pg,
+        }
+
+    def get_all_resource_allocation_summaries(self) -> Dict[str, Dict[str, Any]]:
+        """Return resource summaries for every allocated SPMD."""
+        return {
+            spmd_id: summary
+            for spmd_id in self._spmd_to_resource
+            if (summary := self.get_resource_allocation_summary(spmd_id)) is not None
+        }
+
+    def _bundle_summary(self, bundle: Dict[str, float]) -> Dict[str, float]:
+        """Normalize raw Ray bundle fields into a stable summary shape."""
+        return {
+            "cpu": bundle.get("CPU", 0.0),
+            "gpu": bundle.get("GPU", 0.0),
+            "memory_gb": bundle.get("memory", 0.0) / (1024 * 1024 * 1024),
+        }

@@ -4,8 +4,11 @@ import numpy as np
 import jax.numpy as jnp
 
 from fluxway.common.decorators import spmd, operator
+from fluxway.common.utils.logging import get_logger
 from fluxway.common.types.tensor import TransportTensor
 from .data_types import LookupOutput
+
+logger = get_logger(__name__)
 
 
 @spmd(resource={"num_cpus": 1, "memory_gb": 1}, mesh_axis_names=("shard",), mesh_axis_shapes=(4,))
@@ -13,10 +16,22 @@ class SparseEmbeddingSPMD:
     """Generic sharded embedding table with forward lookup and gradient-based update."""
 
     def __init__(self, vocab_size: int = 1000, embed_dim: int = 3):
+        logger.debug(
+            "SparseEmbeddingSPMD_init_begin rank=%s world_size=%s vocab_size=%s embed_dim=%s",
+            getattr(self, "rank", None),
+            getattr(self, "world_size", None),
+            vocab_size,
+            embed_dim,
+        )
         self.embed_dim = embed_dim
         self.vocab_size = vocab_size
         self.params = jnp.ones((vocab_size, embed_dim)) * 0.01
         self._forward_ids_cache = {}
+        logger.debug(
+            "SparseEmbeddingSPMD_init_complete rank=%s param_shape=%s",
+            getattr(self, "rank", None),
+            tuple(self.params.shape),
+        )
 
     def save_state(self, ckpt_dir: str) -> dict:
         # Each rank owns disjoint rows (hash-routed).  Save this rank's full

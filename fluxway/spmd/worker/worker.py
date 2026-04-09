@@ -145,6 +145,7 @@ class SPMDWorker:
         # Ray actors run in separate worker processes; ensure they respect
         # FLUXWAY_LOG_LEVEL / FLUXWAY_LOG_FORCE so DEBUG logs are not dropped.
         ensure_logging_configured()
+        logger.debug("phase_one_init_begin spmd_id=%s rank=%s", spmd_id, rank)
         self.config = config
         self.rank = rank
         self.spmd_id = spmd_id or ""
@@ -259,7 +260,12 @@ class SPMDWorker:
         # Tracks which (op_name, step) barriers have been registered to avoid double-declaring.
         self._barriers_declared: Dict[Tuple[str, int], bool] = {}
 
-        logger.debug(f"Worker initialized spmd_id={spmd_id} rank={rank}")
+        logger.debug(
+            "phase_one_init_complete spmd_id=%s rank=%s world_size=%s",
+            self.spmd_id,
+            self.rank,
+            self._world_size,
+        )
 
     def __del__(self):
         # Ensure background I/O is complete (e.g. Orbax AsyncCheckpointer)
@@ -345,7 +351,37 @@ class SPMDWorker:
                 instance.num_nodes = 1 if num_nodes is None else num_nodes
                 instance.static_args = static_args
                 instance.ctx = getattr(ctx, "operator_ctx", None)
-                instance.__init__(**init_kwargs)
+                logger.debug(
+                    "operator_init_begin owner_class=%s rank=%s world_size=%s "
+                    "local_rank=%s local_world_size=%s node_rank=%s num_nodes=%s",
+                    cls.__qualname__,
+                    rank,
+                    world_size,
+                    local_rank,
+                    local_world_size,
+                    0 if node_rank is None else node_rank,
+                    1 if num_nodes is None else num_nodes,
+                )
+                try:
+                    instance.__init__(**init_kwargs)
+                except Exception:
+                    logger.exception(
+                        "operator_init_failed owner_class=%s rank=%s world_size=%s "
+                        "local_rank=%s local_world_size=%s node_rank=%s num_nodes=%s",
+                        cls.__qualname__,
+                        rank,
+                        world_size,
+                        local_rank,
+                        local_world_size,
+                        0 if node_rank is None else node_rank,
+                        1 if num_nodes is None else num_nodes,
+                    )
+                    raise
+                logger.debug(
+                    "operator_init_complete owner_class=%s rank=%s",
+                    cls.__qualname__,
+                    rank,
+                )
                 storage[id(cls)] = instance
 
     # =========================================================================
@@ -364,39 +400,77 @@ class SPMDWorker:
         num_nodes: int,
     ) -> None:
         """Finish topology-aware startup after the driver has all worker node IDs."""
-        self.local_rank = local_rank
-        self.local_world_size = local_world_size
-        self.node_rank = node_rank
-        self.num_nodes = num_nodes
-
-        self._pre_instantiate_operators(
-            self.config,
-            self.rank,
-            local_rank=local_rank,
-            local_world_size=local_world_size,
-            node_rank=node_rank,
-            num_nodes=num_nodes,
-        )
-        self._op_manager = OperatorManager(
-            self.config,
-            self.rank,
+        logger.debug(
+            "setup_and_start_begin spmd_id=%s rank=%s local_rank=%s "
+            "local_world_size=%s node_rank=%s num_nodes=%s",
             self.spmd_id,
-            local_rank=local_rank,
-            local_world_size=local_world_size,
-            node_rank=node_rank,
-            num_nodes=num_nodes,
+            self.rank,
+            local_rank,
+            local_world_size,
+            node_rank,
+            num_nodes,
         )
-        self._source_pause_events = {
-            op_name: asyncio.Event()
-            for op_name in (self.config.operators if self.config else {})
-            if self._op_manager.is_source_operator(op_name)
-        }
-        for event in self._source_pause_events.values():
-            event.set()
+        try:
+            self.local_rank = local_rank
+            self.local_world_size = local_world_size
+            self.node_rank = node_rank
+            self.num_nodes = num_nodes
 
-        if self._driver_handle is not None:
-            self._start_heartbeat()
-        self._start_run_loop()
+            self._pre_instantiate_operators(
+                self.config,
+                self.rank,
+                local_rank=local_rank,
+                local_world_size=local_world_size,
+                node_rank=node_rank,
+                num_nodes=num_nodes,
+            )
+            logger.debug(
+                "setup_and_start_preinstantiate_complete spmd_id=%s rank=%s",
+                self.spmd_id,
+                self.rank,
+            )
+            self._op_manager = OperatorManager(
+                self.config,
+                self.rank,
+                self.spmd_id,
+                local_rank=local_rank,
+                local_world_size=local_world_size,
+                node_rank=node_rank,
+                num_nodes=num_nodes,
+            )
+            logger.debug(
+                "setup_and_start_operator_manager_complete spmd_id=%s rank=%s",
+                self.spmd_id,
+                self.rank,
+            )
+            self._source_pause_events = {
+                op_name: asyncio.Event()
+                for op_name in (self.config.operators if self.config else {})
+                if self._op_manager.is_source_operator(op_name)
+            }
+            for event in self._source_pause_events.values():
+                event.set()
+
+            if self._driver_handle is not None:
+                self._start_heartbeat()
+            self._start_run_loop()
+            logger.debug(
+                "setup_and_start_runtime_started spmd_id=%s rank=%s",
+                self.spmd_id,
+                self.rank,
+            )
+        except Exception:
+            logger.exception(
+                "setup_and_start_failed spmd_id=%s rank=%s local_rank=%s "
+                "local_world_size=%s node_rank=%s num_nodes=%s",
+                self.spmd_id,
+                self.rank,
+                local_rank,
+                local_world_size,
+                node_rank,
+                num_nodes,
+            )
+            raise
 
     def set_driver_handle(self, driver_handle: Any) -> None:
         """

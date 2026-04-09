@@ -203,6 +203,10 @@ if RAY_AVAILABLE:
 
             return source_nodes
 
+        def get_resource_allocation_summary(self) -> Dict[str, Dict[str, Any]]:
+            """Expose scheduler resource summaries for debugging and inspection."""
+            return self._scheduler.pg_manager.get_all_resource_allocation_summaries()
+
         async def initialize(self) -> bool:
             """
             Initialize the Controller (event-driven).

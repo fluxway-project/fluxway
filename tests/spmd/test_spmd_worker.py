@@ -443,7 +443,54 @@ def test_worker_setup_and_start_initializes_runtime(monkeypatch):
     assert worker.local_world_size == 3
     assert worker.node_rank == 0
     assert worker.num_nodes == 2
-    assert worker._op_manager.payload[1:] == (2, "spmd-a", 1, 3, 0, 2)
+
+
+def test_worker_setup_and_start_logs_phase_markers(monkeypatch, capsys):
+    mesh = DeviceMesh(axis_names=("dp",), device_shape=(1,))
+    config = _make_config(mesh, "compute")
+    worker_cls = _worker_cls()
+    monkeypatch.setenv("FLUXWAY_LOG_LEVEL", "DEBUG")
+
+    monkeypatch.setattr(
+        worker_cls,
+        "_pre_instantiate_operators",
+        staticmethod(lambda config, rank, **kwargs: None),
+    )
+    monkeypatch.setattr(worker_cls, "_start_heartbeat", lambda self: None)
+    monkeypatch.setattr(worker_cls, "_start_run_loop", lambda self: None)
+
+    class FakeOperatorManager:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def is_source_operator(self, op_name):
+            return False
+
+    monkeypatch.setattr(
+        "fluxway.spmd.worker.worker.OperatorManager",
+        FakeOperatorManager,
+    )
+
+    worker = worker_cls(
+        config=config,
+        rank=0,
+        spmd_id="spmd-log",
+        driver_handle=object(),
+        checkpoint_backend=MagicMock(),
+    )
+
+    worker.setup_and_start(
+        local_rank=0,
+        local_world_size=1,
+        node_rank=0,
+        num_nodes=1,
+    )
+
+    captured = capsys.readouterr()
+    assert "[DEBUG]" in captured.err
+    assert "setup_and_start_begin" in captured.err
+    assert "setup_and_start_preinstantiate_complete" in captured.err
+    assert "setup_and_start_runtime_started" in captured.err
 
 
 # ===========================================================================

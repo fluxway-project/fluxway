@@ -295,6 +295,29 @@ class TestOwnerClassResolution:
         )
         assert id(cls) in _instance_storage
 
+    def test_pre_instantiate_operators_logs_init_boundaries(self, caplog):
+        config = _InstantiableModel.get_spmd_config()
+
+        _instance_storage.clear()
+        caplog.set_level("DEBUG", logger="fluxway.spmd.worker.worker")
+
+        SPMDWorker._pre_instantiate_operators(config, rank=0)
+
+        begin_records = [
+            record
+            for record in caplog.records
+            if "operator_init_begin" in record.getMessage()
+        ]
+        complete_records = [
+            record
+            for record in caplog.records
+            if "operator_init_complete" in record.getMessage()
+        ]
+        assert begin_records
+        assert complete_records
+        assert all(record.levelname == "DEBUG" for record in begin_records)
+        assert all(record.levelname == "DEBUG" for record in complete_records)
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
