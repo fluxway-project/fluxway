@@ -10,12 +10,17 @@ def _install_fake_orbax_runtime(monkeypatch):
     jax_module = types.ModuleType("jax")
 
     class _Array:
-        pass
+        def __init__(self, sharding=None):
+            self.sharding = sharding
 
     class _ShapeDtypeStruct:
-        pass
+        def __init__(self, sharding=None):
+            self.sharding = sharding
 
     class _SingleDeviceSharding:
+        pass
+
+    class _NamedSharding:
         pass
 
     tree_util_module = types.ModuleType("jax.tree_util")
@@ -37,8 +42,24 @@ def _install_fake_orbax_runtime(monkeypatch):
     jax_module.ShapeDtypeStruct = _ShapeDtypeStruct
     jax_module.tree_util = tree_util_module
     jax_module.sharding = types.SimpleNamespace(
-        SingleDeviceSharding=_SingleDeviceSharding
+        SingleDeviceSharding=_SingleDeviceSharding,
+        NamedSharding=_NamedSharding,
     )
+
+    sync_global_devices_calls = []
+
+    def _unexpected_sync_global_devices(*args, **kwargs):
+        sync_global_devices_calls.append((args, kwargs))
+        raise AssertionError(
+            "global Orbax save should use Checkpointer synchronization, not an extra "
+            "manual multihost_utils.sync_global_devices call"
+        )
+
+    multihost_utils_module = types.ModuleType("jax.experimental.multihost_utils")
+    multihost_utils_module.sync_global_devices = _unexpected_sync_global_devices
+    experimental_module = types.ModuleType("jax.experimental")
+    experimental_module.multihost_utils = multihost_utils_module
+    jax_module.experimental = experimental_module
 
     etils_module = types.ModuleType("etils")
     epath_module = types.ModuleType("etils.epath")
@@ -48,16 +69,25 @@ def _install_fake_orbax_runtime(monkeypatch):
     save_calls = []
 
     class _FakeStandardCheckpointHandler:
-        pass
+        async def async_save(self, *args, **kwargs):
+            raise AssertionError(
+                "global Orbax save should not call StandardCheckpointHandler.async_save "
+                "directly"
+            )
 
     class _FakePyTreeCheckpointHandler:
         pass
+
+    checkpointer_save_calls = []
 
     class _FakeCheckpointer:
         def __init__(self, handler):
             self.handler = handler
 
         def save(self, directory, args=None, force=False):
+            checkpointer_save_calls.append(
+                {"directory": Path(directory), "args": args, "force": force}
+            )
             save_calls.append(Path(directory))
             Path(directory).mkdir(parents=True, exist_ok=force)
 
@@ -75,6 +105,10 @@ def _install_fake_orbax_runtime(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "jax", jax_module)
     monkeypatch.setitem(sys.modules, "jax.tree_util", tree_util_module)
+    monkeypatch.setitem(sys.modules, "jax.experimental", experimental_module)
+    monkeypatch.setitem(
+        sys.modules, "jax.experimental.multihost_utils", multihost_utils_module
+    )
     monkeypatch.setitem(sys.modules, "etils", etils_module)
     monkeypatch.setitem(sys.modules, "etils.epath", epath_module)
     monkeypatch.setitem(sys.modules, "orbax", types.ModuleType("orbax"))
@@ -120,12 +154,12 @@ def _install_fake_orbax_runtime(monkeypatch):
     assert orbax_spec.loader is not None
     orbax_spec.loader.exec_module(orbax_module)
 
-    return orbax_module, save_calls
+    return orbax_module, save_calls, checkpointer_save_calls, sync_global_devices_calls
 
 
 @pytest.mark.asyncio
 async def test_local_save_uses_final_path_without_manual_rename(monkeypatch, tmp_path):
-    orbax_module, save_calls = _install_fake_orbax_runtime(monkeypatch)
+    orbax_module, save_calls, _, _ = _install_fake_orbax_runtime(monkeypatch)
     rename_calls = []
 
     def _unexpected_rename(self, target):
@@ -148,3 +182,36 @@ async def test_local_save_uses_final_path_without_manual_rename(monkeypatch, tmp
     assert metadata["orbax_local_dir"] == str(expected_dir)
     assert expected_dir.exists()
     assert rename_calls == []
+
+
+@pytest.mark.asyncio
+async def test_global_save_uses_checkpointer_atomic_save(monkeypatch, tmp_path):
+    orbax_module, _, checkpointer_save_calls, sync_global_devices_calls = (
+        _install_fake_orbax_runtime(monkeypatch)
+    )
+    jax_module = sys.modules["jax"]
+
+    backend = orbax_module.OrbaxBackend(force_write=True)
+    metadata = await backend.save(
+        {
+            "operator_states": {
+                "DenseLayers": {
+                    "weights": jax_module.Array(jax_module.sharding.NamedSharding())
+                }
+            }
+        },
+        str(tmp_path),
+        "DenseLayers",
+        rank=2,
+        step=7,
+    )
+
+    expected_dir = tmp_path / "7" / "DenseLayers" / "orbax_state"
+    assert len(checkpointer_save_calls) == 1
+    assert checkpointer_save_calls[0]["directory"] == expected_dir
+    assert checkpointer_save_calls[0]["force"] is True
+    assert "operator_states" in checkpointer_save_calls[0]["args"]
+    assert metadata["orbax_final_path"] == str(expected_dir)
+    assert "orbax_tmp_path" not in metadata
+    assert expected_dir.exists()
+    assert sync_global_devices_calls == []

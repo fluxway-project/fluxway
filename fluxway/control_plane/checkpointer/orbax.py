@@ -139,29 +139,21 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
 
         if global_state:
             final_path = Path(ckpt_dir) / str(step) / spmd_id / "orbax_state"
-            tmp_path = final_path.parent / "orbax_state.tmp"
-
-            await asyncio.to_thread(tmp_path.mkdir, parents=True, exist_ok=True)
-
-            commit_futures = (
-                await handler.async_save(
-                    epath.Path(tmp_path), args=ocp.args.StandardSave(global_state)
-                )
-                or []
-            )
-
-            await asyncio.gather(*[asyncio.to_thread(f.result) for f in commit_futures])
-
-            from jax.experimental import multihost_utils
-
             await asyncio.to_thread(
-                multihost_utils.sync_global_devices, f"orbax_save_{spmd_id}_{step}"
+                final_path.parent.mkdir, parents=True, exist_ok=True
             )
 
-            if rank == 0:
-                await asyncio.to_thread(handler.finalize, epath.Path(tmp_path))
+            def _write_global():
+                ckptr = ocp.Checkpointer(handler)
+                # Checkpointer manages the temporary directory, synchronization,
+                # and finalization contract for multi-host Orbax saves.
+                ckptr.save(
+                    epath.Path(final_path),
+                    force=self._force_write,
+                    args=ocp.args.StandardSave(global_state),
+                )
 
-            metadata["orbax_tmp_path"] = str(tmp_path)
+            await asyncio.to_thread(_write_global)
             metadata["orbax_final_path"] = str(final_path)
             metadata["ckpt_dir"] = str(final_path)
 
@@ -172,8 +164,15 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
 
         global_state = {}
         if "orbax_final_path" in metadata:
+            import orbax.checkpoint as ocp
+
             ckpt_path = epath.Path(metadata["orbax_final_path"])
-            global_state = await asyncio.to_thread(handler.restore, ckpt_path)
+
+            def _read_global():
+                ckptr = ocp.Checkpointer(handler)
+                return ckptr.restore(ckpt_path)
+
+            global_state = await asyncio.to_thread(_read_global)
 
         local_state = {}
         if "orbax_local_dir" in metadata:
