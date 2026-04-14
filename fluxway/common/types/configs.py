@@ -671,7 +671,9 @@ class ControllerState(str, Enum):
                                                        ↓
                                                     BLOCKED ↔ RECOVERING
                                                        ↓
-                                                  COMPLETED / FAILED
+                                                  COMPLETING / FAILING
+                                                        ↓
+                                                 COMPLETED / FAILED
     """
 
     INITIALIZING = "initializing"  # Allocating resources, starting SPMDs
@@ -680,6 +682,8 @@ class ControllerState(str, Enum):
     RUNNING = "running"  # Normal execution
     BLOCKED = "blocked"  # Task blocked (handling exceptions)
     RECOVERING = "recovering"  # Recovering from errors
+    COMPLETING = "completing"  # Final cleanup after successful execution
+    FAILING = "failing"  # Final cleanup after unrecoverable failure
     COMPLETED = "completed"  # Task completed
     FAILED = "failed"  # Task failed
 
@@ -697,6 +701,7 @@ class ControllerEvent(str, Enum):
     ALL_DRIVERS_COMPLETED = "all_drivers_completed"  # All drivers report completion
     ALL_DRIVERS_DRAINED = "all_drivers_drained"  # All drivers reached DRAINED state
     RECOVERY_FAILED = "recovery_failed"  # Recovery failed
+    CLEANUP_FINISHED = "cleanup_finished"  # Terminal cleanup completed
 
 
 class DriverState(str, Enum):

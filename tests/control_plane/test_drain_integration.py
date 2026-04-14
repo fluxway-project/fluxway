@@ -3,6 +3,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from fluxway.common.types import ControllerState
+from fluxway.common.types import ControllerEvent
 from fluxway.common.types.drain import DrainStrategy
 from fluxway.control_plane.controller import ControllerActor
 
@@ -88,3 +90,64 @@ async def test_stop_checkpointer_skips_self_await(controller):
     await controller.stop_checkpointer()
 
     assert controller._checkpoint_task is None
+
+
+@pytest.mark.asyncio
+async def test_all_drivers_completed_transitions_through_completing(controller):
+    cleanup_gate = asyncio.Event()
+    controller._state_machine._state = ControllerState.RUNNING
+    controller._cleanup_all_spmds = AsyncMock(side_effect=cleanup_gate.wait)
+    controller.stop_checkpointer = AsyncMock()
+
+    transition_task = asyncio.create_task(
+        controller._state_machine.trigger_event(ControllerEvent.ALL_DRIVERS_COMPLETED)
+    )
+    await asyncio.sleep(0)
+    assert controller._state_machine.state == ControllerState.COMPLETING
+    assert not transition_task.done()
+
+    cleanup_gate.set()
+
+    assert await transition_task is True
+    assert controller._state_machine.state == ControllerState.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_wait_for_completion_observes_completed_after_cleanup(controller):
+    cleanup_gate = asyncio.Event()
+    controller._state_machine._state = ControllerState.RUNNING
+    controller._cleanup_all_spmds = AsyncMock(side_effect=cleanup_gate.wait)
+    controller.stop_checkpointer = AsyncMock()
+
+    transition_task = asyncio.create_task(
+        controller._state_machine.trigger_event(ControllerEvent.ALL_DRIVERS_COMPLETED)
+    )
+    wait_task = asyncio.create_task(controller.wait_for_completion(timeout=1.0))
+    await asyncio.sleep(0)
+
+    assert controller._state_machine.state == ControllerState.COMPLETING
+    assert not wait_task.done()
+
+    cleanup_gate.set()
+
+    assert await transition_task is True
+    assert await wait_task is True
+
+
+@pytest.mark.asyncio
+async def test_recovery_failed_transitions_through_failing(controller):
+    cleanup_gate = asyncio.Event()
+    controller._state_machine._state = ControllerState.BLOCKED
+    controller._cleanup_all_spmds = AsyncMock(side_effect=cleanup_gate.wait)
+
+    transition_task = asyncio.create_task(
+        controller._state_machine.trigger_event(ControllerEvent.RECOVERY_FAILED)
+    )
+    await asyncio.sleep(0)
+    assert controller._state_machine.state == ControllerState.FAILING
+    assert not transition_task.done()
+
+    cleanup_gate.set()
+
+    assert await transition_task is True
+    assert controller._state_machine.state == ControllerState.FAILED

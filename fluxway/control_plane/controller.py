@@ -1182,7 +1182,7 @@ if RAY_AVAILABLE:
             """
             Cleanup all SPMD resources.
 
-            Called when entering COMPLETED or FAILED state.
+            Called when entering COMPLETING or FAILING state.
             """
             logger.debug("Cleaning up all SPMDs")
 

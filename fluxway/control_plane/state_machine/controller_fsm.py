@@ -9,8 +9,8 @@ State transitions (event-driven initialization):
     -> starts heartbeat timeout monitoring
 - RUNNING -> BLOCKED (on DRIVER_ERROR, blocks all SPMDs, triggers restart)
 - BLOCKED -> RUNNING (on DRIVER_RECOVERED)
-- BLOCKED -> FAILED (on RECOVERY_FAILED)
-- RUNNING -> COMPLETED (on ALL_DRIVERS_COMPLETED, reclaims resources)
+- BLOCKED -> FAILING -> FAILED (on RECOVERY_FAILED, after cleanup)
+- RUNNING -> COMPLETING -> COMPLETED (on ALL_DRIVERS_COMPLETED, after cleanup)
 
 Supports async callbacks for Ray Actor Controller.
 """
@@ -66,11 +66,11 @@ class ControllerStateMachine:
         (
             ControllerState.BLOCKED,
             ControllerEvent.RECOVERY_FAILED,
-        ): ControllerState.FAILED,
+        ): ControllerState.FAILING,
         (
             ControllerState.RUNNING,
             ControllerEvent.ALL_DRIVERS_COMPLETED,
-        ): ControllerState.COMPLETED,
+        ): ControllerState.COMPLETING,
         # # If task run super fast, RUNNING may not be reached, and ALL_DRIVERS_COMPLETED may be received.
         # (
         #     ControllerState.PENDING,
@@ -79,7 +79,15 @@ class ControllerStateMachine:
         (
             ControllerState.TOPOLOGY_REGISTERING,
             ControllerEvent.ALL_DRIVERS_COMPLETED,
+        ): ControllerState.COMPLETING,
+        (
+            ControllerState.COMPLETING,
+            ControllerEvent.CLEANUP_FINISHED,
         ): ControllerState.COMPLETED,
+        (
+            ControllerState.FAILING,
+            ControllerEvent.CLEANUP_FINISHED,
+        ): ControllerState.FAILED,
         # Recovery from BLOCKED
         (
             ControllerState.BLOCKED,
@@ -179,6 +187,8 @@ class ControllerStateMachine:
             ControllerState.TOPOLOGY_REGISTERING: self._on_enter_topology_registering,
             ControllerState.RUNNING: self._on_enter_running,
             ControllerState.BLOCKED: self._on_enter_blocked,
+            ControllerState.COMPLETING: self._on_enter_completing,
+            ControllerState.FAILING: self._on_enter_failing,
             ControllerState.COMPLETED: self._on_enter_completed,
             ControllerState.FAILED: self._on_enter_failed,
         }
@@ -293,13 +303,13 @@ class ControllerStateMachine:
                 logger.error(f"Failed to restart SPMD {spmd_id}: {e}")
                 self._restarting_spmds.discard(spmd_id)
 
-    async def _on_enter_completed(self) -> None:
+    async def _on_enter_completing(self) -> None:
         """
-        Called when entering COMPLETED state.
+        Called when entering COMPLETING state.
 
         Reclaims all SPMD resources and performs cleanup.
         """
-        logger.debug("Controller entering COMPLETED state")
+        logger.debug("Controller entering COMPLETING state")
 
         try:
             if hasattr(self._controller, "stop_checkpointer"):
@@ -307,14 +317,15 @@ class ControllerStateMachine:
             await self._controller._cleanup_all_spmds()
         except Exception as e:
             logger.error(f"Failed to cleanup SPMDs: {e}")
+        await self.trigger_event(ControllerEvent.CLEANUP_FINISHED)
 
-    async def _on_enter_failed(self) -> None:
+    async def _on_enter_failing(self) -> None:
         """
-        Called when entering FAILED state.
+        Called when entering FAILING state.
 
         Handles unrecoverable failures.
         """
-        logger.error("Controller entering FAILED state")
+        logger.error("Controller entering FAILING state")
 
         errors = dict(self._error_spmds)
         logger.error(f"Failed SPMDs: {errors}")
@@ -324,6 +335,15 @@ class ControllerStateMachine:
             await self._controller._cleanup_all_spmds()
         except Exception as e:
             logger.error(f"Failed to cleanup SPMDs during failure handling: {e}")
+        await self.trigger_event(ControllerEvent.CLEANUP_FINISHED)
+
+    async def _on_enter_completed(self) -> None:
+        """Called when entering COMPLETED state."""
+        logger.debug("Controller entering COMPLETED state")
+
+    async def _on_enter_failed(self) -> None:
+        """Called when entering FAILED state."""
+        logger.error("Controller entering FAILED state")
 
     async def reset(self) -> None:
         """Reset state machine to initial state."""
