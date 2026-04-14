@@ -183,3 +183,30 @@ def test_async_manager_global_limit():
     updates = manager.check_and_enforce_limits()
     # Limit hasn't changed, should be empty
     assert not any(u for u in updates if u[0] == "N" and u[1] == "run")
+
+
+def test_async_manager_reports_all_completed_at_max_steps():
+    """Completion should only trip once every tracked op reaches max_steps."""
+    op_a = "produce"
+    op_b = "consume"
+    node_a = Node(
+        name="A",
+        spmd_config=SPMDConfig(operator_metas={op_a: OperatorMeta(name=op_a)}),
+    )
+    node_b = Node(
+        name="B",
+        spmd_config=SPMDConfig(operator_metas={op_b: OperatorMeta(name=op_b)}),
+    )
+    graph = Graph(nodes={"A": node_a, "B": node_b})
+    manager = AsyncStepManager(graph=graph, config=AsyncStepConfig(max_steps=3))
+
+    assert manager.is_all_completed() is False
+
+    manager.report_op_completed("A", op_a, 3)
+    assert manager.is_all_completed() is False
+
+    manager.report_op_completed("B", op_b, 2)
+    assert manager.is_all_completed() is False
+
+    manager.report_op_completed("B", op_b, 3)
+    assert manager.is_all_completed() is True

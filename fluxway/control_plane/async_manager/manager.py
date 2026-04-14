@@ -193,6 +193,40 @@ class AsyncStepManager:
         with self._lock:
             return {k: SPMDOpStep(**v.as_dict()) for k, v in self._spmd_steps.items()}
 
+    def is_all_completed(self) -> bool:
+        """Return True when every tracked operator has reached its step limit."""
+        with self._lock:
+            global_max_steps = self._config.max_steps
+
+            for node_id, node in self._graph.nodes.items():
+                if node.spmd_config is None:
+                    continue
+
+                node_max_steps = node.spmd_config.max_steps
+                if node_max_steps is None:
+                    node_max_steps = global_max_steps
+                if node_max_steps is None:
+                    return False
+
+                all_ops = set(node.spmd_config.operators.keys()) | set(
+                    node.spmd_config.operator_metas.keys()
+                )
+                if not all_ops:
+                    continue
+
+                spmd_progress = self._spmd_steps.get(node_id)
+                if spmd_progress is None:
+                    return False
+
+                for op_name in all_ops:
+                    if (
+                        spmd_progress.completed_step_count.get(op_name, 0)
+                        < node_max_steps
+                    ):
+                        return False
+
+            return True
+
     def is_op_locked(self, spmd_id: str, op_name: str) -> bool:
         """Check if a specific op is locked."""
         with self._lock:

@@ -881,8 +881,11 @@ if RAY_AVAILABLE:
             so this await never raises.  The upper wait bound is
             FLUXWAY_SNAPSHOT_TIMEOUT_SECS (default 600 s).
             """
-            if self._checkpoint_task is not None and not self._checkpoint_task.done():
-                await self._checkpoint_task
+            task = self._checkpoint_task
+            if task is not None and not task.done():
+                current_task = asyncio.current_task()
+                if task is not current_task:
+                    await task
             self._checkpoint_task = None
 
         # =====================================================================

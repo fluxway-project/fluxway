@@ -1,3 +1,4 @@
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -78,3 +79,12 @@ async def test_controller_orchestrates_drain(controller, mock_spmd_manager):
 
     # Verifies next target issued
     mock_spmd_manager.mock_driver1.request_drain.remote.assert_called_with(4)
+
+
+@pytest.mark.asyncio
+async def test_stop_checkpointer_skips_self_await(controller):
+    controller._checkpoint_task = asyncio.current_task()
+
+    await controller.stop_checkpointer()
+
+    assert controller._checkpoint_task is None
