@@ -131,6 +131,7 @@ if RAY_AVAILABLE:
             # Workers ready/running state tracking
             self._workers_ready: bool = False
             self._workers_running: bool = False
+            self._stopping: bool = False
 
             # Init timeout (seconds) — if workers don't report within this time,
             # INIT_FAILED is triggered
@@ -344,6 +345,7 @@ if RAY_AVAILABLE:
         async def stop(self, save_checkpoint: bool = True) -> None:
             """Stop execution."""
             logger.debug(f"Stopping spmd_id={self.spmd_id}")
+            self._stopping = True
 
             # Stop heartbeat
             self._stop_heartbeat()
@@ -583,6 +585,12 @@ if RAY_AVAILABLE:
                 rank: Worker rank
                 heartbeat: Worker heartbeat data
             """
+            if self._stopping:
+                logger.debug(
+                    f"Ignoring worker heartbeat during shutdown rank={rank} spmd_id={self.spmd_id}"
+                )
+                return
+
             self._worker_heartbeats[rank] = heartbeat
             self._worker_heartbeat_times[rank] = time.time()
             logger.heartbeat(
@@ -671,6 +679,13 @@ if RAY_AVAILABLE:
                 op_name: Operation name
                 step: Completed step number
             """
+            if self._stopping:
+                logger.debug(
+                    f"Ignoring worker op completion during shutdown rank={rank} "
+                    f"op={op_name} step={step} spmd_id={self.spmd_id}"
+                )
+                return
+
             self.spmd_synchronizer.report_worker_op_completed(rank, op_name, step)
 
         def _on_spmd_op_completed(self, spmd_id: str, op_name: str, step: int) -> None:
@@ -796,6 +811,13 @@ if RAY_AVAILABLE:
                 step: Current step number
                 values: State values
             """
+            if self._stopping:
+                logger.debug(
+                    f"Ignoring control_argument routing during shutdown target_spmd_id={target_spmd_id} "
+                    f"step={step} spmd_id={self.spmd_id}"
+                )
+                return
+
             if self.controller_handle is not None:
                 try:
                     self.controller_handle.receive_control_argument.remote(

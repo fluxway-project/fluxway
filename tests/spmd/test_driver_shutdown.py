@@ -64,3 +64,32 @@ def test_stop_heartbeat_joins_background_thread():
     assert driver._heartbeat_running is False
     join_mock.assert_called_once()
     assert driver._heartbeat_thread is None
+
+
+def test_driver_ignores_worker_callbacks_while_stopping():
+    driver = SPMDDriver.__ray_actor_class__(
+        spmd_id="dense",
+        config=SPMDConfig(mesh=SimpleNamespace(size=1)),
+        placement_group=None,
+        worker_bundle_indices=[1],
+        controller_handle=MagicMock(),
+        graph_topology={},
+        checkpoint_backend=None,
+    )
+
+    heartbeat = MagicMock()
+    heartbeat.error_message = None
+    heartbeat.telemetry = None
+    heartbeat.mailbox_status = None
+
+    driver._stopping = True
+    driver.spmd_synchronizer.report_worker_op_completed = MagicMock()
+
+    driver.receive_worker_heartbeat(0, heartbeat)
+    driver.report_worker_op_completed(0, "step", 1)
+    driver.routing_control_argument_to_controller("target", "op", ["x"], 1, [1])
+
+    assert driver._worker_heartbeats == {}
+    assert driver._worker_heartbeat_times == {}
+    driver.spmd_synchronizer.report_worker_op_completed.assert_not_called()
+    driver.controller_handle.receive_control_argument.remote.assert_not_called()
