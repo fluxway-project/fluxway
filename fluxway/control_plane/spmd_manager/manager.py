@@ -53,7 +53,7 @@ class SPMDHandle:
         """Check if the SPMD is initialized."""
         return self._is_initialized
 
-    def set_driver_handle(self, handle: Any) -> None:
+    def set_driver_handle(self, handle: Optional[Any]) -> None:
         """Set the driver actor handle."""
         self._driver_handle = handle
 
@@ -244,9 +244,11 @@ class SPMDManager:
             if RAY_AVAILABLE:
                 # Call stop on driver
                 await handle.call_driver("stop", save_checkpoint)
-
-                # Kill the driver actor
-                ray.kill(handle.driver_handle)
+                # Release the last controller-side reference after the driver has
+                # finished its own graceful shutdown. Force-killing here can race
+                # with in-flight Ray bookkeeping and surfaces spurious FAILED
+                # tasks for already-completed save/metadata RPCs.
+                handle.set_driver_handle(None)
 
             handle.set_initialized(False)
             logger.info(f"Stopped SPMD {spmd_id}")

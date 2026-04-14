@@ -231,6 +231,7 @@ class SPMDWorker:
         # Run loop synchronization
         self._start_event = asyncio.Event()  # Signals when to start execution
         self._run_task: Optional[asyncio.Task] = None
+        self._background_tasks: set[asyncio.Task] = set()
 
         # Source operator pause control
         self._source_pause_events: Dict[str, asyncio.Event] = {}
@@ -472,7 +473,7 @@ class SPMDWorker:
             )
             raise
 
-    def set_driver_handle(self, driver_handle: Any) -> None:
+    def set_driver_handle(self, driver_handle: Optional[Any]) -> None:
         """
         Set the driver handle for callbacks.
 
@@ -616,7 +617,14 @@ class SPMDWorker:
         logger.debug(f"Worker auto-started spmd_id={self.spmd_id} rank={self.rank}")
 
         # Trigger source operators (operators with 0 input tensors)
-        asyncio.create_task(self._trigger_source_operators())
+        self._spawn_background_task(self._trigger_source_operators())
+
+    def _spawn_background_task(self, coro: Any) -> asyncio.Task:
+        """Track detached tasks so stop() can await their shutdown."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     async def _trigger_source_operators(self) -> None:
         """
@@ -890,11 +898,18 @@ class SPMDWorker:
         logger.debug(
             f"Step ready op={op_name} step={step} spmd_id={self.spmd_id} rank={self.rank}"
         )
-        asyncio.create_task(self._enqueue(op_name, step))
+        self._spawn_background_task(self._enqueue(op_name, step))
 
     async def _enqueue(self, op_name: str, step: int) -> None:
         """Enqueue a task for execution."""
         from fluxway.common.types.configs import OperatorMeta
+
+        if not self._running:
+            logger.debug(
+                f"Skipping enqueue after stop op={op_name} step={step} "
+                f"spmd_id={self.spmd_id} rank={self.rank}"
+            )
+            return
 
         key = (op_name, step)
         if key in self._in_op_step_queue:
@@ -1022,14 +1037,27 @@ class SPMDWorker:
     async def stop(self) -> None:
         """Stop the execution loop gracefully."""
         self._running = False
+        self._driver_handle = None
         # Put a sentinel to unblock the queue
         await self._execution_queue.put((999, 0, "__stop__"))
 
-        # Cancel tasks
+        pending_tasks = []
         if self._run_task and not self._run_task.done():
             self._run_task.cancel()
+            pending_tasks.append(self._run_task)
         if self._heartbeat_task and not self._heartbeat_task.done():
             self._heartbeat_task.cancel()
+            pending_tasks.append(self._heartbeat_task)
+        background_tasks = [
+            task for task in self._background_tasks if not task.done()
+        ]
+        for task in background_tasks:
+            task.cancel()
+        pending_tasks.extend(background_tasks)
+
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
+        self._background_tasks.clear()
 
         logger.debug(f"Worker stopping spmd_id={self.spmd_id} rank={self.rank}")
 
@@ -1914,7 +1942,7 @@ class SPMDWorker:
                 if op_name in self._source_pause_events:
                     await self._source_pause_events[op_name].wait()
 
-                asyncio.create_task(
+                self._spawn_background_task(
                     self._enqueue(op_name, next_step_index)
                 )  # Use index for the next task
             else:
@@ -2213,7 +2241,7 @@ class SPMDWorker:
                     finally:
                         self._send_semaphore.release()
 
-                asyncio.create_task(_wait_and_release())
+                self._spawn_background_task(_wait_and_release())
                 return True
 
             await distributor.distribute(send_fn=_send_fn)
@@ -2550,7 +2578,7 @@ class SPMDWorker:
                         f"Auto-triggering source op for restored step {count} op={op_name} "
                         f"spmd_id={self.spmd_id} rank={self.rank}"
                     )
-                    asyncio.create_task(self._enqueue(op_name, count))
+                    self._spawn_background_task(self._enqueue(op_name, count))
 
         if "static_args" not in metadata:
             raise RuntimeError(

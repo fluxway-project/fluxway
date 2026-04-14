@@ -118,6 +118,7 @@ if RAY_AVAILABLE:
             self._heartbeat_config = HeartbeatConfig()
             self._heartbeat_task: Optional[asyncio.Task] = None
             self._heartbeat_running = False
+            self._heartbeat_thread: Optional[threading.Thread] = None
 
             # Worker heartbeat tracking
             self._worker_heartbeats: Dict[int, WorkerHeartbeat] = {}
@@ -340,7 +341,7 @@ if RAY_AVAILABLE:
 
             logger.debug(f"Topology registration completed spmd_id={self.spmd_id}")
 
-        def stop(self, save_checkpoint: bool = True) -> None:
+        async def stop(self, save_checkpoint: bool = True) -> None:
             """Stop execution."""
             logger.debug(f"Stopping spmd_id={self.spmd_id}")
 
@@ -348,13 +349,54 @@ if RAY_AVAILABLE:
             self._stop_heartbeat()
 
             # Stop all workers
+            stop_refs: List[tuple[int, Any]] = []
             for rank, worker in self._worker_handles.items():
                 try:
-                    worker.stop.remote()
+                    stop_refs.append((rank, worker.stop.remote()))
                 except Exception as e:
                     logger.error(
                         f"Failed to stop worker rank={rank} error={e} spmd_id={self.spmd_id}"
                     )
+
+            if not stop_refs:
+                return
+
+            results = await asyncio.gather(
+                *(ref for _, ref in stop_refs),
+                return_exceptions=True,
+            )
+            for (rank, _), result in zip(stop_refs, results, strict=True):
+                if isinstance(result, Exception):
+                    logger.error(
+                        f"Worker stop RPC failed rank={rank} error={result} "
+                        f"spmd_id={self.spmd_id}"
+                    )
+
+            detach_refs: List[tuple[int, Any]] = []
+            for rank, worker in self._worker_handles.items():
+                try:
+                    detach_refs.append((rank, worker.set_driver_handle.remote(None)))
+                except Exception as e:
+                    logger.error(
+                        f"Failed to detach worker rank={rank} error={e} "
+                        f"spmd_id={self.spmd_id}"
+                    )
+
+            if detach_refs:
+                detach_results = await asyncio.gather(
+                    *(ref for _, ref in detach_refs),
+                    return_exceptions=True,
+                )
+                for (rank, _), result in zip(
+                    detach_refs, detach_results, strict=True
+                ):
+                    if isinstance(result, Exception):
+                        logger.error(
+                            f"Worker detach RPC failed rank={rank} error={result} "
+                            f"spmd_id={self.spmd_id}"
+                        )
+
+            self._worker_handles.clear()
 
         # =====================================================================
         # Snapshot Orchestration (Drain → Snapshot → Resume)
@@ -788,6 +830,16 @@ if RAY_AVAILABLE:
         def _stop_heartbeat(self) -> None:
             """Stop heartbeat reporting."""
             self._heartbeat_running = False
+            heartbeat_thread = self._heartbeat_thread
+            if (
+                heartbeat_thread is not None
+                and heartbeat_thread.is_alive()
+                and heartbeat_thread is not threading.current_thread()
+            ):
+                heartbeat_thread.join(
+                    timeout=self._heartbeat_config.heartbeat_interval + 1.0
+                )
+            self._heartbeat_thread = None
 
         def _heartbeat_loop(self) -> None:
             """Heartbeat reporting loop.

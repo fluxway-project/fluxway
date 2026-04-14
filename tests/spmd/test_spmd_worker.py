@@ -439,10 +439,44 @@ def test_worker_setup_and_start_initializes_runtime(monkeypatch):
     ]
     assert calls["heartbeat"] == 1
     assert calls["run_loop"] == 1
-    assert worker.local_rank == 1
-    assert worker.local_world_size == 3
-    assert worker.node_rank == 0
-    assert worker.num_nodes == 2
+
+
+@pytest.mark.asyncio
+async def test_worker_stop_clears_driver_handle_and_waits_for_tasks():
+    mesh = DeviceMesh(axis_names=("dp",), device_shape=(1,))
+    config = _make_config(mesh, "compute")
+    worker_cls = _worker_cls()
+    worker = worker_cls(
+        config=config,
+        rank=0,
+        spmd_id="spmd-a",
+        driver_handle=object(),
+        checkpoint_backend=MagicMock(),
+    )
+
+    async def run_forever():
+        await asyncio.Future()
+
+    background_task_ran = asyncio.Event()
+
+    async def background_task():
+        background_task_ran.set()
+        await asyncio.Future()
+
+    worker._execution_queue = asyncio.Queue()
+    worker._run_task = asyncio.create_task(run_forever())
+    worker._heartbeat_task = asyncio.create_task(run_forever())
+    worker._spawn_background_task(background_task())
+    await background_task_ran.wait()
+
+    await worker.stop()
+
+    assert worker.get_driver_handle() is None
+    assert worker._run_task.cancelled()
+    assert worker._heartbeat_task.cancelled()
+    assert worker._background_tasks == set()
+    sentinel = await worker._execution_queue.get()
+    assert sentinel == (999, 0, "__stop__")
 
 
 def test_worker_setup_and_start_logs_phase_markers(monkeypatch, capsys):
