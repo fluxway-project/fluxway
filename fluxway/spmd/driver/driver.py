@@ -360,22 +360,22 @@ if RAY_AVAILABLE:
                         f"Failed to stop worker rank={rank} error={e} spmd_id={self.spmd_id}"
                     )
 
-            if not stop_refs:
-                return
+            worker_handles = list(self._worker_handles.items())
 
-            results = await asyncio.gather(
-                *(ref for _, ref in stop_refs),
-                return_exceptions=True,
-            )
-            for (rank, _), result in zip(stop_refs, results, strict=True):
-                if isinstance(result, Exception):
-                    logger.error(
-                        f"Worker stop RPC failed rank={rank} error={result} "
-                        f"spmd_id={self.spmd_id}"
-                    )
+            if stop_refs:
+                results = await asyncio.gather(
+                    *(ref for _, ref in stop_refs),
+                    return_exceptions=True,
+                )
+                for (rank, _), result in zip(stop_refs, results, strict=True):
+                    if isinstance(result, Exception):
+                        logger.error(
+                            f"Worker stop RPC failed rank={rank} error={result} "
+                            f"spmd_id={self.spmd_id}"
+                        )
 
             detach_refs: List[tuple[int, Any]] = []
-            for rank, worker in self._worker_handles.items():
+            for rank, worker in worker_handles:
                 try:
                     detach_refs.append((rank, worker.set_driver_handle.remote(None)))
                 except Exception as e:
@@ -397,6 +397,22 @@ if RAY_AVAILABLE:
                             f"Worker detach RPC failed rank={rank} error={result} "
                             f"spmd_id={self.spmd_id}"
                         )
+
+            for rank, worker in worker_handles:
+                terminate_method = getattr(worker, "__ray_terminate__", None)
+                if terminate_method is None:
+                    logger.warning(
+                        f"Worker handle has no __ray_terminate__ rank={rank} "
+                        f"spmd_id={self.spmd_id}"
+                    )
+                    continue
+                try:
+                    terminate_method.remote()
+                except Exception as e:
+                    logger.error(
+                        f"Failed to request worker termination rank={rank} error={e} "
+                        f"spmd_id={self.spmd_id}"
+                    )
 
             self._worker_handles.clear()
 

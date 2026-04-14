@@ -1195,6 +1195,8 @@ if RAY_AVAILABLE:
                     await self._spmd_manager.stop_spmd(spmd_id, save_checkpoint=False)
                 except Exception as e:
                     logger.error(f"Error stopping SPMD {spmd_id}: {e}")
+                finally:
+                    self._heartbeat_manager.unregister_spmd(spmd_id)
 
             # Release all placement groups
             for spmd_id in list(self._scheduler.pg_manager.get_all_spmd_ids()):

@@ -135,6 +135,21 @@ async def test_wait_for_completion_observes_completed_after_cleanup(controller):
 
 
 @pytest.mark.asyncio
+async def test_cleanup_all_spmds_stops_each_spmd_without_special_handle_retention(
+    controller,
+):
+    controller._heartbeat_manager = AsyncMock()
+    controller._spmd_manager.stop_spmd = AsyncMock()
+    controller._scheduler = MagicMock()
+    controller._scheduler.pg_manager.get_all_spmd_ids.return_value = []
+
+    await controller._cleanup_all_spmds()
+
+    controller._spmd_manager.stop_spmd.assert_any_call("op1", save_checkpoint=False)
+    controller._spmd_manager.stop_spmd.assert_any_call("op2", save_checkpoint=False)
+
+
+@pytest.mark.asyncio
 async def test_recovery_failed_transitions_through_failing(controller):
     cleanup_gate = asyncio.Event()
     controller._state_machine._state = ControllerState.BLOCKED
