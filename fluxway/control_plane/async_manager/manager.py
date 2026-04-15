@@ -208,8 +208,9 @@ class AsyncStepManager:
                 if node_max_steps is None:
                     return False
 
-                all_ops = set(node.spmd_config.operators.keys()) | set(
-                    node.spmd_config.operator_metas.keys()
+                all_ops = (
+                    node.spmd_config.operators.keys()
+                    | node.spmd_config.operator_metas.keys()
                 )
                 if not all_ops:
                     continue

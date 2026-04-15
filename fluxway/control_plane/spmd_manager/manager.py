@@ -17,7 +17,7 @@ import asyncio
 from typing import Any, Dict, List, Optional
 
 try:
-    import ray
+    import ray  # noqa: F401
 
     RAY_AVAILABLE = True
 except ImportError:

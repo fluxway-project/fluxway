@@ -157,7 +157,7 @@ if RAY_AVAILABLE:
         # Initialization
         # =====================================================================
 
-        def initialize(self, checkpoint_id: Optional[str] = None) -> bool:
+        async def initialize(self, checkpoint_id: Optional[str] = None) -> bool:
             """
             Initialize the driver and start all workers.
 
@@ -187,7 +187,7 @@ if RAY_AVAILABLE:
                 )
 
                 # Start all worker actors
-                self._start_workers()
+                await self._start_workers()
 
                 if checkpoint_id is not None:
                     raise NotImplementedError(
@@ -216,7 +216,7 @@ if RAY_AVAILABLE:
                 self.state_machine.trigger(DriverEvent.INIT_FAILED, error=str(e))
                 return False
 
-        def _start_workers(self) -> None:
+        async def _start_workers(self) -> None:
             """Start all worker actors."""
 
             # Get self handle for registering with workers
@@ -248,12 +248,17 @@ if RAY_AVAILABLE:
                 self._recovery_attempts[rank] = 0
                 logger.debug(f"Started worker rank={rank} spmd_id={self.spmd_id}")
 
+            # Collect each worker's node_id concurrently without blocking the
+            # event loop.  ray.get() on an async actor would freeze the actor
+            # until all RPCs return, preventing heartbeat processing and
+            # incoming RPC handling during the wait.
             node_id_refs = {
                 rank: worker.get_node_id.remote()
                 for rank, worker in self._worker_handles.items()
             }
-            node_id_values = ray.get(list(node_id_refs.values()))
-            node_ids = dict(zip(node_id_refs.keys(), node_id_values, strict=True))
+            ranks = list(node_id_refs.keys())
+            node_id_values = await asyncio.gather(*node_id_refs.values())
+            node_ids = dict(zip(ranks, node_id_values, strict=True))
             rank_info = self._compute_rank_info(node_ids)
 
             for rank, worker in self._worker_handles.items():
@@ -348,7 +353,7 @@ if RAY_AVAILABLE:
             self._stopping = True
 
             # Stop heartbeat
-            self._stop_heartbeat()
+            await self._stop_heartbeat()
 
             # Stop all workers
             stop_refs: List[tuple[int, Any]] = []
@@ -849,8 +854,16 @@ if RAY_AVAILABLE:
             )
             self._heartbeat_thread.start()
 
-        def _stop_heartbeat(self) -> None:
-            """Stop heartbeat reporting."""
+        async def _stop_heartbeat(self) -> None:
+            """Stop heartbeat reporting.
+
+            The thread join is executed via asyncio.to_thread so that the
+            driver's event loop remains responsive while waiting for the
+            heartbeat thread to finish its current sleep interval.  Without
+            this, a sequential shutdown of N drivers on the controller side
+            would accumulate up to N × (heartbeat_interval + 1 s) of blocking
+            time on the event loop.
+            """
             self._heartbeat_running = False
             heartbeat_thread = self._heartbeat_thread
             if (
@@ -858,8 +871,9 @@ if RAY_AVAILABLE:
                 and heartbeat_thread.is_alive()
                 and heartbeat_thread is not threading.current_thread()
             ):
-                heartbeat_thread.join(
-                    timeout=self._heartbeat_config.heartbeat_interval + 1.0
+                await asyncio.to_thread(
+                    heartbeat_thread.join,
+                    self._heartbeat_config.heartbeat_interval + 1.0,
                 )
             self._heartbeat_thread = None
 
@@ -1173,7 +1187,7 @@ else:
             """Mock Ray remote call."""
             return cls(*args, **kwargs)
 
-        def initialize(self, checkpoint_id: Optional[str] = None) -> bool:
+        async def initialize(self, checkpoint_id: Optional[str] = None) -> bool:
             return True
 
         def start(self) -> None:

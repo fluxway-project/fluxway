@@ -81,12 +81,18 @@ def _install_fake_orbax_runtime(monkeypatch):
     checkpointer_save_calls = []
 
     class _FakeCheckpointer:
-        def __init__(self, handler):
+        def __init__(self, handler, *, multiprocessing_options=None):
             self.handler = handler
+            self.multiprocessing_options = multiprocessing_options
 
         def save(self, directory, args=None, force=False):
             checkpointer_save_calls.append(
-                {"directory": Path(directory), "args": args, "force": force}
+                {
+                    "directory": Path(directory),
+                    "args": args,
+                    "force": force,
+                    "mp_options": self.multiprocessing_options,
+                }
             )
             save_calls.append(Path(directory))
             Path(directory).mkdir(parents=True, exist_ok=force)
@@ -101,6 +107,9 @@ def _install_fake_orbax_runtime(monkeypatch):
     ocp_module.args = types.SimpleNamespace(
         PyTreeSave=lambda item: item,
         StandardSave=lambda item: item,
+    )
+    ocp_module.options = types.SimpleNamespace(
+        MultiprocessingOptions=lambda **kw: types.SimpleNamespace(**kw)
     )
 
     monkeypatch.setitem(sys.modules, "jax", jax_module)
@@ -215,3 +224,114 @@ async def test_global_save_uses_checkpointer_atomic_save(monkeypatch, tmp_path):
     assert "orbax_tmp_path" not in metadata
     assert expected_dir.exists()
     assert sync_global_devices_calls == []
+    # The Checkpointer must receive a step-scoped barrier_sync_key_prefix so
+    # that repeated saves do not reuse the same JAX distributed barrier key.
+    mp_opts = checkpointer_save_calls[0]["mp_options"]
+    assert mp_opts is not None, "multiprocessing_options must be passed to Checkpointer"
+    assert "DenseLayers_7" in mp_opts.barrier_sync_key_prefix, (
+        f"barrier prefix should embed spmd_id and step; got {mp_opts.barrier_sync_key_prefix!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_global_save_uses_distinct_barrier_prefix_per_step(monkeypatch, tmp_path):
+    """Regression test for the distributed barrier-key reuse bug.
+
+    Orbax's Checkpointer.save() calls sync_global_processes() with fixed keys
+    like 'Checkpointer:save_start'. JAX's distributed barrier requires that each
+    key is used exactly once — reusing the same key on a second checkpoint call
+    causes a 300-second deadlock in multi-host environments.
+
+    The fix is to pass a step-scoped ``barrier_sync_key_prefix`` to
+    MultiprocessingOptions so that each checkpoint's barrier keys are unique,
+    e.g. 'DenseLayers_50_Checkpointer:save_start' vs
+         'DenseLayers_100_Checkpointer:save_start'.
+    """
+    orbax_module, _, checkpointer_save_calls, _ = _install_fake_orbax_runtime(monkeypatch)
+    jax_module = sys.modules["jax"]
+
+    state = {
+        "operator_states": {
+            "DenseLayers": {
+                "weights": jax_module.Array(jax_module.sharding.NamedSharding())
+            }
+        }
+    }
+    backend = orbax_module.OrbaxBackend(force_write=True)
+
+    # First checkpoint
+    await backend.save(state, str(tmp_path), "DenseLayers", rank=0, step=50)
+    # Second checkpoint (different step)
+    await backend.save(state, str(tmp_path), "DenseLayers", rank=0, step=100)
+
+    assert len(checkpointer_save_calls) == 2
+    prefix_50 = checkpointer_save_calls[0]["mp_options"].barrier_sync_key_prefix
+    prefix_100 = checkpointer_save_calls[1]["mp_options"].barrier_sync_key_prefix
+
+    assert prefix_50 != prefix_100, (
+        "Each checkpoint step must use a distinct barrier_sync_key_prefix. "
+        f"Both steps produced the same prefix: {prefix_50!r}"
+    )
+    assert "50" in prefix_50
+    assert "100" in prefix_100
+
+
+@pytest.mark.asyncio
+async def test_ckpt_dir_always_points_to_spmd_level_dir(monkeypatch, tmp_path):
+    """ckpt_dir must be ckpt_dir/step/spmd_id, not the orbax_state subdirectory.
+
+    Operators receive the SPMD-level directory during the save phase; the load
+    path must expose the same directory so operators can locate their own
+    artifacts consistently.
+    """
+    orbax_module, _, _, _ = _install_fake_orbax_runtime(monkeypatch)
+    jax_module = sys.modules["jax"]
+
+    state = {
+        "weights": jax_module.Array(jax_module.sharding.NamedSharding())
+    }
+    backend = orbax_module.OrbaxBackend(force_write=True)
+    metadata = await backend.save(
+        state, str(tmp_path), "DenseLayers", rank=0, step=5
+    )
+
+    expected_spmd_dir = tmp_path / "5" / "DenseLayers"
+    assert metadata["ckpt_dir"] == str(expected_spmd_dir), (
+        f"ckpt_dir should be the SPMD-level directory {expected_spmd_dir}, "
+        f"not the orbax_state subdirectory; got {metadata['ckpt_dir']!r}"
+    )
+    # orbax_state lives one level below
+    assert metadata["orbax_final_path"] == str(expected_spmd_dir / "orbax_state")
+
+
+@pytest.mark.asyncio
+async def test_ckpt_dir_set_for_local_only_checkpoint(monkeypatch, tmp_path):
+    """ckpt_dir must be present even when the checkpoint contains only local_state.
+
+    If ckpt_dir is absent, load_state_from_disk silently skips restoration,
+    leading to a silent state reset that is extremely hard to diagnose.
+    """
+    orbax_module, _, checkpointer_save_calls, _ = _install_fake_orbax_runtime(
+        monkeypatch
+    )
+    jax_module = sys.modules["jax"]
+
+    # SingleDeviceSharding → classified as local_state by _split_hybrid_state
+    state = {
+        "optimizer": jax_module.Array(jax_module.sharding.SingleDeviceSharding())
+    }
+    backend = orbax_module.OrbaxBackend(force_write=True)
+    metadata = await backend.save(
+        state, str(tmp_path), "DenseLayers", rank=1, step=3
+    )
+
+    expected_spmd_dir = tmp_path / "3" / "DenseLayers"
+    assert "ckpt_dir" in metadata, (
+        "ckpt_dir must be set for local-only checkpoints so that "
+        "load_state_from_disk does not silently skip restoration"
+    )
+    assert metadata["ckpt_dir"] == str(expected_spmd_dir)
+    assert "orbax_final_path" not in metadata, (
+        "A local-only checkpoint should not produce orbax_final_path"
+    )
+    assert "orbax_local_dir" in metadata

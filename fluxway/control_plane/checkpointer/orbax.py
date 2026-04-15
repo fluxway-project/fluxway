@@ -102,7 +102,16 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
         pytree_meta_encoded = _serialize_treedef(state)
 
         global_state, local_state = _split_hybrid_state(state)
-        metadata = {"pytree_meta": pytree_meta_encoded}
+
+        # The canonical SPMD-level checkpoint directory for this step.  All
+        # artifact sub-paths are derived from it.  Setting ckpt_dir here
+        # unconditionally ensures load_state_from_disk can locate the checkpoint
+        # even when the checkpoint contains only local_state (no global arrays).
+        spmd_step_dir = Path(ckpt_dir) / str(step) / spmd_id
+        metadata: Dict[str, Any] = {
+            "pytree_meta": pytree_meta_encoded,
+            "ckpt_dir": str(spmd_step_dir),
+        }
 
         handler = self._get_handler()
 
@@ -114,9 +123,7 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
                 lambda x: np.asarray(x) if isinstance(x, jax.Array) else x, local_state
             )
 
-            local_final_path = (
-                Path(ckpt_dir) / str(step) / spmd_id / f"worker_{rank}_local_orbax"
-            )
+            local_final_path = spmd_step_dir / f"worker_{rank}_local_orbax"
 
             await asyncio.to_thread(
                 local_final_path.parent.mkdir, parents=True, exist_ok=True
@@ -124,7 +131,16 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
 
             def _write_local():
                 local_handler = ocp.PyTreeCheckpointHandler()
-                ckptr = ocp.Checkpointer(local_handler)
+                # Each save must use a unique barrier_sync_key_prefix so that
+                # Orbax's internal sync_global_devices calls use distinct keys
+                # across checkpoint steps.  Without this, the second checkpoint
+                # would deadlock on the reused 'Checkpointer:save_start' key.
+                mp_options = ocp.options.MultiprocessingOptions(
+                    barrier_sync_key_prefix=f"{spmd_id}_{step}_local_{rank}"
+                )
+                ckptr = ocp.Checkpointer(
+                    local_handler, multiprocessing_options=mp_options
+                )
                 # Orbax Checkpointer.save already guarantees atomic commit for the
                 # destination directory, so writing to the final path avoids an
                 # extra rename race in our wrapper.
@@ -138,15 +154,25 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
             metadata["orbax_local_dir"] = str(local_final_path)
 
         if global_state:
-            final_path = Path(ckpt_dir) / str(step) / spmd_id / "orbax_state"
+            final_path = spmd_step_dir / "orbax_state"
             await asyncio.to_thread(
                 final_path.parent.mkdir, parents=True, exist_ok=True
             )
 
             def _write_global():
-                ckptr = ocp.Checkpointer(handler)
-                # Checkpointer manages the temporary directory, synchronization,
-                # and finalization contract for multi-host Orbax saves.
+                # Each checkpoint step must use a unique barrier_sync_key_prefix.
+                # Orbax's Checkpointer.save() calls sync_global_processes() with
+                # fixed keys ('Checkpointer:save_start', 'Checkpointer:save',
+                # 'Checkpointer:finalize').  JAX's distributed barrier requires
+                # every key to be used exactly once per process — reusing the same
+                # key on a second checkpoint call causes a permanent deadlock
+                # (300 s timeout) in multi-host environments.
+                mp_options = ocp.options.MultiprocessingOptions(
+                    barrier_sync_key_prefix=f"{spmd_id}_{step}"
+                )
+                ckptr = ocp.Checkpointer(
+                    handler, multiprocessing_options=mp_options
+                )
                 ckptr.save(
                     epath.Path(final_path),
                     force=self._force_write,
@@ -155,7 +181,6 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
 
             await asyncio.to_thread(_write_global)
             metadata["orbax_final_path"] = str(final_path)
-            metadata["ckpt_dir"] = str(final_path)
 
         return metadata
 
