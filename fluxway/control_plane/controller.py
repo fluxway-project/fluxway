@@ -1192,7 +1192,11 @@ if RAY_AVAILABLE:
             # Stop all SPMDs
             for spmd_id in self._spmd_manager.get_all_spmd_ids():
                 try:
-                    await self._spmd_manager.stop_spmd(spmd_id, save_checkpoint=False)
+                    await self._spmd_manager.stop_spmd(
+                        spmd_id,
+                        save_checkpoint=False,
+                        release_driver_handle=False,
+                    )
                 except Exception as e:
                     logger.error(f"Error stopping SPMD {spmd_id}: {e}")
                 finally:
@@ -1204,6 +1208,10 @@ if RAY_AVAILABLE:
                     self._scheduler.release_resources(spmd_id)
                 except Exception as e:
                     logger.error(f"Error releasing resources for {spmd_id}: {e}")
+
+        def _release_stopped_spmd_handles(self) -> None:
+            """Release driver handles after terminal cleanup has fully completed."""
+            self._spmd_manager.release_all_driver_handles()
 
         # =====================================================================
         # Lifecycle Control
@@ -1227,6 +1235,7 @@ if RAY_AVAILABLE:
 
             # Cleanup
             await self._cleanup_all_spmds()
+            self._release_stopped_spmd_handles()
 
             logger.debug("Controller stopped")
 

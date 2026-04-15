@@ -23,11 +23,9 @@ async def test_driver_stop_waits_for_worker_shutdown():
     worker0 = MagicMock()
     worker0.stop.remote = AsyncMock(return_value=None)
     worker0.set_driver_handle.remote = AsyncMock(return_value=None)
-    worker0.__ray_terminate__ = SimpleNamespace(remote=MagicMock())
     worker1 = MagicMock()
     worker1.stop.remote = AsyncMock(return_value=None)
     worker1.set_driver_handle.remote = AsyncMock(return_value=None)
-    worker1.__ray_terminate__ = SimpleNamespace(remote=MagicMock())
 
     driver._worker_handles = {0: worker0, 1: worker1}
     driver._stop_heartbeat = MagicMock()
@@ -39,8 +37,6 @@ async def test_driver_stop_waits_for_worker_shutdown():
     worker1.stop.remote.assert_awaited_once_with()
     worker0.set_driver_handle.remote.assert_awaited_once_with(None)
     worker1.set_driver_handle.remote.assert_awaited_once_with(None)
-    worker0.__ray_terminate__.remote.assert_called_once_with()
-    worker1.__ray_terminate__.remote.assert_called_once_with()
     assert driver._worker_handles == {}
 
 

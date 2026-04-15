@@ -9,8 +9,8 @@ State transitions (event-driven initialization):
     -> starts heartbeat timeout monitoring
 - RUNNING -> BLOCKED (on DRIVER_ERROR, blocks all SPMDs, triggers restart)
 - BLOCKED -> RUNNING (on DRIVER_RECOVERED)
-- BLOCKED -> FAILING -> FAILED (on RECOVERY_FAILED, after cleanup)
-- RUNNING -> COMPLETING -> COMPLETED (on ALL_DRIVERS_COMPLETED, after cleanup)
+- BLOCKED -> FAILING -> FAILED
+- RUNNING -> COMPLETING -> COMPLETED
 
 Supports async callbacks for Ray Actor Controller.
 """
@@ -146,7 +146,6 @@ class ControllerStateMachine:
                     f"Invalid state transition: {current} + {event}. Ignoring event."
                 )
                 return False
-
             next_state = self._TRANSITIONS[key]
 
             # Handle event-specific data
@@ -315,6 +314,11 @@ class ControllerStateMachine:
             if hasattr(self._controller, "stop_checkpointer"):
                 await self._controller.stop_checkpointer()
             await self._controller._cleanup_all_spmds()
+            release_fn = getattr(
+                self._controller, "_release_stopped_spmd_handles", None
+            )
+            if release_fn is not None:
+                release_fn()
         except Exception as e:
             logger.error(f"Failed to cleanup SPMDs: {e}")
         await self.trigger_event(ControllerEvent.CLEANUP_FINISHED)
@@ -333,6 +337,11 @@ class ControllerStateMachine:
         # Attempt to cleanup resources even on failure
         try:
             await self._controller._cleanup_all_spmds()
+            release_fn = getattr(
+                self._controller, "_release_stopped_spmd_handles", None
+            )
+            if release_fn is not None:
+                release_fn()
         except Exception as e:
             logger.error(f"Failed to cleanup SPMDs during failure handling: {e}")
         await self.trigger_event(ControllerEvent.CLEANUP_FINISHED)

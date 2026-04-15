@@ -3,8 +3,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from fluxway.common.types import ControllerState
 from fluxway.common.types import ControllerEvent
+from fluxway.common.types import ControllerState
 from fluxway.common.types.drain import DrainStrategy
 from fluxway.control_plane.controller import ControllerActor
 
@@ -98,6 +98,7 @@ async def test_all_drivers_completed_transitions_through_completing(controller):
     controller._state_machine._state = ControllerState.RUNNING
     controller._cleanup_all_spmds = AsyncMock(side_effect=cleanup_gate.wait)
     controller.stop_checkpointer = AsyncMock()
+    controller._release_stopped_spmd_handles = MagicMock()
 
     transition_task = asyncio.create_task(
         controller._state_machine.trigger_event(ControllerEvent.ALL_DRIVERS_COMPLETED)
@@ -110,6 +111,7 @@ async def test_all_drivers_completed_transitions_through_completing(controller):
 
     assert await transition_task is True
     assert controller._state_machine.state == ControllerState.COMPLETED
+    controller._release_stopped_spmd_handles.assert_called_once_with()
 
 
 @pytest.mark.asyncio
@@ -118,6 +120,7 @@ async def test_wait_for_completion_observes_completed_after_cleanup(controller):
     controller._state_machine._state = ControllerState.RUNNING
     controller._cleanup_all_spmds = AsyncMock(side_effect=cleanup_gate.wait)
     controller.stop_checkpointer = AsyncMock()
+    controller._release_stopped_spmd_handles = MagicMock()
 
     transition_task = asyncio.create_task(
         controller._state_machine.trigger_event(ControllerEvent.ALL_DRIVERS_COMPLETED)
@@ -132,12 +135,11 @@ async def test_wait_for_completion_observes_completed_after_cleanup(controller):
 
     assert await transition_task is True
     assert await wait_task is True
+    controller._release_stopped_spmd_handles.assert_called_once_with()
 
 
 @pytest.mark.asyncio
-async def test_cleanup_all_spmds_stops_each_spmd_without_special_handle_retention(
-    controller,
-):
+async def test_cleanup_all_spmds_preserves_driver_handles_until_terminal_release(controller):
     controller._heartbeat_manager = AsyncMock()
     controller._spmd_manager.stop_spmd = AsyncMock()
     controller._scheduler = MagicMock()
@@ -145,8 +147,14 @@ async def test_cleanup_all_spmds_stops_each_spmd_without_special_handle_retentio
 
     await controller._cleanup_all_spmds()
 
-    controller._spmd_manager.stop_spmd.assert_any_call("op1", save_checkpoint=False)
-    controller._spmd_manager.stop_spmd.assert_any_call("op2", save_checkpoint=False)
+    controller._spmd_manager.stop_spmd.assert_any_call(
+        "op1", save_checkpoint=False, release_driver_handle=False
+    )
+    controller._spmd_manager.stop_spmd.assert_any_call(
+        "op2", save_checkpoint=False, release_driver_handle=False
+    )
+    controller._heartbeat_manager.unregister_spmd.assert_any_call("op1")
+    controller._heartbeat_manager.unregister_spmd.assert_any_call("op2")
 
 
 @pytest.mark.asyncio
@@ -154,6 +162,7 @@ async def test_recovery_failed_transitions_through_failing(controller):
     cleanup_gate = asyncio.Event()
     controller._state_machine._state = ControllerState.BLOCKED
     controller._cleanup_all_spmds = AsyncMock(side_effect=cleanup_gate.wait)
+    controller._release_stopped_spmd_handles = MagicMock()
 
     transition_task = asyncio.create_task(
         controller._state_machine.trigger_event(ControllerEvent.RECOVERY_FAILED)
@@ -166,3 +175,4 @@ async def test_recovery_failed_transitions_through_failing(controller):
 
     assert await transition_task is True
     assert controller._state_machine.state == ControllerState.FAILED
+    controller._release_stopped_spmd_handles.assert_called_once_with()

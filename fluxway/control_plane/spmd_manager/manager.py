@@ -223,29 +223,22 @@ class SPMDManager:
             logger.error(f"Failed to start SPMD {spmd_id}: {e}")
             return None
 
-    def _request_actor_termination(self, actor_handle: Any, actor_label: str) -> None:
-        """Request graceful Ray actor termination without relying on refcount GC."""
-        terminate_method = getattr(actor_handle, "__ray_terminate__", None)
-        if terminate_method is None:
-            logger.warning(
-                f"Actor handle has no __ray_terminate__ actor={actor_label}"
-            )
-            return
-
-        try:
-            terminate_method.remote()
-        except Exception as e:
-            logger.error(
-                f"Failed to request actor termination actor={actor_label} error={e}"
-            )
-
-    async def stop_spmd(self, spmd_id: str, save_checkpoint: bool = True) -> None:
+    async def stop_spmd(
+        self,
+        spmd_id: str,
+        save_checkpoint: bool = True,
+        release_driver_handle: bool = True,
+    ) -> None:
         """
         Stop an SPMD instance.
 
         Args:
             spmd_id: ID of SPMD to stop
             save_checkpoint: Whether to save checkpoint before stopping
+            release_driver_handle: Whether to clear the controller-side driver
+                reference immediately after stop returns. Terminal cleanup keeps
+                handles until the controller reaches its terminal state so Ray
+                bookkeeping can settle before actor references are dropped.
         """
         handle = self._spmd_handles.get(spmd_id)
         if handle is None:
@@ -258,20 +251,27 @@ class SPMDManager:
 
         try:
             if RAY_AVAILABLE:
-                # Phase 1: quiesce the driver and wait for its worker shutdown path.
+                # Stop the driver and wait for its worker shutdown path.
                 await handle.call_driver("stop", save_checkpoint)
         except Exception as e:
             logger.error(f"Error stopping SPMD {spmd_id}: {e}")
         finally:
-            if RAY_AVAILABLE:
-                # Phase 2: explicitly terminate the actor so shutdown no longer
-                # depends on Ray reference-count garbage collection timing.
-                self._request_actor_termination(
-                    handle.driver_handle, actor_label=f"driver:{spmd_id}"
-                )
-            handle.set_driver_handle(None)
+            if release_driver_handle:
+                handle.set_driver_handle(None)
             handle.set_initialized(False)
             logger.info(f"Stopped SPMD {spmd_id}")
+
+    def release_driver_handle(self, spmd_id: str) -> None:
+        """Release the controller-side handle to a stopped driver actor."""
+        handle = self._spmd_handles.get(spmd_id)
+        if handle is None:
+            return
+        handle.set_driver_handle(None)
+
+    def release_all_driver_handles(self) -> None:
+        """Release controller-side handles for all registered SPMDs."""
+        for handle in self._spmd_handles.values():
+            handle.set_driver_handle(None)
 
     def get_spmd_handle(self, spmd_id: str) -> Optional[SPMDHandle]:
         """

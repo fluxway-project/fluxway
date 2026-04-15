@@ -398,22 +398,6 @@ if RAY_AVAILABLE:
                             f"spmd_id={self.spmd_id}"
                         )
 
-            for rank, worker in worker_handles:
-                terminate_method = getattr(worker, "__ray_terminate__", None)
-                if terminate_method is None:
-                    logger.warning(
-                        f"Worker handle has no __ray_terminate__ rank={rank} "
-                        f"spmd_id={self.spmd_id}"
-                    )
-                    continue
-                try:
-                    terminate_method.remote()
-                except Exception as e:
-                    logger.error(
-                        f"Failed to request worker termination rank={rank} error={e} "
-                        f"spmd_id={self.spmd_id}"
-                    )
-
             self._worker_handles.clear()
 
         # =====================================================================
