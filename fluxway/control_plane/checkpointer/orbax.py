@@ -131,13 +131,14 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
 
             def _write_local():
                 local_handler = ocp.PyTreeCheckpointHandler()
-                # Orbax Checkpointer.save() still uses multihost barriers even
-                # when writing per-rank local artifacts. All ranks participating
-                # in the save must therefore share the same barrier key for this
-                # local phase, while different checkpoint steps/phases must use
-                # distinct prefixes to avoid key reuse deadlocks.
+                # Each rank writes its own local state to a distinct directory,
+                # so every process must be a writer.  Setting primary_host=None
+                # tells Orbax that ALL processes should persist data (the default
+                # primary_host=0 causes only rank-0 to write while others only
+                # participate in barriers).
                 mp_options = ocp.options.MultiprocessingOptions(
-                    barrier_sync_key_prefix=f"{spmd_id}_{step}_local"
+                    primary_host=None,
+                    barrier_sync_key_prefix=f"{spmd_id}_{step}_local",
                 )
                 ckptr = ocp.Checkpointer(
                     local_handler, multiprocessing_options=mp_options
@@ -202,7 +203,12 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
 
             def _read_local():
                 local_handler = ocp.PyTreeCheckpointHandler()
-                ckptr = ocp.Checkpointer(local_handler)
+                mp_options = ocp.options.MultiprocessingOptions(
+                    primary_host=None,
+                )
+                ckptr = ocp.Checkpointer(
+                    local_handler, multiprocessing_options=mp_options
+                )
                 return ckptr.restore(epath.Path(metadata["orbax_local_dir"]))
 
             local_state = await asyncio.to_thread(_read_local)
