@@ -176,3 +176,46 @@ async def test_recovery_failed_transitions_through_failing(controller):
     assert await transition_task is True
     assert controller._state_machine.state == ControllerState.FAILED
     controller._release_stopped_spmd_handles.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_restore_snapshot_waits_for_all_drivers_ready(
+    controller, mock_spmd_manager
+):
+    ready_gate = asyncio.Event()
+    controller._heartbeat_manager = MagicMock()
+    controller._heartbeat_manager.wait_until_all_drivers_ready = AsyncMock(
+        side_effect=ready_gate.wait
+    )
+    controller._state_manager = MagicMock()
+    controller._async_step_manager = MagicMock()
+    controller._check_and_enforce_step_limits = AsyncMock()
+    controller.block_all_spmds = AsyncMock()
+    controller.unblock_all_spmds = AsyncMock()
+
+    manifest = {
+        "op1": {"0": {"completed_step_count": {}}},
+        "op2": {"0": {"completed_step_count": {}}},
+    }
+
+    restore_task = asyncio.create_task(
+        controller.restore_snapshot("restore_10_0", 10, manifest)
+    )
+    await asyncio.sleep(0)
+
+    controller._heartbeat_manager.wait_until_all_drivers_ready.assert_awaited_once_with()
+    controller.block_all_spmds.assert_not_called()
+    mock_spmd_manager.mock_driver1.restore_from_disk.remote.assert_not_called()
+    mock_spmd_manager.mock_driver2.restore_from_disk.remote.assert_not_called()
+
+    ready_gate.set()
+
+    await restore_task
+
+    controller.block_all_spmds.assert_awaited_once_with()
+    mock_spmd_manager.mock_driver1.restore_from_disk.remote.assert_called_once_with(
+        {0: {"completed_step_count": {}}}
+    )
+    mock_spmd_manager.mock_driver2.restore_from_disk.remote.assert_called_once_with(
+        {0: {"completed_step_count": {}}}
+    )

@@ -83,6 +83,7 @@ class HeartbeatManager:
         # Phase trigger flags (one-shot)
         self._all_ready_triggered = False
         self._all_workers_running_triggered = False
+        self._all_ready_event = asyncio.Event()
 
         # Lock for thread safety (asyncio.Lock for async context)
         self._lock = asyncio.Lock()
@@ -158,6 +159,7 @@ class HeartbeatManager:
             if not self._all_ready_triggered:
                 if self._check_all_ready_internal():
                     self._all_ready_triggered = True
+                    self._all_ready_event.set()
                     should_trigger_ready = True
                     logger.heartbeat("All drivers ready workers_ready=True")
 
@@ -285,6 +287,25 @@ class HeartbeatManager:
                     return False
 
             return True
+
+    async def wait_until_all_drivers_ready(
+        self, timeout: Optional[float] = None
+    ) -> bool:
+        """Wait until all registered drivers report workers_ready=True."""
+        async with self._lock:
+            if self._check_all_ready_internal():
+                self._all_ready_triggered = True
+                self._all_ready_event.set()
+                return True
+
+        try:
+            if timeout is None:
+                await self._all_ready_event.wait()
+            else:
+                await asyncio.wait_for(self._all_ready_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return False
+        return True
 
     def _is_driver_healthy_internal(self, spmd_id: str) -> bool:
         """Check if a driver is healthy (must hold lock)."""
@@ -478,5 +499,6 @@ class HeartbeatManager:
             self._error_drivers.clear()
             self._all_ready_triggered = False
             self._all_workers_running_triggered = False
+            self._all_ready_event = asyncio.Event()
             for spmd_id in self._registered_spmds:
                 self._missed_counts[spmd_id] = 0

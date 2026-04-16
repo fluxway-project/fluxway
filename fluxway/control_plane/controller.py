@@ -817,6 +817,16 @@ if RAY_AVAILABLE:
             """
             logger.info(f"Controller restoring snapshot {snapshot_id} (step {step})")
 
+            if self._heartbeat_manager is not None:
+                logger.debug(
+                    "Waiting for all drivers to report workers_ready before restore"
+                )
+                ready = await self._heartbeat_manager.wait_until_all_drivers_ready()
+                if not ready:
+                    raise RuntimeError(
+                        "Timed out waiting for drivers to become restore-ready"
+                    )
+
             # Important: update the baseline *before* waking up workers,
             # so their `report_op_completed` pulses don't trigger a nested checkpoint.
             self._last_checkpointed_step = step
