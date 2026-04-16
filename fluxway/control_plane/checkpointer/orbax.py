@@ -125,32 +125,33 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
 
             local_final_path = spmd_step_dir / f"worker_{rank}_local_orbax"
 
-            await asyncio.to_thread(
-                local_final_path.parent.mkdir, parents=True, exist_ok=True
-            )
-
             def _write_local():
-                local_handler = ocp.PyTreeCheckpointHandler()
-                # Each rank writes its own local state to a distinct directory,
-                # so every process must be a writer.  Setting primary_host=None
-                # tells Orbax that ALL processes should persist data (the default
-                # primary_host=0 causes only rank-0 to write while others only
-                # participate in barriers).
-                mp_options = ocp.options.MultiprocessingOptions(
-                    primary_host=None,
-                    barrier_sync_key_prefix=f"{spmd_id}_{step}_local",
-                )
-                ckptr = ocp.Checkpointer(
-                    local_handler, multiprocessing_options=mp_options
-                )
-                # Orbax Checkpointer.save already guarantees atomic commit for the
-                # destination directory, so writing to the final path avoids an
-                # extra rename race in our wrapper.
-                ckptr.save(
-                    local_final_path,
-                    force=self._force_write,
-                    args=ocp.args.PyTreeSave(local_state_np),
-                )
+                # Bypass Orbax Checkpointer entirely for per-rank local state.
+                # Orbax's Checkpointer always coordinates across all JAX
+                # distributed processes via barriers, and for non-sharded numpy
+                # arrays only one process actually writes data regardless of
+                # primary_host / active_processes settings.  Direct numpy
+                # serialization lets each rank write independently without any
+                # cross-process coordination.
+                leaves, treedef = jtu.tree_flatten(local_state_np)
+                tmp_path = local_final_path.with_suffix(".tmp")
+                tmp_path.mkdir(parents=True, exist_ok=True)
+                for i, leaf in enumerate(leaves):
+                    leaf_path = tmp_path / f"leaf_{i}.npy"
+                    if isinstance(leaf, np.ndarray):
+                        np.save(str(leaf_path), leaf)
+                    else:
+                        # Non-array leaves (scalars, strings, etc.)
+                        with open(str(leaf_path.with_suffix(".pkl")), "wb") as f:
+                            pickle.dump(leaf, f)
+                # Save the pytree structure so we can reconstruct on load.
+                with open(str(tmp_path / "_treedef.pkl"), "wb") as f:
+                    pickle.dump(treedef, f)
+                # Atomic rename: tmp → final.
+                if local_final_path.exists() and self._force_write:
+                    import shutil
+                    shutil.rmtree(local_final_path)
+                tmp_path.rename(local_final_path)
 
             await asyncio.to_thread(_write_local)
             metadata["orbax_local_dir"] = str(local_final_path)
@@ -199,17 +200,26 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
 
         local_state = {}
         if "orbax_local_dir" in metadata:
-            import orbax.checkpoint as ocp
+            import numpy as np
 
             def _read_local():
-                local_handler = ocp.PyTreeCheckpointHandler()
-                mp_options = ocp.options.MultiprocessingOptions(
-                    primary_host=None,
-                )
-                ckptr = ocp.Checkpointer(
-                    local_handler, multiprocessing_options=mp_options
-                )
-                return ckptr.restore(epath.Path(metadata["orbax_local_dir"]))
+                local_dir = Path(metadata["orbax_local_dir"])
+                with open(str(local_dir / "_treedef.pkl"), "rb") as f:
+                    treedef = pickle.load(f)
+                leaves = []
+                for i in range(treedef.num_leaves):
+                    npy_path = local_dir / f"leaf_{i}.npy"
+                    pkl_path = local_dir / f"leaf_{i}.pkl"
+                    if npy_path.exists():
+                        leaves.append(np.load(str(npy_path)))
+                    elif pkl_path.exists():
+                        with open(str(pkl_path), "rb") as f:
+                            leaves.append(pickle.load(f))
+                    else:
+                        raise FileNotFoundError(
+                            f"Missing leaf {i} in {local_dir}"
+                        )
+                return treedef.unflatten(leaves)
 
             local_state = await asyncio.to_thread(_read_local)
 

@@ -1,9 +1,25 @@
 import importlib.util
+import pickle
 import sys
 import types
 from pathlib import Path
 
+import numpy as np
 import pytest
+
+
+class _FakeTreeDef:
+    """Minimal pytree treedef mock supporting pickle + unflatten."""
+
+    def __init__(self, keys):
+        self._keys = keys
+
+    @property
+    def num_leaves(self):
+        return len(self._keys)
+
+    def unflatten(self, leaves):
+        return dict(zip(self._keys, leaves))
 
 
 def _install_fake_orbax_runtime(monkeypatch):
@@ -26,7 +42,10 @@ def _install_fake_orbax_runtime(monkeypatch):
     tree_util_module = types.ModuleType("jax.tree_util")
 
     def _tree_flatten(state):
-        return [], ("fake_treedef", tuple(state.keys()))
+        if isinstance(state, dict):
+            keys = sorted(state.keys())
+            return [state[k] for k in keys], _FakeTreeDef(keys)
+        return [state], _FakeTreeDef([])
 
     def _tree_map(fn, value):
         if isinstance(value, dict):
@@ -36,7 +55,7 @@ def _install_fake_orbax_runtime(monkeypatch):
     tree_util_module.tree_flatten = _tree_flatten
     tree_util_module.tree_map = _tree_map
     tree_util_module.PyTreeDef = tuple
-    tree_util_module.register_pytree_node = lambda *args, **kwargs: None
+    tree_util_module.tree_leaves = lambda x: _tree_flatten(x)[0]
 
     jax_module.Array = _Array
     jax_module.ShapeDtypeStruct = _ShapeDtypeStruct
@@ -45,6 +64,7 @@ def _install_fake_orbax_runtime(monkeypatch):
         SingleDeviceSharding=_SingleDeviceSharding,
         NamedSharding=_NamedSharding,
     )
+    jax_module.process_index = lambda: 0
 
     sync_global_devices_calls = []
 
@@ -167,21 +187,17 @@ def _install_fake_orbax_runtime(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_local_save_uses_final_path_without_manual_rename(monkeypatch, tmp_path):
+async def test_local_save_bypasses_orbax_checkpointer(monkeypatch, tmp_path):
+    """Local state must be saved via direct numpy serialization, NOT via
+    Orbax Checkpointer, because Orbax coordinates all JAX distributed
+    processes and only one process writes non-sharded numpy data."""
     orbax_module, save_calls, checkpointer_save_calls, _ = _install_fake_orbax_runtime(
         monkeypatch
     )
-    rename_calls = []
-
-    def _unexpected_rename(self, target):
-        rename_calls.append((Path(self), Path(target)))
-        raise AssertionError("local Orbax save should not require a manual rename")
-
-    monkeypatch.setattr(Path, "rename", _unexpected_rename)
 
     backend = orbax_module.OrbaxBackend()
     metadata = await backend.save(
-        {"operator_states": {"DenseLayers": {"step": 2}}},
+        {"operator_states": {"DenseLayers": {"step": np.array(2)}}},
         str(tmp_path),
         "DenseLayers",
         rank=4,
@@ -189,18 +205,22 @@ async def test_local_save_uses_final_path_without_manual_rename(monkeypatch, tmp
     )
 
     expected_dir = tmp_path / "2" / "DenseLayers" / "worker_4_local_orbax"
-    assert save_calls == [expected_dir]
+    # Must NOT use Orbax Checkpointer for local state.
+    assert checkpointer_save_calls == [], (
+        "Local state should bypass Orbax Checkpointer entirely"
+    )
+    # But the metadata and final directory must be correct.
     assert metadata["orbax_local_dir"] == str(expected_dir)
     assert expected_dir.exists()
-    assert rename_calls == []
-    assert len(checkpointer_save_calls) == 1
-    mp_opts = checkpointer_save_calls[0]["mp_options"]
-    assert mp_opts is not None
-    assert mp_opts.barrier_sync_key_prefix == "DenseLayers_2_local"
+    # Verify numpy files were written.
+    assert (expected_dir / "_treedef.pkl").exists()
+    assert any(expected_dir.glob("leaf_*.npy")) or any(expected_dir.glob("leaf_*.pkl"))
 
 
 @pytest.mark.asyncio
-async def test_local_save_uses_shared_barrier_prefix_across_ranks(monkeypatch, tmp_path):
+async def test_local_save_multiple_ranks_independent(monkeypatch, tmp_path):
+    """Each rank must write its own local state independently.
+    No Orbax barriers, no cross-rank coordination."""
     orbax_module, _, checkpointer_save_calls, _ = _install_fake_orbax_runtime(
         monkeypatch
     )
@@ -208,18 +228,23 @@ async def test_local_save_uses_shared_barrier_prefix_across_ranks(monkeypatch, t
 
     backend = orbax_module.OrbaxBackend(force_write=True)
     state = {
-        "optimizer": jax_module.Array(jax_module.sharding.SingleDeviceSharding())
+        "optimizer": np.array([1.0, 2.0, 3.0], dtype=np.float32)
     }
 
     await backend.save(state, str(tmp_path), "DenseLayers", rank=0, step=9)
     await backend.save(state, str(tmp_path), "DenseLayers", rank=5, step=9)
 
-    assert len(checkpointer_save_calls) == 2
-    prefix_rank_0 = checkpointer_save_calls[0]["mp_options"].barrier_sync_key_prefix
-    prefix_rank_5 = checkpointer_save_calls[1]["mp_options"].barrier_sync_key_prefix
-
-    assert prefix_rank_0 == "DenseLayers_9_local"
-    assert prefix_rank_5 == "DenseLayers_9_local"
+    # Local saves must NOT touch Orbax Checkpointer.
+    assert checkpointer_save_calls == [], (
+        "Local saves must bypass Orbax Checkpointer"
+    )
+    # Both ranks must have their own directories with actual data.
+    dir_rank0 = tmp_path / "9" / "DenseLayers" / "worker_0_local_orbax"
+    dir_rank5 = tmp_path / "9" / "DenseLayers" / "worker_5_local_orbax"
+    assert dir_rank0.exists()
+    assert dir_rank5.exists()
+    assert (dir_rank0 / "_treedef.pkl").exists()
+    assert (dir_rank5 / "_treedef.pkl").exists()
 
 
 @pytest.mark.asyncio
@@ -347,7 +372,7 @@ async def test_ckpt_dir_set_for_local_only_checkpoint(monkeypatch, tmp_path):
 
     # SingleDeviceSharding → classified as local_state by _split_hybrid_state
     state = {
-        "optimizer": jax_module.Array(jax_module.sharding.SingleDeviceSharding())
+        "optimizer": np.array([1.0], dtype=np.float32)
     }
     backend = orbax_module.OrbaxBackend(force_write=True)
     metadata = await backend.save(
