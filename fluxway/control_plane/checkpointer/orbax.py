@@ -131,12 +131,13 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
 
             def _write_local():
                 local_handler = ocp.PyTreeCheckpointHandler()
-                # Each save must use a unique barrier_sync_key_prefix so that
-                # Orbax's internal sync_global_devices calls use distinct keys
-                # across checkpoint steps.  Without this, the second checkpoint
-                # would deadlock on the reused 'Checkpointer:save_start' key.
+                # Orbax Checkpointer.save() still uses multihost barriers even
+                # when writing per-rank local artifacts. All ranks participating
+                # in the save must therefore share the same barrier key for this
+                # local phase, while different checkpoint steps/phases must use
+                # distinct prefixes to avoid key reuse deadlocks.
                 mp_options = ocp.options.MultiprocessingOptions(
-                    barrier_sync_key_prefix=f"{spmd_id}_{step}_local_{rank}"
+                    barrier_sync_key_prefix=f"{spmd_id}_{step}_local"
                 )
                 ckptr = ocp.Checkpointer(
                     local_handler, multiprocessing_options=mp_options
@@ -160,15 +161,11 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
             )
 
             def _write_global():
-                # Each checkpoint step must use a unique barrier_sync_key_prefix.
-                # Orbax's Checkpointer.save() calls sync_global_processes() with
-                # fixed keys ('Checkpointer:save_start', 'Checkpointer:save',
-                # 'Checkpointer:finalize').  JAX's distributed barrier requires
-                # every key to be used exactly once per process — reusing the same
-                # key on a second checkpoint call causes a permanent deadlock
-                # (300 s timeout) in multi-host environments.
+                # The global phase uses its own step-scoped prefix so it does
+                # not collide with either another checkpoint step or the local
+                # save phase above.
                 mp_options = ocp.options.MultiprocessingOptions(
-                    barrier_sync_key_prefix=f"{spmd_id}_{step}"
+                    barrier_sync_key_prefix=f"{spmd_id}_{step}_global"
                 )
                 ckptr = ocp.Checkpointer(
                     handler, multiprocessing_options=mp_options

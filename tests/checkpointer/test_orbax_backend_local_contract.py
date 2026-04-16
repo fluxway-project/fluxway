@@ -168,7 +168,9 @@ def _install_fake_orbax_runtime(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_local_save_uses_final_path_without_manual_rename(monkeypatch, tmp_path):
-    orbax_module, save_calls, _, _ = _install_fake_orbax_runtime(monkeypatch)
+    orbax_module, save_calls, checkpointer_save_calls, _ = _install_fake_orbax_runtime(
+        monkeypatch
+    )
     rename_calls = []
 
     def _unexpected_rename(self, target):
@@ -191,6 +193,33 @@ async def test_local_save_uses_final_path_without_manual_rename(monkeypatch, tmp
     assert metadata["orbax_local_dir"] == str(expected_dir)
     assert expected_dir.exists()
     assert rename_calls == []
+    assert len(checkpointer_save_calls) == 1
+    mp_opts = checkpointer_save_calls[0]["mp_options"]
+    assert mp_opts is not None
+    assert mp_opts.barrier_sync_key_prefix == "DenseLayers_2_local"
+
+
+@pytest.mark.asyncio
+async def test_local_save_uses_shared_barrier_prefix_across_ranks(monkeypatch, tmp_path):
+    orbax_module, _, checkpointer_save_calls, _ = _install_fake_orbax_runtime(
+        monkeypatch
+    )
+    jax_module = sys.modules["jax"]
+
+    backend = orbax_module.OrbaxBackend(force_write=True)
+    state = {
+        "optimizer": jax_module.Array(jax_module.sharding.SingleDeviceSharding())
+    }
+
+    await backend.save(state, str(tmp_path), "DenseLayers", rank=0, step=9)
+    await backend.save(state, str(tmp_path), "DenseLayers", rank=5, step=9)
+
+    assert len(checkpointer_save_calls) == 2
+    prefix_rank_0 = checkpointer_save_calls[0]["mp_options"].barrier_sync_key_prefix
+    prefix_rank_5 = checkpointer_save_calls[1]["mp_options"].barrier_sync_key_prefix
+
+    assert prefix_rank_0 == "DenseLayers_9_local"
+    assert prefix_rank_5 == "DenseLayers_9_local"
 
 
 @pytest.mark.asyncio
