@@ -133,8 +133,13 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
                 # primary_host / active_processes settings.  Direct numpy
                 # serialization lets each rank write independently without any
                 # cross-process coordination.
+                import shutil
+
                 leaves, treedef = jtu.tree_flatten(local_state_np)
                 tmp_path = local_final_path.with_suffix(".tmp")
+                # Clean up any leftover tmp dir from a previous interrupted write.
+                if tmp_path.exists():
+                    shutil.rmtree(tmp_path)
                 tmp_path.mkdir(parents=True, exist_ok=True)
                 for i, leaf in enumerate(leaves):
                     leaf_path = tmp_path / f"leaf_{i}.npy"
@@ -148,8 +153,12 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
                 with open(str(tmp_path / "_treedef.pkl"), "wb") as f:
                     pickle.dump(treedef, f)
                 # Atomic rename: tmp → final.
-                if local_final_path.exists() and self._force_write:
-                    import shutil
+                if local_final_path.exists():
+                    if not self._force_write:
+                        raise FileExistsError(
+                            f"Local checkpoint already exists at {local_final_path}. "
+                            "Set force_write=True in CheckpointConfig to overwrite."
+                        )
                     shutil.rmtree(local_final_path)
                 tmp_path.rename(local_final_path)
 

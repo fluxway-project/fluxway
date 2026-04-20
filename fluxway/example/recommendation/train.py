@@ -103,6 +103,7 @@ async def run_training(args):
 
     async_step_config = AsyncStepConfig(max_steps=args.max_steps)
     checkpoint_config = CheckpointConfig(
+        force_write=True,
         backend="orbax",
         ckpt_dir="/tmp/fluxway_recsys_ckpt",
         interval_steps=args.checkpoint_interval,
