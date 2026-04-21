@@ -1,5 +1,4 @@
 import importlib.util
-import pickle
 import sys
 import types
 from pathlib import Path
@@ -19,7 +18,7 @@ class _FakeTreeDef:
         return len(self._keys)
 
     def unflatten(self, leaves):
-        return dict(zip(self._keys, leaves))
+        return dict(zip(self._keys, leaves, strict=True))
 
 
 def _install_fake_orbax_runtime(monkeypatch):
@@ -224,7 +223,6 @@ async def test_local_save_multiple_ranks_independent(monkeypatch, tmp_path):
     orbax_module, _, checkpointer_save_calls, _ = _install_fake_orbax_runtime(
         monkeypatch
     )
-    jax_module = sys.modules["jax"]
 
     backend = orbax_module.OrbaxBackend(force_write=True)
     state = {
@@ -368,7 +366,6 @@ async def test_ckpt_dir_set_for_local_only_checkpoint(monkeypatch, tmp_path):
     orbax_module, _, checkpointer_save_calls, _ = _install_fake_orbax_runtime(
         monkeypatch
     )
-    jax_module = sys.modules["jax"]
 
     # SingleDeviceSharding → classified as local_state by _split_hybrid_state
     state = {
