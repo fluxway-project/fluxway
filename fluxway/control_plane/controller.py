@@ -821,10 +821,17 @@ if RAY_AVAILABLE:
                 logger.debug(
                     "Waiting for all drivers to report workers_ready before restore"
                 )
-                ready = await self._heartbeat_manager.wait_until_all_drivers_ready()
+                restore_timeout = int(
+                    os.environ.get("FLUXWAY_SNAPSHOT_TIMEOUT_SECS", "600")
+                )
+                ready = await self._heartbeat_manager.wait_until_all_drivers_ready(
+                    timeout=restore_timeout
+                )
                 if not ready:
                     raise RuntimeError(
-                        "Timed out waiting for drivers to become restore-ready"
+                        f"Timed out after {restore_timeout}s waiting for drivers to "
+                        f"become restore-ready. A Driver may have failed to start. "
+                        f"Set FLUXWAY_SNAPSHOT_TIMEOUT_SECS to adjust."
                     )
 
             # Important: update the baseline *before* waking up workers,

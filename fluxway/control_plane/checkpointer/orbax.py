@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 import jax.tree_util as jtu
+import numpy as np
 from etils import epath
 
 from fluxway.control_plane.checkpointer.backend import WorkerCheckpointBackend
@@ -117,13 +118,12 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
 
         if local_state:
             import jax
-            import numpy as np
 
             local_state_np = jax.tree_util.tree_map(
                 lambda x: np.asarray(x) if isinstance(x, jax.Array) else x, local_state
             )
 
-            local_final_path = spmd_step_dir / f"worker_{rank}_local_orbax"
+            local_final_path = spmd_step_dir / f"worker_{rank}_local_state"
 
             def _write_local():
                 # Bypass Orbax Checkpointer entirely for per-rank local state.
@@ -160,10 +160,12 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
                             "Set force_write=True in CheckpointConfig to overwrite."
                         )
                     shutil.rmtree(local_final_path)
-                tmp_path.rename(local_final_path)
+                # Use shutil.move instead of Path.rename to handle the case
+                # where tmp and final paths reside on different filesystems.
+                shutil.move(str(tmp_path), str(local_final_path))
 
             await asyncio.to_thread(_write_local)
-            metadata["orbax_local_dir"] = str(local_final_path)
+            metadata["local_state_dir"] = str(local_final_path)
 
         if global_state:
             final_path = spmd_step_dir / "orbax_state"
@@ -208,11 +210,10 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
             global_state = await asyncio.to_thread(_read_global)
 
         local_state = {}
-        if "orbax_local_dir" in metadata:
-            import numpy as np
+        if "local_state_dir" in metadata:
 
             def _read_local():
-                local_dir = Path(metadata["orbax_local_dir"])
+                local_dir = Path(metadata["local_state_dir"])
                 with open(str(local_dir / "_treedef.pkl"), "rb") as f:
                     treedef = pickle.load(f)
                 leaves = []

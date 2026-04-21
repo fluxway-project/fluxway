@@ -875,6 +875,11 @@ if RAY_AVAILABLE:
                     heartbeat_thread.join,
                     self._heartbeat_config.heartbeat_interval + 1.0,
                 )
+                if heartbeat_thread.is_alive():
+                    logger.warning(
+                        f"Heartbeat thread did not terminate within timeout "
+                        f"spmd_id={self.spmd_id}"
+                    )
             self._heartbeat_thread = None
 
         def _heartbeat_loop(self) -> None:

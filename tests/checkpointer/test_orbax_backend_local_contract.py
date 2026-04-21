@@ -203,13 +203,13 @@ async def test_local_save_bypasses_orbax_checkpointer(monkeypatch, tmp_path):
         step=2,
     )
 
-    expected_dir = tmp_path / "2" / "DenseLayers" / "worker_4_local_orbax"
+    expected_dir = tmp_path / "2" / "DenseLayers" / "worker_4_local_state"
     # Must NOT use Orbax Checkpointer for local state.
     assert checkpointer_save_calls == [], (
         "Local state should bypass Orbax Checkpointer entirely"
     )
     # But the metadata and final directory must be correct.
-    assert metadata["orbax_local_dir"] == str(expected_dir)
+    assert metadata["local_state_dir"] == str(expected_dir)
     assert expected_dir.exists()
     # Verify numpy files were written.
     assert (expected_dir / "_treedef.pkl").exists()
@@ -237,8 +237,8 @@ async def test_local_save_multiple_ranks_independent(monkeypatch, tmp_path):
         "Local saves must bypass Orbax Checkpointer"
     )
     # Both ranks must have their own directories with actual data.
-    dir_rank0 = tmp_path / "9" / "DenseLayers" / "worker_0_local_orbax"
-    dir_rank5 = tmp_path / "9" / "DenseLayers" / "worker_5_local_orbax"
+    dir_rank0 = tmp_path / "9" / "DenseLayers" / "worker_0_local_state"
+    dir_rank5 = tmp_path / "9" / "DenseLayers" / "worker_5_local_state"
     assert dir_rank0.exists()
     assert dir_rank5.exists()
     assert (dir_rank0 / "_treedef.pkl").exists()
@@ -385,4 +385,4 @@ async def test_ckpt_dir_set_for_local_only_checkpoint(monkeypatch, tmp_path):
     assert "orbax_final_path" not in metadata, (
         "A local-only checkpoint should not produce orbax_final_path"
     )
-    assert "orbax_local_dir" in metadata
+    assert "local_state_dir" in metadata
