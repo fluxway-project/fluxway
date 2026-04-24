@@ -58,11 +58,31 @@ class BaseDataDistributor:
         """Internal logic for Mirror Backflow (using physical receipts)."""
         backend = get_backend()
         mirror_target_world_size = receipt.world_size
-        sender_rank_tags = backend.as_tensor(receipt.sender_rank_tags)
+        sender_rank_tags = receipt.sender_rank_tags
 
-        stitched_tensors, tensors_size, tensor_offsets = _stitch_with_prime(
-            sender_rank_tags, payloads, mirror_target_world_size
+        # Scalar fast-path: all data goes to one destination.
+        # Handle before entering the JIT-compiled _stitch_with_prime to avoid
+        # ConcretizationTypeError (int() on traced JAX values).
+        is_scalar = (
+            isinstance(sender_rank_tags, (int, np.integer))
+            or (hasattr(sender_rank_tags, 'shape') and np.asarray(sender_rank_tags).ndim == 0)
         )
+        if is_scalar:
+            target_rank = int(sender_rank_tags)
+            counts_np = np.zeros(mirror_target_world_size, dtype=np.int32)
+            offsets_np = np.zeros(mirror_target_world_size, dtype=np.int32)
+            if 0 <= target_rank < mirror_target_world_size:
+                flat_leaves = backend.tree_flatten(payloads)[0]
+                if flat_leaves:
+                    counts_np[target_rank] = backend.shape(flat_leaves[0])[0]
+            stitched_tensors = payloads
+            tensors_size = counts_np
+            tensor_offsets = offsets_np
+        else:
+            sender_rank_tags = backend.as_tensor(sender_rank_tags)
+            stitched_tensors, tensors_size, tensor_offsets = _stitch_with_prime(
+                sender_rank_tags, payloads, mirror_target_world_size
+            )
 
         counts_np = np.array(tensors_size)
         offsets_np = np.array(tensor_offsets)
