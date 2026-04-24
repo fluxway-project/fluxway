@@ -13,7 +13,6 @@ two-loop reference to guarantee behavioral equivalence.
 
 import numpy as np
 
-
 # ---------------------------------------------------------------------------
 # Reference implementation (original two-loop logic from worker.py)
 # ---------------------------------------------------------------------------
@@ -59,9 +58,11 @@ def _old_dispatch(
             "counts": sub_counts,
             "shapes": [global_shapes[i] for i in indices],
             "meta": [meta_tensor_state_list[i] for i in indices],
-            "compact": [slice_compact_desc_params[i] for i in indices]
-            if slice_compact_desc_params
-            else None,
+            "compact": (
+                [slice_compact_desc_params[i] for i in indices]
+                if slice_compact_desc_params
+                else None
+            ),
         }
     return result
 
@@ -122,7 +123,9 @@ def _new_dispatch(
             "counts": sub_c,
             "shapes": sub_s,
             "meta": sub_m,
-            "compact": sub_compact if any(c is not None for c in sub_compact) else None,
+            "compact": (
+                sub_compact if any(c is not None for c in sub_compact) else None
+            ),
         }
     return result
 
@@ -143,17 +146,17 @@ def _arrays_equal(a, b):
 
 
 def _assert_bundles_equal(old, new):
-    assert set(old.keys()) == set(new.keys()), (
-        f"op keys differ: {set(old.keys())} vs {set(new.keys())}"
-    )
+    assert set(old.keys()) == set(
+        new.keys()
+    ), f"op keys differ: {set(old.keys())} vs {set(new.keys())}"
     for op in old:
         for field in ("uuids", "counts", "shapes", "meta", "compact"):
-            assert _arrays_equal(old[op][field], new[op][field]), (
-                f"{op}.{field}: {old[op][field]} != {new[op][field]}"
-            )
-        assert _arrays_equal(old[op]["payloads"], new[op]["payloads"]), (
-            f"{op}.payloads mismatch"
-        )
+            assert _arrays_equal(
+                old[op][field], new[op][field]
+            ), f"{op}.{field}: {old[op][field]} != {new[op][field]}"
+        assert _arrays_equal(
+            old[op]["payloads"], new[op]["payloads"]
+        ), f"{op}.payloads mismatch"
 
 
 # ---------------------------------------------------------------------------

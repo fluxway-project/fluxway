@@ -97,9 +97,10 @@ def test_chunk_layout_ragged():
     index_desc = RaggedIndex(splits=splits)
 
     bounds = spec.get_shard_bounds(0, 0, data_shape, index_desc)
-    assert bounds == (0, 1), (
-        "Hash applies per-item, index_desc shouldn't break basic bounding"
-    )
+    assert bounds == (
+        0,
+        1,
+    ), "Hash applies per-item, index_desc shouldn't break basic bounding"
 
     indices0 = spec.get_shard_indices(0, 0, data_shape[0], index_desc)
     indices1 = spec.get_shard_indices(1, 0, data_shape[0], index_desc)
@@ -313,7 +314,7 @@ def test_multi_axis_chunk_2x3():
     for r in range(6):
         indices = spec.get_shard_indices(r, 0, data_shape[0])
         expected = jnp.arange(r * 2, r * 2 + 2, dtype=jnp.int32)
-        assert_indices_equal(indices, expected), f"Rank {r}: {indices} != {expected}"
+        (assert_indices_equal(indices, expected), f"Rank {r}: {indices} != {expected}")
 
 
 def test_multi_axis_replication():
@@ -489,9 +490,9 @@ def test_replicated_responsibility_mapping():
     for j in range(6):
         producers = src_layout.resolve_producers(dst_layout, j)
         expected_src = (j * 3) // 6
-        assert producers == [expected_src], (
-            f"Dst Rank {j} should receive only from Src Rank {expected_src}"
-        )
+        assert producers == [
+            expected_src
+        ], f"Dst Rank {j} should receive only from Src Rank {expected_src}"
 
     # 2. Sender Perspective: Each src rank i should be responsible for a subset of dst ranks
     # Mapping: Src 0 -> Dst [0, 1], Src 1 -> Dst [2, 3], Src 2 -> Dst [4, 5]

@@ -180,9 +180,7 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
                 mp_options = ocp.options.MultiprocessingOptions(
                     barrier_sync_key_prefix=f"{spmd_id}_{step}_global"
                 )
-                ckptr = ocp.Checkpointer(
-                    handler, multiprocessing_options=mp_options
-                )
+                ckptr = ocp.Checkpointer(handler, multiprocessing_options=mp_options)
                 ckptr.save(
                     epath.Path(final_path),
                     force=self._force_write,
@@ -226,9 +224,7 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
                         with open(str(pkl_path), "rb") as f:
                             leaves.append(pickle.load(f))
                     else:
-                        raise FileNotFoundError(
-                            f"Missing leaf {i} in {local_dir}"
-                        )
+                        raise FileNotFoundError(f"Missing leaf {i} in {local_dir}")
                 return treedef.unflatten(leaves)
 
             local_state = await asyncio.to_thread(_read_local)

@@ -1020,9 +1020,9 @@ if RAY_AVAILABLE:
                 spmd_id=spmd_id,
                 config=node.spmd_config,
                 placement_group=pg_info.get("pg") if pg_info else None,
-                worker_bundle_indices=pg_info.get("worker_bundle_indices")
-                if pg_info
-                else None,
+                worker_bundle_indices=(
+                    pg_info.get("worker_bundle_indices") if pg_info else None
+                ),
                 checkpoint_id=None,  # TODO: implement checkpoint
             )
 
@@ -1210,9 +1210,7 @@ if RAY_AVAILABLE:
             for spmd_id in self._spmd_manager.get_all_spmd_ids():
                 try:
                     await self._spmd_manager.stop_spmd(
-                        spmd_id,
-                        save_checkpoint=False,
-                        release_driver_handle=False,
+                        spmd_id, save_checkpoint=False, release_driver_handle=False
                     )
                 except Exception as e:
                     logger.error(f"Error stopping SPMD {spmd_id}: {e}")

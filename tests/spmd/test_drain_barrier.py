@@ -222,9 +222,9 @@ class TestDrainEdgeCases:
         _register_op(sync, "op_a", step=5)  # both workers at count=5
         fired = threading.Event()
         sync.drain_to_step_count(target_count=3, on_drained=fired.set)
-        assert fired.is_set(), (
-            "drain must fire immediately when workers already exceed target_count"
-        )
+        assert (
+            fired.is_set()
+        ), "drain must fire immediately when workers already exceed target_count"
 
     def test_drain_does_not_fire_when_workers_below_target(self):
         """drain_to_step_count must NOT fire if workers are below target_count."""
@@ -232,6 +232,6 @@ class TestDrainEdgeCases:
         _register_op(sync, "op_a", step=2)  # both workers at count=2
         fired = threading.Event()
         sync.drain_to_step_count(target_count=5, on_drained=fired.set)
-        assert not fired.is_set(), (
-            "drain must not fire when workers have not reached target_count"
-        )
+        assert (
+            not fired.is_set()
+        ), "drain must not fire when workers have not reached target_count"

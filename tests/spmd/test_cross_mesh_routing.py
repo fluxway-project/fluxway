@@ -27,7 +27,6 @@ from fluxway.common.backend import get_backend
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.types.tensor import SymmetryReceipt, TransportTensor
 
-
 # ─── Helper: build a minimal TransportTensor ─────────────────────────────────
 
 
@@ -40,12 +39,16 @@ def make_tt(
 ) -> TransportTensor:
     return TransportTensor(
         jnp.array(values, dtype=jnp.float32),
-        origin_indices=jnp.array(origin_indices, dtype=jnp.int32)
-        if origin_indices is not None
-        else None,
-        routing_indices=jnp.array(routing_indices, dtype=jnp.int32)
-        if routing_indices is not None
-        else None,
+        origin_indices=(
+            jnp.array(origin_indices, dtype=jnp.int32)
+            if origin_indices is not None
+            else None
+        ),
+        routing_indices=(
+            jnp.array(routing_indices, dtype=jnp.int32)
+            if routing_indices is not None
+            else None
+        ),
         receipt=receipt,
         global_shape=global_shape,
     )

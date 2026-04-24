@@ -59,9 +59,7 @@ async def test_stop_spmd_can_preserve_driver_reference_during_terminal_cleanup(
     monkeypatch.setattr(manager_module, "RAY_AVAILABLE", True)
     monkeypatch.setattr(manager_module, "ray", SimpleNamespace(kill=kill_mock))
 
-    await manager.stop_spmd(
-        "dense", save_checkpoint=False, release_driver_handle=False
-    )
+    await manager.stop_spmd("dense", save_checkpoint=False, release_driver_handle=False)
 
     assert stop_method.calls == [((False,), {})]
     kill_mock.assert_not_called()

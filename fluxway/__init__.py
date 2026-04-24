@@ -33,7 +33,6 @@ __version__ = "0.1.0"
 # Users of this repo want INFO logs by default.
 from fluxway.common.utils.logging import ensure_logging_configured
 
-
 # Import decorators for top-level access
 from fluxway.common.decorators import data_type, spmd, operator
 

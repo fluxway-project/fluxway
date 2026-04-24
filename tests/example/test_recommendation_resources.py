@@ -1,7 +1,6 @@
 import ast
 from pathlib import Path
 
-
 REPO_ROOT = Path("/Users/admin/Project/fluxway-antigravity")
 EXAMPLE_DIR = REPO_ROOT / "fluxway" / "example" / "recommendation"
 

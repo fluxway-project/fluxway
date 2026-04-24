@@ -28,7 +28,6 @@ from fluxway.common.mesh import DeviceMesh
 from fluxway.transport.communication import TransportReceiver
 from fluxway.common.types.sharding import ShardingSpec, PartitionSpec
 
-
 # ---------------------------------------------------------------------------
 # Helpers: build minimal SPMDConfig with registered operators
 # ---------------------------------------------------------------------------
@@ -291,9 +290,9 @@ def test_transport_receiver_zero_copy_dlpack_and_no_concat():
     #  so we only check identity for non-JAX backends.)
     if backend.name() != "jax":
         ptr_after = receiver.target_buffers[0].__array_interface__["data"][0]
-        assert ptr_after == ptr_before, (
-            f"Buffer was reallocated! Before: {ptr_before:#x}, After: {ptr_after:#x}"
-        )
+        assert (
+            ptr_after == ptr_before
+        ), f"Buffer was reallocated! Before: {ptr_before:#x}, After: {ptr_after:#x}"
 
     # --- Property 2: No concat needed — read directly from the single buffer ---
     buf = receiver.target_buffers[0]  # single contiguous pre-allocated array
@@ -411,8 +410,7 @@ def test_worker_setup_and_start_initializes_runtime(monkeypatch):
         lambda self: calls.__setitem__("run_loop", calls["run_loop"] + 1),
     )
     monkeypatch.setattr(
-        "fluxway.spmd.worker.worker.OperatorManager",
-        FakeOperatorManager,
+        "fluxway.spmd.worker.worker.OperatorManager", FakeOperatorManager
     )
 
     worker = worker_cls(
@@ -422,20 +420,10 @@ def test_worker_setup_and_start_initializes_runtime(monkeypatch):
         driver_handle=object(),
         checkpoint_backend=MagicMock(),
     )
-    worker.setup_and_start(
-        local_rank=1, local_world_size=3, node_rank=0, num_nodes=2
-    )
+    worker.setup_and_start(local_rank=1, local_world_size=3, node_rank=0, num_nodes=2)
 
     assert calls["preinstantiate"] == [
-        (
-            2,
-            {
-                "local_rank": 1,
-                "local_world_size": 3,
-                "node_rank": 0,
-                "num_nodes": 2,
-            },
-        )
+        (2, {"local_rank": 1, "local_world_size": 3, "node_rank": 0, "num_nodes": 2})
     ]
     assert calls["heartbeat"] == 1
     assert calls["run_loop"] == 1
@@ -501,8 +489,7 @@ def test_worker_setup_and_start_logs_phase_markers(monkeypatch, capsys):
             return False
 
     monkeypatch.setattr(
-        "fluxway.spmd.worker.worker.OperatorManager",
-        FakeOperatorManager,
+        "fluxway.spmd.worker.worker.OperatorManager", FakeOperatorManager
     )
 
     worker = worker_cls(
@@ -513,12 +500,7 @@ def test_worker_setup_and_start_logs_phase_markers(monkeypatch, capsys):
         checkpoint_backend=MagicMock(),
     )
 
-    worker.setup_and_start(
-        local_rank=0,
-        local_world_size=1,
-        node_rank=0,
-        num_nodes=1,
-    )
+    worker.setup_and_start(local_rank=0, local_world_size=1, node_rank=0, num_nodes=1)
 
     captured = capsys.readouterr()
     assert "[DEBUG]" in captured.err

@@ -35,7 +35,6 @@ from fluxway.common.types.sharding import (
 )
 from fluxway.common.types.configs import ArgumentType
 
-
 logger = logging.getLogger(__name__)
 
 

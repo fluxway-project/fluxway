@@ -112,8 +112,7 @@ class FluxwayCheckpointer:
         except FileNotFoundError as e:
             available = self.list_steps()
             raise FileNotFoundError(
-                f"Checkpoint step {step} not found in {self._ckpt_dir}. "
-                f"Available: {available}"
+                f"Checkpoint step {step} not found in {self._ckpt_dir}. Available: {available}"
             ) from e
 
         if not manifest:

@@ -394,11 +394,7 @@ class SPMDWorker:
         return ray.get_runtime_context().get_node_id()
 
     def setup_and_start(
-        self,
-        local_rank: int,
-        local_world_size: int,
-        node_rank: int,
-        num_nodes: int,
+        self, local_rank: int, local_world_size: int, node_rank: int, num_nodes: int
     ) -> None:
         """Finish topology-aware startup after the driver has all worker node IDs."""
         logger.debug(
@@ -846,9 +842,9 @@ class SPMDWorker:
                 sub_counts,
                 sub_shapes,
                 meta_tensor_state_list=sub_meta,
-                slice_compact_desc_params=sub_compact
-                if any(c is not None for c in sub_compact)
-                else None,
+                slice_compact_desc_params=(
+                    sub_compact if any(c is not None for c in sub_compact) else None
+                ),
             )
         return watermark
 
@@ -1030,8 +1026,7 @@ class SPMDWorker:
                 break
             except Exception as e:
                 logger.error(
-                    f"Error in execution loop error={e} "
-                    f"spmd_id={self.spmd_id} rank={self.rank}"
+                    f"Error in execution loop error={e} spmd_id={self.spmd_id} rank={self.rank}"
                 )
 
     async def stop(self) -> None:
@@ -1048,9 +1043,7 @@ class SPMDWorker:
         if self._heartbeat_task and not self._heartbeat_task.done():
             self._heartbeat_task.cancel()
             pending_tasks.append(self._heartbeat_task)
-        background_tasks = [
-            task for task in self._background_tasks if not task.done()
-        ]
+        background_tasks = [task for task in self._background_tasks if not task.done()]
         for task in background_tasks:
             task.cancel()
         pending_tasks.extend(background_tasks)
@@ -1903,9 +1896,11 @@ class SPMDWorker:
         return TransportTensor(
             merged_values,
             routing_indices=merged_routing_indices,
-            global_shape=original_global_shape
-            if original_global_shape is not None
-            else backend.shape(merged_values),
+            global_shape=(
+                original_global_shape
+                if original_global_shape is not None
+                else backend.shape(merged_values)
+            ),
             receipt=merged_receipt,
             origin_indices=merged_origin_indices,
         )
@@ -2359,8 +2354,7 @@ class SPMDWorker:
         """
         self.set_static_arg(state_name, state_value)
         logger.debug(
-            f"Received control_argument name={state_name} "
-            f"spmd_id={self.spmd_id} rank={self.rank}"
+            f"Received control_argument name={state_name} spmd_id={self.spmd_id} rank={self.rank}"
         )
 
     def send_control_argument(
@@ -2408,8 +2402,7 @@ class SPMDWorker:
             )
         except Exception as e:
             logger.error(
-                f"Failed to send control_argument error={e} "
-                f"spmd_id={self.spmd_id} rank={self.rank}"
+                f"Failed to send control_argument error={e} spmd_id={self.spmd_id} rank={self.rank}"
             )
 
     # =========================================================================
@@ -2491,8 +2484,7 @@ class SPMDWorker:
             )
         except Exception as e:
             logger.error(
-                f"Failed to send heartbeat error={e} "
-                f"spmd_id={self.spmd_id} rank={self.rank}"
+                f"Failed to send heartbeat error={e} spmd_id={self.spmd_id} rank={self.rank}"
             )
 
     async def _get_mailbox_status(self) -> MailboxStatus:

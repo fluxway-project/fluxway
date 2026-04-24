@@ -11,7 +11,11 @@ from .data_types import LookupOutput
 logger = get_logger(__name__)
 
 
-@spmd(resource={"num_cpus": 1, "memory_gb": 1}, mesh_axis_names=("shard",), mesh_axis_shapes=(4,))
+@spmd(
+    resource={"num_cpus": 1, "memory_gb": 1},
+    mesh_axis_names=("shard",),
+    mesh_axis_shapes=(4,),
+)
 class SparseEmbeddingSPMD:
     """Generic sharded embedding table with forward lookup and gradient-based update."""
 

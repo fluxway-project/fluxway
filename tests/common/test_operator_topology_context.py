@@ -85,12 +85,7 @@ def test_preinstantiate_operator_sets_topology_fields_in_init():
     )
 
     SPMDWorker.__ray_metadata__.modified_class._pre_instantiate_operators(
-        config,
-        3,
-        local_rank=1,
-        local_world_size=4,
-        node_rank=0,
-        num_nodes=2,
+        config, 3, local_rank=1, local_world_size=4, node_rank=0, num_nodes=2
     )
 
     storage, _ = get_instance_storage()

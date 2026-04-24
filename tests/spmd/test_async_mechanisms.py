@@ -17,7 +17,6 @@ from fluxway.common.types.configs import (
     AsyncStepConfig,
 )
 
-
 # =============================================================================
 # 1. Intra-SPMD: SPMDSynchronizer Tests
 # =============================================================================
@@ -190,12 +189,10 @@ def test_async_manager_reports_all_completed_at_max_steps():
     op_a = "produce"
     op_b = "consume"
     node_a = Node(
-        name="A",
-        spmd_config=SPMDConfig(operator_metas={op_a: OperatorMeta(name=op_a)}),
+        name="A", spmd_config=SPMDConfig(operator_metas={op_a: OperatorMeta(name=op_a)})
     )
     node_b = Node(
-        name="B",
-        spmd_config=SPMDConfig(operator_metas={op_b: OperatorMeta(name=op_b)}),
+        name="B", spmd_config=SPMDConfig(operator_metas={op_b: OperatorMeta(name=op_b)})
     )
     graph = Graph(nodes={"A": node_a, "B": node_b})
     manager = AsyncStepManager(graph=graph, config=AsyncStepConfig(max_steps=3))

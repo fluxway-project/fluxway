@@ -7,17 +7,22 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10", "3.12", "3.14"]
+        python-version: ["3.11", "3.12", "3.14"]
     steps:
     - uses: actions/checkout@v5
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.x'
-    - name: Install the code linting and formatting tool Ruff
-      run: pipx install ruff
+    - name: Install Ruff and Black
+      run: |
+        pipx install ruff
+        pipx install black
     - name: Lint code with Ruff
       run: ruff check --output-format=github
     - name: Check code formatting with Ruff
       run: ruff format --diff
+      continue-on-error: true
+    - name: Check code formatting with Black
+      run: black --check .
       continue-on-error: true

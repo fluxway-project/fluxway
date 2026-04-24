@@ -311,9 +311,7 @@ class PGManager:
             "driver_resource": self._spmd_to_driver_resource.get(spmd_id),
         }
 
-    def get_resource_allocation_summary(
-        self, spmd_id: str
-    ) -> Optional[Dict[str, Any]]:
+    def get_resource_allocation_summary(self, spmd_id: str) -> Optional[Dict[str, Any]]:
         """Return a stable, human-readable resource summary for one SPMD."""
         worker_resource = self._spmd_to_resource.get(spmd_id)
         if worker_resource is None:

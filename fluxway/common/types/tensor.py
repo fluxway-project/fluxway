@@ -679,9 +679,11 @@ class TransportTensor:
                 [],
                 routing_indices=new_indices,
                 origin_indices=new_origin_indices,
-                receipt=self._receipt[start : start + size_tensor]
-                if self._receipt
-                else None,
+                receipt=(
+                    self._receipt[start : start + size_tensor]
+                    if self._receipt
+                    else None
+                ),
             )
 
         else:

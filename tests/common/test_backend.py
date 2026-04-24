@@ -142,9 +142,9 @@ def test_contiguous_view_jax_returns_wrapper():
     arr = jnp.arange(100, dtype=jnp.float32)
     for offset, count in [(0, 10), (5, 20), (50, 50), (99, 1)]:
         view = b.get_contiguous_view(arr, offset, count)
-        assert isinstance(view, JAXViewWrapper), (
-            f"Expected JAXViewWrapper, got {type(view)}"
-        )
+        assert isinstance(
+            view, JAXViewWrapper
+        ), f"Expected JAXViewWrapper, got {type(view)}"
         assert view.arr is arr, "JAXViewWrapper must reference the original array"
         assert view.slices == slice(offset, offset + count)
 

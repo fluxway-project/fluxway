@@ -815,9 +815,10 @@ class PhysicalLayout(FluxwayBaseSchema):
         backend = get_backend()
         if backend.shape(indices)[0] == 0:
             return 0, 0
-        return int(backend.item(backend.min(indices))), int(
-            backend.item(backend.max(indices))
-        ) + 1
+        return (
+            int(backend.item(backend.min(indices))),
+            int(backend.item(backend.max(indices))) + 1,
+        )
 
     def get_shard_indices(
         self,

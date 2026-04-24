@@ -88,12 +88,12 @@ async def test_reader_processor_data_flows():
             else {}
         )
 
-        assert reader_steps.get("read", 0) > 0, (
-            f"Reader {reader_id} never produced data. Heartbeat: {heartbeats.get(reader_id)}"
-        )
-        assert proc_steps.get("process", 0) > 0, (
-            f"Processor {proc_id} never consumed data. Heartbeat: {heartbeats.get(proc_id)}"
-        )
+        assert (
+            reader_steps.get("read", 0) > 0
+        ), f"Reader {reader_id} never produced data. Heartbeat: {heartbeats.get(reader_id)}"
+        assert (
+            proc_steps.get("process", 0) > 0
+        ), f"Processor {proc_id} never consumed data. Heartbeat: {heartbeats.get(proc_id)}"
     finally:
         await controller.stop.remote()
 

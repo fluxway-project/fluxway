@@ -28,9 +28,9 @@ class Monitor:
     """
 
     def __init__(self):
-        self._telemetry: Dict[
-            str, Dict[str, WorkerTelemetry]
-        ] = {}  # spmd_id -> worker_id -> telemetry
+        self._telemetry: Dict[str, Dict[str, WorkerTelemetry]] = (
+            {}
+        )  # spmd_id -> worker_id -> telemetry
         self._spmd_status: Dict[str, str] = {}  # spmd_id -> status
 
     def report_telemetry(

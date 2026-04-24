@@ -278,7 +278,9 @@ if RAY_AVAILABLE:
             for ranks in node_groups.values():
                 ranks.sort()
 
-            sorted_nodes = sorted(node_groups, key=lambda node_id: node_groups[node_id][0])
+            sorted_nodes = sorted(
+                node_groups, key=lambda node_id: node_groups[node_id][0]
+            )
             node_to_rank = {
                 node_id: node_rank for node_rank, node_id in enumerate(sorted_nodes)
             }
@@ -369,8 +371,7 @@ if RAY_AVAILABLE:
 
             if stop_refs:
                 results = await asyncio.gather(
-                    *(ref for _, ref in stop_refs),
-                    return_exceptions=True,
+                    *(ref for _, ref in stop_refs), return_exceptions=True
                 )
                 for (rank, _), result in zip(stop_refs, results, strict=True):
                     if isinstance(result, Exception):
@@ -385,18 +386,14 @@ if RAY_AVAILABLE:
                     detach_refs.append((rank, worker.set_driver_handle.remote(None)))
                 except Exception as e:
                     logger.error(
-                        f"Failed to detach worker rank={rank} error={e} "
-                        f"spmd_id={self.spmd_id}"
+                        f"Failed to detach worker rank={rank} error={e} spmd_id={self.spmd_id}"
                     )
 
             if detach_refs:
                 detach_results = await asyncio.gather(
-                    *(ref for _, ref in detach_refs),
-                    return_exceptions=True,
+                    *(ref for _, ref in detach_refs), return_exceptions=True
                 )
-                for (rank, _), result in zip(
-                    detach_refs, detach_results, strict=True
-                ):
+                for (rank, _), result in zip(detach_refs, detach_results, strict=True):
                     if isinstance(result, Exception):
                         logger.error(
                             f"Worker detach RPC failed rank={rank} error={result} "
@@ -877,8 +874,7 @@ if RAY_AVAILABLE:
                 )
                 if heartbeat_thread.is_alive():
                     logger.warning(
-                        f"Heartbeat thread did not terminate within timeout "
-                        f"spmd_id={self.spmd_id}"
+                        f"Heartbeat thread did not terminate within timeout spmd_id={self.spmd_id}"
                     )
             self._heartbeat_thread = None
 

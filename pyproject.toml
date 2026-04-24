@@ -111,7 +111,7 @@ skip-magic-trailing-comma = true
 "release/*_tests/*.py" = ["I"]
 
 [tool.black]
-line-length = 100
+line-length = 88
 target-version = ['py311', 'py312', 'py313']
 
 [tool.mypy]

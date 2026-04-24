@@ -139,7 +139,9 @@ async def test_wait_for_completion_observes_completed_after_cleanup(controller):
 
 
 @pytest.mark.asyncio
-async def test_cleanup_all_spmds_preserves_driver_handles_until_terminal_release(controller):
+async def test_cleanup_all_spmds_preserves_driver_handles_until_terminal_release(
+    controller,
+):
     controller._heartbeat_manager = AsyncMock()
     controller._spmd_manager.stop_spmd = AsyncMock()
     controller._scheduler = MagicMock()

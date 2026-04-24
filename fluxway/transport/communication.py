@@ -1056,7 +1056,7 @@ def _jit_plan_and_pack(
     backend = get_backend()
 
     # 1. Compute Plan
-    (sort_indices, dest_devices, send_counts, target_num_workers, replica_size) = (
+    sort_indices, dest_devices, send_counts, target_num_workers, replica_size = (
         TransportPlanner._compute_plan_internal(
             src_local_rank=src_local_rank,
             src_data_shape=src_data_shape,

@@ -1127,7 +1127,7 @@ class OperatorManager:
 
         # Build a name-to-TUUID map from local metadata.
         out_args = meta.get_arguments(is_output=True, arg_type=ArgumentType.DATA)
-        name_to_tuuid = dict(zip(out_args, meta.output_uuids, strict=True))  # type:ignore
+        name_to_tuuid = dict(zip(out_args, meta.output_uuids, strict=True))  # type: ignore
 
         res = {}
         if meta.output_sharding:

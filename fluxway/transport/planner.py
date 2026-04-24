@@ -100,14 +100,16 @@ class TransportPlanner:
                 return src_spec.get_shard_indices(
                     rank,
                     dim,
-                    dim_size=src_data_shape[dim]
-                    if src_data_shape and dim < len(src_data_shape)
-                    else 0,
+                    dim_size=(
+                        src_data_shape[dim]
+                        if src_data_shape and dim < len(src_data_shape)
+                        else 0
+                    ),
                     index_desc=src_index_desc,
                 )
 
         # Call internal static method (JIT-friendly)
-        (sort_indices, dest_devices, send_counts, target_num_workers, replica_size) = (
+        sort_indices, dest_devices, send_counts, target_num_workers, replica_size = (
             TransportPlanner._compute_plan_internal(
                 src_local_rank=src_local_rank,
                 src_data_shape=src_data_shape,

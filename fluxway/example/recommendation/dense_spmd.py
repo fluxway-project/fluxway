@@ -9,7 +9,11 @@ from fluxway.common.types.tensor import TransportTensor
 from .data_types import DPFeatures
 
 
-@spmd(resource={"num_cpus": 1, "memory_gb": 1}, mesh_axis_names=("dp",), mesh_axis_shapes=(2,))
+@spmd(
+    resource={"num_cpus": 1, "memory_gb": 1},
+    mesh_axis_names=("dp",),
+    mesh_axis_shapes=(2,),
+)
 class DenseSPMD:
     """Final computation node: forward pass, loss, and dense/embedding gradient computation."""
 

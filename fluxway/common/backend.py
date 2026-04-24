@@ -579,9 +579,11 @@ class TorchBackend(TensorBackend):
         if sliced_tensor.is_cuda:
             device_tuple = (
                 2,
-                sliced_tensor.device.index
-                if sliced_tensor.device.index is not None
-                else 0,
+                (
+                    sliced_tensor.device.index
+                    if sliced_tensor.device.index is not None
+                    else 0
+                ),
             )
 
         return DLPackObject(to_dlpack(sliced_tensor), device=device_tuple)

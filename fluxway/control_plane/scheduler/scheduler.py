@@ -285,12 +285,12 @@ class Scheduler:
                     spmd_id=node_name,
                     config=spmd_config,
                     placement_group=pg_info.get("pg") if pg_info else None,
-                    worker_bundle_indices=pg_info.get("worker_bundle_indices")
-                    if pg_info
-                    else None,
-                    driver_bundle_index=pg_info.get("driver_bundle_index", 0)
-                    if pg_info
-                    else 0,
+                    worker_bundle_indices=(
+                        pg_info.get("worker_bundle_indices") if pg_info else None
+                    ),
+                    driver_bundle_index=(
+                        pg_info.get("driver_bundle_index", 0) if pg_info else 0
+                    ),
                     checkpoint_id=None,
                 )
             )

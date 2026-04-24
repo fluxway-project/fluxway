@@ -17,7 +17,6 @@ from fluxway.common.backend import set_backend
 from fluxway.common.decorators import data_type, operator, operator_context, spmd
 from fluxway.common.types.tensor import TransportTensor
 
-
 # ---------------------------------------------------------------------------
 # Inline data types (mirrors the structure of example/recommendation/data_types.py
 # without importing from it)
@@ -333,9 +332,9 @@ def test_embedding_update_modifies_params():
     # embedding = params[local_id] * local_id, so delta = -0.05 * local_id
     local_ids = jnp.mod(ids, 1000)
     expected_delta = -0.05 * local_ids[:, None] * jnp.ones((1, 4))
-    assert jnp.allclose(emb_after - emb_before, expected_delta, atol=1e-5), (
-        f"Expected param update delta {expected_delta}, got {emb_after - emb_before}"
-    )
+    assert jnp.allclose(
+        emb_after - emb_before, expected_delta, atol=1e-5
+    ), f"Expected param update delta {expected_delta}, got {emb_after - emb_before}"
 
 
 def test_dense_op_step_grad_shape():
@@ -385,8 +384,8 @@ def test_dense_op_step_scatter_add_correctness():
 
     # w=0.1 for all dims; each unique user accumulates from 2 samples → grad = 2 * 0.1
     expected_g1 = jnp.ones((2, embed_dim)) * 0.2
-    assert jnp.allclose(result["grad1"], expected_g1), (
-        f"Expected {expected_g1}, got {result['grad1']}"
-    )
+    assert jnp.allclose(
+        result["grad1"], expected_g1
+    ), f"Expected {expected_g1}, got {result['grad1']}"
     expected_g2 = jnp.ones((2, embed_dim)) * 0.2
     assert jnp.allclose(result["grad2"], expected_g2)

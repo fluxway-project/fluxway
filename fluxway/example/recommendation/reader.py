@@ -37,7 +37,7 @@ class RecommendationReader(GrainReader):
                     "user_id": [1000 + i],
                     "user_age_level": [i % 5],
                     "request_hour": [18],
-                    "hist_click_item_seq": [200, 201, 202] if i % 2 == 0 else [210],
+                    "hist_click_item_seq": ([200, 201, 202] if i % 2 == 0 else [210]),
                     "hist_seq_length": 3 if i % 2 == 0 else 1,
                     "target_item_id": [500 + i],
                     "target_item_category": [i % 10],

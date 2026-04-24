@@ -13,6 +13,7 @@ except ModuleNotFoundError as exc:
                 "OrbaxBackend requires optional jax/orbax dependencies."
             ) from _ORBAX_IMPORT_ERROR
 
+
 __all__ = [
     "FluxwayCheckpointer",
     "WorkerCheckpointBackend",

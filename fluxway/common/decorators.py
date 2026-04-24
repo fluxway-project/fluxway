@@ -618,9 +618,9 @@ def _create_operator_wrapper(
     _is_class_method = "." in func.__qualname__
     meta = OperatorMeta(
         name=name,
-        owner_class_qualname=func.__qualname__.rsplit(".", 1)[0]
-        if _is_class_method
-        else "",
+        owner_class_qualname=(
+            func.__qualname__.rsplit(".", 1)[0] if _is_class_method else ""
+        ),
         owner_class_module=func.__module__ if _is_class_method else "",
         is_source=is_source,
         max_inflight_steps=max_inflight_steps,
@@ -635,17 +635,23 @@ def _create_operator_wrapper(
         input_param_map=input_param_map,
         output_param_map=output_param_map,
         input_treedefs=input_treedefs,
-        output_treedef=meta_output_treedef
-        if meta_output_treedef
-        else (
-            tree_flatten_type(return_tp) if _is_fluxway_data_type(return_tp) else None
+        output_treedef=(
+            meta_output_treedef
+            if meta_output_treedef
+            else (
+                tree_flatten_type(return_tp)
+                if _is_fluxway_data_type(return_tp)
+                else None
+            )
         ),
-        barrier_config=barrier_config
-        if barrier_config
-        else (
-            PeriodicBarrierConfig(n=periodic_barrier)
-            if periodic_barrier is not None
-            else StandardBarrierConfig()
+        barrier_config=(
+            barrier_config
+            if barrier_config
+            else (
+                PeriodicBarrierConfig(n=periodic_barrier)
+                if periodic_barrier is not None
+                else StandardBarrierConfig()
+            )
         ),
     )
 
@@ -793,6 +799,23 @@ def spmd(
         cls.get_mesh = classmethod(lambda c: c._mesh)
         cls.get_num_workers = classmethod(lambda c: c._mesh.size if c._mesh else 1)
         cls.is_fluxway_spmd = classmethod(lambda c: True)
+
+        original_new = cls.__new__
+
+        @functools.wraps(original_new)
+        def __new__(cls_obj, *args, **kwargs):
+            from fluxway.control_plane.graph.functional import FunctionalGraph
+
+            current_graph = FunctionalGraph.current()
+            if current_graph is not None:
+                name = kwargs.pop("name", cls_obj.__name__)
+                return current_graph.node(name, cls_obj, *args, **kwargs)
+
+            if original_new is object.__new__:
+                return original_new(cls_obj)
+            return original_new(cls_obj, *args, **kwargs)
+
+        cls.__new__ = __new__
 
         def get_spmd_config(c) -> "SPMDConfig":
             from fluxway.common.types import SPMDConfig, OperatorMeta

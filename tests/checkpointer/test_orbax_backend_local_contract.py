@@ -60,8 +60,7 @@ def _install_fake_orbax_runtime(monkeypatch):
     jax_module.ShapeDtypeStruct = _ShapeDtypeStruct
     jax_module.tree_util = tree_util_module
     jax_module.sharding = types.SimpleNamespace(
-        SingleDeviceSharding=_SingleDeviceSharding,
-        NamedSharding=_NamedSharding,
+        SingleDeviceSharding=_SingleDeviceSharding, NamedSharding=_NamedSharding
     )
     jax_module.process_index = lambda: 0
 
@@ -90,8 +89,7 @@ def _install_fake_orbax_runtime(monkeypatch):
     class _FakeStandardCheckpointHandler:
         async def async_save(self, *args, **kwargs):
             raise AssertionError(
-                "global Orbax save should not call StandardCheckpointHandler.async_save "
-                "directly"
+                "global Orbax save should not call StandardCheckpointHandler.async_save directly"
             )
 
     class _FakePyTreeCheckpointHandler:
@@ -124,8 +122,7 @@ def _install_fake_orbax_runtime(monkeypatch):
     ocp_module.PyTreeCheckpointHandler = _FakePyTreeCheckpointHandler
     ocp_module.Checkpointer = _FakeCheckpointer
     ocp_module.args = types.SimpleNamespace(
-        PyTreeSave=lambda item: item,
-        StandardSave=lambda item: item,
+        PyTreeSave=lambda item: item, StandardSave=lambda item: item
     )
     ocp_module.options = types.SimpleNamespace(
         MultiprocessingOptions=lambda **kw: types.SimpleNamespace(**kw)
@@ -182,7 +179,12 @@ def _install_fake_orbax_runtime(monkeypatch):
     assert orbax_spec.loader is not None
     orbax_spec.loader.exec_module(orbax_module)
 
-    return orbax_module, save_calls, checkpointer_save_calls, sync_global_devices_calls
+    return (
+        orbax_module,
+        save_calls,
+        checkpointer_save_calls,
+        sync_global_devices_calls,
+    )
 
 
 @pytest.mark.asyncio
@@ -205,9 +207,9 @@ async def test_local_save_bypasses_orbax_checkpointer(monkeypatch, tmp_path):
 
     expected_dir = tmp_path / "2" / "DenseLayers" / "worker_4_local_state"
     # Must NOT use Orbax Checkpointer for local state.
-    assert checkpointer_save_calls == [], (
-        "Local state should bypass Orbax Checkpointer entirely"
-    )
+    assert (
+        checkpointer_save_calls == []
+    ), "Local state should bypass Orbax Checkpointer entirely"
     # But the metadata and final directory must be correct.
     assert metadata["local_state_dir"] == str(expected_dir)
     assert expected_dir.exists()
@@ -225,17 +227,13 @@ async def test_local_save_multiple_ranks_independent(monkeypatch, tmp_path):
     )
 
     backend = orbax_module.OrbaxBackend(force_write=True)
-    state = {
-        "optimizer": np.array([1.0, 2.0, 3.0], dtype=np.float32)
-    }
+    state = {"optimizer": np.array([1.0, 2.0, 3.0], dtype=np.float32)}
 
     await backend.save(state, str(tmp_path), "DenseLayers", rank=0, step=9)
     await backend.save(state, str(tmp_path), "DenseLayers", rank=5, step=9)
 
     # Local saves must NOT touch Orbax Checkpointer.
-    assert checkpointer_save_calls == [], (
-        "Local saves must bypass Orbax Checkpointer"
-    )
+    assert checkpointer_save_calls == [], "Local saves must bypass Orbax Checkpointer"
     # Both ranks must have their own directories with actual data.
     dir_rank0 = tmp_path / "9" / "DenseLayers" / "worker_0_local_state"
     dir_rank5 = tmp_path / "9" / "DenseLayers" / "worker_5_local_state"
@@ -280,9 +278,9 @@ async def test_global_save_uses_checkpointer_atomic_save(monkeypatch, tmp_path):
     # that repeated saves do not reuse the same JAX distributed barrier key.
     mp_opts = checkpointer_save_calls[0]["mp_options"]
     assert mp_opts is not None, "multiprocessing_options must be passed to Checkpointer"
-    assert "DenseLayers_7" in mp_opts.barrier_sync_key_prefix, (
-        f"barrier prefix should embed spmd_id and step; got {mp_opts.barrier_sync_key_prefix!r}"
-    )
+    assert (
+        "DenseLayers_7" in mp_opts.barrier_sync_key_prefix
+    ), f"barrier prefix should embed spmd_id and step; got {mp_opts.barrier_sync_key_prefix!r}"
 
 
 @pytest.mark.asyncio
@@ -299,7 +297,9 @@ async def test_global_save_uses_distinct_barrier_prefix_per_step(monkeypatch, tm
     e.g. 'DenseLayers_50_Checkpointer:save_start' vs
          'DenseLayers_100_Checkpointer:save_start'.
     """
-    orbax_module, _, checkpointer_save_calls, _ = _install_fake_orbax_runtime(monkeypatch)
+    orbax_module, _, checkpointer_save_calls, _ = _install_fake_orbax_runtime(
+        monkeypatch
+    )
     jax_module = sys.modules["jax"]
 
     state = {
@@ -339,13 +339,9 @@ async def test_ckpt_dir_always_points_to_spmd_level_dir(monkeypatch, tmp_path):
     orbax_module, _, _, _ = _install_fake_orbax_runtime(monkeypatch)
     jax_module = sys.modules["jax"]
 
-    state = {
-        "weights": jax_module.Array(jax_module.sharding.NamedSharding())
-    }
+    state = {"weights": jax_module.Array(jax_module.sharding.NamedSharding())}
     backend = orbax_module.OrbaxBackend(force_write=True)
-    metadata = await backend.save(
-        state, str(tmp_path), "DenseLayers", rank=0, step=5
-    )
+    metadata = await backend.save(state, str(tmp_path), "DenseLayers", rank=0, step=5)
 
     expected_spmd_dir = tmp_path / "5" / "DenseLayers"
     assert metadata["ckpt_dir"] == str(expected_spmd_dir), (
@@ -368,13 +364,9 @@ async def test_ckpt_dir_set_for_local_only_checkpoint(monkeypatch, tmp_path):
     )
 
     # SingleDeviceSharding → classified as local_state by _split_hybrid_state
-    state = {
-        "optimizer": np.array([1.0], dtype=np.float32)
-    }
+    state = {"optimizer": np.array([1.0], dtype=np.float32)}
     backend = orbax_module.OrbaxBackend(force_write=True)
-    metadata = await backend.save(
-        state, str(tmp_path), "DenseLayers", rank=1, step=3
-    )
+    metadata = await backend.save(state, str(tmp_path), "DenseLayers", rank=1, step=3)
 
     expected_spmd_dir = tmp_path / "3" / "DenseLayers"
     assert "ckpt_dir" in metadata, (
@@ -382,7 +374,7 @@ async def test_ckpt_dir_set_for_local_only_checkpoint(monkeypatch, tmp_path):
         "load_state_from_disk does not silently skip restoration"
     )
     assert metadata["ckpt_dir"] == str(expected_spmd_dir)
-    assert "orbax_final_path" not in metadata, (
-        "A local-only checkpoint should not produce orbax_final_path"
-    )
+    assert (
+        "orbax_final_path" not in metadata
+    ), "A local-only checkpoint should not produce orbax_final_path"
     assert "local_state_dir" in metadata
