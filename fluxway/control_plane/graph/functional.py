@@ -1,4 +1,6 @@
+from contextvars import ContextVar, Token
 from typing import Any, Callable, Dict, Optional, Type
+
 from fluxway.control_plane.graph.builder import Builder
 
 
@@ -222,25 +224,25 @@ class FunctionalGraph:
             task_graph = graph.compile()
     """
 
-    import threading
-
-    _local = threading.local()
+    _current: ContextVar[Optional["FunctionalGraph"]] = ContextVar(
+        "FunctionalGraph._current", default=None
+    )
 
     def __init__(self, name: str = "functional_graph"):
         self._builder = Builder()
         self.name = name
+        self._tokens: list[Token] = []
 
     @classmethod
     def current(cls) -> Optional["FunctionalGraph"]:
-        return getattr(cls._local, "current", None)
+        return cls._current.get()
 
     def __enter__(self):
-        self._previous = getattr(self._local, "current", None)
-        self._local.current = self
+        self._tokens.append(self._current.set(self))
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self._local.current = self._previous
+        self._current.reset(self._tokens.pop())
 
     def node(
         self, name: str, spmd_class: Type, description: str = "", *args, **kwargs
