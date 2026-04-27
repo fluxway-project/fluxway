@@ -865,7 +865,7 @@ class JaxBackend(TensorBackend):
     def tree_map(self, fun: Any, tree: Any) -> Any:
         return self._jax.tree.map(fun, tree)
 
-    def tree_flatten(self, tree: Any) -> Tuple[list, Any]:
+    def tree_flatten(self, tree: Any) -> Tuple[List[Any], Any]:
         return self._jax.tree.flatten(tree)
 
     def tile(self, x: Any, dims: Tuple[int, ...]) -> Any:
