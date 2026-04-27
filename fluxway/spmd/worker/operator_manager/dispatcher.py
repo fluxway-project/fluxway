@@ -9,6 +9,12 @@ class SKIPPED:
     pass
 
 
+class STALE_AFTER_RESTORE:
+    """Sentinel: step became stale during drain self-block (e.g. checkpoint restore)."""
+
+    pass
+
+
 class ExecutionDispatcher(ABC):
     """
     Abstract strategy for operator execution dispatching.

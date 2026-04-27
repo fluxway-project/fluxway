@@ -58,7 +58,7 @@ from fluxway.common.utils.tree import tree_flatten, tree_unflatten
 from fluxway.rpc.protocol import DataPlaneCallable
 from fluxway.spmd.worker.mailbox import WorkerMailbox
 from fluxway.spmd.worker.operator_manager import OperatorManager
-from fluxway.spmd.worker.operator_manager.dispatcher import SKIPPED
+from fluxway.spmd.worker.operator_manager.dispatcher import SKIPPED, STALE_AFTER_RESTORE
 from fluxway.transport.communication import AsyncDataDistributor
 from typing import Any, Dict, List, Optional, Tuple, Type, get_type_hints
 
@@ -1016,6 +1016,12 @@ class SPMDWorker:
                 # Execute (for periodic mode, execute any task that comes)
                 result = await self._execute_operator(op_name, step)
 
+                # Guard: if a restore happened during execution (e.g. while
+                # the worker was blocked in the drain self-block), the step
+                # is now stale.  Skip advancement to preserve the watermark.
+                if result is STALE_AFTER_RESTORE:
+                    continue
+
                 # Advance execution step counter
                 await self._advance_step(op_name, result=result)
 
@@ -1169,6 +1175,21 @@ class SPMDWorker:
                         f"task_step={step} spmd_id={self.spmd_id} rank={self.rank}"
                     )
                     await self._drain_cond.wait()
+
+            # Re-validate after drain wait: a checkpoint restore may have
+            # happened while we were blocked, advancing completed_step_count
+            # past this step.  Executing a stale step would corrupt the
+            # watermark and cause downstream deadlocks.
+            current_completed = self._completed_step_count.get(op_name, 0)
+            if step < current_completed:
+                logger.warning(
+                    f"Step became stale during drain wait (likely restore) "
+                    f"op={op_name} step={step} completed_count={current_completed} "
+                    f"spmd_id={self.spmd_id} rank={self.rank}"
+                )
+                await self._mailbox.clear_step(op_name, step)
+                self._barriers_declared.pop((op_name, step), None)
+                return STALE_AFTER_RESTORE
 
             # --- Dispatcher Check: Should this rank execute this step? ---
             dispatcher = self._op_manager.get_dispatcher(op_name)
