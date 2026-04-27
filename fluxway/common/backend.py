@@ -258,6 +258,11 @@ class TensorBackend(ABC):
         pass
 
     @abstractmethod
+    def tree_flatten(self, tree: Any) -> Tuple[list, Any]:
+        """Flatten a pytree into (leaves_list, treedef)."""
+        pass
+
+    @abstractmethod
     def tile(self, x: Any, dims: Tuple[int, ...]) -> Any:
         """Constructs a new tensor by repeating input."""
         pass
@@ -531,6 +536,18 @@ class TorchBackend(TensorBackend):
             if isinstance(tree, (list, tuple)):
                 return type(tree)(fun(x) for x in tree)
             return fun(tree)
+
+    def tree_flatten(self, tree: Any) -> Tuple[list, Any]:
+        try:
+            import torch.utils._pytree as pytree
+
+            return pytree.tree_flatten(tree)
+        except ImportError:
+            if isinstance(tree, (list, tuple)):
+                return list(tree), type(tree)
+            elif isinstance(tree, dict):
+                return list(tree.values()), tree.keys()
+            return [tree], None
 
     def tile(self, x: Any, dims: Tuple[int, ...]) -> Any:
         return self._torch.tile(x, dims)
@@ -847,6 +864,9 @@ class JaxBackend(TensorBackend):
 
     def tree_map(self, fun: Any, tree: Any) -> Any:
         return self._jax.tree.map(fun, tree)
+
+    def tree_flatten(self, tree: Any) -> Tuple[list, Any]:
+        return self._jax.tree.flatten(tree)
 
     def tile(self, x: Any, dims: Tuple[int, ...]) -> Any:
         return self._jnp.tile(x, dims)

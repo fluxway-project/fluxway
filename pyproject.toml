@@ -36,6 +36,7 @@ dependencies = [
     "uvloop",
     "numpy>=1.20.0",
     "ray>=2.0.0",
+    "pandas",
 ]
 
 [project.optional-dependencies]

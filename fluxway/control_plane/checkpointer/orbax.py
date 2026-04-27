@@ -70,6 +70,45 @@ def _deep_merge(d1: dict, d2: dict) -> dict:
     return d1
 
 
+def _uniform_key_types(obj: Any) -> Any:
+    """Ensure every dict level has uniform key types.
+
+    Orbax restore may return string keys (e.g. ``"0"``) where the
+    original pytree had integer keys (e.g. ``0``).  After merging with
+    pickle-restored local state that preserves the original int keys,
+    a single dict level can contain *both* int and str keys, which
+    breaks ``jax.tree_util.tree_leaves`` (it tries to sort keys using
+    Python's default ``<`` comparator, which cannot compare int to str).
+
+    This function detects mixed-type dict levels and converts string keys
+    that are purely numeric (e.g. ``"0"``, ``"12"``) back to ints,
+    restoring the original key type so that leaf ordering is preserved.
+    """
+    if not isinstance(obj, dict):
+        return obj
+
+    has_int = False
+    has_str = False
+    for k in obj:
+        if isinstance(k, int):
+            has_int = True
+        elif isinstance(k, str):
+            has_str = True
+        if has_int and has_str:
+            break
+
+    if has_int and has_str:
+        new_dict: dict = {}
+        for k, v in obj.items():
+            if isinstance(k, str) and k.isdigit():
+                new_dict[int(k)] = _uniform_key_types(v)
+            else:
+                new_dict[k] = _uniform_key_types(v)
+        return new_dict
+
+    return {k: _uniform_key_types(v) for k, v in obj.items()}
+
+
 def _serialize_treedef(state: Any) -> str:
     _, treedef = jtu.tree_flatten(state)
     return base64.b64encode(pickle.dumps(treedef)).decode("ascii")
@@ -230,6 +269,7 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
             local_state = await asyncio.to_thread(_read_local)
 
         flat_restored = _deep_merge(local_state, global_state)
+        flat_restored = _uniform_key_types(flat_restored)
 
         if "pytree_meta" in metadata:
             saved_treedef = _deserialize_treedef(metadata["pytree_meta"])

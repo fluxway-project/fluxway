@@ -72,7 +72,7 @@ class BaseDataDistributor:
             counts_np = np.zeros(mirror_target_world_size, dtype=np.int32)
             offsets_np = np.zeros(mirror_target_world_size, dtype=np.int32)
             if 0 <= target_rank < mirror_target_world_size:
-                flat_leaves = backend.tree_flatten(payloads)[0]
+                flat_leaves, _ = backend.tree_flatten(payloads)
                 if flat_leaves:
                     counts_np[target_rank] = backend.shape(flat_leaves[0])[0]
             stitched_tensors = payloads
