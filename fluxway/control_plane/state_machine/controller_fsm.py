@@ -267,13 +267,26 @@ class ControllerStateMachine:
                 f"Failed to start heartbeat monitoring or issue initial drain: {e}"
             )
 
-        # Prevent discarded events: Check if operations were already completed during restoration (PENDING state).
-        # We perform this check upon entering RUNNING state to safely trigger completion.
+        # Prevent discarded events: Check if operations were already completed
+        # during restoration (PENDING state).  However, when a drain strategy is
+        # active, the drain→checkpoint→resume pipeline will detect max_steps and
+        # trigger ALL_DRIVERS_COMPLETED itself after the final checkpoint is
+        # persisted.  Firing the event here would race with that pipeline —
+        # cleanup would release placement groups while saves are in-flight.
         if self._controller._async_step_manager.is_all_completed():
-            logger.debug(
-                "wait_for_completion detected all operators completed upon entering RUNNING, transitioning"
-            )
-            await self.trigger_event(ControllerEvent.ALL_DRIVERS_COMPLETED)
+            has_drain = self._controller._drain_strategy is not None
+            if has_drain:
+                logger.debug(
+                    "All operators completed upon entering RUNNING, but drain "
+                    "strategy is active — deferring completion to the "
+                    "drain→checkpoint→resume pipeline"
+                )
+            else:
+                logger.debug(
+                    "wait_for_completion detected all operators completed "
+                    "upon entering RUNNING, transitioning"
+                )
+                await self.trigger_event(ControllerEvent.ALL_DRIVERS_COMPLETED)
 
     async def _on_enter_blocked(self) -> None:
         """

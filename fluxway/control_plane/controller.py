@@ -441,6 +441,20 @@ if RAY_AVAILABLE:
             """Triggered when all drivers are blocked at the designated drain target."""
             self._drained_drivers.clear()
             if self._checkpointer is not None:
+                boundary = self._last_requested_drain_target
+
+                # Skip redundant saves: if the checkpoint at this boundary
+                # was already persisted (e.g. we just restored to this step
+                # and no new training has occurred).
+                if boundary == self._last_checkpointed_step and boundary > 0:
+                    logger.info(
+                        f"Skipping checkpoint at step {boundary} "
+                        f"(already persisted at this step)"
+                    )
+                    await self._resume_and_schedule_next_drain()
+                    await self._check_and_enforce_step_limits()
+                    return
+
                 # Issue snapshot
                 async def do_ckpt(boundary: int) -> None:
                     logger.info(f"Checkpointer executing snapshot at count {boundary}")
@@ -454,7 +468,7 @@ if RAY_AVAILABLE:
                         await self._check_and_enforce_step_limits()
 
                 self._checkpoint_task = asyncio.create_task(
-                    do_ckpt(self._last_requested_drain_target)
+                    do_ckpt(boundary)
                 )
             else:
                 # No checkpointer configured.
