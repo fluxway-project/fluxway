@@ -258,7 +258,7 @@ class TensorBackend(ABC):
         pass
 
     @abstractmethod
-    def tree_flatten(self, tree: Any) -> Tuple[list, Any]:
+    def tree_flatten(self, tree: Any) -> Tuple[List[Any], Any]:
         """Flatten a pytree into (leaves_list, treedef)."""
         pass
 
