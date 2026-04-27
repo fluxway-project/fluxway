@@ -65,7 +65,7 @@ class BaseDataDistributor:
         # ConcretizationTypeError (int() on traced JAX values).
         is_scalar = (
             isinstance(sender_rank_tags, (int, np.integer))
-            or (hasattr(sender_rank_tags, 'shape') and np.asarray(sender_rank_tags).ndim == 0)
+            or (hasattr(sender_rank_tags, "shape") and np.asarray(sender_rank_tags).ndim == 0)
         )
         if is_scalar:
             target_rank = int(sender_rank_tags)
