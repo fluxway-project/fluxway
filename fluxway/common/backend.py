@@ -537,7 +537,7 @@ class TorchBackend(TensorBackend):
                 return type(tree)(fun(x) for x in tree)
             return fun(tree)
 
-    def tree_flatten(self, tree: Any) -> Tuple[list, Any]:
+    def tree_flatten(self, tree: Any) -> Tuple[List[Any], Any]:
         try:
             import torch.utils._pytree as pytree
 
