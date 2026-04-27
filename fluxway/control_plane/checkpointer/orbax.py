@@ -62,11 +62,29 @@ def _split_hybrid_state(state: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str
 
 
 def _deep_merge(d1: dict, d2: dict) -> dict:
+    """Recursively merge *d2* into *d1*, handling mixed key types.
+
+    Orbax restore may use ``str`` keys (e.g. ``"0"``) where the
+    original pytree had ``int`` keys (e.g. ``0``).  A naive ``k in d1``
+    check would miss these matches, producing duplicate keys that later
+    break ``jax.tree_util`` sorting / leaf counting.  We match keys by
+    their string representation so that ``0`` and ``"0"`` are treated
+    as the same logical key.
+    """
+    # Build a map: str(existing_key) -> existing_key for O(1) lookup.
+    d1_str_map = {str(k): k for k in d1}
+
     for k, v in d2.items():
-        if k in d1 and isinstance(d1[k], dict) and isinstance(v, dict):
-            _deep_merge(d1[k], v)
+        str_k = str(k)
+        if str_k in d1_str_map:
+            existing_key = d1_str_map[str_k]
+            if isinstance(d1[existing_key], dict) and isinstance(v, dict):
+                _deep_merge(d1[existing_key], v)
+            else:
+                d1[existing_key] = v
         else:
             d1[k] = v
+            d1_str_map[str(k)] = k
     return d1
 
 
@@ -207,10 +225,24 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
             metadata["local_state_dir"] = str(local_final_path)
 
         if global_state:
+            import jax
+
             final_path = spmd_step_dir / "orbax_state"
             await asyncio.to_thread(
                 final_path.parent.mkdir, parents=True, exist_ok=True
             )
+
+            # Save the abstract structure of global_state so that restore
+            # can use StandardRestore(target) for deterministic key types
+            # and tree structure, instead of relying on Orbax to infer
+            # them from directory names.
+            abstract_global = jax.tree.map(
+                lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype),
+                global_state,
+            )
+            metadata["global_abstract"] = base64.b64encode(
+                pickle.dumps(abstract_global)
+            ).decode("ascii")
 
             def _write_global():
                 # The global phase uses its own step-scoped prefix so it does
@@ -240,8 +272,25 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
 
             ckpt_path = epath.Path(metadata["orbax_final_path"])
 
+            # If global_abstract is available (saved by the new save path),
+            # use StandardRestore(target) for deterministic key types and
+            # tree structure.  Fall back to untyped restore for old ckpts.
+            abstract_target = None
+            if "global_abstract" in metadata:
+                try:
+                    abstract_target = pickle.loads(
+                        base64.b64decode(metadata["global_abstract"])
+                    )
+                except Exception:
+                    abstract_target = None
+
             def _read_global():
                 ckptr = ocp.Checkpointer(handler)
+                if abstract_target is not None:
+                    return ckptr.restore(
+                        ckpt_path,
+                        args=ocp.args.StandardRestore(abstract_target),
+                    )
                 return ckptr.restore(ckpt_path)
 
             global_state = await asyncio.to_thread(_read_global)
