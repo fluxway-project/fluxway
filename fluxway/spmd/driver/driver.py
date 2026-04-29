@@ -90,6 +90,7 @@ if RAY_AVAILABLE:
             self.controller_handle = controller_handle
             self.graph_topology = graph_topology
             self._checkpoint_backend = checkpoint_backend
+            self._runtime_env = config.runtime_env
 
             # State machine
             self.state_machine = DriverStateMachine(self)
@@ -216,6 +217,16 @@ if RAY_AVAILABLE:
                 self.state_machine.trigger(DriverEvent.INIT_FAILED, error=str(e))
                 return False
 
+        def _build_worker_opts(self, bundle_idx: int, name: str) -> Dict[str, Any]:
+            """Build .options() kwargs for a worker actor."""
+            opts: Dict[str, Any] = {"name": name}
+            if self.placement_group is not None:
+                opts["placement_group"] = self.placement_group
+                opts["placement_group_bundle_index"] = bundle_idx
+            if self._runtime_env:
+                opts["runtime_env"] = self._runtime_env
+            return opts
+
         async def _start_workers(self) -> None:
             """Start all worker actors."""
 
@@ -223,26 +234,18 @@ if RAY_AVAILABLE:
             self_handle = ray.get_runtime_context().current_actor
 
             for rank, bundle_idx in enumerate(self.worker_bundle_indices):
-                if self.placement_group is not None:
-                    worker = SPMDWorker.options(  # type: ignore[attr-defined]
-                        placement_group=self.placement_group,
-                        placement_group_bundle_index=bundle_idx,
-                        name=f"spmd_worker_{self.spmd_id}_{rank}",
-                    ).remote(
-                        config=self.config,
-                        rank=rank,
-                        spmd_id=self.spmd_id,
-                        driver_handle=self_handle,
-                        checkpoint_backend=self._checkpoint_backend,
-                    )
-                else:
-                    worker = SPMDWorker.remote(
-                        config=self.config,
-                        rank=rank,
-                        spmd_id=self.spmd_id,
-                        driver_handle=self_handle,
-                        checkpoint_backend=self._checkpoint_backend,
-                    )
+                opts = self._build_worker_opts(
+                    bundle_idx, f"spmd_worker_{self.spmd_id}_{rank}"
+                )
+                worker = SPMDWorker.options(  # type: ignore[attr-defined]
+                    **opts
+                ).remote(
+                    config=self.config,
+                    rank=rank,
+                    spmd_id=self.spmd_id,
+                    driver_handle=self_handle,
+                    checkpoint_backend=self._checkpoint_backend,
+                )
 
                 self._worker_handles[rank] = worker
                 self._recovery_attempts[rank] = 0
@@ -1007,27 +1010,19 @@ if RAY_AVAILABLE:
                 # Start new worker
                 bundle_idx = self.worker_bundle_indices[rank]
                 self_handle = ray.get_runtime_context().current_actor
-
-                if self.placement_group is not None:
-                    worker = SPMDWorker.options(  # type: ignore[attr-defined]
-                        placement_group=self.placement_group,
-                        placement_group_bundle_index=bundle_idx,
-                        name=f"spmd_worker_{self.spmd_id}_{rank}_recovered",
-                    ).remote(
-                        config=self.config,
-                        rank=rank,
-                        spmd_id=self.spmd_id,
-                        driver_handle=self_handle,
-                        checkpoint_backend=self._checkpoint_backend,
-                    )
-                else:
-                    worker = SPMDWorker.remote(
-                        config=self.config,
-                        rank=rank,
-                        spmd_id=self.spmd_id,
-                        driver_handle=self_handle,
-                        checkpoint_backend=self._checkpoint_backend,
-                    )
+                opts = self._build_worker_opts(
+                    bundle_idx,
+                    f"spmd_worker_{self.spmd_id}_{rank}_recovered",
+                )
+                worker = SPMDWorker.options(  # type: ignore[attr-defined]
+                    **opts
+                ).remote(
+                    config=self.config,
+                    rank=rank,
+                    spmd_id=self.spmd_id,
+                    driver_handle=self_handle,
+                    checkpoint_backend=self._checkpoint_backend,
+                )
 
                 self._worker_handles[rank] = worker
 

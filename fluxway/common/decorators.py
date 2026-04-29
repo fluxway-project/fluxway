@@ -767,11 +767,19 @@ def data_type():
 
 def spmd(
     resource: Optional[Dict[str, Any]] = None,
+    runtime_env: Optional[Dict[str, Any]] = None,
     mesh_axis_names: Optional[Tuple[str, ...]] = None,
     mesh_axis_shapes: Optional[Tuple[int, ...]] = None,
 ):
     """
     Configure a class for SPMD distributed execution.
+
+    Args:
+        resource: Resource requirements (num_cpus, num_gpus, memory_gb).
+        runtime_env: Ray runtime_env dict for Driver/Worker actors.
+                     Example: {"env_vars": {"JAX_PLATFORMS": "gpu"}}
+        mesh_axis_names: Axis names for the execution mesh.
+        mesh_axis_shapes: Shape of the execution mesh.
     """
     from fluxway.common.types import ResourceSpec, SPMDConfig
     from fluxway.common.mesh import DeviceMesh
@@ -793,10 +801,12 @@ def spmd(
     def decorator(cls: Type[T]) -> Type[T]:
         cls._resource = res_spec
         cls._mesh = mesh
+        cls._runtime_env = runtime_env
 
         # Standard API
         cls.get_resource = classmethod(lambda c: c._resource)
         cls.get_mesh = classmethod(lambda c: c._mesh)
+        cls.get_runtime_env = classmethod(lambda c: c._runtime_env)
         cls.get_num_workers = classmethod(lambda c: c._mesh.size if c._mesh else 1)
         cls.is_fluxway_spmd = classmethod(lambda c: True)
 
@@ -831,7 +841,8 @@ def spmd(
                     operators[meta.name] = attr
                     metas[meta.name] = copy.deepcopy(meta)
 
-            return SPMDConfig(mesh=c._mesh, operators=operators, operator_metas=metas)
+            return SPMDConfig(mesh=c._mesh, operators=operators, operator_metas=metas,
+                              runtime_env=c._runtime_env)
 
         cls.get_spmd_config = classmethod(get_spmd_config)
         return cls

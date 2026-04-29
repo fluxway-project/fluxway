@@ -182,34 +182,23 @@ class SPMDManager:
 
             # Create driver actor with placement group
             driver_name = f"spmd_driver_{spmd_id}"
-
+            driver_opts: Dict[str, Any] = {"name": driver_name}
             if placement_group is not None:
-                driver = spmd_driver_cls.options(
-                    placement_group=placement_group,
-                    placement_group_bundle_index=driver_bundle_index,
-                    name=driver_name,
-                ).remote(
-                    spmd_id=spmd_id,
-                    config=config,
-                    placement_group=placement_group,
-                    worker_bundle_indices=worker_bundle_indices
-                    or list(range(1, config.num_workers + 1)),
-                    controller_handle=self._controller_handle,
-                    graph_topology=graph_topology,
-                    checkpoint_backend=self._checkpoint_backend,
-                )
-            else:
-                # No placement group - for testing or mock scenarios
-                driver = spmd_driver_cls.remote(
-                    spmd_id=spmd_id,
-                    config=config,
-                    placement_group=None,
-                    worker_bundle_indices=worker_bundle_indices
-                    or list(range(1, config.num_workers + 1)),
-                    controller_handle=self._controller_handle,
-                    graph_topology=graph_topology,
-                    checkpoint_backend=self._checkpoint_backend,
-                )
+                driver_opts["placement_group"] = placement_group
+                driver_opts["placement_group_bundle_index"] = driver_bundle_index
+            if config.runtime_env:
+                driver_opts["runtime_env"] = config.runtime_env
+
+            driver = spmd_driver_cls.options(**driver_opts).remote(
+                spmd_id=spmd_id,
+                config=config,
+                placement_group=placement_group,
+                worker_bundle_indices=worker_bundle_indices
+                or list(range(1, config.num_workers + 1)),
+                controller_handle=self._controller_handle,
+                graph_topology=graph_topology,
+                checkpoint_backend=self._checkpoint_backend,
+            )
 
             handle.set_driver_handle(driver)
 
