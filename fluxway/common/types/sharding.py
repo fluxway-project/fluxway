@@ -26,14 +26,14 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 
-class RoutingParadigm(str, enum.Enum):
+class RoutingParadigm(enum.StrEnum):
     """Semantics of routing: static (rank-based) or dynamic (content-based)."""
 
     STATIC = "static"
     DYNAMIC = "dynamic"
 
 
-class ScalarReduceOp(str, enum.Enum):
+class ScalarReduceOp(enum.StrEnum):
     """Reduction operations for scalar replication."""
 
     SUM = "sum"

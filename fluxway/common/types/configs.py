@@ -10,7 +10,7 @@ from collections.abc import Callable
 from pydantic import BaseModel, Field, ConfigDict
 
 
-from enum import Enum
+from enum import StrEnum
 
 T = TypeVar("T")
 
@@ -63,13 +63,13 @@ class TensorProxy(FluxwayBaseSchema):
         return f"TensorProxy(tuuid={self.tuuid}, name={self.name})"
 
 
-class NodeType(str, Enum):
+class NodeType(StrEnum):
     """Node type identifier."""
 
     SPMD = "spmd"  # Normal SPMD node
 
 
-class ReaderState(str, Enum):
+class ReaderState(StrEnum):
     """Reader state for data reading nodes."""
 
     INITIALIZING = "initializing"
@@ -187,7 +187,7 @@ class ResourceSpec(FluxwayBaseSchema):
     # TODO: Add storage requirements
 
 
-class PlacementStrategy(str, Enum):
+class PlacementStrategy(StrEnum):
     """Placement strategy for resource allocation."""
 
     PACK = "PACK"  # Pack bundles on as few nodes as possible
@@ -196,7 +196,7 @@ class PlacementStrategy(str, Enum):
     STRICT_SPREAD = "STRICT_SPREAD"  # Strict spreading requirement
 
 
-class ResourcePriority(str, Enum):
+class ResourcePriority(StrEnum):
     """Resource priority for allocation and preemption decisions."""
 
     HIGH = "HIGH"  # High priority, less likely to be preempted
@@ -265,7 +265,7 @@ class Node(FluxwayBaseSchema):
     node_type: NodeType = NodeType.SPMD  # Node type: SPMD
 
 
-class ArgumentType(str, Enum):
+class ArgumentType(StrEnum):
     """Argument type for fluxway transfer data."""
 
     CONTROL = "control"  # Control argument
@@ -294,7 +294,7 @@ class EdgeShardingInfo(FluxwayBaseSchema):
     interleave_unit_size: int = 1
 
 
-class BarrierType(str, Enum):
+class BarrierType(StrEnum):
     """Execution barrier types for operators."""
 
     STANDARD = "standard"  # Wait for all expected shards/states (default)
@@ -638,7 +638,7 @@ class NodeView(FluxwayBaseSchema):
 # =============================================================================
 
 
-class DriverStatus(str, Enum):
+class DriverStatus(StrEnum):
     """Driver health status."""
 
     HEALTHY = "healthy"
@@ -647,7 +647,7 @@ class DriverStatus(str, Enum):
     TIMEOUT = "timeout"
 
 
-class WorkerStatus(str, Enum):
+class WorkerStatus(StrEnum):
     """Worker operational status."""
 
     INITIALIZING = "initializing"
@@ -656,7 +656,7 @@ class WorkerStatus(str, Enum):
     ERROR = "error"
 
 
-class ControllerState(str, Enum):
+class ControllerState(StrEnum):
     """Controller state machine states.
 
     Lifecycle:
@@ -681,7 +681,7 @@ class ControllerState(str, Enum):
     FAILED = "failed"  # Task failed
 
 
-class ControllerEvent(str, Enum):
+class ControllerEvent(StrEnum):
     """Events that trigger controller state transitions."""
 
     INIT_COMPLETE = "init_complete"  # Resources allocated, SPMDs started
@@ -697,7 +697,7 @@ class ControllerEvent(str, Enum):
     CLEANUP_FINISHED = "cleanup_finished"  # Terminal cleanup completed
 
 
-class DriverState(str, Enum):
+class DriverState(StrEnum):
     """SPMD Driver state machine states."""
 
     INITIALIZING = "initializing"  # Initializing workers
@@ -712,7 +712,7 @@ class DriverState(str, Enum):
     COMPLETED = "completed"  # Completed
 
 
-class DriverEvent(str, Enum):
+class DriverEvent(StrEnum):
     """Events that trigger driver state transitions."""
 
     INIT_COMPLETE = "init_complete"
