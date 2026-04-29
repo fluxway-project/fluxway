@@ -970,9 +970,9 @@ class WorkerMailbox:
         async with self._lock:
             receiver = TransportReceiver(wait_for_n_slices=0)
             receiver.register_zero_copy_buffers(target_buffers, expect_offsets)
-            self._zc_receivers.setdefault(op_name, {}).setdefault(tuuid, {})[
-                step
-            ] = receiver
+            self._zc_receivers.setdefault(op_name, {}).setdefault(tuuid, {})[step] = (
+                receiver
+            )
 
     async def get_zero_copy_buffers(
         self, op_name: str, tuuid: int, step: int

@@ -146,17 +146,17 @@ def _arrays_equal(a, b):
 
 
 def _assert_bundles_equal(old, new):
-    assert set(old.keys()) == set(
-        new.keys()
-    ), f"op keys differ: {set(old.keys())} vs {set(new.keys())}"
+    assert set(old.keys()) == set(new.keys()), (
+        f"op keys differ: {set(old.keys())} vs {set(new.keys())}"
+    )
     for op in old:
         for field in ("uuids", "counts", "shapes", "meta", "compact"):
-            assert _arrays_equal(
-                old[op][field], new[op][field]
-            ), f"{op}.{field}: {old[op][field]} != {new[op][field]}"
-        assert _arrays_equal(
-            old[op]["payloads"], new[op]["payloads"]
-        ), f"{op}.payloads mismatch"
+            assert _arrays_equal(old[op][field], new[op][field]), (
+                f"{op}.{field}: {old[op][field]} != {new[op][field]}"
+            )
+        assert _arrays_equal(old[op]["payloads"], new[op]["payloads"]), (
+            f"{op}.payloads mismatch"
+        )
 
 
 # ---------------------------------------------------------------------------

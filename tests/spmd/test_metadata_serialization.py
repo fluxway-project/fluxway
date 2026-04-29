@@ -144,9 +144,9 @@ print(repr(restored_fn.meta))
             child_output = result.stdout.strip()
 
             # The key assertion: modifications are LOST in cross-process pickle
-            assert (
-                child_output == "{'key': 'default_value'}"
-            ), f"Expected original meta, but got: {child_output}"
+            assert child_output == "{'key': 'default_value'}", (
+                f"Expected original meta, but got: {child_output}"
+            )
 
         finally:
             # Cleanup

@@ -1,6 +1,6 @@
 from collections.abc import Callable
 from contextvars import ContextVar, Token
-from typing import Any
+from typing import Any, Optional
 from fluxway.control_plane.graph.builder import Builder
 
 
@@ -297,7 +297,7 @@ class FunctionalGraph:
         )
         return NodeProxy(name, self)
 
-    def compile(self, graph_name: Optional[str] = None) -> Any:
+    def compile(self, graph_name: str | None = None) -> Any:
         """
         Compiles the defined functional flow into a concrete Fluxway Graph.
 

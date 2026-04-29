@@ -101,9 +101,9 @@ class SPMDManager:
         self._controller_handle = controller_handle
         self._spmd_handles: dict[str, SPMDHandle] = {}
         self._topology: dict[str, list[str]] = {}  # spmd_id -> downstream spmd_ids
-        self._reverse_topology: dict[str, list[str]] = (
-            {}
-        )  # spmd_id -> upstream spmd_ids
+        self._reverse_topology: dict[
+            str, list[str]
+        ] = {}  # spmd_id -> upstream spmd_ids
         self._checkpoint_backend: Any | None = None
 
     def set_controller_handle(self, controller_handle: Any) -> None:

@@ -207,9 +207,9 @@ async def test_local_save_bypasses_orbax_checkpointer(monkeypatch, tmp_path):
 
     expected_dir = tmp_path / "2" / "DenseLayers" / "worker_4_local_state"
     # Must NOT use Orbax Checkpointer for local state.
-    assert (
-        checkpointer_save_calls == []
-    ), "Local state should bypass Orbax Checkpointer entirely"
+    assert checkpointer_save_calls == [], (
+        "Local state should bypass Orbax Checkpointer entirely"
+    )
     # But the metadata and final directory must be correct.
     assert metadata["local_state_dir"] == str(expected_dir)
     assert expected_dir.exists()
@@ -278,9 +278,9 @@ async def test_global_save_uses_checkpointer_atomic_save(monkeypatch, tmp_path):
     # that repeated saves do not reuse the same JAX distributed barrier key.
     mp_opts = checkpointer_save_calls[0]["mp_options"]
     assert mp_opts is not None, "multiprocessing_options must be passed to Checkpointer"
-    assert (
-        "DenseLayers_7" in mp_opts.barrier_sync_key_prefix
-    ), f"barrier prefix should embed spmd_id and step; got {mp_opts.barrier_sync_key_prefix!r}"
+    assert "DenseLayers_7" in mp_opts.barrier_sync_key_prefix, (
+        f"barrier prefix should embed spmd_id and step; got {mp_opts.barrier_sync_key_prefix!r}"
+    )
 
 
 @pytest.mark.asyncio
@@ -374,7 +374,7 @@ async def test_ckpt_dir_set_for_local_only_checkpoint(monkeypatch, tmp_path):
         "load_state_from_disk does not silently skip restoration"
     )
     assert metadata["ckpt_dir"] == str(expected_spmd_dir)
-    assert (
-        "orbax_final_path" not in metadata
-    ), "A local-only checkpoint should not produce orbax_final_path"
+    assert "orbax_final_path" not in metadata, (
+        "A local-only checkpoint should not produce orbax_final_path"
+    )
     assert "local_state_dir" in metadata

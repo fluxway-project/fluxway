@@ -290,9 +290,9 @@ def test_transport_receiver_zero_copy_dlpack_and_no_concat():
     #  so we only check identity for non-JAX backends.)
     if backend.name() != "jax":
         ptr_after = receiver.target_buffers[0].__array_interface__["data"][0]
-        assert (
-            ptr_after == ptr_before
-        ), f"Buffer was reallocated! Before: {ptr_before:#x}, After: {ptr_after:#x}"
+        assert ptr_after == ptr_before, (
+            f"Buffer was reallocated! Before: {ptr_before:#x}, After: {ptr_after:#x}"
+        )
 
     # --- Property 2: No concat needed — read directly from the single buffer ---
     buf = receiver.target_buffers[0]  # single contiguous pre-allocated array
