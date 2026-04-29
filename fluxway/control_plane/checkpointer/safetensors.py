@@ -8,7 +8,7 @@ Tensors are stored in a ``.safetensors`` file; non-tensor metadata
 
 import json
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 import asyncio
 import numpy as np
@@ -52,7 +52,7 @@ class SafeTensorsBackend(WorkerCheckpointBackend, backend_name="safetensors"):
         pass  # SafeTensors writes are fully synchronous; nothing to drain.
 
 
-def _try_jax_flatten(value: Any) -> Optional[Dict[str, np.ndarray]]:
+def _try_jax_flatten(value: Any) -> dict[str, np.ndarray] | None:
     try:
         import jax
     except ImportError:
@@ -69,11 +69,11 @@ def _try_jax_flatten(value: Any) -> Optional[Dict[str, np.ndarray]]:
 
 
 def _flatten_worker_state(
-    state: Dict[str, Any], prefix: str = ""
-) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
+    state: dict[str, Any], prefix: str = ""
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     """Flatten state dict into (flat_tensors, meta_fields), recursing into nested dicts."""
-    flat_tensors: Dict[str, np.ndarray] = {}
-    meta_fields: Dict[str, Any] = {}
+    flat_tensors: dict[str, np.ndarray] = {}
+    meta_fields: dict[str, Any] = {}
 
     for field_key, value in state.items():
         key = f"{prefix}{_SEP}{field_key}" if prefix else field_key
@@ -83,7 +83,7 @@ def _flatten_worker_state(
         elif hasattr(value, "detach"):  # PyTorch tensor
             flat_tensors[key] = value.detach().cpu().numpy()
         elif hasattr(value, "__jax_array__") or (
-            not isinstance(value, (int, float, bool, str, dict, list, type(None)))
+            not isinstance(value, int | float | bool | str | dict | list | type(None))
             and type(value).__module__.startswith("jax")
         ):
             flat_tensors[key] = np.asarray(value)
@@ -98,7 +98,7 @@ def _flatten_worker_state(
             # Primitives must be checked before _try_jax_flatten: JAX treats
             # Python scalars as traceable leaves, producing an empty-path entry.
             if isinstance(
-                value, (int, float, bool, str, bytes, list, tuple, type(None))
+                value, int | float | bool | str | bytes | list | tuple | type(None)
             ):
                 meta_fields[key] = value
             else:
@@ -118,8 +118,8 @@ def _flatten_worker_state(
 
 
 def _unflatten_worker_state(
-    flat_tensors: Dict[str, Any], meta_fields: Dict[str, Any]
-) -> Dict[str, Any]:
+    flat_tensors: dict[str, Any], meta_fields: dict[str, Any]
+) -> dict[str, Any]:
     """Reconstruct state dict from flat tensors + JSON metadata."""
 
     def _set_nested(d: dict, parts: list, value: Any) -> None:
@@ -133,7 +133,7 @@ def _unflatten_worker_state(
         else:
             d[leaf] = value
 
-    state: Dict[str, Any] = {}
+    state: dict[str, Any] = {}
 
     for key, arr in flat_tensors.items():
         parts = key.split(_SEP)
@@ -146,7 +146,7 @@ def _unflatten_worker_state(
     return state
 
 
-def save_worker_state(state: Dict[str, Any], tensors_path: str, meta_path: str) -> None:
+def save_worker_state(state: dict[str, Any], tensors_path: str, meta_path: str) -> None:
     from safetensors.numpy import save_file
 
     flat_tensors, meta_fields = _flatten_worker_state(state)
@@ -157,7 +157,7 @@ def save_worker_state(state: Dict[str, Any], tensors_path: str, meta_path: str) 
         json.dump(meta_fields, f)
 
 
-def load_worker_state(tensors_path: str, meta_path: str) -> Dict[str, Any]:
+def load_worker_state(tensors_path: str, meta_path: str) -> dict[str, Any]:
     """
     Deserialize one Worker's state dict from disk.
 
@@ -170,7 +170,7 @@ def load_worker_state(tensors_path: str, meta_path: str) -> Dict[str, Any]:
     """
     from safetensors.numpy import load_file
 
-    flat_tensors: Dict[str, np.ndarray] = {}
+    flat_tensors: dict[str, np.ndarray] = {}
     if Path(tensors_path).exists():
         flat_tensors = load_file(tensors_path)
 

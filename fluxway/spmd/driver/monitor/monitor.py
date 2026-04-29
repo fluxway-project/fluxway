@@ -10,8 +10,6 @@ Responsibilities:
 - Anomaly detection
 """
 
-from typing import Dict, Optional
-
 from fluxway.common.types import WorkerTelemetry
 
 
@@ -24,10 +22,10 @@ class SPMDMonitor:
 
     def __init__(self, spmd_id: str):
         self.spmd_id = spmd_id
-        self._worker_telemetry: Dict[str, WorkerTelemetry] = {}
-        self._heartbeat_timestamps: Dict[str, float] = {}
+        self._worker_telemetry: dict[str, WorkerTelemetry] = {}
+        self._heartbeat_timestamps: dict[str, float] = {}
 
-    def report_worker_telemetry(self, telemetry: Dict[str, WorkerTelemetry]) -> None:
+    def report_worker_telemetry(self, telemetry: dict[str, WorkerTelemetry]) -> None:
         """
         Report worker telemetry to Main Orchestrator.
 
@@ -50,7 +48,7 @@ class SPMDMonitor:
         """
         pass
 
-    def get_worker_telemetry(self, worker_id: str) -> Optional[WorkerTelemetry]:
+    def get_worker_telemetry(self, worker_id: str) -> WorkerTelemetry | None:
         """
         Query worker telemetry.
 
@@ -76,7 +74,7 @@ class SPMDMonitor:
         """
         pass
 
-    def detect_anomalies(self) -> Dict[str, str]:
+    def detect_anomalies(self) -> dict[str, str]:
         """
         Detect anomalies across workers.
 
@@ -88,7 +86,7 @@ class SPMDMonitor:
         """
         pass
 
-    def aggregate_telemetry(self) -> Dict[str, float]:
+    def aggregate_telemetry(self) -> dict[str, float]:
         """
         Aggregate telemetry values across workers.
 

@@ -1,4 +1,4 @@
-from typing import List, Any, Optional, Tuple
+from typing import Any, Optional
 
 import numpy as np
 
@@ -39,7 +39,7 @@ class SymmetryReceipt:
         return self._sender_rank_tags
 
     def is_scalar(self) -> bool:
-        return isinstance(self._sender_rank_tags, (int, np.integer))
+        return isinstance(self._sender_rank_tags, int | np.integer)
 
     def __getitem__(self, key: Any) -> "SymmetryReceipt":
         """Slice or gather symmetry metadata."""
@@ -58,7 +58,7 @@ class SymmetryReceipt:
 
     @classmethod
     def concatenate(
-        cls, receipts: List[Optional["SymmetryReceipt"]], lengths: List[int]
+        cls, receipts: list[Optional["SymmetryReceipt"]], lengths: list[int]
     ) -> Optional["SymmetryReceipt"]:
         """Concatenate multiple receipts into one."""
         if not receipts:
@@ -116,17 +116,17 @@ class TransportTensor:
     def __init__(
         self,
         flat_values: Any,
-        nested_splits: Optional[List[np.ndarray]] = None,  # type: ignore
-        origin_indices: Optional[IndexDescriptor] = None,
-        routing_indices: Optional[IndexDescriptor] = None,
-        global_shape: Optional[Tuple[int, ...]] = None,
-        receipt: Optional[SymmetryReceipt] = None,
+        nested_splits: list[np.ndarray] | None = None,  # type: ignore
+        origin_indices: IndexDescriptor | None = None,
+        routing_indices: IndexDescriptor | None = None,
+        global_shape: tuple[int, ...] | None = None,
+        receipt: SymmetryReceipt | None = None,
     ):
         self._flat_values = flat_values
         self._nested_splits = nested_splits if nested_splits is not None else []
         self._global_shape = global_shape
 
-        self._origin_indices: Optional[IndexDescriptor]
+        self._origin_indices: IndexDescriptor | None
         if origin_indices is not None:
             if isinstance(origin_indices, IndexDescriptor):
                 self._origin_indices = origin_indices
@@ -139,7 +139,7 @@ class TransportTensor:
         self._routing_indices_materialize_cache = None
         self._origin_indices_materialize_cache = None
 
-        self._routing_indices: Optional[IndexDescriptor]
+        self._routing_indices: IndexDescriptor | None
         if isinstance(routing_indices, ContinuousIndex):
             self._routing_indices = routing_indices
         elif isinstance(routing_indices, slice):
@@ -186,10 +186,10 @@ class TransportTensor:
     def from_tensor(
         cls,
         tensor: Any,
-        global_shape: Optional[Tuple[int, ...]] = None,
-        origin_indices: Optional[Any] = None,
-        routing_indices: Optional[Any] = None,
-        receipt: Optional[SymmetryReceipt] = None,
+        global_shape: tuple[int, ...] | None = None,
+        origin_indices: Any | None = None,
+        routing_indices: Any | None = None,
+        receipt: SymmetryReceipt | None = None,
     ) -> "TransportTensor":
         """Creates a dense TransportTensor directly from a multi-dimensional tensor.
 
@@ -221,12 +221,12 @@ class TransportTensor:
     @classmethod
     def from_lists(
         cls,
-        data: List[Any],
-        dtype: Optional[Any] = None,
-        global_shape: Optional[Tuple[int, ...]] = None,
-        origin_indices: Optional[Any] = None,
-        routing_indices: Optional[Any] = None,
-        receipt: Optional[SymmetryReceipt] = None,
+        data: list[Any],
+        dtype: Any | None = None,
+        global_shape: tuple[int, ...] | None = None,
+        origin_indices: Any | None = None,
+        routing_indices: Any | None = None,
+        receipt: SymmetryReceipt | None = None,
     ) -> "TransportTensor":
         """Creates a TransportTensor from a nested list.
 
@@ -324,7 +324,7 @@ class TransportTensor:
             receipt=receipt,
         )
 
-    def to_lists(self) -> List[Any]:
+    def to_lists(self) -> list[Any]:
         """Converts back to a nested list."""
         backend = get_backend()
 
@@ -360,7 +360,7 @@ class TransportTensor:
         return self._flat_values
 
     @property
-    def nested_splits(self) -> List[Any]:
+    def nested_splits(self) -> list[Any]:
         return self._nested_splits
 
     @property
@@ -374,12 +374,12 @@ class TransportTensor:
         return len(self._nested_splits) > 0
 
     @property
-    def origin_indices(self) -> Optional[IndexDescriptor]:
+    def origin_indices(self) -> IndexDescriptor | None:
         """The underlying IndexDescriptor (metadata) for origin tracking."""
         return self._origin_indices
 
     @property
-    def origin_indices_materialized(self) -> Optional[Any]:
+    def origin_indices_materialized(self) -> Any | None:
         """Global indices marking the original sequence/batch row.
 
         Lazy-materializes from descriptor if no explicit tensor is set.
@@ -398,12 +398,12 @@ class TransportTensor:
         return self._origin_indices_materialize_cache
 
     @property
-    def routing_indices(self) -> Optional[IndexDescriptor]:
+    def routing_indices(self) -> IndexDescriptor | None:
         """The underlying IndexDescriptor (metadata) for spatial positioning."""
         return self._routing_indices
 
     @property
-    def routing_indices_materialized(self) -> Optional[Any]:
+    def routing_indices_materialized(self) -> Any | None:
         """Routing indices to remote workers this local data corresponds to.
 
         Lazy-materializes from descriptor if no explicit tensor is set.
@@ -425,12 +425,12 @@ class TransportTensor:
         return self._routing_indices_materialize_cache
 
     @property
-    def global_shape(self) -> Optional[Tuple[int, ...]]:
+    def global_shape(self) -> tuple[int, ...] | None:
         """Global shape of the full tensor across all ranks."""
         return self._global_shape
 
     @property
-    def shape(self) -> Tuple[int, ...]:
+    def shape(self) -> tuple[int, ...]:
         """Local shape of the data shard (physical tensor shape with padding)."""
         backend = get_backend()
         return backend.shape(self._flat_values)
@@ -446,7 +446,7 @@ class TransportTensor:
         return int(backend.shape(self._flat_values)[0])
 
     @property
-    def logical_shape(self) -> Tuple[int, ...]:
+    def logical_shape(self) -> tuple[int, ...]:
         """Returns the logical shape, honoring ragged boundaries."""
         backend = get_backend()
         p_shape = backend.shape(self._flat_values)
@@ -461,16 +461,16 @@ class TransportTensor:
         return backend.dtype(self._flat_values)
 
     @property
-    def topology(self) -> Optional[List[Any]]:
+    def topology(self) -> list[Any] | None:
         """IndexDescriptor metadata derived from nested_splits. None for dense."""
         return self._nested_splits if self._nested_splits else None
 
     @property
-    def receipt(self) -> Optional[SymmetryReceipt]:
+    def receipt(self) -> SymmetryReceipt | None:
         return self._receipt
 
     @receipt.setter
-    def receipt(self, value: Optional[SymmetryReceipt]):
+    def receipt(self, value: SymmetryReceipt | None):
         self._receipt = value
 
     @property
@@ -561,7 +561,7 @@ class TransportTensor:
         backend = get_backend()
         return backend.sum(self._flat_values, dim=dim)
 
-    def unique_with_routing(self) -> Tuple["TransportTensor", "TransportTensor"]:
+    def unique_with_routing(self) -> tuple["TransportTensor", "TransportTensor"]:
         """
         Finds the unique elements and creates a compact TransportTensor.
         Returns (compacted_tensor, inverse_indices_tensor).
@@ -695,7 +695,7 @@ class TransportTensor:
         self,
         start: Any,
         end: Any,
-        static_shape: Optional[Any] = None,
+        static_shape: Any | None = None,
         unsafe: bool = False,
     ) -> "TransportTensor":
         """Slices the tensor along the first dimension.
@@ -719,7 +719,7 @@ class TransportTensor:
         dim0_static = None
         val_static = None
         if static_shape is not None:
-            if isinstance(static_shape, (tuple, list)):
+            if isinstance(static_shape, tuple | list):
                 dim0_static = static_shape[0]
                 if len(static_shape) > 1:
                     val_static = static_shape[
@@ -924,7 +924,7 @@ class TransportTensor:
             receipt=self._receipt[start:end] if self._receipt else None,
         )
 
-    def as_dlpack_slice(self, cursor: Optional[Any] = None) -> Any:
+    def as_dlpack_slice(self, cursor: Any | None = None) -> Any:
         """Returns a zero-copy DLPack-compatible slice of the tensor.
 
         Args:

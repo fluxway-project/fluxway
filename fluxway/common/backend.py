@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Any, List, Optional, Tuple
+from typing import Any
 import contextlib
 
 
@@ -62,11 +62,11 @@ class TensorBackend(ABC):
         pass
 
     @abstractmethod
-    def cat(self, tensors: List[Any], dim: int = 0) -> Any:
+    def cat(self, tensors: list[Any], dim: int = 0) -> Any:
         pass
 
     @abstractmethod
-    def stack(self, tensors: List[Any], dim: int = 0) -> Any:
+    def stack(self, tensors: list[Any], dim: int = 0) -> Any:
         pass
 
     @abstractmethod
@@ -113,11 +113,11 @@ class TensorBackend(ABC):
         pass
 
     @abstractmethod
-    def reshape(self, tensor: Any, shape: Tuple[int, ...]) -> Any:
+    def reshape(self, tensor: Any, shape: tuple[int, ...]) -> Any:
         pass
 
     @abstractmethod
-    def unravel_index(self, indices: Any, shape: Tuple[int, ...]) -> Any:
+    def unravel_index(self, indices: Any, shape: tuple[int, ...]) -> Any:
         """Converts flat indices into tuple of coordinate arrays."""
         pass
 
@@ -144,7 +144,7 @@ class TensorBackend(ABC):
     @abstractmethod
     def sort(
         self, x: Any, dim: int = -1, descending: bool = False, stable: bool = False
-    ) -> Tuple[Any, Any]:
+    ) -> tuple[Any, Any]:
         """Returns (sorted_values, indices)"""
         pass
 
@@ -212,8 +212,8 @@ class TensorBackend(ABC):
         self,
         x: Any,
         repeats: Any,
-        dim: Optional[int] = None,
-        total_repeat_length: Optional[int] = None,
+        dim: int | None = None,
+        total_repeat_length: int | None = None,
     ) -> Any:
         pass
 
@@ -241,9 +241,7 @@ class TensorBackend(ABC):
         pass
 
     @abstractmethod
-    def bincount(
-        self, x: Any, weights: Optional[Any] = None, minlength: int = 0
-    ) -> Any:
+    def bincount(self, x: Any, weights: Any | None = None, minlength: int = 0) -> Any:
         """Count occurrences of each value in array of non-negative ints."""
         pass
 
@@ -258,17 +256,17 @@ class TensorBackend(ABC):
         pass
 
     @abstractmethod
-    def tree_flatten(self, tree: Any) -> Tuple[List[Any], Any]:
+    def tree_flatten(self, tree: Any) -> tuple[list[Any], Any]:
         """Flatten a pytree into (leaves_list, treedef)."""
         pass
 
     @abstractmethod
-    def tile(self, x: Any, dims: Tuple[int, ...]) -> Any:
+    def tile(self, x: Any, dims: tuple[int, ...]) -> Any:
         """Constructs a new tensor by repeating input."""
         pass
 
     @abstractmethod
-    def scan(self, f: Any, init: Any, xs: Any, length: Optional[int] = None) -> Any:
+    def scan(self, f: Any, init: Any, xs: Any, length: int | None = None) -> Any:
         """
         Scans a function over leading array axes while carrying along state.
 
@@ -284,7 +282,7 @@ class TensorBackend(ABC):
         pass
 
     @abstractmethod
-    def get_dlpack_slice(self, tensor: Any, cursor: Optional[Any] = None) -> Any:
+    def get_dlpack_slice(self, tensor: Any, cursor: Any | None = None) -> Any:
         """
         Returns a DLPack-compatible object viewing a slice of the tensor without copying.
         Typically used for ragged/sparse transport optimization.
@@ -341,10 +339,10 @@ class TorchBackend(TensorBackend):
     def arange(self, start: int, end: int, step: int = 1, dtype: Any = None) -> Any:
         return self._torch.arange(start, end, step, dtype=dtype)
 
-    def cat(self, tensors: List[Any], dim: int = 0) -> Any:
+    def cat(self, tensors: list[Any], dim: int = 0) -> Any:
         return self._torch.cat(tensors, dim=dim)
 
-    def stack(self, tensors: List[Any], dim: int = 0) -> Any:
+    def stack(self, tensors: list[Any], dim: int = 0) -> Any:
         return self._torch.stack(tensors, dim=dim)
 
     def equal(self, x: Any, y: Any) -> bool:
@@ -377,10 +375,10 @@ class TorchBackend(TensorBackend):
     def item(self, tensor: Any) -> Any:
         return tensor.item()
 
-    def reshape(self, tensor: Any, shape: Tuple[int, ...]) -> Any:
+    def reshape(self, tensor: Any, shape: tuple[int, ...]) -> Any:
         return self._torch.reshape(tensor, shape)
 
-    def unravel_index(self, indices: Any, shape: Tuple[int, ...]) -> Any:
+    def unravel_index(self, indices: Any, shape: tuple[int, ...]) -> Any:
         try:
             return self._torch.unravel_index(indices, shape)
         except AttributeError:
@@ -406,7 +404,7 @@ class TorchBackend(TensorBackend):
 
     def sort(
         self, x: Any, dim: int = -1, descending: bool = False, stable: bool = False
-    ) -> Tuple[Any, Any]:
+    ) -> tuple[Any, Any]:
         return self._torch.sort(x, dim=dim, descending=descending, stable=stable)
 
     def gather(self, x: Any, dim: int, index: Any) -> Any:
@@ -452,8 +450,8 @@ class TorchBackend(TensorBackend):
         self,
         x: Any,
         repeats: Any,
-        dim: Optional[int] = None,
-        total_repeat_length: Optional[int] = None,
+        dim: int | None = None,
+        total_repeat_length: int | None = None,
     ) -> Any:
         return self._torch.repeat_interleave(
             x, repeats, dim=dim, output_size=total_repeat_length
@@ -491,7 +489,7 @@ class TorchBackend(TensorBackend):
         """
         if isinstance(start, int):
             x[start : start + update.shape[0]] = update
-        elif isinstance(start, (list, tuple)):
+        elif isinstance(start, list | tuple):
             slices = []
             for i, s in enumerate(start):
                 slice_len = update.shape[i]
@@ -505,9 +503,7 @@ class TorchBackend(TensorBackend):
 
         return x
 
-    def bincount(
-        self, x: Any, weights: Optional[Any] = None, minlength: int = 0
-    ) -> Any:
+    def bincount(self, x: Any, weights: Any | None = None, minlength: int = 0) -> Any:
         return self._torch.bincount(x, weights=weights, minlength=minlength)
 
     def unique(
@@ -533,26 +529,26 @@ class TorchBackend(TensorBackend):
             return pytree.tree_map(fun, tree)
         except ImportError:
             # Fallback for simple structures
-            if isinstance(tree, (list, tuple)):
+            if isinstance(tree, list | tuple):
                 return type(tree)(fun(x) for x in tree)
             return fun(tree)
 
-    def tree_flatten(self, tree: Any) -> Tuple[List[Any], Any]:
+    def tree_flatten(self, tree: Any) -> tuple[list[Any], Any]:
         try:
             import torch.utils._pytree as pytree
 
             return pytree.tree_flatten(tree)
         except ImportError:
-            if isinstance(tree, (list, tuple)):
+            if isinstance(tree, list | tuple):
                 return list(tree), type(tree)
             elif isinstance(tree, dict):
                 return list(tree.values()), tree.keys()
             return [tree], None
 
-    def tile(self, x: Any, dims: Tuple[int, ...]) -> Any:
+    def tile(self, x: Any, dims: tuple[int, ...]) -> Any:
         return self._torch.tile(x, dims)
 
-    def scan(self, f: Any, init: Any, xs: Any, length: Optional[int] = None) -> Any:
+    def scan(self, f: Any, init: Any, xs: Any, length: int | None = None) -> Any:
         """PyTorch implementation of scan using a simple loop."""
         carry = init
         ys = []
@@ -578,12 +574,12 @@ class TorchBackend(TensorBackend):
 
         return carry, self.stack(ys)
 
-    def get_dlpack_slice(self, tensor: Any, cursor: Optional[Any] = None) -> Any:
+    def get_dlpack_slice(self, tensor: Any, cursor: Any | None = None) -> Any:
         from torch.utils.dlpack import to_dlpack
 
         sliced_tensor = tensor
         if cursor is not None:
-            if isinstance(cursor, (int, slice, tuple, list)):
+            if isinstance(cursor, int | slice | tuple | list):
                 sliced_tensor = tensor[cursor]
             else:
                 # Fallback for other types?
@@ -651,10 +647,10 @@ class JaxBackend(TensorBackend):
     def arange(self, start: int, end: int, step: int = 1, dtype: Any = None) -> Any:
         return self._jnp.arange(start, end, step, dtype=dtype)
 
-    def cat(self, tensors: List[Any], dim: int = 0) -> Any:
+    def cat(self, tensors: list[Any], dim: int = 0) -> Any:
         return self._jnp.concatenate(tensors, axis=dim)
 
-    def stack(self, tensors: List[Any], dim: int = 0) -> Any:
+    def stack(self, tensors: list[Any], dim: int = 0) -> Any:
         return self._jnp.stack(tensors, axis=dim)
 
     def equal(self, x: Any, y: Any) -> bool:
@@ -667,7 +663,7 @@ class JaxBackend(TensorBackend):
         return self._jnp.int32
 
     def is_tensor(self, obj: Any) -> bool:
-        return isinstance(obj, (self._jnp.ndarray, self._np.ndarray, JAXViewWrapper))
+        return isinstance(obj, self._jnp.ndarray | self._np.ndarray | JAXViewWrapper)
 
     def is_scalar(self, obj: Any) -> bool:
         return self.is_tensor(obj) and obj.ndim == 0
@@ -693,7 +689,7 @@ class JaxBackend(TensorBackend):
     def item(self, tensor: Any) -> Any:
         return tensor.item()
 
-    def unravel_index(self, indices: Any, shape: Tuple[int, ...]) -> Any:
+    def unravel_index(self, indices: Any, shape: tuple[int, ...]) -> Any:
         return self._jnp.unravel_index(indices, shape)
 
     def floor_divide(self, x: Any, y: Any) -> Any:
@@ -718,7 +714,7 @@ class JaxBackend(TensorBackend):
 
     def sort(
         self, x: Any, dim: int = -1, descending: bool = False, stable: bool = False
-    ) -> Tuple[Any, Any]:
+    ) -> tuple[Any, Any]:
         """Returns (sorted_values, indices)."""
         idx = self.argsort(x, dim, descending, stable=stable)
         val = self._jnp.take_along_axis(x, idx, axis=dim)
@@ -806,8 +802,8 @@ class JaxBackend(TensorBackend):
         self,
         x: Any,
         repeats: Any,
-        dim: Optional[int] = None,
-        total_repeat_length: Optional[int] = None,
+        dim: int | None = None,
+        total_repeat_length: int | None = None,
     ) -> Any:
         # JAX jnp.repeat repeats elements.
         return self._jnp.repeat(
@@ -825,10 +821,10 @@ class JaxBackend(TensorBackend):
             x = x.arr[x.slices]
         # Ensure start/size are tuples for JAX compatibility
         ndim = x.ndim
-        if isinstance(start, (int, float)) or self.is_scalar(start):
+        if isinstance(start, int | float) or self.is_scalar(start):
             start = (start,) + (0,) * (ndim - 1)
 
-        if (isinstance(size, (int, float)) or self.is_scalar(size)) and ndim == 1:
+        if (isinstance(size, int | float) or self.is_scalar(size)) and ndim == 1:
             size = (size,)
 
         return self._jax.lax.dynamic_slice(x, start, size)
@@ -849,14 +845,12 @@ class JaxBackend(TensorBackend):
             start = (start,) + (0,) * (x.ndim - 1)
         elif self.is_scalar(start):
             start = (start,) + (0,) * (x.ndim - 1)
-        elif isinstance(start, (list, tuple)) and len(start) < x.ndim:
+        elif isinstance(start, list | tuple) and len(start) < x.ndim:
             start = tuple(start) + (0,) * (x.ndim - len(start))
 
         return self._jax.lax.dynamic_update_slice(x, update, start)
 
-    def bincount(
-        self, x: Any, weights: Optional[Any] = None, minlength: int = 0
-    ) -> Any:
+    def bincount(self, x: Any, weights: Any | None = None, minlength: int = 0) -> Any:
         return self._jnp.bincount(x, weights=weights, length=minlength)
 
     def vmap(self, fun: Any, in_axes: Any = 0, out_axes: Any = 0) -> Any:
@@ -865,16 +859,16 @@ class JaxBackend(TensorBackend):
     def tree_map(self, fun: Any, tree: Any) -> Any:
         return self._jax.tree.map(fun, tree)
 
-    def tree_flatten(self, tree: Any) -> Tuple[List[Any], Any]:
+    def tree_flatten(self, tree: Any) -> tuple[list[Any], Any]:
         return self._jax.tree.flatten(tree)
 
-    def tile(self, x: Any, dims: Tuple[int, ...]) -> Any:
+    def tile(self, x: Any, dims: tuple[int, ...]) -> Any:
         return self._jnp.tile(x, dims)
 
-    def scan(self, f: Any, init: Any, xs: Any, length: Optional[int] = None) -> Any:
+    def scan(self, f: Any, init: Any, xs: Any, length: int | None = None) -> Any:
         return self._jax.lax.scan(f, init, xs, length=length)
 
-    def get_dlpack_slice(self, tensor: Any, cursor: Optional[Any] = None) -> Any:
+    def get_dlpack_slice(self, tensor: Any, cursor: Any | None = None) -> Any:
         # returns a zero-copy wrapper for JAX
         return JAXViewWrapper(tensor, cursor) if cursor is not None else tensor
 
@@ -981,7 +975,7 @@ class JAXViewWrapper:
             key = (slice(0, self.slices, 1),)
         elif isinstance(self.slices, slice):
             key = (self.slices,)
-        elif isinstance(self.slices, (tuple, list)):
+        elif isinstance(self.slices, tuple | list):
             key = tuple(self.slices)
         else:
             raise ValueError(f"Unsupported slice type: {type(self.slices)}")
@@ -1052,7 +1046,7 @@ try:
 except ImportError:
     pass
 
-_BACKEND: Optional[TensorBackend] = None
+_BACKEND: TensorBackend | None = None
 
 
 def get_backend() -> TensorBackend:

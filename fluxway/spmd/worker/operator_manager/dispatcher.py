@@ -2,17 +2,26 @@ from abc import ABC, abstractmethod
 
 from fluxway.common.types.configs import OperatorMeta, OperatorContext
 
-
-class SKIPPED:
-    """Sentinel for skipped interleaved execution."""
-
-    pass
+from dataclasses import dataclass
+from enum import Enum, auto
+from typing import Any
 
 
-class STALE_AFTER_RESTORE:
-    """Sentinel: step became stale during drain self-block (e.g. checkpoint restore)."""
+class ExecutionStatus(Enum):
+    """Sentinels for operator execution status."""
 
-    pass
+    SUCCESS = auto()
+    SKIPPED = auto()
+    STALE_AFTER_RESTORE = auto()
+    EMPTY_PROPAGATION = auto()
+
+
+@dataclass
+class ExecutionResult:
+    """Standardized result for operator execution."""
+
+    status: ExecutionStatus
+    data: Any = None
 
 
 class ExecutionDispatcher(ABC):

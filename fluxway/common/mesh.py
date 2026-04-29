@@ -5,7 +5,7 @@ Device Mesh Abstraction.
 from __future__ import annotations
 
 import numpy as np
-from typing import Any, List, Optional, Tuple
+from typing import Any
 
 
 class DeviceMesh:
@@ -22,9 +22,9 @@ class DeviceMesh:
 
     def __init__(
         self,
-        axis_names: Tuple[str, ...],
-        device_shape: Optional[Tuple[int, ...]] = None,
-        device_ids: Optional[Any] = None,
+        axis_names: tuple[str, ...],
+        device_shape: tuple[int, ...] | None = None,
+        device_ids: Any | None = None,
     ):
         """
         Initialize a DeviceMesh.
@@ -101,11 +101,11 @@ class DeviceMesh:
         return self.device_ids.size
 
     @property
-    def axis_names(self) -> Tuple[str, ...]:
+    def axis_names(self) -> tuple[str, ...]:
         return self._axis_names
 
     @property
-    def shape(self) -> Tuple[int, ...]:
+    def shape(self) -> tuple[int, ...]:
         return self._shape
 
     def get_axis_size(self, axis_name: str) -> int:
@@ -114,13 +114,13 @@ class DeviceMesh:
             raise ValueError(f"Axis {axis_name} not found in mesh {self.axis_names}")
         return self.size_map[axis_name]
 
-    def get_coordinate(self, rank_id: int) -> Tuple[int, ...]:
+    def get_coordinate(self, rank_id: int) -> tuple[int, ...]:
         """Get the multi-dimensional logical coordinates of a physical rank in the mesh."""
         if rank_id not in self._inverse_map:
             raise ValueError(f"Rank {rank_id} not found in mesh")
         return self._inverse_map[rank_id]
 
-    def get_rank(self, coord: Tuple[int, ...]) -> int:
+    def get_rank(self, coord: tuple[int, ...]) -> int:
         """Get the physical rank corresponding to logical coordinates."""
         if len(coord) != self.ndim:
             raise ValueError(
@@ -128,7 +128,7 @@ class DeviceMesh:
             )
         return self.device_ids[coord]
 
-    def coordinate_to_device(self, coords: Tuple[Any, ...]) -> Any:
+    def coordinate_to_device(self, coords: tuple[Any, ...]) -> Any:
         """Vectorized get_rank. coords elements can be tensors or numpy arrays."""
         from fluxway.common.backend import get_backend
 
@@ -141,7 +141,7 @@ class DeviceMesh:
 
         return self.device_ids[coords]
 
-    def unravel_index(self, ranks: Any) -> Tuple[Any, ...]:
+    def unravel_index(self, ranks: Any) -> tuple[Any, ...]:
         """Convert physical ranks to multi-dimensional logical coordinates."""
         from fluxway.common.backend import get_backend
 
@@ -152,7 +152,7 @@ class DeviceMesh:
             # Fallback for simple numpy usage if backend fails or not set
             return np.unravel_index(ranks, self.shape)
 
-    def flatten(self) -> List[int]:
+    def flatten(self) -> list[int]:
         """Return a flattened list of physical device IDs."""
         from fluxway.common.backend import get_backend
 

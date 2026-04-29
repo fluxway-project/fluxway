@@ -7,11 +7,10 @@ control-plane and worker components.
 
 from __future__ import annotations
 
-from typing import List, Type
 import typing
 
 
-def infer_fluxway_output_fields(spmd_class: Type, method_name: str) -> List[str]:
+def infer_fluxway_output_fields(spmd_class: type, method_name: str) -> list[str]:
     """
     Infer output data fields from an operator return annotation.
 
@@ -38,7 +37,7 @@ def infer_fluxway_output_fields(spmd_class: Type, method_name: str) -> List[str]
         return list(ann.keys())
 
     # fallback: custom class vars
-    fields: List[str] = []
+    fields: list[str] = []
     for var_name, var_value in getattr(ret, "__dict__", {}).items():
         if var_name.startswith("__") and var_name.endswith("__"):
             continue

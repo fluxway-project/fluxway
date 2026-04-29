@@ -12,7 +12,7 @@ Uses asyncio for non-blocking monitoring loop.
 
 import asyncio
 import time
-from typing import Awaitable, Callable, Dict, List, Optional, Set, Union
+from collections.abc import Awaitable, Callable
 
 from fluxway.common.types import (
     DriverHeartbeat,
@@ -43,13 +43,11 @@ class HeartbeatManager:
 
     def __init__(
         self,
-        config: Optional[HeartbeatConfig] = None,
-        on_all_ready: Optional[Union[SyncCallback, AsyncCallback]] = None,
-        on_all_workers_running: Optional[Union[SyncCallback, AsyncCallback]] = None,
-        on_driver_error: Optional[Union[SyncErrorCallback, AsyncErrorCallback]] = None,
-        on_driver_recovered: Optional[
-            Union[SyncRecoverCallback, AsyncRecoverCallback]
-        ] = None,
+        config: HeartbeatConfig | None = None,
+        on_all_ready: SyncCallback | AsyncCallback | None = None,
+        on_all_workers_running: SyncCallback | AsyncCallback | None = None,
+        on_driver_error: SyncErrorCallback | AsyncErrorCallback | None = None,
+        on_driver_recovered: SyncRecoverCallback | AsyncRecoverCallback | None = None,
     ):
         """
         Initialize HeartbeatManager.
@@ -69,16 +67,16 @@ class HeartbeatManager:
         self._on_driver_recovered = on_driver_recovered
 
         # Registered SPMD IDs that we expect heartbeats from
-        self._registered_spmds: Set[str] = set()
+        self._registered_spmds: set[str] = set()
 
         # Latest heartbeat from each driver
-        self._heartbeats: Dict[str, DriverHeartbeat] = {}
+        self._heartbeats: dict[str, DriverHeartbeat] = {}
 
         # Missed heartbeat counts
-        self._missed_counts: Dict[str, int] = {}
+        self._missed_counts: dict[str, int] = {}
 
         # Drivers currently in error state
-        self._error_drivers: Set[str] = set()
+        self._error_drivers: set[str] = set()
 
         # Phase trigger flags (one-shot)
         self._all_ready_triggered = False
@@ -90,7 +88,7 @@ class HeartbeatManager:
 
         # Monitoring task
         self._monitoring = False
-        self._monitor_task: Optional[asyncio.Task] = None
+        self._monitor_task: asyncio.Task | None = None
 
     def register_spmd(self, spmd_id: str) -> None:
         """
@@ -288,9 +286,7 @@ class HeartbeatManager:
 
             return True
 
-    async def wait_until_all_drivers_ready(
-        self, timeout: Optional[float] = None
-    ) -> bool:
+    async def wait_until_all_drivers_ready(self, timeout: float | None = None) -> bool:
         """Wait until all registered drivers report workers_ready=True."""
         async with self._lock:
             if self._check_all_ready_internal():
@@ -303,7 +299,7 @@ class HeartbeatManager:
                 await self._all_ready_event.wait()
             else:
                 await asyncio.wait_for(self._all_ready_event.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return False
         return True
 
@@ -327,7 +323,7 @@ class HeartbeatManager:
         async with self._lock:
             return self._is_driver_healthy_internal(spmd_id)
 
-    async def get_driver_status(self, spmd_id: str) -> Optional[DriverStatus]:
+    async def get_driver_status(self, spmd_id: str) -> DriverStatus | None:
         """Get the status of a specific driver."""
         async with self._lock:
             heartbeat = self._heartbeats.get(spmd_id)
@@ -335,7 +331,7 @@ class HeartbeatManager:
                 return None
             return heartbeat.status
 
-    async def get_all_driver_status(self) -> Dict[str, DriverStatus]:
+    async def get_all_driver_status(self) -> dict[str, DriverStatus]:
         """Get status of all registered drivers."""
         async with self._lock:
             result = {}
@@ -347,7 +343,7 @@ class HeartbeatManager:
                     result[spmd_id] = DriverStatus.TIMEOUT
             return result
 
-    async def get_unhealthy_drivers(self) -> List[str]:
+    async def get_unhealthy_drivers(self) -> list[str]:
         """Get list of unhealthy driver SPMD IDs."""
         async with self._lock:
             unhealthy = []
@@ -356,12 +352,12 @@ class HeartbeatManager:
                     unhealthy.append(spmd_id)
             return unhealthy
 
-    async def get_driver_heartbeat(self, spmd_id: str) -> Optional[DriverHeartbeat]:
+    async def get_driver_heartbeat(self, spmd_id: str) -> DriverHeartbeat | None:
         """Get the latest heartbeat from a driver."""
         async with self._lock:
             return self._heartbeats.get(spmd_id)
 
-    async def get_all_heartbeats(self) -> Dict[str, DriverHeartbeat]:
+    async def get_all_heartbeats(self) -> dict[str, DriverHeartbeat]:
         """Get all latest heartbeats."""
         async with self._lock:
             return dict(self._heartbeats)
@@ -438,7 +434,7 @@ class HeartbeatManager:
     async def _check_heartbeat_timeouts(self) -> None:
         """Check for heartbeat timeouts and trigger callbacks."""
         current_time = time.time()
-        timeout_drivers: List[tuple] = []
+        timeout_drivers: list[tuple] = []
 
         async with self._lock:
             for spmd_id in self._registered_spmds:

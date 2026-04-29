@@ -1,12 +1,13 @@
 """Execution utilities for controlling JIT behavior."""
 
-from typing import Any, Callable, Optional
+from typing import Any
+from collections.abc import Callable
 import functools
 
 from fluxway.common.backend import get_backend
 
 
-def shield(func: Optional[Callable] = None, *, result_shape: Any = None):
+def shield(func: Callable | None = None, *, result_shape: Any = None):
     """
     Decorator/Context Manager to shield a function from JIT compilation.
 
@@ -72,7 +73,7 @@ def shield(func: Optional[Callable] = None, *, result_shape: Any = None):
     return wrapper
 
 
-def compile(func: Optional[Callable] = None, **kwargs):
+def compile(func: Callable | None = None, **kwargs):
     """
     Unified compilation decorator (JAX JIT / PyTorch Compile).
 

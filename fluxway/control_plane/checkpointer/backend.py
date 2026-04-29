@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Type
+from typing import Any
 
-_BACKEND_REGISTRY: Dict[str, Type["WorkerCheckpointBackend"]] = {}
+_BACKEND_REGISTRY: dict[str, type["WorkerCheckpointBackend"]] = {}
 
 
 class WorkerCheckpointBackend(ABC):
@@ -43,12 +43,12 @@ class WorkerCheckpointBackend(ABC):
 
     @abstractmethod
     async def save(
-        self, state: Dict[str, Any], ckpt_dir: str, spmd_id: str, rank: int, step: int
-    ) -> Dict[str, Any]:
+        self, state: dict[str, Any], ckpt_dir: str, spmd_id: str, rank: int, step: int
+    ) -> dict[str, Any]:
         """Persist ``state`` and return opaque metadata needed by :meth:`load`."""
 
     @abstractmethod
-    async def load(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
+    async def load(self, metadata: dict[str, Any]) -> dict[str, Any]:
         """Reconstruct and return the state dict described by ``metadata``."""
 
     @abstractmethod

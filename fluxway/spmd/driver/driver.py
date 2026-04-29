@@ -17,7 +17,7 @@ from collections import defaultdict
 import threading
 import time
 import pathlib
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 try:
     import ray
@@ -62,11 +62,11 @@ if RAY_AVAILABLE:
             self,
             spmd_id: str,
             config: SPMDConfig,
-            placement_group: Optional[Any],
-            worker_bundle_indices: List[int],
-            controller_handle: Optional[Any],
-            graph_topology: Dict[str, Any],
-            checkpoint_backend: Optional[Any] = None,
+            placement_group: Any | None,
+            worker_bundle_indices: list[int],
+            controller_handle: Any | None,
+            graph_topology: dict[str, Any],
+            checkpoint_backend: Any | None = None,
         ):
             """
             Initialize SPMD Driver.
@@ -113,20 +113,20 @@ if RAY_AVAILABLE:
             self.monitor = SPMDMonitor(spmd_id)
 
             # Worker handles
-            self._worker_handles: Dict[int, Any] = {}
+            self._worker_handles: dict[int, Any] = {}
 
             # Heartbeat configuration
             self._heartbeat_config = HeartbeatConfig()
-            self._heartbeat_task: Optional[asyncio.Task] = None
+            self._heartbeat_task: asyncio.Task | None = None
             self._heartbeat_running = False
-            self._heartbeat_thread: Optional[threading.Thread] = None
+            self._heartbeat_thread: threading.Thread | None = None
 
             # Worker heartbeat tracking
-            self._worker_heartbeats: Dict[int, WorkerHeartbeat] = {}
-            self._worker_heartbeat_times: Dict[int, float] = {}
+            self._worker_heartbeats: dict[int, WorkerHeartbeat] = {}
+            self._worker_heartbeat_times: dict[int, float] = {}
 
             # Recovery tracking
-            self._recovery_attempts: Dict[int, int] = {}
+            self._recovery_attempts: dict[int, int] = {}
             self._max_recovery_attempts = 3
 
             # Workers ready/running state tracking
@@ -143,12 +143,12 @@ if RAY_AVAILABLE:
 
             # Backpressure / Pause control
             self._is_paused = False
-            self._source_state: Optional[ReaderState] = ReaderState.INITIALIZING
+            self._source_state: ReaderState | None = ReaderState.INITIALIZING
 
             # Pending snapshot state
-            self._pending_snapshot_id: Optional[str] = None
-            self._pending_target_step_count: Optional[int] = None
-            self._pending_ckpt_dir: Optional[str] = None
+            self._pending_snapshot_id: str | None = None
+            self._pending_target_step_count: int | None = None
+            self._pending_ckpt_dir: str | None = None
 
             logger.debug(
                 f"Driver initialized spmd_id={spmd_id} num_workers={config.num_workers}"
@@ -158,7 +158,7 @@ if RAY_AVAILABLE:
         # Initialization
         # =====================================================================
 
-        async def initialize(self, checkpoint_id: Optional[str] = None) -> bool:
+        async def initialize(self, checkpoint_id: str | None = None) -> bool:
             """
             Initialize the driver and start all workers.
 
@@ -217,9 +217,9 @@ if RAY_AVAILABLE:
                 self.state_machine.trigger(DriverEvent.INIT_FAILED, error=str(e))
                 return False
 
-        def _build_worker_opts(self, bundle_idx: int, name: str) -> Dict[str, Any]:
+        def _build_worker_opts(self, bundle_idx: int, name: str) -> dict[str, Any]:
             """Build .options() kwargs for a worker actor."""
-            opts: Dict[str, Any] = {"name": name}
+            opts: dict[str, Any] = {"name": name}
             if self.placement_group is not None:
                 opts["placement_group"] = self.placement_group
                 opts["placement_group_bundle_index"] = bundle_idx
@@ -237,9 +237,7 @@ if RAY_AVAILABLE:
                 opts = self._build_worker_opts(
                     bundle_idx, f"spmd_worker_{self.spmd_id}_{rank}"
                 )
-                worker = SPMDWorker.options(  # type: ignore[attr-defined]
-                    **opts
-                ).remote(
+                worker = SPMDWorker.options(**opts).remote(  # type: ignore[attr-defined]
                     config=self.config,
                     rank=rank,
                     spmd_id=self.spmd_id,
@@ -272,9 +270,9 @@ if RAY_AVAILABLE:
             )
 
         def _compute_rank_info(
-            self, node_ids: Dict[int, str]
-        ) -> Dict[int, Dict[str, int]]:
-            node_groups: Dict[str, List[int]] = defaultdict(list)
+            self, node_ids: dict[int, str]
+        ) -> dict[int, dict[str, int]]:
+            node_groups: dict[str, list[int]] = defaultdict(list)
             for rank, node_id in node_ids.items():
                 node_groups[node_id].append(rank)
 
@@ -299,16 +297,16 @@ if RAY_AVAILABLE:
                 for local_rank, rank in enumerate(ranks)
             }
 
-        def get_worker_handles(self) -> Dict[int, Any]:
+        def get_worker_handles(self) -> dict[int, Any]:
             """Get all worker handles for topology registration."""
             return dict(self._worker_handles)
 
         def register_topology(
             self,
-            predecessor_handlers: Dict[
-                str, Dict[int, Any]
+            predecessor_handlers: dict[
+                str, dict[int, Any]
             ],  # {spmd_id: {rank: handle}}
-            successor_handlers: Dict[str, Dict[int, Any]],  # {spmd_id: {rank: handle}}
+            successor_handlers: dict[str, dict[int, Any]],  # {spmd_id: {rank: handle}}
             predecessor_count: int,
             successor_count: int,
         ) -> None:
@@ -361,7 +359,7 @@ if RAY_AVAILABLE:
             await self._stop_heartbeat()
 
             # Stop all workers
-            stop_refs: List[tuple[int, Any]] = []
+            stop_refs: list[tuple[int, Any]] = []
             for rank, worker in self._worker_handles.items():
                 try:
                     stop_refs.append((rank, worker.stop.remote()))
@@ -383,7 +381,7 @@ if RAY_AVAILABLE:
                             f"spmd_id={self.spmd_id}"
                         )
 
-            detach_refs: List[tuple[int, Any]] = []
+            detach_refs: list[tuple[int, Any]] = []
             for rank, worker in worker_handles:
                 try:
                     detach_refs.append((rank, worker.set_driver_handle.remote(None)))
@@ -553,7 +551,7 @@ if RAY_AVAILABLE:
             self.state_machine.trigger(DriverEvent.SNAPSHOT_COMPLETE)
 
         async def restore_from_disk(
-            self, rank_metadata_map: Dict[int, Dict[str, Any]]
+            self, rank_metadata_map: dict[int, dict[str, Any]]
         ) -> None:
             """
             Fan out checkpoint restore to all workers in parallel.
@@ -769,7 +767,7 @@ if RAY_AVAILABLE:
         # =====================================================================
 
         def broadcast_control_argument(
-            self, target_op: str, names: List[str], step: int, values: List[Any]
+            self, target_op: str, names: list[str], step: int, values: list[Any]
         ) -> None:
             """
             Broadcast control_arguments to all workers via receive_control.
@@ -802,9 +800,9 @@ if RAY_AVAILABLE:
             self,
             target_spmd_id: str,
             target_op: str,
-            names: List[str],
+            names: list[str],
             step: int,
-            values: List[Any],
+            values: list[Any],
         ) -> None:
             """
             Route control_arguments to controller (called by rank0 worker).
@@ -1011,12 +1009,9 @@ if RAY_AVAILABLE:
                 bundle_idx = self.worker_bundle_indices[rank]
                 self_handle = ray.get_runtime_context().current_actor
                 opts = self._build_worker_opts(
-                    bundle_idx,
-                    f"spmd_worker_{self.spmd_id}_{rank}_recovered",
+                    bundle_idx, f"spmd_worker_{self.spmd_id}_{rank}_recovered"
                 )
-                worker = SPMDWorker.options(  # type: ignore[attr-defined]
-                    **opts
-                ).remote(
+                worker = SPMDWorker.options(**opts).remote(  # type: ignore[attr-defined]
                     config=self.config,
                     rank=rank,
                     spmd_id=self.spmd_id,
@@ -1070,7 +1065,7 @@ if RAY_AVAILABLE:
         # =====================================================================
 
         def update_topology(
-            self, predecessors: List[str], successors: List[str]
+            self, predecessors: list[str], successors: list[str]
         ) -> None:
             """
             Update topology information.
@@ -1094,7 +1089,7 @@ if RAY_AVAILABLE:
             """Get current driver state."""
             return self.state_machine.state
 
-        def get_status(self) -> Dict[str, Any]:
+        def get_status(self) -> dict[str, Any]:
             """Get detailed driver status."""
             status = {
                 "spmd_id": self.spmd_id,
@@ -1154,7 +1149,7 @@ if RAY_AVAILABLE:
                         f"Failed to resume worker error={e} spmd_id={self.spmd_id}"
                     )
 
-        def get_source_state(self) -> Optional[ReaderState]:
+        def get_source_state(self) -> ReaderState | None:
             """Get current source state."""
             return self._source_state
 
@@ -1183,7 +1178,7 @@ else:
             """Mock Ray remote call."""
             return cls(*args, **kwargs)
 
-        async def initialize(self, checkpoint_id: Optional[str] = None) -> bool:
+        async def initialize(self, checkpoint_id: str | None = None) -> bool:
             return True
 
         def start(self) -> None:

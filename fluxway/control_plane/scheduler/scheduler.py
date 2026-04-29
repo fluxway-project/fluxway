@@ -11,7 +11,7 @@ Responsibilities:
 - Support preemption and eviction (via Ray API)
 """
 
-from typing import List, Optional, Any, Dict, TYPE_CHECKING
+from typing import Optional, Any, TYPE_CHECKING
 import asyncio
 import logging
 
@@ -61,7 +61,7 @@ class Scheduler:
         """
         self._spmd_manager = spmd_manager
         self._pg_manager = PGManager()
-        self._current_plan: Optional[PlacementPlan] = None
+        self._current_plan: PlacementPlan | None = None
 
     def set_spmd_manager(self, spmd_manager: "SPMDManager") -> None:
         """Set the SPMD manager reference."""
@@ -185,9 +185,9 @@ class Scheduler:
         Returns:
             Placement plan for all SPMDs
         """
-        spmd_placements: Dict[str, ResourceSpec] = {}
-        spmd_priorities: Dict[str, ResourcePriority] = {}
-        shared_pgs: Dict[str, List[str]] = {}
+        spmd_placements: dict[str, ResourceSpec] = {}
+        spmd_priorities: dict[str, ResourcePriority] = {}
+        shared_pgs: dict[str, list[str]] = {}
 
         for node_name, node in graph.nodes.items():
             spmd_placements[node_name] = (
@@ -297,7 +297,7 @@ class Scheduler:
 
         return True
 
-    def _build_topology(self, graph: Graph) -> Dict[str, List[str]]:
+    def _build_topology(self, graph: Graph) -> dict[str, list[str]]:
         """
         Build SPMD topology from graph edges.
 
@@ -307,7 +307,7 @@ class Scheduler:
         Returns:
             Mapping of node name to list of downstream node names
         """
-        topology: Dict[str, List[str]] = {name: [] for name in graph.nodes}
+        topology: dict[str, list[str]] = {name: [] for name in graph.nodes}
         for edge in graph.edges:
             if edge.source_node in topology:
                 if edge.target_node not in topology[edge.source_node]:
@@ -316,7 +316,7 @@ class Scheduler:
 
     def create_shared_pg(
         self,
-        spmd_ids: List[str],
+        spmd_ids: list[str],
         resources: ResourceSpec,
         priority: ResourcePriority = ResourcePriority.MID,
     ) -> Any:
@@ -375,7 +375,7 @@ class Scheduler:
         """
         self._pg_manager.release_pg(spmd_id)
 
-    def get_allocated_resources(self, spmd_id: str) -> Optional[ResourceSpec]:
+    def get_allocated_resources(self, spmd_id: str) -> ResourceSpec | None:
         """
         Get the resources allocated to an SPMD.
 
@@ -438,7 +438,7 @@ class Scheduler:
             logger.error(f"Error checking resource availability: {e}")
             return False
 
-    def get_preemptable_spmds(self, required_resource: ResourceSpec) -> List[str]:
+    def get_preemptable_spmds(self, required_resource: ResourceSpec) -> list[str]:
         """
         Get SPMDs that could be preempted to free resources.
 

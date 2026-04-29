@@ -1191,7 +1191,13 @@ async def test_send_output_none_mesh():
 
     worker._successor_handlers = {"succ": {0: DataPlaneCallable(handler)}}
 
+    from fluxway.spmd.worker.operator_manager.dispatcher import (
+        ExecutionStatus,
+        ExecutionResult,
+    )
+
     data = [np.array([1, 2, 3])]
-    await worker._send_output("compute", data, exec_step=0)
+    result = ExecutionResult(status=ExecutionStatus.SUCCESS, data=data)
+    await worker._send_output("compute", result, exec_step=0)
 
     assert handler.receive_shards.remote.called

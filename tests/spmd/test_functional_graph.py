@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any
 import sys
 import os
 
@@ -10,15 +10,15 @@ from fluxway.common.decorators import spmd, operator, data_type
 
 @data_type()
 class DummyData:
-    h_obs: Optional[Any] = None
-    h_action: Optional[Any] = None
-    h_reward: Optional[Any] = None
-    h_train: Optional[Any] = None
-    dummy_tensor: Optional[Any] = None
-    input1: Optional[Any] = None
-    input2: Optional[Any] = None
-    h_fwd: Optional[Any] = None
-    dummy: Optional[Any] = None
+    h_obs: Any | None = None
+    h_action: Any | None = None
+    h_reward: Any | None = None
+    h_train: Any | None = None
+    dummy_tensor: Any | None = None
+    input1: Any | None = None
+    input2: Any | None = None
+    h_fwd: Any | None = None
+    dummy: Any | None = None
 
 
 # Universal sharding config for replicated data

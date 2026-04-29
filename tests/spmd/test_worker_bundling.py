@@ -1,7 +1,6 @@
 import unittest
 import numpy as np
 import jax.numpy as jnp
-from typing import Dict, List, Tuple
 from fluxway.common.types.tensor import TransportTensor
 from fluxway.common.types.sharding import ShardingSpec, P
 from fluxway.common.mesh import DeviceMesh
@@ -210,7 +209,7 @@ class TestWorkerBundling(unittest.IsolatedAsyncioTestCase):
         # Scenario 1: Mixed sharding in one @data_type
         # Flattened fields:
         fields = [("my_data.field_a", spec1, spec1), ("my_data.field_b", spec2, spec2)]
-        batches: Dict[Tuple[ShardingSpec, ShardingSpec], List[str]] = {}
+        batches: dict[tuple[ShardingSpec, ShardingSpec], list[str]] = {}
         for name, src, dst in fields:
             key = (src, dst)
             batches.setdefault(key, []).append(name)
@@ -221,7 +220,7 @@ class TestWorkerBundling(unittest.IsolatedAsyncioTestCase):
 
         # Scenario 2: Same sharding in @data_type
         fields = [("my_data.field_a", spec1, spec1), ("my_data.field_b", spec1, spec1)]
-        batches: Dict[Tuple[ShardingSpec, ShardingSpec], List[str]] = {}
+        batches: dict[tuple[ShardingSpec, ShardingSpec], list[str]] = {}
         for name, src, dst in fields:
             key = (src, dst)
             batches.setdefault(key, []).append(name)

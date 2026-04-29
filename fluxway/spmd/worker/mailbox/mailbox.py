@@ -14,7 +14,8 @@ Zero-copy shard writing is supported via TransportReceiver delegation.
 
 import asyncio
 import logging
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Optional
+from collections.abc import Callable
 
 import numpy as np
 
@@ -57,18 +58,18 @@ class StepBarrier:
         self,
         op_name: str,
         step: int,
-        expected_tensors: Dict[int, int],
-        expected_states: List[str],
+        expected_tensors: dict[int, int],
+        expected_states: list[str],
         periodic: bool = False,
     ) -> None:
         self._op_name = op_name
         self._step = step
         self._periodic = periodic
-        self._tensor_barriers: Dict[int, ArrivalBarrier] = {
+        self._tensor_barriers: dict[int, ArrivalBarrier] = {
             u: ArrivalBarrier(count, periodic=periodic)
             for u, count in expected_tensors.items()
         }
-        self._control_arg_barriers: Dict[str, ArrivalBarrier] = {
+        self._control_arg_barriers: dict[str, ArrivalBarrier] = {
             name: ArrivalBarrier(1, periodic=periodic) for name in expected_states
         }
         # Combined completion event (one-shot mode only)
@@ -77,22 +78,22 @@ class StepBarrier:
             self._check()  # fire immediately if both dicts are empty
 
     @property
-    def arrived_tensors(self) -> List[int]:
+    def arrived_tensors(self) -> list[int]:
         return [u for u, b in self._tensor_barriers.items() if b.count >= b.target]
 
     @property
-    def expected_tensors(self) -> List[int]:
+    def expected_tensors(self) -> list[int]:
         return list(self._tensor_barriers.keys())
 
     @property
-    def tensor_progress(self) -> Dict[int, str]:
+    def tensor_progress(self) -> dict[int, str]:
         return {u: f"{b.count}/{b.target}" for u, b in self._tensor_barriers.items()}
 
     # ------------------------------------------------------------------
     # Arrival notification
     # ------------------------------------------------------------------
 
-    def tensor_arrived(self, tuuid: int, current_step: Optional[int] = None) -> bool:
+    def tensor_arrived(self, tuuid: int, current_step: int | None = None) -> bool:
         """Record one shard arriving for tensor TUUID. Returns True if barrier just fired."""
         barrier = self._tensor_barriers.get(tuuid)
         if barrier is not None:
@@ -110,9 +111,7 @@ class StepBarrier:
             )
         return False
 
-    def control_arg_arrived(
-        self, name: str, current_step: Optional[int] = None
-    ) -> bool:
+    def control_arg_arrived(self, name: str, current_step: int | None = None) -> bool:
         """Record state data arriving for `name`. Returns True if barrier just fired."""
         barrier = self._control_arg_barriers.get(name)
         if barrier is not None:
@@ -130,7 +129,7 @@ class StepBarrier:
             )
         return False
 
-    def satisfy_tensor(self, tuuid: int, current_step: Optional[int] = None) -> bool:
+    def satisfy_tensor(self, tuuid: int, current_step: int | None = None) -> bool:
         """Force a tensor barrier to be satisfied (e.g., via staleness fallback)."""
         barrier = self._tensor_barriers.get(tuuid)
         if barrier is not None and not barrier.is_done():
@@ -141,9 +140,7 @@ class StepBarrier:
             return self._check(current_step=current_step)
         return False
 
-    def satisfy_control_arg(
-        self, name: str, current_step: Optional[int] = None
-    ) -> bool:
+    def satisfy_control_arg(self, name: str, current_step: int | None = None) -> bool:
         """Force a state barrier to be satisfied."""
         barrier = self._control_arg_barriers.get(name)
         if barrier is not None and not barrier.is_done():
@@ -158,7 +155,7 @@ class StepBarrier:
     # Completion query
     # ------------------------------------------------------------------
 
-    def _check(self, current_step: Optional[int] = None) -> bool:
+    def _check(self, current_step: int | None = None) -> bool:
         if self._combined.is_set():
             return False
         tensors_ok = all(b.is_done() for b in self._tensor_barriers.values())
@@ -217,37 +214,37 @@ class WorkerMailbox:
 
     def __init__(self) -> None:
         # Control plane
-        self._control_arg_data: Dict[str, Dict[str, Dict[int, Any]]] = {}
+        self._control_arg_data: dict[str, dict[str, dict[int, Any]]] = {}
 
         # Data plane (buffered path)
-        self._tensor_slots: Dict[
-            str, Dict[int, Dict[int, Dict[Tuple[str, int], List["TransportTensor"]]]]
+        self._tensor_slots: dict[
+            str, dict[int, dict[int, dict[tuple[str, int], list[TransportTensor]]]]
         ] = {}
 
         # Completion barriers: {op_name: {step: StepBarrier}}
-        self._barriers: Dict[str, Dict[int, StepBarrier]] = {}
+        self._barriers: dict[str, dict[int, StepBarrier]] = {}
 
         # Zero-copy receivers (activated on demand)
-        self._zc_receivers: Dict[str, Dict[int, Dict[int, TransportReceiver]]] = {}
+        self._zc_receivers: dict[str, dict[int, dict[int, TransportReceiver]]] = {}
 
         # Called with (op_name, step) when a step barrier fires
-        self._on_ready: Optional[Callable[[str, int], None]] = None
+        self._on_ready: Callable[[str, int], None] | None = None
 
         # Periodic mode state: {op_name: current_virtual_step}
-        self._periodic_steps: Dict[str, int] = {}
+        self._periodic_steps: dict[str, int] = {}
         # Mapping from periodic op to its perpetual barrier
-        self._periodic_barriers: Dict[str, StepBarrier] = {}
+        self._periodic_barriers: dict[str, StepBarrier] = {}
 
         # Tolerant mode (staleness) config: {op_name: {name_or_uuid: staleness_value}}
-        self._staleness_config: Dict[str, Dict[Any, int]] = {}
+        self._staleness_config: dict[str, dict[Any, int]] = {}
         # Expected counts for satisfying staleness: {op_name: {name_or_uuid: expected_count}}
-        self._expected_tensor_counts: Dict[str, Dict[int, int]] = {}
-        self._expected_control_arg_names: Dict[str, List[str]] = {}
+        self._expected_tensor_counts: dict[str, dict[int, int]] = {}
+        self._expected_control_arg_names: dict[str, list[str]] = {}
         # Retrieval policy for tolerant params: {op_name: {name_or_uuid: policy_string}}
-        self._retrieval_policy: Dict[str, Dict[Any, str]] = {}
+        self._retrieval_policy: dict[str, dict[Any, str]] = {}
 
         # Barrier configurations: {op_name: BarrierConfig}
-        self._barrier_configs: Dict[str, "BarrierConfig"] = {}
+        self._barrier_configs: dict[str, BarrierConfig] = {}
 
         self._lock = asyncio.Lock()
 
@@ -271,8 +268,8 @@ class WorkerMailbox:
         self,
         op_name: str,
         step: int,
-        expected_tensors: Dict[int, int],
-        expected_states: List[str],
+        expected_tensors: dict[int, int],
+        expected_states: list[str],
         barrier_config: Optional["BarrierConfig"] = None,
     ) -> None:
         """
@@ -419,7 +416,7 @@ class WorkerMailbox:
     # ------------------------------------------------------------------
 
     async def deposit_control_arguments(
-        self, op_name: str, step: int, names: List[str], values: List[Any]
+        self, op_name: str, step: int, names: list[str], values: list[Any]
     ) -> None:
         """Cache state data and notify the step barrier."""
         if len(names) != len(values):
@@ -470,7 +467,7 @@ class WorkerMailbox:
 
     async def get_control_argument(
         self, op_name: str, name: str, step: int
-    ) -> Optional[Any]:
+    ) -> Any | None:
         async with self._lock:
             staleness = self._staleness_config.get(op_name, {}).get(name, 0)
             if staleness > 0:
@@ -489,7 +486,7 @@ class WorkerMailbox:
 
     async def get_all_control_arguments(
         self, op_name: str, step: int
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         async with self._lock:
             result = {}
             for name, step_dict in self._control_arg_data.get(op_name, {}).items():
@@ -522,7 +519,7 @@ class WorkerMailbox:
 
     def _buffered_slot(
         self, op_name: str, tuuid: int, step: int
-    ) -> Dict[Tuple[str, int], List["TransportTensor"]]:
+    ) -> dict[tuple[str, int], list["TransportTensor"]]:
         return (
             self._tensor_slots.setdefault(op_name, {})
             .setdefault(tuuid, {})
@@ -532,16 +529,16 @@ class WorkerMailbox:
     async def deposit_shards(
         self,
         op_name: str,
-        tuuids: List[int],
+        tuuids: list[int],
         step: int,
         sender_id: str,
         rank: int,
         sender_world_size: int,
-        payloads: List[Any],
-        counts: List[int],
-        global_shapes: Optional[List[Optional[Tuple[int, ...]]]] = None,
-        meta_tensor_state_list: Optional[List[int]] = None,
-        slice_compact_desc_params: Optional[List[Optional[List[int]]]] = None,
+        payloads: list[Any],
+        counts: list[int],
+        global_shapes: list[tuple[int, ...] | None] | None = None,
+        meta_tensor_state_list: list[int] | None = None,
+        slice_compact_desc_params: list[list[int] | None] | None = None,
     ) -> int:
         """
         Cache multiple tensor shards and notify the step barrier.
@@ -679,13 +676,13 @@ class WorkerMailbox:
         sender_id: str,
         rank: int,
         sender_world_size: int,
-        payloads: List[Any],
-        counts: List[int],
-        global_shape: Optional[Tuple[int, ...]] = None,
+        payloads: list[Any],
+        counts: list[int],
+        global_shape: tuple[int, ...] | None = None,
         is_ragged: bool = False,
         has_origin_indices: bool = False,
         has_compact_index: bool = False,
-        compact_desc_params: Optional[List[int]] = None,
+        compact_desc_params: list[int] | None = None,
     ) -> int:
         """Internal helper for buffered shard storage."""
 
@@ -779,7 +776,7 @@ class WorkerMailbox:
 
     async def get_all_tensor_shards(
         self, op_name: str, step: int
-    ) -> Dict[int, Dict[Tuple[str, int], List[TransportTensor]]]:
+    ) -> dict[int, dict[tuple[str, int], list[TransportTensor]]]:
         """Get all received shards for a step, prioritizing Zero-Copy buffers."""
         async with self._lock:
             # Combine all TUUIDs for this operator
@@ -787,7 +784,7 @@ class WorkerMailbox:
                 self._zc_receivers.get(op_name, {}).keys()
             )
 
-            result: Dict[int, Dict[Tuple[str, int], List[TransportTensor]]] = {}
+            result: dict[int, dict[tuple[str, int], list[TransportTensor]]] = {}
             # We want to collect ALL tensors expected by this operator, including stale ones
             # First, check what TUUIDs this operator expects
             expected_counts = self._expected_tensor_counts.get(op_name, {})
@@ -846,7 +843,7 @@ class WorkerMailbox:
 
             return result
 
-    def _get_barrier(self, op_name: str, step: int) -> Optional[StepBarrier]:
+    def _get_barrier(self, op_name: str, step: int) -> StepBarrier | None:
         """Internal helper to get barrier."""
         if op_name in self._periodic_barriers:
             return self._periodic_barriers[op_name]
@@ -862,8 +859,8 @@ class WorkerMailbox:
         tuuid: int,
         step: int,
         rank: int,
-        sender_id: Optional[str] = None,
-    ) -> Optional[List["TransportTensor"]]:
+        sender_id: str | None = None,
+    ) -> list["TransportTensor"] | None:
         async with self._lock:
             slot = self._tensor_slots.get(op_name, {}).get(tuuid, {}).get(step, {})
             if sender_id is not None:
@@ -877,7 +874,7 @@ class WorkerMailbox:
 
     async def get_tensor_shards(
         self, op_name: str, tuuid: int, step: int
-    ) -> Dict[Tuple[str, int], List["TransportTensor"]]:
+    ) -> dict[tuple[str, int], list["TransportTensor"]]:
         async with self._lock:
             staleness = self._staleness_config.get(op_name, {}).get(tuuid, 0)
             if staleness > 0:
@@ -904,7 +901,7 @@ class WorkerMailbox:
 
     async def get_all_tensor_shards_with_staleness(
         self, op_name: str, step: int
-    ) -> Dict[int, Dict[Tuple[str, int], List[TransportTensor]]]:
+    ) -> dict[int, dict[tuple[str, int], list[TransportTensor]]]:
         """Prioritized version of get_all_tensor_shards including staleness check."""
         async with self._lock:
             result = {}
@@ -966,7 +963,7 @@ class WorkerMailbox:
         op_name: str,
         tuuid: int,
         step: int,
-        target_buffers: List[Any],
+        target_buffers: list[Any],
         expect_offsets: dict,
     ) -> None:
         """Enable zero-copy write-through for a tensor slot."""
@@ -979,7 +976,7 @@ class WorkerMailbox:
 
     async def get_zero_copy_buffers(
         self, op_name: str, tuuid: int, step: int
-    ) -> Optional[List[Any]]:
+    ) -> list[Any] | None:
         async with self._lock:
             receiver = self._zc_receivers.get(op_name, {}).get(tuuid, {}).get(step)
             return receiver.target_buffers if receiver is not None else None

@@ -16,7 +16,8 @@ State transitions:
 
 import logging
 import threading
-from typing import TYPE_CHECKING, Callable, Dict, Optional
+from typing import TYPE_CHECKING
+from collections.abc import Callable
 
 from fluxway.common.types import DriverState, DriverEvent
 
@@ -72,11 +73,11 @@ class DriverStateMachine:
         self._lock = threading.Lock()
 
         # Track error information
-        self._error_workers: Dict[int, str] = {}  # rank -> error_message
-        self._error_message: Optional[str] = None
+        self._error_workers: dict[int, str] = {}  # rank -> error_message
+        self._error_message: str | None = None
 
         # Callbacks for state entry
-        self._entry_callbacks: Dict[DriverState, Callable[[], None]] = {
+        self._entry_callbacks: dict[DriverState, Callable[[], None]] = {
             DriverState.READY: self._on_enter_ready,
             DriverState.RUNNING: self._on_enter_running,
             DriverState.BLOCKED: self._on_enter_blocked,
@@ -190,12 +191,12 @@ class DriverStateMachine:
         """Check if driver has completed."""
         return self.state == DriverState.COMPLETED
 
-    def get_error_workers(self) -> Dict[int, str]:
+    def get_error_workers(self) -> dict[int, str]:
         """Get workers currently in error state."""
         with self._lock:
             return dict(self._error_workers)
 
-    def get_error_message(self) -> Optional[str]:
+    def get_error_message(self) -> str | None:
         """Get the latest error message."""
         with self._lock:
             return self._error_message

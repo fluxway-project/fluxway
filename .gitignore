@@ -236,3 +236,5 @@ Thumbs.db
 # Agent
 .agent/
 .cursor/
+
+tmp/

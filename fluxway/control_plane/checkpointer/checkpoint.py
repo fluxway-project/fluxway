@@ -4,7 +4,8 @@ import logging
 import os
 import shutil
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any
+from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +39,7 @@ class FluxwayCheckpointer:
         interval_steps: int,
         force_write: bool = False,
         max_to_keep: int = 2,
-        validate_deps: Optional[Callable] = None,
+        validate_deps: Callable | None = None,
     ) -> None:
         if interval_steps < 1:
             raise ValueError(f"interval_steps must be >= 1, got {interval_steps}")
@@ -63,7 +64,7 @@ class FluxwayCheckpointer:
     # Public API
     # =========================================================================
 
-    def list_steps(self) -> List[int]:
+    def list_steps(self) -> list[int]:
         """Return all valid checkpoint steps on disk, ascending."""
         root = Path(self._ckpt_dir)
         if not root.exists():
@@ -74,7 +75,7 @@ class FluxwayCheckpointer:
             if d.is_dir() and d.name.isdigit() and (d / "manifest.json").exists()
         )
 
-    def latest_step(self) -> Optional[int]:
+    def latest_step(self) -> int | None:
         steps = self.list_steps()
         return steps[-1] if steps else None
 
@@ -93,7 +94,7 @@ class FluxwayCheckpointer:
         self._persist(step, manifest)
         logger.info(f"Checkpoint step {step} saved ({list(manifest.keys())})")
 
-    async def restore(self, step: Optional[int] = None) -> Optional[int]:
+    async def restore(self, step: int | None = None) -> int | None:
         """
         Restore state from a checkpoint.
 
@@ -128,7 +129,7 @@ class FluxwayCheckpointer:
     # Internal Persistence (format-agnostic manifest JSON)
     # =========================================================================
 
-    def _persist(self, step: int, manifest: Dict[str, Any]) -> None:
+    def _persist(self, step: int, manifest: dict[str, Any]) -> None:
         """Write the manifest that maps spmd_id/rank to Worker-written path metadata."""
         step_dir = Path(self._ckpt_dir) / str(step)
         manifest_path = step_dir / "manifest.json"
@@ -168,7 +169,7 @@ class FluxwayCheckpointer:
         tmp_man.rename(manifest_path)
         self._evict_old_checkpoints()
 
-    def _load(self, step: int) -> Dict[str, Any]:
+    def _load(self, step: int) -> dict[str, Any]:
         """Read and return the manifest dict for ``step``."""
         manifest_path = Path(self._ckpt_dir) / str(step) / "manifest.json"
         if not manifest_path.exists():

@@ -7,7 +7,7 @@ Responsibilities:
 - Track SPMD runtime states for monitoring
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from fluxway.common.types import GlobalState, SPMDState
 
@@ -25,24 +25,24 @@ class StateManager:
 
     def __init__(self):
         self._global_state: GlobalState = GlobalState()
-        self._spmd_states: Dict[str, SPMDState] = {}
-        self._snapshot_store: Dict[str, Dict[str, Dict[int, Dict[str, Any]]]] = {}
+        self._spmd_states: dict[str, SPMDState] = {}
+        self._snapshot_store: dict[str, dict[str, dict[int, dict[str, Any]]]] = {}
 
     # =========================================================================
     # Snapshot API (framework-level, no persistence)
     # =========================================================================
 
     def save_snapshot(
-        self, snapshot_id: str, spmd_states: Dict[str, Dict[int, Dict[str, Any]]]
+        self, snapshot_id: str, spmd_states: dict[str, dict[int, dict[str, Any]]]
     ) -> None:
         self._snapshot_store[snapshot_id] = spmd_states
 
-    def load_snapshot(self, snapshot_id: str) -> Dict[str, Dict[int, Dict[str, Any]]]:
+    def load_snapshot(self, snapshot_id: str) -> dict[str, dict[int, dict[str, Any]]]:
         if snapshot_id not in self._snapshot_store:
             raise KeyError(f"Snapshot {snapshot_id!r} not found")
         return self._snapshot_store[snapshot_id]
 
-    def list_snapshots(self) -> List[str]:
+    def list_snapshots(self) -> list[str]:
         return list(self._snapshot_store.keys())
 
     def delete_snapshot(self, snapshot_id: str) -> None:
@@ -57,7 +57,7 @@ class StateManager:
     def update_spmd_state(self, spmd_id: str, state: SPMDState) -> None:
         self._spmd_states[spmd_id] = state
 
-    def get_spmd_state(self, spmd_id: str) -> Optional[SPMDState]:
+    def get_spmd_state(self, spmd_id: str) -> SPMDState | None:
         return self._spmd_states.get(spmd_id)
 
     def get_global_state(self) -> GlobalState:

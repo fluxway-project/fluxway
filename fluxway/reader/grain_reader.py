@@ -3,7 +3,7 @@ Standardized Reader implementation leveraging Google Grain.
 """
 
 import base64
-from typing import Any, Dict, Optional
+from typing import Any
 
 from fluxway.common.decorators import spmd, operator
 from fluxway.common.utils.logging import get_logger
@@ -47,11 +47,11 @@ class GrainReader(BaseReader):
 
     def _create_data_loader(
         self,
-        static_args: Dict[str, Any],
+        static_args: dict[str, Any],
         rank: int,
         world_size: int,
-        shard_index: Optional[int] = None,
-        shard_count: Optional[int] = None,
+        shard_index: int | None = None,
+        shard_count: int | None = None,
     ):
         """
         Construct the Grain DataLoader pipeline and create the iterator.
@@ -133,7 +133,7 @@ class GrainReader(BaseReader):
 
     _GRAIN_STATE_KEY = "__grain_iter_state__"
 
-    def save_state(self) -> Dict[str, Any]:
+    def save_state(self) -> dict[str, Any]:
         """
         Return the iterator position as a framework-compatible dict.
 
@@ -147,7 +147,7 @@ class GrainReader(BaseReader):
             return {self._GRAIN_STATE_KEY: base64.b64encode(raw).decode()}
         return {}
 
-    def restore_state(self, state: Dict[str, Any]) -> None:
+    def restore_state(self, state: dict[str, Any]) -> None:
         """
         Restore the iterator to a previously saved position.
 

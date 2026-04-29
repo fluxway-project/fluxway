@@ -1,4 +1,5 @@
-from typing import Any, List, Tuple, Callable, Optional, Union
+from typing import Any, Union
+from collections.abc import Callable
 
 
 def _is_fluxway_data_type(tp: Any) -> bool:
@@ -16,9 +17,9 @@ def _is_fluxway_data_type(tp: Any) -> bool:
 
 def tree_flatten(
     tree: Any,
-    is_leaf: Optional[Callable[[Any], bool]] = None,
-    treedef_template: Optional[Any] = None,
-) -> Tuple[List[Any], Any]:
+    is_leaf: Callable[[Any], bool] | None = None,
+    treedef_template: Any | None = None,
+) -> tuple[list[Any], Any]:
     """
     Flattens a nested structure (dict, list, tuple) into a list of leaves and a treedef.
 
@@ -162,7 +163,7 @@ def tree_flatten_type(cls: Any) -> Any:
     return ("data_type", cls, public_keys, children)
 
 
-def tree_unflatten(treedef: Any, leaves: List[Any]) -> Any:
+def tree_unflatten(treedef: Any, leaves: list[Any]) -> Any:
     """
     Reconstructs a nested structure from its treedef and leaves.
 

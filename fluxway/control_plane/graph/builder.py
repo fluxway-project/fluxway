@@ -14,7 +14,8 @@ Usage:
 
 from fluxway import SPMDConfig
 import copy
-from typing import Any, Dict, List, Optional, Callable, Type, Tuple
+from typing import Any
+from collections.abc import Callable
 import logging
 
 from fluxway.common.types import (
@@ -47,13 +48,13 @@ class Builder:
     """
 
     def __init__(self):
-        self._nodes: Dict[str, Node] = {}
-        self._edges: List[Edge] = []
-        self._spmd_classes: Dict[str, Type] = {}
+        self._nodes: dict[str, Node] = {}
+        self._edges: list[Edge] = []
+        self._spmd_classes: dict[str, type] = {}
         self._uuid_counter = 0
         # Unified Registry for all TUUID slots: {(node, op, direction, name): tuuid}
         # Includes both definitions (outputs) and references (inputs)
-        self._tuuid_slots: Dict[Tuple[str, str, str, str], int] = {}
+        self._tuuid_slots: dict[tuple[str, str, str, str], int] = {}
 
     def _next_uuid(self) -> int:
         self._uuid_counter += 1
@@ -62,9 +63,9 @@ class Builder:
     def add_node(
         self,
         name: str,
-        spmd_class: Type,
+        spmd_class: type,
         description: str = "",
-        mesh: Optional[DeviceMesh] = None,
+        mesh: DeviceMesh | None = None,
         **kwargs: Any,
     ) -> "Builder":
         """
@@ -196,11 +197,11 @@ class Builder:
         self,
         name: str,
         data_source: Any = None,
-        reader_class: Optional[Type] = None,
+        reader_class: type | None = None,
         num_workers: int = 1,
-        mesh_shape: Optional[Tuple[int, ...]] = None,
-        mesh_axis_names: Optional[Tuple[str, ...]] = None,
-        resource: Optional[Dict[str, Any]] = None,
+        mesh_shape: tuple[int, ...] | None = None,
+        mesh_axis_names: tuple[str, ...] | None = None,
+        resource: dict[str, Any] | None = None,
         description: str = "",
         **reader_kwargs: Any,
     ) -> "Builder":
@@ -271,11 +272,11 @@ class Builder:
         source_op: str,
         target_node: str,
         target_op: str,
-        condition_fn: Optional[Callable[..., bool]] = None,
-        source_output: Optional[str] = None,
-        target_input: Optional[str] = None,
-        tensor_map: Optional[Dict[str, str]] = None,
-        symmetric_to: Optional[Tuple[str, str, str, str]] = None,
+        condition_fn: Callable[..., bool] | None = None,
+        source_output: str | None = None,
+        target_input: str | None = None,
+        tensor_map: dict[str, str] | None = None,
+        symmetric_to: tuple[str, str, str, str] | None = None,
     ) -> "Builder":
         """
         Add a generic edge specifying source and target op names.
@@ -345,7 +346,7 @@ class Builder:
         node2: str,
         op2_fwd: str,
         op2_bwd: str,
-        tensor_map: Optional[Dict[str, str]] = None,
+        tensor_map: dict[str, str] | None = None,
     ) -> "Builder":
         """
         Create a pair of symmetric edges (forward/backward) between two nodes.
@@ -382,7 +383,7 @@ class Builder:
     # -------------------------------------------------------------------------
 
     def _ensure_meta_exists(
-        self, node_name: str, method_name: str, meta: Optional[OperatorMeta], ctx: str
+        self, node_name: str, method_name: str, meta: OperatorMeta | None, ctx: str
     ) -> OperatorMeta:
         """Ensure that an operator meta exists for the given node/method; otherwise raise."""
         if meta is None:
@@ -434,11 +435,11 @@ class Builder:
         source_op: str,
         target_node: str,
         target_op: str,
-        condition_fn: Optional[Callable[..., bool]],
-        source_output: Optional[str] = None,
-        target_input: Optional[str] = None,
-        tensor_map: Optional[Dict[str, str]] = None,
-        symmetric_to: Optional[Tuple[str, str, str, str]] = None,
+        condition_fn: Callable[..., bool] | None,
+        source_output: str | None = None,
+        target_input: str | None = None,
+        tensor_map: dict[str, str] | None = None,
+        symmetric_to: tuple[str, str, str, str] | None = None,
     ) -> None:
         """
         Validate and link operator metadata between two nodes.
@@ -465,9 +466,9 @@ class Builder:
 
         # TUUID Generation and Mapping
         # We assign an integer TUUID to cada tensor produced by an operator
-        tuuid_map: Dict[str, int] = {}  # {target_name: tuuid}
-        tuuid_src_out: Dict[int, Any] = {}  # {tuuid: src_spec}
-        tuuid_dst_in: Dict[int, Any] = {}  # {tuuid: dst_spec}
+        tuuid_map: dict[str, int] = {}  # {target_name: tuuid}
+        tuuid_src_out: dict[int, Any] = {}  # {tuuid: src_spec}
+        tuuid_dst_in: dict[int, Any] = {}  # {tuuid: dst_spec}
 
         if tensor_map:
             for src_name, target_name in tensor_map.items():
@@ -550,11 +551,11 @@ class Builder:
         source_op: str,
         target_node: str,
         target_op: str,
-        source_output: Optional[str],
-        target_input: Optional[str],
+        source_output: str | None,
+        target_input: str | None,
         ctx: str,
-        tensor_map: Optional[Dict[str, str]] = None,
-    ) -> Tuple[OperatorMeta, OperatorMeta, Dict[str, Any], Dict[str, str]]:
+        tensor_map: dict[str, str] | None = None,
+    ) -> tuple[OperatorMeta, OperatorMeta, dict[str, Any], dict[str, str]]:
         """
         Unified validation for edge IO.
         Returns (source_meta, target_meta, { 'src_specs': ..., 'dst_specs': ..., 'src_names': ..., 'dst_names': ... }, tensor_map)
@@ -734,13 +735,13 @@ class Builder:
         source_op: str,
         target_node: str,
         target_op: str,
-        condition_fn: Optional[Callable[..., bool]],
-        tensor_map: Dict[str, str],
+        condition_fn: Callable[..., bool] | None,
+        tensor_map: dict[str, str],
         src_meta: OperatorMeta,
-        tuuid_map: Dict[str, int],
-        tuuid_src_out: Dict[int, Any],
-        tuuid_dst_in: Dict[int, Any],
-        symmetric_to: Optional[Tuple[str, str, str, str]] = None,
+        tuuid_map: dict[str, int],
+        tuuid_src_out: dict[int, Any],
+        tuuid_dst_in: dict[int, Any],
+        symmetric_to: tuple[str, str, str, str] | None = None,
     ) -> None:
         """Link nodes within the SPMDConfig topology dictionaries."""
         src_cfg = self._nodes[source_node].spmd_config
@@ -797,10 +798,10 @@ class Builder:
         # Eagerly resolve topological and async strategy references
         dst_meta = dst_cfg.operator_metas[target_op]
 
-        def resolver_src(path: str) -> Optional[int]:
+        def resolver_src(path: str) -> int | None:
             return self._resolve_path_to_tuuid(source_node, source_op, "out", path)
 
-        def resolver_dst(path: str) -> Optional[int]:
+        def resolver_dst(path: str) -> int | None:
             return self._resolve_path_to_tuuid(target_node, target_op, "in", path)
 
         for meta, res in [(src_meta, resolver_src), (dst_meta, resolver_dst)]:
@@ -809,7 +810,7 @@ class Builder:
 
     def _infer_interleave_params(
         self, spmd_config: SPMDConfig, meta: OperatorMeta
-    ) -> Tuple[bool, int]:
+    ) -> tuple[bool, int]:
         """
         Infer interleave parameters based on mesh and output sharding.
 
@@ -861,12 +862,12 @@ class Builder:
         target_op: str,
         src_meta: OperatorMeta,
         dst_meta: OperatorMeta,
-        effective_sharding: Dict[str, Any],
-        condition_fn: Optional[Callable[..., bool]],
-        tensor_map: Dict[str, str],
-        tuuid_map: Dict[str, int],
-        tuuid_src_out: Dict[int, Any],
-        tuuid_dst_in: Dict[int, Any],
+        effective_sharding: dict[str, Any],
+        condition_fn: Callable[..., bool] | None,
+        tensor_map: dict[str, str],
+        tuuid_map: dict[str, int],
+        tuuid_src_out: dict[int, Any],
+        tuuid_dst_in: dict[int, Any],
     ) -> None:
         """Inject edge sharding information into OperatorMeta objects."""
         src_cfg = self._nodes[source_node].spmd_config
@@ -1020,7 +1021,7 @@ class Builder:
 
     def _resolve_path_to_tuuid(
         self, node_name: str, op_name: str, primary_direction: str, path: str
-    ) -> Optional[int]:
+    ) -> int | None:
         """
         Find the physical TUUID for a logical path like 'forward.y'.
         Searches the unified slot registry (covers both definitions and references).
@@ -1051,7 +1052,7 @@ class Builder:
         self._tuuid_slots.clear()
         return self
 
-    def get_spmd_class(self, node_name: str) -> Optional[Type]:
+    def get_spmd_class(self, node_name: str) -> type | None:
         """
         Get the SPMD class associated with a node.
 

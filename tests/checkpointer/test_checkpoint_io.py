@@ -12,7 +12,7 @@ Covers:
 
 import pickle
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 import numpy as np
 import pytest
@@ -33,7 +33,7 @@ from fluxway.control_plane.checkpointer.safetensors import (
 # =========================================================================
 
 
-def _make_state() -> Dict[str, Any]:
+def _make_state() -> dict[str, Any]:
     """Canonical test state: tensors, scalars, and nested dicts."""
     return {
         "weights": np.array([1.0, 2.0, 3.0], dtype=np.float32),

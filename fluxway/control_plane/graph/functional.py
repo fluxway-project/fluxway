@@ -1,6 +1,6 @@
+from collections.abc import Callable
 from contextvars import ContextVar, Token
-from typing import Any, Callable, Dict, Optional, Type
-
+from typing import Any
 from fluxway.control_plane.graph.builder import Builder
 
 
@@ -18,8 +18,8 @@ class OpHandle:
         node_id: str,
         op_name: str,
         graph: "FunctionalGraph",
-        tuuids: Dict[str, int],
-        output_name: Optional[str] = None,
+        tuuids: dict[str, int],
+        output_name: str | None = None,
     ):
         self.node_id = node_id
         self.op_name = op_name
@@ -62,9 +62,7 @@ class NodeProxy:
         """
 
         def _call_op(
-            *args: OpHandle,
-            condition_fn: Optional[Callable[..., bool]] = None,
-            **kwargs,
+            *args: OpHandle, condition_fn: Callable[..., bool] | None = None, **kwargs
         ) -> OpHandle:
             # Fetch target arguments to map positional args
             target_node = self._graph._builder._nodes.get(self.node_id)
@@ -245,7 +243,7 @@ class FunctionalGraph:
         self._current.reset(self._tokens.pop())
 
     def node(
-        self, name: str, spmd_class: Type, description: str = "", *args, **kwargs
+        self, name: str, spmd_class: type, description: str = "", *args, **kwargs
     ) -> NodeProxy:
         """
         Registers an SPMD node and returns a proxy for functional graph construction.
@@ -265,11 +263,11 @@ class FunctionalGraph:
     def reader(
         self,
         name: str,
-        reader_class: Type,
-        mesh_axis_names: Optional[tuple] = None,
-        mesh_shape: Optional[tuple] = None,
+        reader_class: type,
+        mesh_axis_names: tuple | None = None,
+        mesh_shape: tuple | None = None,
         num_workers: int = 1,
-        resource: Optional[Dict[str, Any]] = None,
+        resource: dict[str, Any] | None = None,
         description: str = "",
         **reader_kwargs: Any,
     ) -> NodeProxy:

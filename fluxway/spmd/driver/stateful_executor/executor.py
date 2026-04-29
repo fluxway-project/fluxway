@@ -10,7 +10,7 @@ Responsibilities:
 - Report state to Main Orchestrator's State Manager
 """
 
-from typing import Any, Dict, List
+from typing import Any
 
 from fluxway.common.types import SPMDState
 
@@ -29,9 +29,9 @@ class StatefulExecutor:
 
     def __init__(self, spmd_id: str):
         self.spmd_id = spmd_id
-        self._metrics: Dict[str, Any] = {}
+        self._metrics: dict[str, Any] = {}
 
-    def execute_on_all_workers(self, method: str, *args, **kwargs) -> List[Any]:
+    def execute_on_all_workers(self, method: str, *args, **kwargs) -> list[Any]:
         """
         Execute a method on all workers.
 
@@ -47,7 +47,7 @@ class StatefulExecutor:
         """
         pass
 
-    def save_worker_states(self) -> Dict[str, Any]:
+    def save_worker_states(self) -> dict[str, Any]:
         """
         Save all worker states.
 
@@ -59,7 +59,7 @@ class StatefulExecutor:
         """
         pass
 
-    def load_worker_states(self, states: Dict[str, Any]) -> None:
+    def load_worker_states(self, states: dict[str, Any]) -> None:
         """
         Load states to all workers.
 
@@ -80,7 +80,7 @@ class StatefulExecutor:
         """
         pass
 
-    def collect_metrics(self) -> Dict[str, Any]:
+    def collect_metrics(self) -> dict[str, Any]:
         """
         Collect metrics from all workers.
 

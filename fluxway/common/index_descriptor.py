@@ -1,7 +1,8 @@
 from builtins import slice as python_slice
 from dataclasses import dataclass
 import enum
-from typing import Any, List, Callable, Optional
+from typing import Any, Optional
+from collections.abc import Callable
 
 
 from fluxway.common.backend import get_backend
@@ -29,7 +30,7 @@ class IndexDescriptor:
         raise NotImplementedError
 
     @staticmethod
-    def concatenate(descriptors: List["IndexDescriptor"]) -> "IndexDescriptor":
+    def concatenate(descriptors: list["IndexDescriptor"]) -> "IndexDescriptor":
         """Merge multiple index descriptors into one.
 
         Attempts O(1) metadata merging for compatible descriptors (e.g., adjacent chunks).
@@ -126,7 +127,7 @@ class ContinuousIndex(IndexDescriptor):
     step: int = 1
     count: int = 0
 
-    def to_compact_params(self) -> List[int]:
+    def to_compact_params(self) -> list[int]:
         """Calculate sharded parameters for compact transport."""
         return [
             int(self.start),
@@ -136,7 +137,7 @@ class ContinuousIndex(IndexDescriptor):
         ]
 
     @staticmethod
-    def from_compact_params(p: List[int]) -> "ContinuousIndex":
+    def from_compact_params(p: list[int]) -> "ContinuousIndex":
         """Reconstruct from parameters."""
         return ContinuousIndex(
             pattern=IndexPattern(int(p[3])),
@@ -257,7 +258,7 @@ class ContinuousIndex(IndexDescriptor):
 class RaggedIndex(IndexDescriptor):
     """IndexDescriptor describing segments of variable lengths via splits (formerly nested_splits)."""
 
-    splits: List[Any]
+    splits: list[Any]
 
     @property
     def morphology(self) -> IndexMorphology:

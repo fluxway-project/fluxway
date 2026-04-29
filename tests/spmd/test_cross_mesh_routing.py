@@ -17,7 +17,6 @@ Test scenarios
 from __future__ import annotations
 
 import unittest
-from typing import Dict, List, Optional
 from unittest.mock import MagicMock
 
 import jax.numpy as jnp
@@ -34,7 +33,7 @@ def make_tt(
     values,
     origin_indices=None,
     routing_indices=None,
-    receipt: Optional[SymmetryReceipt] = None,
+    receipt: SymmetryReceipt | None = None,
     global_shape=None,
 ) -> TransportTensor:
     return TransportTensor(
@@ -159,14 +158,14 @@ class _AssemblyMixin:
         return TransportTensor.from_tensor(backend.zeros((0,), dtype=dtype))
 
     def _assemble_dynamic_to_static_core(
-        self, valid_shards: List[TransportTensor], input_spec, has_mirror: bool
+        self, valid_shards: list[TransportTensor], input_spec, has_mirror: bool
     ):
         """Extracted core of _assemble_dynamic_to_static_tensor for testing."""
         backend = get_backend()
         all_receipt = self._maybe_merge_receipts(valid_shards, has_mirror)
 
         routing_dim = getattr(input_spec, "routing_dim", 0)
-        if isinstance(routing_dim, (list, tuple)):
+        if isinstance(routing_dim, list | tuple):
             routing_dim = routing_dim[0]
 
         all_values = backend.cat(
@@ -355,7 +354,7 @@ class TestDynamicToStaticAssembly(unittest.TestCase):
     def _run_rank(
         self,
         rank: int,
-        shards: List[TransportTensor],
+        shards: list[TransportTensor],
         world_size: int,
         has_mirror: bool,
     ):
@@ -540,7 +539,7 @@ class TestOperatorManagerPhase2MeshCorrectness(unittest.TestCase):
         )
 
         # Phase 0 topology that Builder would inject: maps receiver_spmd → its physical mesh
-        topology: Dict[str, SPMDTopology] = {
+        topology: dict[str, SPMDTopology] = {
             sender_op: SPMDTopology(
                 successors={
                     receiver_spmd: SPMDTopologyInfo(
@@ -721,7 +720,7 @@ class TestEmbeddingToDenseFullCommunication(unittest.TestCase):
         }
 
         # 3. Simulated Network: receiver_id -> List of TransportTensors received
-        network_mailbox: Dict[int, List[TransportTensor]] = {
+        network_mailbox: dict[int, list[TransportTensor]] = {
             i: [] for i in range(RECEIVER_SIZE)
         }
 
@@ -744,9 +743,9 @@ class TestEmbeddingToDenseFullCommunication(unittest.TestCase):
                 tuuids: list,
                 tensors: list,
                 counts: list,
-                global_shapes_list: Optional[list] = None,
-                meta_tensor_state_list: Optional[list] = None,
-                compact_params_list: Optional[list] = None,
+                global_shapes_list: list | None = None,
+                meta_tensor_state_list: list | None = None,
+                compact_params_list: list | None = None,
             ):
                 if int(counts[0]) > 0:
                     g_shape = global_shapes_list[0] if global_shapes_list else None

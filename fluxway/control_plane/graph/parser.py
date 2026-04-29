@@ -11,7 +11,7 @@ Responsibilities:
 - Compute topological ordering for execution
 """
 
-from typing import Dict, List, Optional, Any, Union, Set
+from typing import Any
 from pathlib import Path
 from collections import deque
 
@@ -28,9 +28,9 @@ class GraphParser:
     """
 
     def __init__(self):
-        self._graph: Optional[Graph] = None
+        self._graph: Graph | None = None
 
-    def parse_file(self, config_path: Union[str, Path]) -> Graph:
+    def parse_file(self, config_path: str | Path) -> Graph:
         """
         Parse Graph configuration from a file (JSON/YAML).
 
@@ -46,7 +46,7 @@ class GraphParser:
         """
         pass
 
-    def parse_dict(self, config: Dict[str, Any]) -> Graph:
+    def parse_dict(self, config: dict[str, Any]) -> Graph:
         """
         Parse Graph configuration from a dictionary.
 
@@ -67,8 +67,8 @@ class GraphParser:
         self,
         node_id: str,
         config: SPMDConfig,
-        upstream_nodes: Optional[List[str]] = None,
-        downstream_nodes: Optional[List[str]] = None,
+        upstream_nodes: list[str] | None = None,
+        downstream_nodes: list[str] | None = None,
     ) -> Node:
         """
         Build a Node programmatically.
@@ -112,7 +112,7 @@ class GraphParser:
         """
         pass
 
-    def compute_topological_order(self) -> List[str]:
+    def compute_topological_order(self) -> list[str]:
         """
         Compute topological ordering of Graph nodes.
 
@@ -129,7 +129,7 @@ class GraphParser:
             return []
 
         # Build adjacency info from edges
-        in_degree: Dict[str, int] = dict.fromkeys(self._graph.nodes, 0)
+        in_degree: dict[str, int] = dict.fromkeys(self._graph.nodes, 0)
 
         # Count in-degrees from edges
         for edge in self._graph.edges:
@@ -235,7 +235,7 @@ class GraphParser:
 
         return result
 
-    def _find_reachable_nodes(self, start_nodes: Set[str]) -> Set[str]:
+    def _find_reachable_nodes(self, start_nodes: set[str]) -> set[str]:
         """Find all nodes reachable from the given start nodes."""
         if self._graph is None:
             return set()
@@ -256,7 +256,7 @@ class GraphParser:
 
         return reachable
 
-    def get_spmd_topology(self) -> Dict[str, List[str]]:
+    def get_spmd_topology(self) -> dict[str, list[str]]:
         """
         Extract SPMD topology (hierarchy and connections).
 
@@ -266,14 +266,14 @@ class GraphParser:
         if self._graph is None:
             return {}
 
-        topology: Dict[str, List[str]] = {name: [] for name in self._graph.nodes}
+        topology: dict[str, list[str]] = {name: [] for name in self._graph.nodes}
         for edge in self._graph.edges:
             if edge.source_node in topology:
                 topology[edge.source_node].append(edge.target_node)
 
         return topology
 
-    def get_execution_levels(self) -> List[List[str]]:
+    def get_execution_levels(self) -> list[list[str]]:
         """
         Group nodes into execution levels for parallel execution.
 
@@ -287,7 +287,7 @@ class GraphParser:
             return []
 
         # Compute levels based on longest path from sources
-        levels: Dict[str, int] = {}
+        levels: dict[str, int] = {}
         topo_order = self.compute_topological_order()
 
         for node_id in topo_order:
@@ -312,6 +312,6 @@ class GraphParser:
         return result
 
     @property
-    def graph(self) -> Optional[Graph]:
+    def graph(self) -> Graph | None:
         """Get the parsed Graph."""
         return self._graph

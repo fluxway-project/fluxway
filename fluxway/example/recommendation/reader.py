@@ -1,7 +1,7 @@
 import json
 import pathlib
 import jax.numpy as jnp
-from typing import Any, Dict, Optional
+from typing import Any
 
 from fluxway.common.decorators import spmd_source, operator
 from fluxway.common.index_descriptor import ContinuousIndex
@@ -25,11 +25,11 @@ class RecommendationReader(GrainReader):
 
     def _create_data_loader(
         self,
-        static_args: Dict[str, Any],
+        static_args: dict[str, Any],
         rank: int,
         world_size: int,
-        shard_index: Optional[int] = None,
-        shard_count: Optional[int] = None,
+        shard_index: int | None = None,
+        shard_count: int | None = None,
     ):
         if "data_source" not in static_args:
             data = [
@@ -64,7 +64,7 @@ class RecommendationReader(GrainReader):
             "labels": {"type": "static", "axis": ["worker"]},
         },
     )
-    def read(self) -> Optional[UserBatch]:
+    def read(self) -> UserBatch | None:
         static_args = getattr(self, "static_args", {})
         batch_size = static_args.get("batch_size", 24)
 
@@ -150,7 +150,7 @@ class RecommendationReader(GrainReader):
 
         return UserBatch(active=active, passive=passive, labels=labels)
 
-    def save_state(self, ckpt_dir: str) -> Dict[str, Any]:
+    def save_state(self, ckpt_dir: str) -> dict[str, Any]:
         shard_count = getattr(self, "world_size", 1)
         static_args = getattr(self, "static_args", {})
         path = pathlib.Path(ckpt_dir) / f"reader_rank_{self.rank}_of_{shard_count}.json"
@@ -164,7 +164,7 @@ class RecommendationReader(GrainReader):
             )
         return {}
 
-    def restore_state(self, state: Dict[str, Any], ckpt_dir: str) -> None:
+    def restore_state(self, state: dict[str, Any], ckpt_dir: str) -> None:
         # completed_steps is identical across all ranks, so take the max.
         # Pair it with the saved batch_size to get the exact items-per-rank to skip,
         # regardless of the new world_size or batch_size.

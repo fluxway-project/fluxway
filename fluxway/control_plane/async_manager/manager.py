@@ -15,7 +15,6 @@ Key logic:
 import logging
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
 
 from fluxway.common.types import AsyncStepConfig, Graph, SPMDOpStep, OpLockState
 
@@ -29,7 +28,7 @@ class AsyncStepManager:
     Enforces maximum step difference by locking/unlocking ops.
     """
 
-    def __init__(self, graph: Graph, config: Optional[AsyncStepConfig] = None):
+    def __init__(self, graph: Graph, config: AsyncStepConfig | None = None):
         """
         Initialize AsyncStepManager.
 
@@ -41,17 +40,17 @@ class AsyncStepManager:
         self._config = config or AsyncStepConfig()
 
         # SPMD step tracking: spmd_id -> SPMDOpStep
-        self._spmd_steps: Dict[str, SPMDOpStep] = {}
+        self._spmd_steps: dict[str, SPMDOpStep] = {}
 
         # Initialize step tracking for all nodes
         for node_name in graph.nodes:
             self._spmd_steps[node_name] = SPMDOpStep(spmd_id=node_name)
 
         # Op lock states: (spmd_id, op_type) -> OpLockState
-        self._lock_states: Dict[Tuple[str, str], OpLockState] = {}
+        self._lock_states: dict[tuple[str, str], OpLockState] = {}
 
         # Cache for last issued allowed steps to optimize Controller RPCs
-        self._last_allowed_steps: Dict[Tuple[str, str], int] = {}
+        self._last_allowed_steps: dict[tuple[str, str], int] = {}
 
         # Lock for thread safety
         self._lock = threading.Lock()
@@ -71,7 +70,7 @@ class AsyncStepManager:
                 spmd_progress.completed_step_count.get(op_name, 0), completed_count
             )
 
-    def check_and_enforce_limits(self) -> List[Tuple[str, str, int]]:
+    def check_and_enforce_limits(self) -> list[tuple[str, str, int]]:
         """
         Calculate the allowed step for each operator based on topology and limits.
 
@@ -178,17 +177,17 @@ class AsyncStepManager:
 
         return True
 
-    def get_locked_ops(self) -> List[OpLockState]:
+    def get_locked_ops(self) -> list[OpLockState]:
         """Get all currently locked ops."""
         with self._lock:
             return list(self._lock_states.values())
 
-    def get_spmd_steps(self, spmd_id: str) -> Optional[SPMDOpStep]:
+    def get_spmd_steps(self, spmd_id: str) -> SPMDOpStep | None:
         """Get current steps for an SPMD."""
         with self._lock:
             return self._spmd_steps.get(spmd_id)
 
-    def get_all_spmd_steps(self) -> Dict[str, SPMDOpStep]:
+    def get_all_spmd_steps(self) -> dict[str, SPMDOpStep]:
         """Get current steps for all SPMDs."""
         with self._lock:
             return {k: SPMDOpStep(**v.as_dict()) for k, v in self._spmd_steps.items()}

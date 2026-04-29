@@ -10,7 +10,8 @@ Responsibilities:
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Set, Type, Tuple, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
+from collections.abc import Callable
 from fluxway.common.utils.logging import get_logger
 import threading
 import inspect as _inspect
@@ -58,14 +59,14 @@ class ResolvedTopologyInfo:
     spmd_id: str
     world_size: int = 1
 
-    mesh: Optional[DeviceMesh] = None
+    mesh: DeviceMesh | None = None
     # Sharding by TUUID (Logical)
-    tuuid_sharding: Dict[int, ShardingSpec] = field(default_factory=dict)
+    tuuid_sharding: dict[int, ShardingSpec] = field(default_factory=dict)
     # Map from logical path to TUUID
-    tuuid_map: Dict[str, int] = field(default_factory=dict)
+    tuuid_map: dict[str, int] = field(default_factory=dict)
 
     # Condition function for conditional edges (only for successors)
-    condition_fn: Optional[Callable[..., bool]] = None
+    condition_fn: Callable[..., bool] | None = None
     # Whether this is a step-interleaved data stream. Every interleaved worker unit has its own step and is regarded as a separated sender, a fake SPMD.
     is_interleaved: bool = False
     # Size of the interleaved group
@@ -73,10 +74,10 @@ class ResolvedTopologyInfo:
     # Whether this is a self-loop edge (source_node == target_node)
     is_self_loop: bool = False
     # Link to the symmetric edge – carried over from configs.SPMDTopologyInfo
-    symmetric_to: Optional[tuple] = None
+    symmetric_to: tuple | None = None
     # For hierarchical sharding resolution
-    input_param_map: Dict[str, List[str]] = field(default_factory=dict)
-    output_param_map: Dict[str, List[str]] = field(default_factory=dict)
+    input_param_map: dict[str, list[str]] = field(default_factory=dict)
+    output_param_map: dict[str, list[str]] = field(default_factory=dict)
 
 
 class OperatorManager:
@@ -95,8 +96,8 @@ class OperatorManager:
         rank: int,
         spmd_id: str = "",
         *,
-        local_rank: Optional[int] = None,
-        local_world_size: Optional[int] = None,
+        local_rank: int | None = None,
+        local_world_size: int | None = None,
         node_rank: int = 0,
         num_nodes: int = 1,
     ):
@@ -120,23 +121,23 @@ class OperatorManager:
 
         # Register operators
         # Register operators dynamically from config
-        self._operators: Dict[str, Callable] = config.operators
+        self._operators: dict[str, Callable] = config.operators
 
         # Initialize per-operator dictionaries
-        self._input_sharding: Dict[str, Dict[int, ShardingSpec]] = {}
-        self._output_sharding: Dict[str, Dict[int, ShardingSpec]] = {}
-        self._expected_control_arg_names: Dict[str, List[str]] = {}
-        self._expected_tensor_names: Dict[str, List[str]] = {}
-        self._predecessor_topology: Dict[str, Dict[str, ResolvedTopologyInfo]] = {}
-        self._successor_topology: Dict[str, Dict[str, ResolvedTopologyInfo]] = {}
-        self._expected_tensor_shards_cache: Dict[str, Dict[int, int]] = {}
-        self._periodic_trigger_cache: Dict[str, bool] = {}
-        self._operator_input_types: Dict[str, Dict[str, Type]] = {}
-        self._dispatchers: Dict[str, ExecutionDispatcher] = {}
+        self._input_sharding: dict[str, dict[int, ShardingSpec]] = {}
+        self._output_sharding: dict[str, dict[int, ShardingSpec]] = {}
+        self._expected_control_arg_names: dict[str, list[str]] = {}
+        self._expected_tensor_names: dict[str, list[str]] = {}
+        self._predecessor_topology: dict[str, dict[str, ResolvedTopologyInfo]] = {}
+        self._successor_topology: dict[str, dict[str, ResolvedTopologyInfo]] = {}
+        self._expected_tensor_shards_cache: dict[str, dict[int, int]] = {}
+        self._periodic_trigger_cache: dict[str, bool] = {}
+        self._operator_input_types: dict[str, dict[str, type]] = {}
+        self._dispatchers: dict[str, ExecutionDispatcher] = {}
         # Global dispatch table: {tensor_tuuid: [op_name1, op_name2]}
-        self._tuuid_to_op_inputs: Dict[int, List[str]] = {}
-        self._tuuid_to_op_outputs: Dict[int, Tuple[str, str]] = {}
-        self._logical_path_to_tuuid: Dict[Tuple[str, str], int] = {}
+        self._tuuid_to_op_inputs: dict[int, list[str]] = {}
+        self._tuuid_to_op_outputs: dict[int, tuple[str, str]] = {}
+        self._logical_path_to_tuuid: dict[tuple[str, str], int] = {}
 
         for op_name in self._operators:
             self._input_sharding[op_name] = {}
@@ -148,10 +149,10 @@ class OperatorManager:
             self._operator_input_types[op_name] = {}
 
         # Cache for TUUID to arg name mapping (for debugging/errors)
-        self._output_tuuid_to_name_cache: Dict[str, Optional[Dict[int, str]]] = {}
+        self._output_tuuid_to_name_cache: dict[str, dict[int, str] | None] = {}
 
         # Static arguments from config
-        self._static_args: Dict[str, Any] = {}
+        self._static_args: dict[str, Any] = {}
         if config.static_args:
             self._static_args.update(config.static_args)
 
@@ -160,17 +161,17 @@ class OperatorManager:
 
         # Central TUUID registry for resolving all routing logic (Source of Truth)
         # Only production-side routing (outputs/predecessors) are registered here.
-        self._tuuid_registry: Dict[int, ShardingSpec] = {}
+        self._tuuid_registry: dict[int, ShardingSpec] = {}
 
         # Context-isolated resolution caches
-        self._resolved_input_cache: Dict[Tuple[str, int], PhysicalLayout] = {}
-        self._resolved_producer_cache: Dict[int, ShardingSpec] = {}
+        self._resolved_input_cache: dict[tuple[str, int], PhysicalLayout] = {}
+        self._resolved_producer_cache: dict[int, ShardingSpec] = {}
 
         # Performance Caches
         # (op_name, tuuid, pre_spmd_id, rank, step_mod) -> List[int]
-        self._producer_cache: Dict[Tuple[str, int, str, int, int], List[int]] = {}
+        self._producer_cache: dict[tuple[str, int, str, int, int], list[int]] = {}
         # (tuuid, pre_spmd_id) -> PhysicalLayout (projected)
-        self._effective_layout_cache: Dict[Tuple[int, str], PhysicalLayout] = {}
+        self._effective_layout_cache: dict[tuple[int, str], PhysicalLayout] = {}
 
         # Parse topology from OperatorMeta
         self._parse_operator_metadata()
@@ -185,7 +186,7 @@ class OperatorManager:
         # Pre-compute operator input types from function signatures
         self._precompute_operator_input_types()
 
-    def _resolve_input_spec(self, op_name: str, tuuid: int) -> Optional[PhysicalLayout]:
+    def _resolve_input_spec(self, op_name: str, tuuid: int) -> PhysicalLayout | None:
         """
         Resolve a consumer-side input requirement for a specific operator.
         Returns a PhysicalLayout bound to the current mesh.
@@ -225,9 +226,9 @@ class OperatorManager:
     def _resolve_producer_spec(
         self,
         tuuid: int,
-        provider_map: Optional[Dict[int, ShardingSpec]] = None,
-        _trace: Optional[Set[int]] = None,
-    ) -> Optional[ShardingSpec]:
+        provider_map: dict[int, ShardingSpec] | None = None,
+        _trace: set[int] | None = None,
+    ) -> ShardingSpec | None:
         """Resolve a producer-side implementation (Logical Truth)."""
         if provider_map is None and tuuid in self._resolved_producer_cache:
             return self._resolved_producer_cache[tuuid]
@@ -259,7 +260,7 @@ class OperatorManager:
             self._resolved_producer_cache[tuuid] = spec
         return spec
 
-    def _register_sharding_specs(self, specs: Dict[int, ShardingSpec]) -> None:
+    def _register_sharding_specs(self, specs: dict[int, ShardingSpec]) -> None:
         """
         Register a batch of ShardingSpec into the global registry.
         """
@@ -270,8 +271,8 @@ class OperatorManager:
             self._tuuid_registry[tuuid] = routing
 
     def _get_effective_layout(
-        self, routing: Optional[ShardingSpec], info: ResolvedTopologyInfo
-    ) -> Optional[PhysicalLayout]:
+        self, routing: ShardingSpec | None, info: ResolvedTopologyInfo
+    ) -> PhysicalLayout | None:
         """
         Extract the effective layout for routing/assembly.
         """
@@ -310,7 +311,7 @@ class OperatorManager:
         pre_spmd_id: str,
         current_rank: int,
         step: int = 0,
-    ) -> List[int]:
+    ) -> list[int]:
         """
         Locate the physical source ranks producing a specific tensor shard by its TUUID.
         Uses memoization to avoid re-calculating fixed sharding overlaps.
@@ -349,7 +350,7 @@ class OperatorManager:
         if pre_info.is_interleaved:
             unit_base_rank = step_mod * pre_info.interleave_unit_size
 
-        producers: List[int] = []
+        producers: list[int] = []
         if effective_pre_layout:
             if input_layout is None:
                 raise ValueError(
@@ -469,7 +470,7 @@ class OperatorManager:
             )
 
             # Collect all available TUUIDs from predecessors to create a logical path -> TUUID lookup
-            global_path_to_tuuid: Dict[str, int] = {}
+            global_path_to_tuuid: dict[str, int] = {}
             for pre_info in self._predecessor_topology.get(op_name, {}).values():
                 # Bind Local Spec with TUUID by [Injected Argument Name -> TUUID] dict.
                 # The local function arguments name is the pre_info.tuuid_map key, which was binded in _validate_and_link_edge
@@ -596,7 +597,7 @@ class OperatorManager:
         # Phase 3: Path Resolution (Binding)
         for op_name in self._operators:
 
-            def res_fn(path: str, context_op=op_name) -> Optional[int]:
+            def res_fn(path: str, context_op=op_name) -> int | None:
                 return self.resolve_path(context_op, path)
 
             self._resolve_referential_uuids_in_map(
@@ -635,8 +636,8 @@ class OperatorManager:
 
     def _resolve_referential_uuids_in_map(
         self,
-        sharding_map: Dict[int, "ShardingSpec"],
-        resolver_fn: Callable[[str], Optional[int]],
+        sharding_map: dict[int, "ShardingSpec"],
+        resolver_fn: Callable[[str], int | None],
     ) -> None:
         """Helper to resolve referential paths to TUUIDs in a specific map."""
         for spec in sharding_map.values():
@@ -644,7 +645,7 @@ class OperatorManager:
                 spec.routing.resolve(resolver_fn)
 
     def _register_all_algebraic_specs(
-        self, sharding_map: Dict[int, "ShardingSpec"]
+        self, sharding_map: dict[int, "ShardingSpec"]
     ) -> None:
         """Helper to populate the global TUUID registry with concrete sharding information."""
         from fluxway.common.types.sharding import AlgebraicRouting
@@ -654,7 +655,7 @@ class OperatorManager:
                 self._tuuid_registry[tuuid] = spec
 
     def _resolve_referential_strategies_in_map(
-        self, sharding_map: Dict[int, "ShardingSpec"]
+        self, sharding_map: dict[int, "ShardingSpec"]
     ) -> None:
         """Helper to resolve referential sharding in a specific map."""
         from fluxway.common.types.sharding import ShardingSpec
@@ -722,8 +723,8 @@ class OperatorManager:
     def register_eager_inputs(
         self,
         op_name: str,
-        tuuid_sharding: Dict[int, ShardingSpec],
-        expected_counts: Optional[Dict[int, int]] = None,
+        tuuid_sharding: dict[int, ShardingSpec],
+        expected_counts: dict[int, int] | None = None,
     ) -> None:
         """
         Dynamically register TUUIDs and their sharding specs for Eager mode.
@@ -760,8 +761,8 @@ class OperatorManager:
         )
 
     def _build_sharding_specs(
-        self, raw_specs: Dict[Any, Any], mesh: "DeviceMesh"
-    ) -> Dict[Any, "ShardingSpec"]:
+        self, raw_specs: dict[Any, Any], mesh: "DeviceMesh"
+    ) -> dict[Any, "ShardingSpec"]:
         from fluxway.common.types.sharding import ShardingSpec, ShardingConfig
 
         parsed = {}
@@ -801,7 +802,7 @@ class OperatorManager:
         are set to the barrier's 'n' value (default=1).
         """
         for op_name in self._operators:
-            expected: Dict[int, int] = {}
+            expected: dict[int, int] = {}
 
             # Check if periodic_trigger is enabled for this operator
             is_periodic = self.is_periodic_trigger(op_name)
@@ -887,29 +888,29 @@ class OperatorManager:
     # Topology Query
     # =========================================================================
 
-    def get_predecessor_ids(self, op_name: str) -> List[str]:
+    def get_predecessor_ids(self, op_name: str) -> list[str]:
         """Get all predecessor SPMD IDs for an operator."""
         return list(self._predecessor_topology.get(op_name, {}).keys())
 
-    def get_successor_ids(self, op_name: str) -> List[str]:
+    def get_successor_ids(self, op_name: str) -> list[str]:
         """Get all successor SPMD IDs for an operator."""
         return list(self._successor_topology.get(op_name, {}).keys())
 
     def get_predecessor_info(
         self, op_name: str, spmd_id: str
-    ) -> Optional[ResolvedTopologyInfo]:
+    ) -> ResolvedTopologyInfo | None:
         """Get predecessor topology info."""
         return self._predecessor_topology.get(op_name, {}).get(spmd_id)
 
     def get_successor_info(
         self, op_name: str, spmd_id: str
-    ) -> Optional[ResolvedTopologyInfo]:
+    ) -> ResolvedTopologyInfo | None:
         """Get successor topology info."""
         return self._successor_topology.get(op_name, {}).get(spmd_id)
 
     def get_successor_condition_fn(
         self, op_name: str, spmd_id: str
-    ) -> Optional[Callable[..., bool]]:
+    ) -> Callable[..., bool] | None:
         """Get condition function for a successor edge."""
         info = self._successor_topology.get(op_name, {}).get(spmd_id)
         return info.condition_fn if info else None
@@ -945,15 +946,15 @@ class OperatorManager:
             return False
         return meta.barrier_config.type == BarrierType.PERIODIC
 
-    def get_expected_control_arg_names(self, op_name: str) -> List[str]:
+    def get_expected_control_arg_names(self, op_name: str) -> list[str]:
         """Get expected state variable names."""
         return list(self._expected_control_arg_names.get(op_name, []))
 
-    def get_expected_tensor_names(self, op_name: str) -> List[str]:
+    def get_expected_tensor_names(self, op_name: str) -> list[str]:
         """Get expected tensor variable names."""
         return list(self._expected_tensor_names.get(op_name, []))
 
-    def get_expected_tuuids(self, op_name: str) -> List[int]:
+    def get_expected_tuuids(self, op_name: str) -> list[int]:
         """Get expected TUUIDs for an operator."""
         return list(self._expected_tensor_shards_cache.get(op_name, {}).keys())
 
@@ -981,18 +982,18 @@ class OperatorManager:
         # Strict Mode: Heuristic detection is disabled. Operators must be explicitly marked as sources.
         return False
 
-    def get_source_operators(self) -> List[str]:
+    def get_source_operators(self) -> list[str]:
         """Get names of all source operators."""
         return [op for op in self._operators if self.is_source_operator(op)]
 
-    def get_expected_tensor_shards(self, op_name: str) -> Dict[int, int]:
+    def get_expected_tensor_shards(self, op_name: str) -> dict[int, int]:
         """
         Get pre-computed expected tensor shard counts based on topology.
         Returns a dictionary mapping TUUIDs (int) to counts.
         """
         return self._expected_tensor_shards_cache.get(op_name, {})
 
-    def get_operator_input_types(self, op_name: str) -> Dict[str, Type]:
+    def get_operator_input_types(self, op_name: str) -> dict[str, type]:
         """
         Get the input parameter types expected by an operator.
 
@@ -1001,14 +1002,14 @@ class OperatorManager:
         """
         return self._operator_input_types.get(op_name, {})
 
-    def get_output_tuuids(self, op_name: str) -> List[int]:
+    def get_output_tuuids(self, op_name: str) -> list[int]:
         """Returns ordered list of UUIDs matching tree_flatten(output) order."""
         meta = self._get_operator_metadata(op_name)
         if meta and meta.output_uuids:
             return meta.output_uuids
         return []
 
-    def get_output_tuuid_to_name(self, op_name: str) -> Optional[Dict[int, str]]:
+    def get_output_tuuid_to_name(self, op_name: str) -> dict[int, str] | None:
         """Get cached TUUID-to-name mapping for operator outputs."""
         if op_name not in self._output_tuuid_to_name_cache:
             meta = self._get_operator_metadata(op_name)
@@ -1027,28 +1028,28 @@ class OperatorManager:
                 self._output_tuuid_to_name_cache[op_name] = None
         return self._output_tuuid_to_name_cache[op_name]
 
-    def get_input_sharding(self, op_name: str) -> Dict[int, ShardingSpec]:
+    def get_input_sharding(self, op_name: str) -> dict[int, ShardingSpec]:
         """
         Get sharding specifications for an operator's inputs by TUUID.
         Returns {tuuid: ShardingSpec}.
         """
         return self._input_sharding.get(op_name, {})
 
-    def get_operators_for_tuuid(self, tuuid: int) -> List[str]:
+    def get_operators_for_tuuid(self, tuuid: int) -> list[str]:
         """Returns all local operator names that consume the given TUUID."""
         return self._tuuid_to_op_inputs.get(tuuid, [])
 
-    def get_predecessor_topology(self, op_name: str) -> Dict[str, ResolvedTopologyInfo]:
+    def get_predecessor_topology(self, op_name: str) -> dict[str, ResolvedTopologyInfo]:
         """Get predecessor topology info for an operator."""
         return dict(self._predecessor_topology.get(op_name, {}))
 
-    def get_successor_topology(self, op_name: str) -> Dict[str, ResolvedTopologyInfo]:
+    def get_successor_topology(self, op_name: str) -> dict[str, ResolvedTopologyInfo]:
         """Get successor topology info for an operator."""
         return dict(self._successor_topology.get(op_name, {}))
 
     def get_all_input_pre_sharding(
         self, op_name: str
-    ) -> Dict[str, List[EdgeShardingInfo]]:
+    ) -> dict[str, list[EdgeShardingInfo]]:
         """
         Get all input pre-sharding strategies for an operator.
         Returns a map from predecessor spmd_id to a list of EdgeShardingInfo.
@@ -1060,7 +1061,7 @@ class OperatorManager:
 
     def get_edge_input_sharding_strategies(
         self, op_name: str, spmd_id: str
-    ) -> List[EdgeShardingInfo]:
+    ) -> list[EdgeShardingInfo]:
         """
         Get input sharding strategies for a specific incoming edge.
         """
@@ -1071,7 +1072,7 @@ class OperatorManager:
 
     def get_tensor_input_sharding_spec(
         self, op_name: str, spmd_id: str, tuuid: int
-    ) -> Optional[ShardingSpec]:
+    ) -> ShardingSpec | None:
         """
         Resolve the ShardingSpec for a specific tensor TUUID coming from a specific predecessor.
         """
@@ -1083,7 +1084,7 @@ class OperatorManager:
 
     def get_sender_world_size(
         self, op_name: str, sender_id: str, tuuid: int
-    ) -> Optional[int]:
+    ) -> int | None:
         """
         Retrieve the world size of the sender for a given TUUID.
 
@@ -1115,7 +1116,7 @@ class OperatorManager:
     # Sharding Query
     # =========================================================================
 
-    def get_output_sharding(self, op_name: str) -> Dict[int, "ShardingSpec"]:
+    def get_output_sharding(self, op_name: str) -> dict[int, "ShardingSpec"]:
         """
         Get output sharding for an operator, keyed by TUUID.
         """
@@ -1155,7 +1156,7 @@ class OperatorManager:
         """Get the execution dispatcher strategy for an operator."""
         return self._dispatchers[op_name]
 
-    def get_output_state_names(self, op_name: str) -> List[str]:
+    def get_output_state_names(self, op_name: str) -> list[str]:
         """
         Get output state argument names for an operator.
 
@@ -1174,7 +1175,7 @@ class OperatorManager:
     # Static Arguments
     # =========================================================================
 
-    def get_static_args(self) -> Dict[str, Any]:
+    def get_static_args(self) -> dict[str, Any]:
         """Get all static arguments."""
         return dict(self._static_args)
 
@@ -1183,7 +1184,7 @@ class OperatorManager:
         with self._lock:
             self._static_args[name] = value
 
-    def get_static_arg(self, name: str) -> Optional[Any]:
+    def get_static_arg(self, name: str) -> Any | None:
         """Get a static argument."""
         return self._static_args.get(name)
 

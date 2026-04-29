@@ -14,7 +14,7 @@ Note: Controller layer only starts drivers. Workers are started by drivers.
 """
 
 import asyncio
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 try:
     import ray  # noqa: F401
@@ -39,12 +39,12 @@ class SPMDHandle:
 
     def __init__(self, spmd_id: str):
         self.spmd_id = spmd_id
-        self._driver_handle: Optional[Any] = None  # ray.ActorHandle
-        self._config: Optional[SPMDConfig] = None
+        self._driver_handle: Any | None = None  # ray.ActorHandle
+        self._config: SPMDConfig | None = None
         self._is_initialized: bool = False
 
     @property
-    def driver_handle(self) -> Optional[Any]:
+    def driver_handle(self) -> Any | None:
         """Get the driver actor handle."""
         return self._driver_handle
 
@@ -53,7 +53,7 @@ class SPMDHandle:
         """Check if the SPMD is initialized."""
         return self._is_initialized
 
-    def set_driver_handle(self, handle: Optional[Any]) -> None:
+    def set_driver_handle(self, handle: Any | None) -> None:
         """Set the driver actor handle."""
         self._driver_handle = handle
 
@@ -91,7 +91,7 @@ class SPMDManager:
     Workers are managed by their respective drivers.
     """
 
-    def __init__(self, controller_handle: Optional[Any] = None):
+    def __init__(self, controller_handle: Any | None = None):
         """
         Initialize SPMDManager.
 
@@ -99,12 +99,12 @@ class SPMDManager:
             controller_handle: Reference to the Controller (for driver callbacks)
         """
         self._controller_handle = controller_handle
-        self._spmd_handles: Dict[str, SPMDHandle] = {}
-        self._topology: Dict[str, List[str]] = {}  # spmd_id -> downstream spmd_ids
-        self._reverse_topology: Dict[str, List[str]] = (
+        self._spmd_handles: dict[str, SPMDHandle] = {}
+        self._topology: dict[str, list[str]] = {}  # spmd_id -> downstream spmd_ids
+        self._reverse_topology: dict[str, list[str]] = (
             {}
         )  # spmd_id -> upstream spmd_ids
-        self._checkpoint_backend: Optional[Any] = None
+        self._checkpoint_backend: Any | None = None
 
     def set_controller_handle(self, controller_handle: Any) -> None:
         """Set the controller handle for driver callbacks."""
@@ -132,11 +132,11 @@ class SPMDManager:
         self,
         spmd_id: str,
         config: SPMDConfig,
-        placement_group: Optional[Any] = None,
-        worker_bundle_indices: Optional[List[int]] = None,
+        placement_group: Any | None = None,
+        worker_bundle_indices: list[int] | None = None,
         driver_bundle_index: int = 0,
-        checkpoint_id: Optional[str] = None,
-    ) -> Optional[SPMDHandle]:
+        checkpoint_id: str | None = None,
+    ) -> SPMDHandle | None:
         """
         Start an SPMD instance by creating its driver.
 
@@ -182,7 +182,7 @@ class SPMDManager:
 
             # Create driver actor with placement group
             driver_name = f"spmd_driver_{spmd_id}"
-            driver_opts: Dict[str, Any] = {"name": driver_name}
+            driver_opts: dict[str, Any] = {"name": driver_name}
             if placement_group is not None:
                 driver_opts["placement_group"] = placement_group
                 driver_opts["placement_group_bundle_index"] = driver_bundle_index
@@ -262,7 +262,7 @@ class SPMDManager:
         for handle in self._spmd_handles.values():
             handle.set_driver_handle(None)
 
-    def get_spmd_handle(self, spmd_id: str) -> Optional[SPMDHandle]:
+    def get_spmd_handle(self, spmd_id: str) -> SPMDHandle | None:
         """
         Get handle to an SPMD instance.
 
@@ -274,7 +274,7 @@ class SPMDManager:
         """
         return self._spmd_handles.get(spmd_id)
 
-    def get_driver_handle(self, spmd_id: str) -> Optional[Any]:
+    def get_driver_handle(self, spmd_id: str) -> Any | None:
         """
         Get the driver actor handle for an SPMD.
 
@@ -289,11 +289,11 @@ class SPMDManager:
             return None
         return handle.driver_handle
 
-    def get_all_spmd_ids(self) -> List[str]:
+    def get_all_spmd_ids(self) -> list[str]:
         """Get all registered SPMD IDs."""
         return list(self._spmd_handles.keys())
 
-    async def evict_spmd(self, spmd_id: str) -> Optional[str]:
+    async def evict_spmd(self, spmd_id: str) -> str | None:
         """
         Evict an SPMD and return checkpoint ID.
 
@@ -313,10 +313,10 @@ class SPMDManager:
         self,
         spmd_id: str,
         config: SPMDConfig,
-        placement_group: Optional[Any] = None,
-        worker_bundle_indices: Optional[List[int]] = None,
-        checkpoint_id: Optional[str] = None,
-    ) -> Optional[SPMDHandle]:
+        placement_group: Any | None = None,
+        worker_bundle_indices: list[int] | None = None,
+        checkpoint_id: str | None = None,
+    ) -> SPMDHandle | None:
         """
         Restore an SPMD from checkpoint.
 
@@ -345,7 +345,7 @@ class SPMDManager:
             checkpoint_id=checkpoint_id,
         )
 
-    def establish_topology(self, topology: Dict[str, List[str]]) -> None:
+    def establish_topology(self, topology: dict[str, list[str]]) -> None:
         """
         Establish SPMD topology connections.
 
@@ -378,13 +378,13 @@ class SPMDManager:
                     except Exception as e:
                         logger.error(f"Failed to update topology for {spmd_id}: {e}")
 
-    def get_predecessors(self, spmd_id: str) -> List[str]:
+    def get_predecessors(self, spmd_id: str) -> list[str]:
         """
         Get predecessor SPMD IDs.
         """
         return self._reverse_topology.get(spmd_id, [])
 
-    def get_successors(self, spmd_id: str) -> List[str]:
+    def get_successors(self, spmd_id: str) -> list[str]:
         """
         Get successor SPMD IDs.
         """
@@ -392,7 +392,7 @@ class SPMDManager:
 
     async def broadcast_to_all_drivers(
         self, method: str, *args, **kwargs
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Broadcast a method call to all drivers.
 

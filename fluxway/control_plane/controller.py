@@ -19,7 +19,7 @@ import asyncio
 import functools
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 try:
     import ray
@@ -135,9 +135,9 @@ if RAY_AVAILABLE:
         def __init__(
             self,
             graph: Graph,
-            heartbeat_config: Optional[HeartbeatConfig] = None,
-            async_step_config: Optional[AsyncStepConfig] = None,
-            checkpoint_config: Optional[CheckpointConfig] = None,
+            heartbeat_config: HeartbeatConfig | None = None,
+            async_step_config: AsyncStepConfig | None = None,
+            checkpoint_config: CheckpointConfig | None = None,
         ):
             """
             Initialize Controller with configuration.
@@ -162,9 +162,9 @@ if RAY_AVAILABLE:
             self._state_machine = ControllerStateMachine(self)
             self._async_step_manager = AsyncStepManager(graph, self._async_step_config)
             # snapshot_id → {expected, received, metadata, event}
-            self._pending_snapshots: Dict[str, Any] = {}
+            self._pending_snapshots: dict[str, Any] = {}
 
-            self._checkpoint_task: Optional[asyncio.Task] = None
+            self._checkpoint_task: asyncio.Task | None = None
             self._last_checkpointed_step: int = 0
 
             # Track source nodes (entry points)
@@ -173,16 +173,16 @@ if RAY_AVAILABLE:
             )
 
             self._initialized = False
-            self._spmd_manager: Optional[SPMDManager] = None
-            self._heartbeat_manager: Optional[HeartbeatManager] = None
+            self._spmd_manager: SPMDManager | None = None
+            self._heartbeat_manager: HeartbeatManager | None = None
             self._checkpointer = None
-            self._drain_strategy: Optional[DrainStrategy] = None
+            self._drain_strategy: DrainStrategy | None = None
             self._last_requested_drain_target: int = 0
             self._last_completed_drain_target: int = 0
             self._drained_drivers: set = set()
 
             # Backpressure tracking
-            self._busy_spmds: Dict[str, float] = {}  # {spmd_id: busy_worker_ratio}
+            self._busy_spmds: dict[str, float] = {}  # {spmd_id: busy_worker_ratio}
             self._backpressure_threshold: float = (
                 0.5  # 50% workers busy triggers backpressure
             )
@@ -190,7 +190,7 @@ if RAY_AVAILABLE:
 
             logger.debug(f"ControllerActor created with {len(graph.nodes)} nodes")
 
-        def _find_source_nodes(self) -> List[str]:
+        def _find_source_nodes(self) -> list[str]:
             """Find nodes with no predecessors (source nodes)."""
             all_targets = set()
             for edge in self._graph.edges:
@@ -203,7 +203,7 @@ if RAY_AVAILABLE:
 
             return source_nodes
 
-        def get_resource_allocation_summary(self) -> Dict[str, Dict[str, Any]]:
+        def get_resource_allocation_summary(self) -> dict[str, dict[str, Any]]:
             """Expose scheduler resource summaries for debugging and inspection."""
             return self._scheduler.pg_manager.get_all_resource_allocation_summaries()
 
@@ -323,12 +323,12 @@ if RAY_AVAILABLE:
             """Get current controller state."""
             return self._state_machine.state
 
-        async def get_status(self) -> Dict[str, Any]:
+        async def get_status(self) -> dict[str, Any]:
             """Get detailed controller status."""
             return await self.get_cluster_status()
 
         @require_heartbeat_manager
-        async def get_all_heartbeats(self) -> Dict[str, Any]:
+        async def get_all_heartbeats(self) -> dict[str, Any]:
             """Get all latest heartbeats from all SPMDs."""
             return await self._heartbeat_manager.get_all_heartbeats()
 
@@ -341,7 +341,7 @@ if RAY_AVAILABLE:
         # =====================================================================
 
         @require_spmd_manager
-        def get_spmd_handle(self, spmd_id: str) -> Optional[SPMDHandle]:
+        def get_spmd_handle(self, spmd_id: str) -> SPMDHandle | None:
             """
             Get handle to an SPMD instance from spmd_manager.
 
@@ -467,9 +467,7 @@ if RAY_AVAILABLE:
                         await self._resume_and_schedule_next_drain()
                         await self._check_and_enforce_step_limits()
 
-                self._checkpoint_task = asyncio.create_task(
-                    do_ckpt(boundary)
-                )
+                self._checkpoint_task = asyncio.create_task(do_ckpt(boundary))
             else:
                 # No checkpointer configured.
                 # In future 'eager' mode, this would notify the caller.
@@ -613,7 +611,7 @@ if RAY_AVAILABLE:
                 except Exception as e:
                     logger.error(f"Failed to resume reader {reader_id}: {e}")
 
-        def get_paused_readers(self) -> List[str]:
+        def get_paused_readers(self) -> list[str]:
             """Get list of currently paused readers."""
             return list(self._paused_readers)
 
@@ -627,9 +625,9 @@ if RAY_AVAILABLE:
             source_spmd_id: str,
             target_spmd_id: str,
             target_op: str,
-            names: List[str],
+            names: list[str],
             step: int,
-            values: List[Any],
+            values: list[Any],
         ) -> None:
             """
             Receive control_arguments and forward to target SPMD.
@@ -670,7 +668,7 @@ if RAY_AVAILABLE:
         @require_spmd_manager
         async def request_snapshot(
             self, snapshot_id: str, target_count: int, ckpt_dir: str
-        ) -> Dict[str, Any]:
+        ) -> dict[str, Any]:
             """
             Trigger a global snapshot and block until all Workers have persisted
             their state and all Drivers have reported metadata back.
@@ -686,7 +684,7 @@ if RAY_AVAILABLE:
 
             # validate all drivers exist BEFORE registering the snapshot entry
             # and before dispatching any RPCs.
-            drivers: Dict[str, Any] = {}
+            drivers: dict[str, Any] = {}
             for spmd_id in all_spmd_ids:
                 driver = self._spmd_manager.get_driver_handle(spmd_id)
                 if driver is None:
@@ -715,7 +713,7 @@ if RAY_AVAILABLE:
             )
             try:
                 await asyncio.wait_for(done_event.wait(), timeout=snapshot_timeout)
-            except asyncio.TimeoutError as err:
+            except TimeoutError as err:
                 for d in drivers.values():
                     if d:
                         d._clear_drain_and_fail.remote()
@@ -744,7 +742,7 @@ if RAY_AVAILABLE:
 
         @require_spmd_manager
         async def receive_snapshot_metadata(
-            self, spmd_id: str, snapshot_id: str, metadata_futures: Dict[int, Any]
+            self, spmd_id: str, snapshot_id: str, metadata_futures: dict[int, Any]
         ) -> None:
             snap_info = self._pending_snapshots.get(snapshot_id)
             if snap_info is None:
@@ -818,7 +816,7 @@ if RAY_AVAILABLE:
 
         @require_spmd_manager
         async def restore_snapshot(
-            self, snapshot_id: str, step: int, manifest: Dict[str, Any]
+            self, snapshot_id: str, step: int, manifest: dict[str, Any]
         ) -> None:
             """
             Restore a snapshot: each Driver loads its Workers' tensors from disk directly.
@@ -892,7 +890,7 @@ if RAY_AVAILABLE:
 
             logger.info("Snapshot restored successfully")
 
-        async def restore_checkpoint(self, step: Optional[int] = None) -> Optional[int]:
+        async def restore_checkpoint(self, step: int | None = None) -> int | None:
             """
             User-facing API to trigger checkpoint restoration.
             """
@@ -1141,7 +1139,7 @@ if RAY_AVAILABLE:
 
             # Collect all worker handles upfront to avoid actor re-entrancy deadlocks during registration
             # {spmd_id: {rank: worker_handle}}
-            all_worker_handles: Dict[str, Dict[int, Any]] = {}
+            all_worker_handles: dict[str, dict[int, Any]] = {}
 
             fetch_tasks = []
             spmd_ids_to_fetch = []
@@ -1269,7 +1267,7 @@ if RAY_AVAILABLE:
             logger.debug("Controller stopped")
 
         @require_heartbeat_manager
-        async def get_cluster_status(self) -> Dict[str, str]:
+        async def get_cluster_status(self) -> dict[str, str]:
             """
             Get status of all SPMD nodes.
 
@@ -1279,7 +1277,7 @@ if RAY_AVAILABLE:
             status = await self._heartbeat_manager.get_all_driver_status()
             return {spmd_id: s.value for spmd_id, s in status.items()}
 
-        async def wait_for_completion(self, timeout: Optional[float] = None) -> bool:
+        async def wait_for_completion(self, timeout: float | None = None) -> bool:
             """
             Wait for training to complete.
 
@@ -1311,10 +1309,10 @@ if RAY_AVAILABLE:
 
 async def create_controller(
     graph: Graph,
-    heartbeat_config: Optional[HeartbeatConfig] = None,
-    async_step_config: Optional[AsyncStepConfig] = None,
-    checkpoint_config: Optional[CheckpointConfig] = None,
-    runtime_env: Optional[Dict[str, Any]] = None,
+    heartbeat_config: HeartbeatConfig | None = None,
+    async_step_config: AsyncStepConfig | None = None,
+    checkpoint_config: CheckpointConfig | None = None,
+    runtime_env: dict[str, Any] | None = None,
 ) -> Any:
     """
     Create and initialize a Controller actor.

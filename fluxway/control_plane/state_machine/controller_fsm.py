@@ -16,7 +16,7 @@ Supports async callbacks for Ray Actor Controller.
 """
 
 import asyncio
-from typing import TYPE_CHECKING, Dict
+from typing import TYPE_CHECKING
 
 from fluxway.common.types import ControllerState, ControllerEvent
 from fluxway.common.utils.logging import get_logger
@@ -116,7 +116,7 @@ class ControllerStateMachine:
         self._lock = asyncio.Lock()
 
         # Track error information
-        self._error_spmds: Dict[str, str] = {}  # spmd_id -> error_message
+        self._error_spmds: dict[str, str] = {}  # spmd_id -> error_message
         self._restarting_spmds: set = set()
 
     @property
@@ -211,7 +211,7 @@ class ControllerStateMachine:
         """Check if controller has completed."""
         return self.state in (ControllerState.COMPLETED, ControllerState.FAILED)
 
-    def get_error_spmds(self) -> Dict[str, str]:
+    def get_error_spmds(self) -> dict[str, str]:
         """Get SPMDs currently in error state."""
         return dict(self._error_spmds)
 

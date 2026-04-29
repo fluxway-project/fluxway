@@ -11,7 +11,8 @@ Responsibilities:
 import logging
 import threading
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Dict, List, Optional
+from collections.abc import Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,7 @@ class SyncPolicy(ABC):
     @abstractmethod
     def evaluate(
         self,
-        worker_steps: Dict[int, Dict[str, int]],
+        worker_steps: dict[int, dict[str, int]],
         num_workers: int,
         rank: int,
         op_name: str,
@@ -45,7 +46,7 @@ class MaxSkewSyncPolicy(SyncPolicy):
 
     def evaluate(
         self,
-        worker_steps: Dict[int, Dict[str, int]],
+        worker_steps: dict[int, dict[str, int]],
         num_workers: int,
         rank: int,
         op_name: str,
@@ -66,45 +67,45 @@ class SPMDSynchronizer:
     """
 
     def __init__(
-        self, spmd_id: str, num_workers: int, sync_policy: Optional[SyncPolicy] = None
+        self, spmd_id: str, num_workers: int, sync_policy: SyncPolicy | None = None
     ):
         self.spmd_id = spmd_id
         self.num_workers = num_workers
         self.sync_policy = sync_policy or MaxSkewSyncPolicy()
 
         # Worker-level completed count tracking: rank -> {op_name -> count}
-        self._worker_completed_count: Dict[int, Dict[str, int]] = {
+        self._worker_completed_count: dict[int, dict[str, int]] = {
             rank: {} for rank in range(num_workers)
         }
 
         # SPMD-level completed count (minimum count reached by all workers)
-        self._spmd_completed_count: Dict[str, int] = {}
+        self._spmd_completed_count: dict[str, int] = {}
 
         # Op lock states (controller-requested)
-        self._op_locked: Dict[str, bool] = {}
+        self._op_locked: dict[str, bool] = {}
 
         # Worker lock states (for step difference enforcement)
-        self._worker_op_locked: Dict[int, Dict[str, bool]] = {
+        self._worker_op_locked: dict[int, dict[str, bool]] = {
             rank: {} for rank in range(num_workers)
         }
 
         # Global flow control: op_name -> max allowed step (watermark from Controller)
-        self._allowed_steps: Dict[str, int] = {}
+        self._allowed_steps: dict[str, int] = {}
 
         self._lock = threading.Lock()
 
-        self._on_spmd_op_completed: Optional[Callable[[str, str, int], None]] = None
-        self._block_worker_op: Optional[Callable[[int, str], None]] = None
-        self._unblock_worker_op: Optional[Callable[[int, str], None]] = None
+        self._on_spmd_op_completed: Callable[[str, str, int], None] | None = None
+        self._block_worker_op: Callable[[int, str], None] | None = None
+        self._unblock_worker_op: Callable[[int, str], None] | None = None
 
         self._expected_ops: set = set()
 
         # Drain parameters
-        self._drain_target_count: Optional[int] = None
-        self._drain_on_drained: Optional[Callable[[], None]] = None
+        self._drain_target_count: int | None = None
+        self._drain_on_drained: Callable[[], None] | None = None
         self._drain_acked_ops: set = set()  # ops where all workers reached ceiling
 
-    def load_step_counts(self, rank_metadata_map: Dict[int, Dict[str, Any]]) -> None:
+    def load_step_counts(self, rank_metadata_map: dict[int, dict[str, Any]]) -> None:
         """Load step counts directly from metadata, skipping callback to avoid RPC storms."""
         with self._lock:
             for rank, metadata in rank_metadata_map.items():
@@ -137,7 +138,7 @@ class SPMDSynchronizer:
                         f"SPMD {self.spmd_id} initialized {op_name} total_count {min_count} from manifest"
                     )
 
-    def register_expected_ops(self, ops: List[str]) -> None:
+    def register_expected_ops(self, ops: list[str]) -> None:
         """Register statically known operators to properly anchor drain ceilings.
         Can be called additively to prepare for Eager Mode dynamic scheduling.
         """
@@ -166,9 +167,9 @@ class SPMDSynchronizer:
 
     def set_callbacks(
         self,
-        on_spmd_op_completed: Optional[Callable[[str, str, int], None]] = None,
-        block_worker_op: Optional[Callable[[int, str], None]] = None,
-        unblock_worker_op: Optional[Callable[[int, str], None]] = None,
+        on_spmd_op_completed: Callable[[str, str, int], None] | None = None,
+        block_worker_op: Callable[[int, str], None] | None = None,
+        unblock_worker_op: Callable[[int, str], None] | None = None,
     ) -> None:
         self._on_spmd_op_completed = on_spmd_op_completed
         self._block_worker_op = block_worker_op
@@ -402,7 +403,7 @@ class SPMDSynchronizer:
     # Step Query
     # =========================================================================
 
-    def get_spmd_steps(self) -> Dict[str, int]:
+    def get_spmd_steps(self) -> dict[str, int]:
         with self._lock:
             return dict(self._spmd_completed_count)
 
@@ -414,13 +415,13 @@ class SPMDSynchronizer:
         with self._lock:
             return self._worker_completed_count.get(rank, {}).get(op_name, 0)
 
-    def get_all_worker_steps(self) -> Dict[int, Dict[str, int]]:
+    def get_all_worker_steps(self) -> dict[int, dict[str, int]]:
         with self._lock:
             return {
                 rank: dict(ops) for rank, ops in self._worker_completed_count.items()
             }
 
-    def get_locked_ops(self) -> List[str]:
+    def get_locked_ops(self) -> list[str]:
         with self._lock:
             return [op_name for op_name, locked in self._op_locked.items() if locked]
 

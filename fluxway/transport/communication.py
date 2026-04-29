@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Tuple, Union, Optional
+from typing import Any
+from collections.abc import Callable
 import logging
 
 import asyncio
@@ -32,7 +33,7 @@ class BaseDataDistributor:
                 return f"{u} ({tuuid_to_name[u]})"
             return str(u)
 
-        if isinstance(tuuid, (list, tuple)):
+        if isinstance(tuuid, list | tuple):
             return "[" + ", ".join(_fmt(u) for u in tuuid) + "]"
         return _fmt(tuuid)
 
@@ -42,7 +43,7 @@ class BaseDataDistributor:
 
         # Internal aggregation for "Late Aggregation"
         # {target_rank: [(tensors, counts, global_shapes, has_meta_tensor_state_list)]}
-        self._dest_agg: Dict[int, List[Tuple]] = defaultdict(list)
+        self._dest_agg: dict[int, list[tuple]] = defaultdict(list)
         self._meta_sort_indices = None
         self._current_source_spec = None
         self._current_target_spec = None
@@ -63,9 +64,9 @@ class BaseDataDistributor:
         # Scalar fast-path: all data goes to one destination.
         # Handle before entering the JIT-compiled _stitch_with_prime to avoid
         # ConcretizationTypeError (int() on traced JAX values).
-        is_scalar = (
-            isinstance(sender_rank_tags, (int, np.integer))
-            or (hasattr(sender_rank_tags, "shape") and np.asarray(sender_rank_tags).ndim == 0)
+        is_scalar = isinstance(sender_rank_tags, int | np.integer) or (
+            hasattr(sender_rank_tags, "shape")
+            and np.asarray(sender_rank_tags).ndim == 0
         )
         if is_scalar:
             target_rank = int(sender_rank_tags)
@@ -122,12 +123,12 @@ class BaseDataDistributor:
 
     def _plan_single_tensor_group(
         self,
-        local_data: Union[TransportTensor, List[TransportTensor]],
+        local_data: TransportTensor | list[TransportTensor],
         source: PhysicalLayout,
         target: PhysicalLayout,
-        capacity: Optional[Union[int, List[int]]] = None,
-        tuuid: Optional[Union[int, List[int]]] = None,
-        tuuid_to_name: Optional[Dict[int, str]] = None,
+        capacity: int | list[int] | None = None,
+        tuuid: int | list[int] | None = None,
+        tuuid_to_name: dict[int, str] | None = None,
     ):
         """Generates plans and padded sequences for a single distribution group.
 
@@ -170,7 +171,7 @@ class BaseDataDistributor:
         payloads = []
         has_meta_tensor_state_list = []
         nested_length_list = []
-        compact_desc_info: List[Optional[IndexDescriptor]] = []
+        compact_desc_info: list[IndexDescriptor | None] = []
 
         for tt in tensors_to_pack:
             payloads.append(tt.flat_values)
@@ -339,7 +340,7 @@ class BaseDataDistributor:
 
         # Set capacity bucket
         actual_req = local_shape[0] if local_shape else 1
-        if isinstance(capacity, (list, tuple)):
+        if isinstance(capacity, list | tuple):
             selected_capacity = None
             for cap in sorted(capacity):
                 if cap >= actual_req:
@@ -454,7 +455,7 @@ class BaseDataDistributor:
         offsets_per_payload_host = [np.array(o).flatten() for o in offsets_per_payload]
 
         def _get_slice_compact_desc_params(device_id):
-            slice_compact_desc_params: List[Optional[List[int]]] = []
+            slice_compact_desc_params: list[list[int] | None] = []
             for meta_tensor_state, desc_obj in zip(  # type: ignore
                 has_meta_tensor_state_list,
                 compact_desc_info,
@@ -561,12 +562,12 @@ class BaseDataDistributor:
 
     def plan_and_shard(
         self,
-        local_data: Union[TransportTensor, List[TransportTensor]],
-        source: Optional[PhysicalLayout] = None,
-        target: Optional[PhysicalLayout] = None,
-        capacity: Optional[Union[int, List[int]]] = None,
-        tuuid: Optional[Union[int, List[int]]] = None,
-        tuuid_to_name: Optional[Dict[int, str]] = None,
+        local_data: TransportTensor | list[TransportTensor],
+        source: PhysicalLayout | None = None,
+        target: PhysicalLayout | None = None,
+        capacity: int | list[int] | None = None,
+        tuuid: int | list[int] | None = None,
+        tuuid_to_name: dict[int, str] | None = None,
     ) -> None:
         """Computes sharding plan and buffers data for all destinations."""
 
@@ -613,14 +614,14 @@ class SyncDataDistributor(BaseDataDistributor):
 
     def distribute(
         self,
-        local_data: Optional[Union[TransportTensor, List[TransportTensor]]] = None,
-        source: Optional[PhysicalLayout] = None,
-        target: Optional[PhysicalLayout] = None,
-        send_fn: Optional[Callable] = None,
-        capacity: Optional[Union[int, List[int]]] = None,
-        tuuid: Optional[Union[int, List[int]]] = None,
-        tuuid_to_name: Optional[Dict[int, str]] = None,
-    ) -> Tuple[List[Any], Any]:
+        local_data: TransportTensor | list[TransportTensor] | None = None,
+        source: PhysicalLayout | None = None,
+        target: PhysicalLayout | None = None,
+        send_fn: Callable | None = None,
+        capacity: int | list[int] | None = None,
+        tuuid: int | list[int] | None = None,
+        tuuid_to_name: dict[int, str] | None = None,
+    ) -> tuple[list[Any], Any]:
         """Performs synchronous distribution."""
         if local_data is not None:
             self.plan_and_shard(
@@ -640,7 +641,7 @@ class SyncDataDistributor(BaseDataDistributor):
             merged_h_states = []
             merged_c_params = []
             for tuuids, tensors, counts, g_shapes, h_states, c_params in groups:
-                if isinstance(tuuids, (list, tuple)):
+                if isinstance(tuuids, list | tuple):
                     merged_tuuids.extend(tuuids)
                 else:
                     merged_tuuids.append(tuuids)
@@ -673,14 +674,14 @@ class AsyncDataDistributor(BaseDataDistributor):
 
     async def distribute(
         self,
-        local_data: Optional[Union[TransportTensor, List[TransportTensor]]] = None,
-        source: Optional[PhysicalLayout] = None,
-        target: Optional[PhysicalLayout] = None,
-        send_fn: Optional[Callable] = None,
-        capacity: Optional[Union[int, List[int]]] = None,
-        tuuid: Optional[Union[int, List[int]]] = None,
-        tuuid_to_name: Optional[Dict[int, str]] = None,
-    ) -> Tuple[List[Any], Any]:
+        local_data: TransportTensor | list[TransportTensor] | None = None,
+        source: PhysicalLayout | None = None,
+        target: PhysicalLayout | None = None,
+        send_fn: Callable | None = None,
+        capacity: int | list[int] | None = None,
+        tuuid: int | list[int] | None = None,
+        tuuid_to_name: dict[int, str] | None = None,
+    ) -> tuple[list[Any], Any]:
         """Performs asynchronous distribution."""
         if local_data is not None:
             self.plan_and_shard(
@@ -700,7 +701,7 @@ class AsyncDataDistributor(BaseDataDistributor):
             merged_h_states = []
             merged_c_params = []
             for tuuids, tensors, counts, g_shapes, h_states, c_params in groups:
-                if isinstance(tuuids, (list, tuple)):
+                if isinstance(tuuids, list | tuple):
                     merged_tuuids.extend(tuuids)
                 else:
                     merged_tuuids.append(tuuids)
@@ -824,11 +825,11 @@ class TransportReceiver:
         self._periodic = periodic
 
         # Shared-buffer zero-copy (offset mode)
-        self.target_buffers: Optional[List[Any]] = None
+        self.target_buffers: list[Any] | None = None
         self.expect_offsets: dict = {}
 
         # Per-sender zero-copy (no-offset mode)
-        self._per_sender_buffers: Optional[dict] = None  # {rank: [buf, ...]}
+        self._per_sender_buffers: dict | None = None  # {rank: [buf, ...]}
 
         # Buffered mode
         self._rx_buffers: list = []
@@ -842,7 +843,7 @@ class TransportReceiver:
     # ------------------------------------------------------------------
 
     def register_zero_copy_buffers(
-        self, target_buffers: List[Any], expect_offsets: dict
+        self, target_buffers: list[Any], expect_offsets: dict
     ) -> None:
         """
         Offset mode: all senders write into a single shared buffer set.
@@ -877,7 +878,7 @@ class TransportReceiver:
     # ------------------------------------------------------------------
 
     def receive_slices(
-        self, source_rank: int, tensors: List[Any], counts: List[int]
+        self, source_rank: int, tensors: list[Any], counts: list[int]
     ) -> bool:
         """Called by the network layer when a payload arrives.
 
@@ -914,7 +915,7 @@ class TransportReceiver:
             # Offset zero-copy
             if source_rank in self.expect_offsets:
                 offsets = self.expect_offsets[source_rank]
-                if not isinstance(offsets, (list, tuple)):
+                if not isinstance(offsets, list | tuple):
                     offsets = [offsets]
 
                 for i, tensor in enumerate(tensors):
@@ -988,7 +989,7 @@ class TransportReceiver:
         self._rx_buffers = []
         return ret
 
-    def get_per_sender_buffers(self) -> Optional[dict]:
+    def get_per_sender_buffers(self) -> dict | None:
         """Return the per-sender buffer dict (no-offset zero-copy) or None."""
         return self._per_sender_buffers
 
@@ -1013,7 +1014,7 @@ def _stitch_with_prime(prime_rank_tags, slave_tensors, world_size):
 
     # Fast path: If prime_rank_tags is a scalar, everyone goes to one destination
     if (
-        isinstance(prime_rank_tags, (int, np.integer))
+        isinstance(prime_rank_tags, int | np.integer)
         or len(backend.shape(prime_rank_tags)) == 0
     ):
         target_rank = int(prime_rank_tags)
@@ -1049,22 +1050,22 @@ def _stitch_with_prime(prime_rank_tags, slave_tensors, world_size):
 
 @compile(static_argnums=(2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15))
 def _jit_plan_and_pack(
-    payloads_tuple: Tuple[Any, ...],
-    nested_length_list: Tuple[Optional[Any], ...],
+    payloads_tuple: tuple[Any, ...],
+    nested_length_list: tuple[Any | None, ...],
     src_local_rank: int,
-    src_data_shape: Tuple[int, ...],
-    src_routing_indices: Optional[Any],
+    src_data_shape: tuple[int, ...],
+    src_routing_indices: Any | None,
     src_routing_based_values: Any,
     dst_index_desc: Any,
-    dst_routing_dim: Optional[Union[int, Tuple[int, ...]]],
+    dst_routing_dim: int | tuple[int, ...] | None,
     dst_strategy: Callable,
     dst_mesh: Any,
     dst_partitions: Any,
     dst_replica_axes: Any,
     dst_replica_size: int,
-    static_shapes: Tuple[int, ...],
-    src_spec: Optional[Any] = None,
-    src_index_desc: Optional[Any] = None,
+    static_shapes: tuple[int, ...],
+    src_spec: Any | None = None,
+    src_index_desc: Any | None = None,
 ):
     """JIT-compiled kernel: compute routing plan and reorder payloads.
 

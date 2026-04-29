@@ -58,9 +58,12 @@ from fluxway.common.utils.tree import tree_flatten, tree_unflatten
 from fluxway.rpc.protocol import DataPlaneCallable
 from fluxway.spmd.worker.mailbox import WorkerMailbox
 from fluxway.spmd.worker.operator_manager import OperatorManager
-from fluxway.spmd.worker.operator_manager.dispatcher import SKIPPED, STALE_AFTER_RESTORE
+from fluxway.spmd.worker.operator_manager.dispatcher import (
+    ExecutionStatus,
+    ExecutionResult,
+)
 from fluxway.transport.communication import AsyncDataDistributor
-from typing import Any, Dict, List, Optional, Tuple, Type, get_type_hints
+from typing import Any, Optional, get_type_hints
 
 
 @compile(static_argnums=())
@@ -127,8 +130,8 @@ class SPMDWorker:
         config: SPMDConfig,
         rank: int,
         spmd_id: str = "",
-        driver_handle: Optional[Any] = None,
-        checkpoint_backend: Optional[Any] = None,
+        driver_handle: Any | None = None,
+        checkpoint_backend: Any | None = None,
     ):
         """
         Initialize worker.
@@ -159,25 +162,25 @@ class SPMDWorker:
         self._checkpoint_backend = checkpoint_backend
 
         # Driver handle for callbacks (Control Plane - Native Ray)
-        self._driver_handle: Optional[Any] = driver_handle
+        self._driver_handle: Any | None = driver_handle
 
         # Mesh from config
         self._mesh = config.mesh
         self._world_size = config.num_workers
-        self.local_rank: Optional[int] = None
-        self.local_world_size: Optional[int] = None
-        self.node_rank: Optional[int] = None
-        self.num_nodes: Optional[int] = None
+        self.local_rank: int | None = None
+        self.local_world_size: int | None = None
+        self.node_rank: int | None = None
+        self.num_nodes: int | None = None
 
-        self._op_manager: Optional[OperatorManager] = None
+        self._op_manager: OperatorManager | None = None
 
         # Completed step counters {op_name: count} - tracks how many steps were executed
-        self._completed_step_count: Dict[str, int] = dict.fromkeys(
+        self._completed_step_count: dict[str, int] = dict.fromkeys(
             self.config.operators if self.config else {}, 0
         )
 
         # Op-level blocking: asyncio.Event (set=runnable, clear=blocked)
-        self._op_runnable: Dict[str, asyncio.Event] = {
+        self._op_runnable: dict[str, asyncio.Event] = {
             op_name: asyncio.Event()
             for op_name in (self.config.operators if self.config else {})
         }
@@ -185,19 +188,19 @@ class SPMDWorker:
             event.set()  # Initially all ops are runnable
 
         # Pending tasks when blocked (to avoid priority queue reentry loop)
-        self._pending_blocked: Dict[str, List[int]] = {
+        self._pending_blocked: dict[str, list[int]] = {
             op_name: [] for op_name in (self.config.operators if self.config else {})
         }
 
         # Pending tasks for future steps (arrived early, waiting for current step to complete)
         # Structure: {op_name: List[step]} - steps waiting to be executed
-        self._pending_future_steps: Dict[str, List[int]] = {
+        self._pending_future_steps: dict[str, list[int]] = {
             op_name: [] for op_name in (self.config.operators if self.config else {})
         }
 
         # Priority queue: asyncio.PriorityQueue with (priority, step, op_name)
         # Can extract priority from OperatorMeta
-        self._execution_queue: asyncio.PriorityQueue[Tuple[int, int, str]] = (
+        self._execution_queue: asyncio.PriorityQueue[tuple[int, int, str]] = (
             asyncio.PriorityQueue()
         )
 
@@ -213,31 +216,31 @@ class SPMDWorker:
 
         # Handler storage (Data Plane - wrapped in DataPlaneCallable)
         # {spmd_id: {rank: DataPlaneCallable}}
-        self._predecessor_handlers: Dict[str, Dict[int, DataPlaneCallable]] = {}
-        self._successor_handlers: Dict[str, Dict[int, DataPlaneCallable]] = {}
+        self._predecessor_handlers: dict[str, dict[int, DataPlaneCallable]] = {}
+        self._successor_handlers: dict[str, dict[int, DataPlaneCallable]] = {}
 
         # Heartbeat configuration
         self._heartbeat_interval: float = 5.0
         self._heartbeat_running: bool = False
-        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._heartbeat_task: asyncio.Task | None = None
 
         # Tracks tasks currently sitting in _execution_queue to prevent double-scheduling.
         # Removed when dequeued (whether to execute, pending_blocked, or pending_future).
         self._in_op_step_queue: set = set()
 
         # State tracking
-        self._last_error: Optional[str] = None
+        self._last_error: str | None = None
 
         # Run loop synchronization
         self._start_event = asyncio.Event()  # Signals when to start execution
-        self._run_task: Optional[asyncio.Task] = None
+        self._run_task: asyncio.Task | None = None
         self._background_tasks: set[asyncio.Task] = set()
 
         # Source operator pause control
-        self._source_pause_events: Dict[str, asyncio.Event] = {}
+        self._source_pause_events: dict[str, asyncio.Event] = {}
 
         # Drain-to-step state
-        self._drain_target_count: Optional[int] = None
+        self._drain_target_count: int | None = None
         self._drain_cond: asyncio.Condition = asyncio.Condition()
         if self.config and getattr(self.config, "requires_drain_at_startup", False):
             # Block at step 0 until Controller issues the initial drain target!
@@ -245,21 +248,21 @@ class SPMDWorker:
 
         # Expected topology counts for auto-start detection
         # Initialize to None to strictly wait for registration from driver
-        self._expected_predecessor_count: Optional[int] = None
-        self._expected_successor_count: Optional[int] = None
+        self._expected_predecessor_count: int | None = None
+        self._expected_successor_count: int | None = None
 
         # Cached assembled input tensors: {op_name: {tuuid: TransportTensor}}
         # Updated by _assemble_input, used by _send_output for pass-through metadata
-        self._last_assembled_tensors: Dict[
-            str, Dict[str, Optional[TransportTensor]]
-        ] = {op_name: {} for op_name in (self.config.operators if self.config else {})}
+        self._last_assembled_tensors: dict[str, dict[str, TransportTensor | None]] = {
+            op_name: {} for op_name in (self.config.operators if self.config else {})
+        }
 
         # Metadata for "Mirror Sharding" (Symmetry Routing)
         # Structure: {step_id: {op_name.tuuid: TransportTensor}}
-        self._step_tuuid_cache: Dict[int, Dict[int, TransportTensor]] = {}
+        self._step_tuuid_cache: dict[int, dict[int, TransportTensor]] = {}
 
         # Tracks which (op_name, step) barriers have been registered to avoid double-declaring.
-        self._barriers_declared: Dict[Tuple[str, int], bool] = {}
+        self._barriers_declared: dict[tuple[str, int], bool] = {}
 
         logger.debug(
             "phase_one_init_complete spmd_id=%s rank=%s world_size=%s",
@@ -282,10 +285,10 @@ class SPMDWorker:
         config: "SPMDConfig",
         rank: int,
         *,
-        local_rank: Optional[int] = None,
-        local_world_size: Optional[int] = None,
-        node_rank: Optional[int] = None,
-        num_nodes: Optional[int] = None,
+        local_rank: int | None = None,
+        local_world_size: int | None = None,
+        node_rank: int | None = None,
+        num_nodes: int | None = None,
     ) -> None:
         """Eagerly instantiate all SPMD operator class instances.
 
@@ -469,7 +472,7 @@ class SPMDWorker:
             )
             raise
 
-    def set_driver_handle(self, driver_handle: Optional[Any]) -> None:
+    def set_driver_handle(self, driver_handle: Any | None) -> None:
         """
         Set the driver handle for callbacks.
 
@@ -478,7 +481,7 @@ class SPMDWorker:
         """
         self._driver_handle = driver_handle
 
-    def get_driver_handle(self) -> Optional[Any]:
+    def get_driver_handle(self) -> Any | None:
         """Get the driver handle."""
         return self._driver_handle
 
@@ -487,7 +490,7 @@ class SPMDWorker:
     # =========================================================================
 
     def register_predecessor_handlers(
-        self, spmd_id: str, handlers: Dict[int, Any]
+        self, spmd_id: str, handlers: dict[int, Any]
     ) -> None:
         """
         Register handlers for a predecessor SPMD.
@@ -511,7 +514,7 @@ class SPMDWorker:
         self._check_and_auto_start()
 
     def register_successor_handlers(
-        self, spmd_id: str, handlers: Dict[int, Any]
+        self, spmd_id: str, handlers: dict[int, Any]
     ) -> None:
         """
         Register handlers for a successor SPMD.
@@ -678,8 +681,8 @@ class SPMDWorker:
         self,
         op_name: str,
         step: int,
-        tuuid_sharding: Dict[int, "ShardingSpec"],
-        expected_counts: Optional[Dict[int, int]] = None,
+        tuuid_sharding: dict[int, "ShardingSpec"],
+        expected_counts: dict[int, int] | None = None,
     ) -> None:
         """
         Prepare for an Eager operator execution by registering its input TUUIDs.
@@ -703,7 +706,7 @@ class SPMDWorker:
     # =========================================================================
 
     async def receive_control(
-        self, op_name: str, step: int, names: List[str], values: List[Any]
+        self, op_name: str, step: int, names: list[str], values: list[Any]
     ) -> None:
         """
         Receive state data from Driver (control plane).
@@ -744,15 +747,15 @@ class SPMDWorker:
 
     async def receive_shards(
         self,
-        tuuids: List[int],
+        tuuids: list[int],
         step: int,
         sender_id: str,
         sender_rank: int,
-        payloads: List[Any],
-        counts: List[int],
-        global_shapes: Optional[List[Optional[Tuple[int, ...]]]] = None,
-        meta_tensor_state_list: Optional[List[int]] = None,
-        slice_compact_desc_params: Optional[List[Optional[List[int]]]] = None,
+        payloads: list[Any],
+        counts: list[int],
+        global_shapes: list[tuple[int, ...] | None] | None = None,
+        meta_tensor_state_list: list[int] | None = None,
+        slice_compact_desc_params: list[list[int] | None] | None = None,
     ) -> int:
         """Receive multiple tensor shards and dispatch to local operators by TUUID.
 
@@ -775,7 +778,7 @@ class SPMDWorker:
         )
         global_shapes = global_shapes if global_shapes is not None else [None] * num
 
-        op_bundles: Dict[str, Dict[str, List[Any]]] = {}
+        op_bundles: dict[str, dict[str, list[Any]]] = {}
         cursor = 0
         for i in range(num):
             u = tuuids[i]
@@ -1019,7 +1022,7 @@ class SPMDWorker:
                 # Guard: if a restore happened during execution (e.g. while
                 # the worker was blocked in the drain self-block), the step
                 # is now stale.  Skip advancement to preserve the watermark.
-                if result is STALE_AFTER_RESTORE:
+                if result.status is ExecutionStatus.STALE_AFTER_RESTORE:
                     continue
 
                 # Advance execution step counter
@@ -1157,7 +1160,7 @@ class SPMDWorker:
                             slice_compact_desc_params=[None],
                         )
 
-    async def _execute_operator(self, op_name: str, step: int) -> Any:
+    async def _execute_operator(self, op_name: str, step: int) -> ExecutionResult:
         """Execute an operator: assemble data, execute, send outputs."""
         try:
             # Drain self-block: `step` is the 0-indexed task sequence number that is
@@ -1189,7 +1192,7 @@ class SPMDWorker:
                 )
                 await self._mailbox.clear_step(op_name, step)
                 self._barriers_declared.pop((op_name, step), None)
-                return STALE_AFTER_RESTORE
+                return ExecutionResult(status=ExecutionStatus.STALE_AFTER_RESTORE)
 
             # --- Dispatcher Check: Should this rank execute this step? ---
             dispatcher = self._op_manager.get_dispatcher(op_name)
@@ -1200,7 +1203,7 @@ class SPMDWorker:
                 )
                 await self._mailbox.clear_step(op_name, step)
                 self._barriers_declared.pop((op_name, step), None)
-                return SKIPPED
+                return ExecutionResult(status=ExecutionStatus.SKIPPED)
 
             # --- Early check: all received shards are empty packets ---
             all_empty = await self._check_all_empty(op_name, step)
@@ -1212,7 +1215,7 @@ class SPMDWorker:
                 await self._propagate_empty_packets(op_name, step)
                 await self._mailbox.clear_step(op_name, step)
                 self._barriers_declared.pop((op_name, step), None)
-                return []
+                return ExecutionResult(status=ExecutionStatus.EMPTY_PROPAGATION)
 
             # Assemble input data
             try:
@@ -1226,18 +1229,20 @@ class SPMDWorker:
 
             # Execute operator in a thread to avoid blocking the worker event loop
             if isinstance(input_data, dict):
-                result = await asyncio.to_thread(
+                op_result = await asyncio.to_thread(
                     self._op_manager.execute, op_name, step, **input_data
                 )
             else:
-                result = await asyncio.to_thread(
+                op_result = await asyncio.to_thread(
                     self._op_manager.execute, op_name, step, input_data
                 )
             logger.debug(
                 f"Execution finished op={op_name} step={step} spmd_id={self.spmd_id} rank={self.rank}"
             )
 
-            if result is None:
+            result = ExecutionResult(status=ExecutionStatus.SUCCESS, data=op_result)
+
+            if op_result is None:
                 logger.debug(
                     f"Operator returned None continuing op={op_name} "
                     f"spmd_id={self.spmd_id} rank={self.rank}"
@@ -1245,7 +1250,7 @@ class SPMDWorker:
 
             # Send output
             logger.debug(
-                f"Sending output op={op_name} step={step} result_type={type(result).__name__} "
+                f"Sending output op={op_name} step={step} result_type={type(op_result).__name__} "
                 f"spmd_id={self.spmd_id} rank={self.rank}"
             )
             await self._send_output(op_name, result, exec_step=step)
@@ -1343,14 +1348,14 @@ class SPMDWorker:
             return obj.flat_values
         return obj
 
-    def _get_routing_indices(self, obj: Any) -> Optional[Any]:
+    def _get_routing_indices(self, obj: Any) -> Any | None:
         if isinstance(obj, TransportTensor):
             return obj.routing_indices_materialized
         return None
 
     def _flatten_shards(
-        self, shards: Dict[Tuple[str, int], List[TransportTensor]], index: int = 0
-    ) -> List[TransportTensor]:
+        self, shards: dict[tuple[str, int], list[TransportTensor]], index: int = 0
+    ) -> list[TransportTensor]:
         """
         Extract the N-th tensor from each multi-tensor packet.
         """
@@ -1361,8 +1366,8 @@ class SPMDWorker:
         return tensors
 
     def _flatten_shards_with_ranks(
-        self, shards: Dict[Any, List[TransportTensor]], index: int = 0
-    ) -> List[Tuple[Any, TransportTensor]]:
+        self, shards: dict[Any, list[TransportTensor]], index: int = 0
+    ) -> list[tuple[Any, TransportTensor]]:
         """Flatten shards and include their sender keys (ranks)."""
         flat = []
         for key in sorted(shards.keys()):
@@ -1371,7 +1376,7 @@ class SPMDWorker:
                 flat.append((key, tensor_list[index]))
         return flat
 
-    def _normalize_and_cat_shards(self, tensor_list: List[Any], dim: int = 0) -> Any:
+    def _normalize_and_cat_shards(self, tensor_list: list[Any], dim: int = 0) -> Any:
         """
         Robustly concatenate high-dimensional shards, healing rank/dtype mismatches.
         """
@@ -1433,10 +1438,10 @@ class SPMDWorker:
     # =========================================================================
 
     def _merge_index_descriptors(
-        self, shard_list: List["TransportTensor"], property: str = "origin_indices"
+        self, shard_list: list["TransportTensor"], property: str = "origin_indices"
     ) -> Optional["IndexDescriptor"]:
         """Merge IndexDescriptors from shards only when ALL shards carry one."""
-        descriptors: List[IndexDescriptor] = [
+        descriptors: list[IndexDescriptor] = [
             getattr(s, property) for s in shard_list if getattr(s, property) is not None
         ]
         if len(descriptors) == len(shard_list) and shard_list:
@@ -1445,9 +1450,9 @@ class SPMDWorker:
 
     def _merge_materialized_index_descriptors(
         self,
-        shards: List["TransportTensor"],
+        shards: list["TransportTensor"],
         property: str = "origin_indices_materialized",
-    ) -> Optional[Any]:
+    ) -> Any | None:
         """Merge materialized indices from shards, falling back to spatial / arange."""
         backend = get_backend()
         if not any(
@@ -1471,7 +1476,7 @@ class SPMDWorker:
         return self._normalize_and_cat_shards(index_list, dim=0)
 
     def _maybe_merge_receipts(
-        self, shards: List["TransportTensor"]
+        self, shards: list["TransportTensor"]
     ) -> Optional["SymmetryReceipt"]:
         """Merge SymmetryReceipts from input shards into a single receipt."""
         receipts = [s.receipt for s in shards]
@@ -1484,7 +1489,7 @@ class SPMDWorker:
     def _heal_empty_shape(
         self,
         input_layout: "PhysicalLayout",
-        global_shape: Optional[Tuple[int, ...]] = None,
+        global_shape: tuple[int, ...] | None = None,
     ) -> "TransportTensor":
         """Return a correctly-shaped empty TransportTensor when no data arrived.
 
@@ -1518,7 +1523,7 @@ class SPMDWorker:
         op_name: str,
         tuuid: int,
         step: int,
-        shards: Dict[Any, List["TransportTensor"]],
+        shards: dict[Any, list["TransportTensor"]],
     ) -> "TransportTensor":
         """Assemble tensor shards into a complete TransportTensor."""
         # Note: Input layout is now retrieved as a PhysicalLayout bound to current mesh
@@ -1552,9 +1557,9 @@ class SPMDWorker:
         op_name: str,
         tuuid: int,
         step: int,
-        shards_dict: Dict[Any, List[TransportTensor]],
-        predecessor_topology: Dict[str, Any],
-    ) -> List[TransportTensor]:
+        shards_dict: dict[Any, list[TransportTensor]],
+        predecessor_topology: dict[str, Any],
+    ) -> list[TransportTensor]:
         """
         Filters shards from mailbox based on analytical or fallback routing.
         """
@@ -1581,9 +1586,9 @@ class SPMDWorker:
         op_name: str,
         tuuid: int,
         step: int,
-        shards: Dict[Any, List["TransportTensor"]],
+        shards: dict[Any, list["TransportTensor"]],
         input_layout: "PhysicalLayout",
-        predecessor_topology: Dict[str, Any],
+        predecessor_topology: dict[str, Any],
     ) -> "TransportTensor":
         """Assemble static-to-static tensor using exact physical shards."""
         shard_list = self._filter_shards_by_routing(
@@ -1642,7 +1647,7 @@ class SPMDWorker:
         op_name: str,
         tuuid: int,
         step: int,
-        shards: Dict[Any, List[TransportTensor]],
+        shards: dict[Any, list[TransportTensor]],
         input_layout: "PhysicalLayout",
     ) -> TransportTensor:
         backend = get_backend()
@@ -1674,9 +1679,9 @@ class SPMDWorker:
         op_name: str,
         tuuid: int,
         step: int,
-        shards: Dict[Any, List["TransportTensor"]],
+        shards: dict[Any, list["TransportTensor"]],
         input_layout: "PhysicalLayout",
-        predecessor_topology: Dict[str, Any],
+        predecessor_topology: dict[str, Any],
     ) -> "TransportTensor":
         """Assemble dynamic-to-static (Sparse-to-Dense) tensor using origin_indices."""
         backend = get_backend()
@@ -1716,7 +1721,7 @@ class SPMDWorker:
         all_receipt = self._maybe_merge_receipts(valid_shards)
 
         routing_dim = getattr(input_layout, "routing_dim", 0)
-        if isinstance(routing_dim, (list, tuple)):
+        if isinstance(routing_dim, list | tuple):
             routing_dim = routing_dim[0]
 
         all_values = backend.cat(
@@ -1809,8 +1814,8 @@ class SPMDWorker:
         op_name: str,
         tuuid: int,
         step: int,
-        shards: Dict[Any, List["TransportTensor"]],
-        predecessor_topology: Dict[str, Any],
+        shards: dict[Any, list["TransportTensor"]],
+        predecessor_topology: dict[str, Any],
     ) -> "TransportTensor":
         """
         Assemble to-dynamic (Sparse/Dense -> Sparse) tensor by merging shards.
@@ -1926,7 +1931,7 @@ class SPMDWorker:
             origin_indices=merged_origin_indices,
         )
 
-    async def _advance_step(self, op_name: str, result: Any = "not_none") -> None:
+    async def _advance_step(self, op_name: str, result: ExecutionResult) -> None:
         """
         Advance session progress after completing a step.
         Explicitly differentiates between Count (Progress Watermark) and Index (Task Sequence).
@@ -1953,7 +1958,9 @@ class SPMDWorker:
                     f"spmd_id={self.spmd_id} rank={self.rank}"
                 )
                 # Max steps reached, do NOT enqueue next task.
-            elif result is not None or result is SKIPPED:
+            elif (
+                result.status is not ExecutionStatus.SUCCESS or result.data is not None
+            ):
                 # Wait if paused by backpressure
                 if op_name in self._source_pause_events:
                     await self._source_pause_events[op_name].wait()
@@ -2015,9 +2022,14 @@ class SPMDWorker:
     # Data Sending
     # =========================================================================
 
-    async def _send_output(self, op_name: str, result: Any, *, exec_step: int) -> None:
+    async def _send_output(
+        self, op_name: str, result: ExecutionResult, *, exec_step: int
+    ) -> None:
         """Send output to successor SPMDs using TransportTensor."""
-        if result is None or result is SKIPPED:
+        if result.status in (
+            ExecutionStatus.SKIPPED,
+            ExecutionStatus.EMPTY_PROPAGATION,
+        ) or (result.status is ExecutionStatus.SUCCESS and result.data is None):
             # If the result is None (e.g., end of stream or no data Produced),
             # we must propagate empty packets to all successors to prevent deadlocks.
             await self._propagate_empty_packets(op_name, exec_step)
@@ -2027,7 +2039,7 @@ class SPMDWorker:
         # Flatten the result using guided tree_flatten
         meta = self._op_manager.get_operator_metadata(op_name)
         flat_results, treedef = tree_flatten(
-            result, treedef_template=meta.output_treedef if meta else None
+            result.data, treedef_template=meta.output_treedef if meta else None
         )
 
         if exec_step not in self._step_tuuid_cache:
@@ -2226,9 +2238,9 @@ class SPMDWorker:
                 tuuids: list,
                 tensors: list,
                 counts: list,
-                global_shapes_list: Optional[list] = None,
-                hash_meta_tensor_state_list: Optional[list] = None,
-                slice_compact_desc_params: Optional[list] = None,
+                global_shapes_list: list | None = None,
+                hash_meta_tensor_state_list: list | None = None,
+                slice_compact_desc_params: list | None = None,
                 *,
                 _handlers=handlers,
                 _step=output_step,
@@ -2304,7 +2316,7 @@ class SPMDWorker:
                                 f"target_spmd_id={spmd_id} spmd_id={self.spmd_id} rank={self.rank}"
                             )
 
-    def _reconstruct_data_type_from_dict(self, cls: Type, data: Dict[str, Any]) -> Any:
+    def _reconstruct_data_type_from_dict(self, cls: type, data: dict[str, Any]) -> Any:
         """Reconstruct a @data_type or dataclass from a nested dictionary of fields."""
         from fluxway.common.decorators import _is_fluxway_data_type
 
@@ -2330,10 +2342,10 @@ class SPMDWorker:
         return cls(**kwargs)
 
     def _extract_control_arguments(
-        self, data: Any, state_names: List[str]
-    ) -> Dict[str, Any]:
+        self, data: Any, state_names: list[str]
+    ) -> dict[str, Any]:
         """Extract named control argument values from operator output data."""
-        args: Dict[str, Any] = {}
+        args: dict[str, Any] = {}
 
         for name in state_names:
             val = getattr(data, name, None)
@@ -2355,7 +2367,7 @@ class SPMDWorker:
         """Set a static argument value."""
         self._op_manager.set_static_arg(name, value)
 
-    def get_static_arg(self, name: str) -> Optional[Any]:
+    def get_static_arg(self, name: str) -> Any | None:
         """Get a static argument value."""
         return self._op_manager.get_static_arg(name)
 
@@ -2522,7 +2534,7 @@ class SPMDWorker:
             full_ratio=full_ratio,
         )
 
-    def _collect_telemetry(self) -> Optional[WorkerTelemetry]:
+    def _collect_telemetry(self) -> WorkerTelemetry | None:
         """Collect worker telemetry data."""
         # Placeholder - implement actual telemetry collection
         return WorkerTelemetry(worker_id=f"{self.spmd_id}_{self.rank}")
@@ -2531,7 +2543,7 @@ class SPMDWorker:
     # State Persistence (checkpoint I/O)
     # =========================================================================
 
-    async def save_state_to_disk(self, ckpt_dir: str, step: int) -> Dict[str, Any]:
+    async def save_state_to_disk(self, ckpt_dir: str, step: int) -> dict[str, Any]:
         """
         Persist this worker's state to disk and return lightweight path metadata.
 
@@ -2573,7 +2585,7 @@ class SPMDWorker:
         )
         return metadata
 
-    async def load_state_from_disk(self, metadata: Dict[str, Any]) -> None:
+    async def load_state_from_disk(self, metadata: dict[str, Any]) -> None:
         """Restore this worker's state from disk using previously returned path metadata."""
         if "completed_step_count" not in metadata:
             raise RuntimeError(
@@ -2614,10 +2626,10 @@ class SPMDWorker:
             self._call_operator_restore_state(state["operator_states"], ckpt_dir)
         logger.debug(f"State loaded from disk spmd_id={self.spmd_id} rank={self.rank}")
 
-    def _call_operator_save_state(self, ckpt_dir: str) -> Dict[str, Any]:
+    def _call_operator_save_state(self, ckpt_dir: str) -> dict[str, Any]:
         """Call save_state() on each operator instance and collect results."""
         seen_cls_ids: set = set()
-        states: Dict[str, Any] = {}
+        states: dict[str, Any] = {}
         storage, lock = get_instance_storage()
         for op_name, op_meta in (self.config.operator_metas or {}).items():
             if not op_meta.owner_class_qualname:
@@ -2640,7 +2652,7 @@ class SPMDWorker:
         return states
 
     def _call_operator_restore_state(
-        self, operator_states: Dict[str, Any], ckpt_dir: str
+        self, operator_states: dict[str, Any], ckpt_dir: str
     ) -> None:
         """Call restore_state() on each operator instance with its persisted state."""
         storage, lock = get_instance_storage()

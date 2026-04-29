@@ -8,7 +8,6 @@ the persistence mechanism (like Checkpointing).
 
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Optional
 
 
 class DrainMode(str, Enum):
@@ -22,12 +21,12 @@ class DrainStrategy(ABC):
     """
 
     @abstractmethod
-    def get_initial_drain_target(self, baseline: int = 0) -> Optional[int]:
+    def get_initial_drain_target(self, baseline: int = 0) -> int | None:
         """Get the step target for the very first drain ceiling."""
         pass
 
     @abstractmethod
-    def get_next_drain_target(self, current_completed_step: int) -> Optional[int]:
+    def get_next_drain_target(self, current_completed_step: int) -> int | None:
         """Given the current completed step, calculate the next drain target."""
         pass
 
@@ -42,10 +41,10 @@ class GraphModeDrainStrategy(DrainStrategy):
             raise ValueError(f"interval_steps must be >= 1, got {interval_steps}")
         self.interval_steps = interval_steps
 
-    def get_initial_drain_target(self, baseline: int = 0) -> Optional[int]:
+    def get_initial_drain_target(self, baseline: int = 0) -> int | None:
         return baseline + self.interval_steps
 
-    def get_next_drain_target(self, current_completed_step: int) -> Optional[int]:
+    def get_next_drain_target(self, current_completed_step: int) -> int | None:
         return current_completed_step + self.interval_steps
 
 
@@ -58,8 +57,8 @@ class EagerModeDrainStrategy(DrainStrategy):
     def __init__(self):
         pass
 
-    def get_initial_drain_target(self, baseline: int = 0) -> Optional[int]:
+    def get_initial_drain_target(self, baseline: int = 0) -> int | None:
         raise NotImplementedError("Eager mode drain is not yet implemented")
 
-    def get_next_drain_target(self, current_completed_step: int) -> Optional[int]:
+    def get_next_drain_target(self, current_completed_step: int) -> int | None:
         raise NotImplementedError("Eager mode drain is not yet implemented")

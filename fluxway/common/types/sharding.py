@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import enum
 import logging
-from typing import Any, Callable, List, Optional, Tuple, Union, Dict
+from typing import Any
+from collections.abc import Callable
 from pydantic import Field, model_validator
 
 from fluxway.common.backend import get_backend
@@ -72,10 +73,10 @@ class AlgebraicRouting(Routing):
 
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
-    strategy: "PartitionStrategy"
-    partition: "PartitionSpec"
-    routing_dim: Union[int, Tuple[int, ...]] = 0
-    index_descriptor: Optional[IndexDescriptor] = None
+    strategy: PartitionStrategy
+    partition: PartitionSpec
+    routing_dim: int | tuple[int, ...] = 0
+    index_descriptor: IndexDescriptor | None = None
 
     @property
     def is_static(self) -> bool:
@@ -92,18 +93,18 @@ class ReferentialRouting(Routing):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
     path: str
-    tuuid: Optional[int] = None
+    tuuid: int | None = None
     # Map: Target Dimension -> Source Dimension
-    dim_map: Dict[int, int] = Field(default_factory=lambda: {0: 0})
+    dim_map: dict[int, int] = Field(default_factory=lambda: {0: 0})
     # To be populated during topology resolution phase to avoid late-binding logic in the Hot Path.
-    _resolved_routing: Optional[AlgebraicRouting] = None
+    _resolved_routing: AlgebraicRouting | None = None
 
     @property
     def is_referential(self) -> bool:
         return True
 
     @property
-    def routing_dim(self) -> Union[int, Tuple[int, ...]]:
+    def routing_dim(self) -> int | tuple[int, ...]:
         if self._resolved_routing:
             return self._resolved_routing.routing_dim
         raise RuntimeError(
@@ -113,7 +114,7 @@ class ReferentialRouting(Routing):
         )
 
     @property
-    def strategy(self) -> "PartitionStrategy":
+    def strategy(self) -> PartitionStrategy:
         if self._resolved_routing:
             return self._resolved_routing.strategy
         raise RuntimeError(
@@ -122,14 +123,14 @@ class ReferentialRouting(Routing):
         )
 
     @property
-    def partition(self) -> "PartitionSpec":
+    def partition(self) -> PartitionSpec:
         if self._resolved_routing:
             return self._resolved_routing.partition
         raise RuntimeError(
             f"[Fluxway Referential Error] Partition accessed on unresolved path '{self.path}'."
         )
 
-    def resolve(self, resolver_fn: Callable[[str], Optional[int]]) -> None:
+    def resolve(self, resolver_fn: Callable[[str], int | None]) -> None:
         """Resolve the logical path to a physical TUUID."""
         if self.tuuid is None:
             object.__setattr__(self, "tuuid", resolver_fn(self.path))
@@ -153,19 +154,17 @@ class PartitionSpec(FluxwayBaseSchema):
 
     model_config = ConfigDict(frozen=True)
 
-    specs: Tuple[Optional[Union[str, Tuple[str, ...]]], ...] = Field(
-        default_factory=tuple
-    )
+    specs: tuple[str | tuple[str, ...] | None, ...] = Field(default_factory=tuple)
 
-    def __init__(self, *specs: Optional[Union[str, Tuple[str, ...]]]):
-        if len(specs) == 1 and isinstance(specs[0], (list, tuple)) and not specs[0]:
+    def __init__(self, *specs: str | tuple[str, ...] | None):
+        if len(specs) == 1 and isinstance(specs[0], list | tuple) and not specs[0]:
             super().__init__(specs=())
         else:
             super().__init__(specs=specs)
 
     @property
-    def partitions(self) -> Dict[int, Tuple[str, ...]]:
-        result: Dict[int, Tuple[str, ...]] = {}
+    def partitions(self) -> dict[int, tuple[str, ...]]:
+        result: dict[int, tuple[str, ...]] = {}
         for i, s in enumerate(self.specs):
             if s is not None:
                 if isinstance(s, str):
@@ -195,10 +194,10 @@ class ShardingConfig(FluxwayBaseSchema):
     model_config = ConfigDict(populate_by_name=True)
 
     sharding_type: str = Field(default="static", alias="type")
-    axis: List[str] = Field(default_factory=list)
-    fn: Optional[str] = None
-    routing_dim: Union[int, Tuple[int, ...]] = 0
-    reference: Optional[str] = None
+    axis: list[str] = Field(default_factory=list)
+    fn: str | None = None
+    routing_dim: int | tuple[int, ...] = 0
+    reference: str | None = None
 
     def bind(self, mesh: DeviceMesh) -> PhysicalLayout:
         """Binds the sharding config to a physical mesh, producing a PhysicalLayout."""
@@ -283,7 +282,7 @@ class PartitionStrategy(FluxwayBaseSchema):
         indices: Any,
         dim_size: int,
         num_workers: int,
-        index_desc: Optional[IndexDescriptor] = None,
+        index_desc: IndexDescriptor | None = None,
     ) -> Any:
         raise NotImplementedError
 
@@ -296,7 +295,7 @@ class PartitionStrategy(FluxwayBaseSchema):
         indices: Any,
         dim_size: int,
         num_workers: int,
-        index_desc: Optional[IndexDescriptor] = None,
+        index_desc: IndexDescriptor | None = None,
     ) -> Any:
         """Determines rank assignments for given indices."""
         return self(indices, dim_size, num_workers, index_desc)
@@ -306,8 +305,8 @@ class PartitionStrategy(FluxwayBaseSchema):
         rank: int,
         world_size: int,
         dim_size: int,
-        index_desc: Optional[IndexDescriptor] = None,
-    ) -> Tuple[Optional[int], Optional[int]]:
+        index_desc: IndexDescriptor | None = None,
+    ) -> tuple[int | None, int | None]:
         """Returns (start, end) bounds of the global indices held by this rank.
         Default: covers the entire [0, dim_size).
         """
@@ -320,7 +319,7 @@ class PartitionStrategy(FluxwayBaseSchema):
         dst_rank: int,
         dst_world_size: int,
         dim_size: int,
-        dst_strategy: "PartitionStrategy",
+        dst_strategy: PartitionStrategy,
     ) -> bool:
         """Topological test: does this rank have common indices with dst_rank?
         Determines if a 'link' (communication channel) should exist between them.
@@ -492,13 +491,13 @@ class ShardingSpec(FluxwayBaseSchema):
 
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
-    routing: Union[AlgebraicRouting, ReferentialRouting]
+    routing: AlgebraicRouting | ReferentialRouting
 
-    def __init__(self, routing: Union[AlgebraicRouting, ReferentialRouting], **kwargs):
+    def __init__(self, routing: AlgebraicRouting | ReferentialRouting, **kwargs):
         super().__init__(routing=routing, **kwargs)
 
     @property
-    def strategy(self) -> "PartitionStrategy":
+    def strategy(self) -> PartitionStrategy:
         if isinstance(self.routing, AlgebraicRouting):
             return self.routing.strategy
         if self.routing._resolved_routing:
@@ -510,7 +509,7 @@ class ShardingSpec(FluxwayBaseSchema):
         )
 
     @property
-    def partition(self) -> "PartitionSpec":
+    def partition(self) -> PartitionSpec:
         if isinstance(self.routing, AlgebraicRouting):
             return self.routing.partition
         if self.routing._resolved_routing:
@@ -521,7 +520,7 @@ class ShardingSpec(FluxwayBaseSchema):
         )
 
     @property
-    def routing_dim(self) -> Union[int, Tuple[int, ...]]:
+    def routing_dim(self) -> int | tuple[int, ...]:
         if isinstance(self.routing, AlgebraicRouting):
             return self.routing.routing_dim
         if self.routing._resolved_routing:
@@ -532,12 +531,12 @@ class ShardingSpec(FluxwayBaseSchema):
         )
 
     @property
-    def index_descriptor(self) -> Optional["IndexDescriptor"]:
+    def index_descriptor(self) -> IndexDescriptor | None:
         if isinstance(self.routing, AlgebraicRouting):
             return self.routing.index_descriptor
         return None
 
-    def bind(self, mesh: DeviceMesh) -> "PhysicalLayout":
+    def bind(self, mesh: DeviceMesh) -> PhysicalLayout:
         """Bind this logical routing to a physical mesh to create a layout."""
         return PhysicalLayout(spec=self, mesh=mesh)
 
@@ -566,7 +565,7 @@ class ShardingSpec(FluxwayBaseSchema):
         """Returns True if the routing is rank-based (Algebraic STATIC)."""
         return self.routing.is_static
 
-    def resolve(self, resolver_fn: Callable[[str], Optional[int]]) -> None:
+    def resolve(self, resolver_fn: Callable[[str], int | None]) -> None:
         """Resolve the logical path to a physical TUUID."""
         if hasattr(self.routing, "resolve"):
             self.routing.resolve(resolver_fn)
@@ -618,8 +617,8 @@ class ShardingSpec(FluxwayBaseSchema):
 
     @staticmethod
     def follow(
-        reference_path: str, dim_map: Optional[Dict[int, int]] = None
-    ) -> "ShardingSpec":
+        reference_path: str, dim_map: dict[int, int] | None = None
+    ) -> ShardingSpec:
         if not isinstance(reference_path, str):
             raise TypeError(
                 f"ShardingSpec.follow() expects a string path (e.g., 'train_step.embedding.weight'), "
@@ -633,11 +632,11 @@ class ShardingSpec(FluxwayBaseSchema):
 
     @staticmethod
     def derive_from(
-        driver_spec: "PhysicalLayout",
-        driver_data_shape: Optional[Tuple[int, ...]] = None,
+        driver_spec: PhysicalLayout,
+        driver_data_shape: tuple[int, ...] | None = None,
         driver_index_desc: Any = None,
         follow_dim: int = 0,
-    ) -> "ShardingSpec":
+    ) -> ShardingSpec:
         """One-liner for routing_indices distribution. Follows the same strategy but for a different tensor."""
         return ShardingSpec(
             routing=AlgebraicRouting(
@@ -662,11 +661,11 @@ class PhysicalLayout(FluxwayBaseSchema):
     spec: ShardingSpec
     mesh: DeviceMesh
 
-    replica_axes: Optional[Tuple[str, ...]] = Field(default=None)
+    replica_axes: tuple[str, ...] | None = Field(default=None)
     replica_size: int = Field(default=1)
 
     @property
-    def partitions(self) -> Dict[int, Tuple[str, ...]]:
+    def partitions(self) -> dict[int, tuple[str, ...]]:
         return self.spec.partitions
 
     @property
@@ -682,26 +681,26 @@ class PhysicalLayout(FluxwayBaseSchema):
         return self.spec.is_static
 
     @property
-    def routing(self) -> Union[AlgebraicRouting, ReferentialRouting]:
+    def routing(self) -> AlgebraicRouting | ReferentialRouting:
         return self.spec.routing
 
     @property
-    def strategy(self) -> "PartitionStrategy":
+    def strategy(self) -> PartitionStrategy:
         return self.spec.strategy
 
     @property
-    def routing_dim(self) -> Union[int, Tuple[int, ...]]:
+    def routing_dim(self) -> int | tuple[int, ...]:
         return self.spec.routing_dim
 
     @property
-    def index_descriptor(self) -> Optional["IndexDescriptor"]:
+    def index_descriptor(self) -> IndexDescriptor | None:
         return self.spec.index_descriptor
 
     def __init__(self, spec: ShardingSpec, mesh: DeviceMesh, **kwargs):
         super().__init__(spec=spec, mesh=mesh, **kwargs)
 
     @model_validator(mode="after")
-    def _compute_replica_info(self) -> "PhysicalLayout":
+    def _compute_replica_info(self) -> PhysicalLayout:
         if self.spec.is_referential:
             return self
 
@@ -748,7 +747,7 @@ class PhysicalLayout(FluxwayBaseSchema):
             return 0
         return _ravel_multi_index(sub_coords, sub_sizes)
 
-    def get_logical_identity(self, physical_rank: int) -> Tuple[int, ...]:
+    def get_logical_identity(self, physical_rank: int) -> tuple[int, ...]:
         """Returns a tuple that uniquely identifies the logical shard (fragment)."""
         if self.spec.is_dynamic:
             return (physical_rank,)
@@ -769,9 +768,9 @@ class PhysicalLayout(FluxwayBaseSchema):
     def get_shard_shape(
         self,
         rank: int,
-        data_shape: Tuple[int, ...],
-        index_desc: Optional[IndexDescriptor] = None,
-    ) -> Tuple[int, ...]:
+        data_shape: tuple[int, ...],
+        index_desc: IndexDescriptor | None = None,
+    ) -> tuple[int, ...]:
         """Returns the shape of the local shard for a given rank."""
         backend = get_backend()
         result = []
@@ -786,9 +785,9 @@ class PhysicalLayout(FluxwayBaseSchema):
         self,
         rank: int,
         dim: int,
-        data_shape: Tuple[int, ...],
-        index_desc: Optional[IndexDescriptor] = None,
-    ) -> Tuple[int, int]:
+        data_shape: tuple[int, ...],
+        index_desc: IndexDescriptor | None = None,
+    ) -> tuple[int, int]:
         """Returns the (start, end) index bounds for a given dimension and rank."""
         world_size = self.shard_size(dim)
         dim_size = data_shape[dim] if data_shape and dim < len(data_shape) else 0
@@ -824,8 +823,8 @@ class PhysicalLayout(FluxwayBaseSchema):
         self,
         rank: int,
         dim: int,
-        dim_size: Optional[int] = None,
-        index_desc: Optional[IndexDescriptor] = None,
+        dim_size: int | None = None,
+        index_desc: IndexDescriptor | None = None,
     ) -> Any:
         """Returns the global indices held by this rank along a specific dimension."""
         backend = get_backend()
@@ -889,10 +888,10 @@ class PhysicalLayout(FluxwayBaseSchema):
             nz = backend.nonzero(mask, size=dim_size, fill_value=-1)
         else:
             nz = backend.nonzero(mask)
-        idx = nz[0] if isinstance(nz, (list, tuple)) else nz
+        idx = nz[0] if isinstance(nz, list | tuple) else nz
         return backend.reshape(idx, (-1,))
 
-    def infer_global_shape(self, local_shape: Tuple[int, ...]) -> Tuple[int, ...]:
+    def infer_global_shape(self, local_shape: tuple[int, ...]) -> tuple[int, ...]:
         if self.spec.is_dynamic:
             return local_shape
 
@@ -912,8 +911,8 @@ class PhysicalLayout(FluxwayBaseSchema):
         return tuple(inferred)
 
     def resolve_producers(
-        self, target_layout: "PhysicalLayout", target_rank: int, dim: int = 0
-    ) -> List[int]:
+        self, target_layout: PhysicalLayout, target_rank: int, dim: int = 0
+    ) -> list[int]:
         """
         Determine which source ranks produce data that overlaps with target_rank's shard.
         Based on the Unified Mathematical Model: S_src(r_s) INTERSECT S_dst(r_d) != EMPTY
@@ -951,8 +950,8 @@ class PhysicalLayout(FluxwayBaseSchema):
         return list(range(source_world))
 
     def resolve_consumers(
-        self, target_layout: "PhysicalLayout", source_rank: int, dim: int = 0
-    ) -> List[int]:
+        self, target_layout: PhysicalLayout, source_rank: int, dim: int = 0
+    ) -> list[int]:
         """
         Determine which target ranks consume data produced by source_rank's shard.
         """
@@ -1007,7 +1006,7 @@ class PhysicalLayout(FluxwayBaseSchema):
     @staticmethod
     def derive_from(
         reference_path: str, source_dim: int = 0, target_dim: int = 0
-    ) -> "ShardingSpec":
+    ) -> ShardingSpec:
         """Specialized follow for derived tensors like routing_indices."""
         return ShardingSpec.follow(
             reference_path=reference_path, dim_map={target_dim: source_dim}

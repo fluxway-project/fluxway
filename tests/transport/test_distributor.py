@@ -1,6 +1,6 @@
 import pytest
 
-from typing import List, Dict, Any, Optional
+from typing import Any
 
 from fluxway.common.types.tensor import TransportTensor
 from fluxway.common.types.sharding import ShardingSpec, P
@@ -27,14 +27,14 @@ class VirtualRank:
         self.distributor = DataDistributor(rank)
         # Using the new unified receiver
         self.receiver = TransportReceiver(wait_for_n_slices=0)
-        self.data_store: Dict[str, Any] = {}
+        self.data_store: dict[str, Any] = {}
 
     def send(
         self,
-        target_ranks: List[int],
-        tensors: List[Any],
-        counts: List[int],
-        cluster_receivers: Dict[int, "VirtualRank"],
+        target_ranks: list[int],
+        tensors: list[Any],
+        counts: list[int],
+        cluster_receivers: dict[int, "VirtualRank"],
     ):
         """Simulates network payload transmission to target ranks via direct memory delivery."""
         for target_rank in target_ranks:
@@ -44,7 +44,7 @@ class VirtualRank:
                     self.rank, tensors, counts
                 )
 
-    def process_incoming(self) -> List[Any]:
+    def process_incoming(self) -> list[Any]:
         """Extracts and consumes the buffered payloads received over the mock network."""
         return self.receiver.get_buffered_slices()
 
@@ -676,9 +676,9 @@ def test_colocation_dispatch():
         tuuids: list,
         tensors: list,
         counts: list,
-        global_shapes_list: Optional[list] = None,
-        meta_tensor_state_list: Optional[list] = None,
-        compact_params_list: Optional[list] = None,
+        global_shapes_list: list | None = None,
+        meta_tensor_state_list: list | None = None,
+        compact_params_list: list | None = None,
     ):
         received_payloads.append((target, tensors, counts))
         return True
@@ -718,15 +718,7 @@ def test_reconstruct_splits_from_lengths():
 
     # And the corresponding flat element buffer:
     received_data_flat = bk.tensor(
-        [
-            1.0,
-            1.0,  # seq 0
-            2.0,
-            2.0,
-            2.0,
-            2.0,  # seq 1
-            3.0,
-        ],  # seq 2
+        [1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 3.0],  # seq 0  # seq 1  # seq 2
         dtype=bk.float32(),
     )
 

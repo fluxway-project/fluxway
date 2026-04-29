@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional, Tuple, Union
+from typing import Any
+from collections.abc import Callable
 import logging
 
 import numpy as np
@@ -71,14 +72,14 @@ class TransportPlanner:
     @staticmethod
     def compute_plan(
         src_local_rank: int,
-        src_data_shape: Tuple[int, ...],
+        src_data_shape: tuple[int, ...],
         src_spec: PhysicalLayout,
         dst_spec: PhysicalLayout,
-        src_index_desc: Optional[Any] = None,
-        dst_index_desc: Optional[Any] = None,
-        src_routing_shard_resolver: Optional[Callable[[int, int], Any]] = None,
-        src_routing_indices: Optional[Any] = None,
-        src_routing_based_values: Optional[Any] = None,
+        src_index_desc: Any | None = None,
+        dst_index_desc: Any | None = None,
+        src_routing_shard_resolver: Callable[[int, int], Any] | None = None,
+        src_routing_indices: Any | None = None,
+        src_routing_based_values: Any | None = None,
     ) -> TransportPlan:
         """Diff(L_src, L_dst) using physical layouts."""
         # N-D Native logic extracts the correct dimensionalities implicitly.
@@ -138,19 +139,19 @@ class TransportPlanner:
     @staticmethod
     def _compute_plan_internal(
         src_local_rank: int,
-        src_data_shape: Tuple[int, ...],
-        src_routing_indices: Optional[Any],
-        src_routing_based_values: Optional[Any],
+        src_data_shape: tuple[int, ...],
+        src_routing_indices: Any | None,
+        src_routing_based_values: Any | None,
         dst_index_desc: Any,
-        dst_routing_dim: Optional[Union[int, Tuple[int, ...]]],
-        dst_strategy: Optional[Callable],
-        dst_mesh: Optional[Any],
-        dst_partitions: Optional[dict],
-        dst_replica_axes: Optional[Any],
+        dst_routing_dim: int | tuple[int, ...] | None,
+        dst_strategy: Callable | None,
+        dst_mesh: Any | None,
+        dst_partitions: dict | None,
+        dst_replica_axes: Any | None,
         dst_replica_size: int,
-        src_spec: Optional[Any] = None,
-        src_index_desc: Optional[Any] = None,
-    ) -> Tuple[Any, Any, Any, int, int]:
+        src_spec: Any | None = None,
+        src_index_desc: Any | None = None,
+    ) -> tuple[Any, Any, Any, int, int]:
         """Internal static logical core for JIT compilation."""
         backend = get_backend()
 
@@ -203,9 +204,7 @@ class TransportPlanner:
         global_shape = src_data_shape
         ndim = len(global_shape)
 
-        mesh_coords: List[Optional[Any]] = (
-            [None] * len(dst_mesh.shape) if dst_mesh else []
-        )
+        mesh_coords: list[Any | None] = [None] * len(dst_mesh.shape) if dst_mesh else []
         combined_valid_mask = backend.ones((1,), dtype=backend.int32())
 
         from fluxway.common.types.sharding import ChunkPartition
@@ -372,7 +371,7 @@ class TransportPlanner:
         src_local_rank: int,
         src_spec: PhysicalLayout,
         dst_spec: PhysicalLayout,
-        src_data_shape: Tuple[int, ...],
+        src_data_shape: tuple[int, ...],
         src_index_desc: Any = None,
         dst_index_desc: Any = None,
     ) -> TransportPlan:
@@ -393,7 +392,7 @@ class TransportPlanner:
 
 
 def _bincount(
-    backend, tensor: Any, weights: Optional[Any] = None, minlength: int = 0
+    backend, tensor: Any, weights: Any | None = None, minlength: int = 0
 ) -> Any:
     """Cross-backend bincount."""
     return backend.bincount(tensor, weights=weights, minlength=minlength)

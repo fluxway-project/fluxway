@@ -15,8 +15,6 @@ Telemetry information:
 - Node eviction and recovery history
 """
 
-from typing import Dict, Optional
-
 from fluxway.common.types import WorkerTelemetry
 
 
@@ -28,13 +26,13 @@ class Monitor:
     """
 
     def __init__(self):
-        self._telemetry: Dict[str, Dict[str, WorkerTelemetry]] = (
+        self._telemetry: dict[str, dict[str, WorkerTelemetry]] = (
             {}
         )  # spmd_id -> worker_id -> telemetry
-        self._spmd_status: Dict[str, str] = {}  # spmd_id -> status
+        self._spmd_status: dict[str, str] = {}  # spmd_id -> status
 
     def report_telemetry(
-        self, spmd_id: str, telemetry: Dict[str, WorkerTelemetry]
+        self, spmd_id: str, telemetry: dict[str, WorkerTelemetry]
     ) -> None:
         """
         Report telemetry to metric service.
@@ -48,7 +46,7 @@ class Monitor:
         """
         pass
 
-    def get_spmd_telemetry(self, spmd_id: str) -> Dict[str, WorkerTelemetry]:
+    def get_spmd_telemetry(self, spmd_id: str) -> dict[str, WorkerTelemetry]:
         """
         Query SPMD telemetry.
 
@@ -64,7 +62,7 @@ class Monitor:
 
     def get_worker_telemetry(
         self, spmd_id: str, worker_id: str
-    ) -> Optional[WorkerTelemetry]:
+    ) -> WorkerTelemetry | None:
         """
         Query single worker telemetry.
 
@@ -72,7 +70,7 @@ class Monitor:
         """
         pass
 
-    def get_cluster_health(self) -> Dict[str, str]:
+    def get_cluster_health(self) -> dict[str, str]:
         """
         Get overall cluster health status.
 

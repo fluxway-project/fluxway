@@ -4,19 +4,8 @@ Decorators for Fluxway framework.
 Provides @operator and @data_type decorators to manage metadata and transport.
 """
 
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    List,
-    Optional,
-    Type,
-    TypeVar,
-    Tuple,
-    Union,
-    get_type_hints,
-    Annotated,
-)
+from typing import Any, TypeVar, Union, get_type_hints, Annotated
+from collections.abc import Callable
 import functools
 import inspect
 import importlib
@@ -73,16 +62,16 @@ _operator_context = PicklableThreadLocal()
 # dict here is intentional: threading.local would hide the pre-instantiated entries
 # from the asyncio.to_thread() worker threads.
 _instance_storage_lock = _PicklableLock()
-_instance_storage: Dict[int, Any] = {}
+_instance_storage: dict[int, Any] = {}
 
 
-def get_instance_storage() -> Tuple[Dict[int, Any], Any]:
+def get_instance_storage() -> tuple[dict[int, Any], Any]:
     import fluxway.common.decorators as fd
 
     return fd._instance_storage, fd._instance_storage_lock
 
 
-def _resolve_owner_class(module_name: str, class_qualname: str) -> Type:
+def _resolve_owner_class(module_name: str, class_qualname: str) -> type:
     module = importlib.import_module(module_name)
     cls = module
     for part in class_qualname.split("."):
@@ -92,12 +81,12 @@ def _resolve_owner_class(module_name: str, class_qualname: str) -> Type:
 
 @contextmanager
 def operator_context(
-    static_args: Dict[str, Any],
+    static_args: dict[str, Any],
     rank: int,
     world_size: int,
-    operator_ctx: Optional[Any] = None,
-    local_rank: Optional[int] = None,
-    local_world_size: Optional[int] = None,
+    operator_ctx: Any | None = None,
+    local_rank: int | None = None,
+    local_world_size: int | None = None,
     node_rank: int = 0,
     num_nodes: int = 1,
 ):
@@ -137,7 +126,7 @@ def get_current_context():
     return _operator_context
 
 
-def _get_fluxway_streams(tp: Any, prefix: str = "") -> Tuple[List[str], List[str]]:
+def _get_fluxway_streams(tp: Any, prefix: str = "") -> tuple[list[str], list[str]]:
     """
     Recursively extract Data (Worker-to-Worker) and Control (Driver-to-Driver) fields from a @data_type.
     Returns: (data_fields, control_fields) as flattened paths (e.g. 'active.user_id').
@@ -196,7 +185,7 @@ def _get_fluxway_streams(tp: Any, prefix: str = "") -> Tuple[List[str], List[str
 
 def _build_hierarchical_map(
     tp: Any, prefix: str = "", include_root: bool = False
-) -> Dict[str, List[str]]:
+) -> dict[str, list[str]]:
     """
     Recursively builds a map from every valid field path prefix to the list of
     flattened physical stream names it contains.
@@ -252,16 +241,16 @@ def _build_hierarchical_map(
 
 
 def operator(
-    name: Optional[Union[str, Callable]] = None,
-    input_sharding: Optional[Dict[str, Any]] = None,
-    output_sharding: Optional[Dict[str, Any]] = None,
-    control_argument: Optional[List[str]] = None,
-    data_argument: Optional[List[str]] = None,
-    static_argument: Optional[List[str]] = None,
-    periodic_barrier: Optional[int] = None,
+    name: str | Callable | None = None,
+    input_sharding: dict[str, Any] | None = None,
+    output_sharding: dict[str, Any] | None = None,
+    control_argument: list[str] | None = None,
+    data_argument: list[str] | None = None,
+    static_argument: list[str] | None = None,
+    periodic_barrier: int | None = None,
     max_inflight_steps: int = 0,
-    is_source: Optional[bool] = None,
-    barrier_config: Optional[Any] = None,
+    is_source: bool | None = None,
+    barrier_config: Any | None = None,
 ):
     """
     Mark a function as a Fluxway operator with automatic metadata inference.
@@ -285,7 +274,7 @@ def operator(
         )
 
     # At this point, name is either a str or None
-    name_str: Optional[str] = name
+    name_str: str | None = name
 
     def decorator(func: Callable):
         return _create_operator_wrapper(
@@ -726,7 +715,7 @@ def data_type():
     """
     T = TypeVar("T")
 
-    def decorator(cls: Type[T]) -> Type[T]:
+    def decorator(cls: type[T]) -> type[T]:
         try:
             hints = get_type_hints(cls, include_extras=True)
         except Exception as e:
@@ -744,7 +733,7 @@ def data_type():
                 base_tp = tp.__args__[0]
 
             origin = getattr(base_tp, "__origin__", base_tp)
-            if origin is dict or origin is Dict:
+            if origin is dict or origin is dict:
                 raise TypeError(
                     f"Fluxway Data Error: Class '{cls.__name__}' field '{name}' uses 'dict', which is not supported.\n"
                     f"Fix: Use a @data_type decorated dataclass instead of a dictionary."
@@ -766,10 +755,10 @@ def data_type():
 
 
 def spmd(
-    resource: Optional[Dict[str, Any]] = None,
-    runtime_env: Optional[Dict[str, Any]] = None,
-    mesh_axis_names: Optional[Tuple[str, ...]] = None,
-    mesh_axis_shapes: Optional[Tuple[int, ...]] = None,
+    resource: dict[str, Any] | None = None,
+    runtime_env: dict[str, Any] | None = None,
+    mesh_axis_names: tuple[str, ...] | None = None,
+    mesh_axis_shapes: tuple[int, ...] | None = None,
 ):
     """
     Configure a class for SPMD distributed execution.
@@ -798,7 +787,7 @@ def spmd(
     if mesh_axis_names and mesh_axis_shapes:
         mesh = DeviceMesh(axis_names=mesh_axis_names, device_shape=mesh_axis_shapes)
 
-    def decorator(cls: Type[T]) -> Type[T]:
+    def decorator(cls: type[T]) -> type[T]:
         cls._resource = res_spec
         cls._mesh = mesh
         cls._runtime_env = runtime_env
@@ -841,8 +830,12 @@ def spmd(
                     operators[meta.name] = attr
                     metas[meta.name] = copy.deepcopy(meta)
 
-            return SPMDConfig(mesh=c._mesh, operators=operators, operator_metas=metas,
-                              runtime_env=c._runtime_env)
+            return SPMDConfig(
+                mesh=c._mesh,
+                operators=operators,
+                operator_metas=metas,
+                runtime_env=c._runtime_env,
+            )
 
         cls.get_spmd_config = classmethod(get_spmd_config)
         return cls
@@ -851,9 +844,9 @@ def spmd(
 
 
 def spmd_source(
-    resource: Optional[Dict[str, Any]] = None,
-    mesh_axis_names: Optional[Tuple[str, ...]] = None,
-    mesh_axis_shapes: Optional[Tuple[int, ...]] = None,
+    resource: dict[str, Any] | None = None,
+    mesh_axis_names: tuple[str, ...] | None = None,
+    mesh_axis_shapes: tuple[int, ...] | None = None,
     interleaved: bool = False,
     interleave_unit_size: int = 1,
 ):

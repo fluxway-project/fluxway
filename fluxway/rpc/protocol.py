@@ -4,7 +4,7 @@ Used for high-performance peer-to-peer data transmission (Tensors).
 Control plane operations (scheduling, heartbeats) still use native Ray.
 """
 
-from typing import Any, List, Optional, Tuple
+from typing import Any
 
 
 class DataPlaneCallable:
@@ -18,15 +18,15 @@ class DataPlaneCallable:
 
     async def receive_shards(
         self,
-        tuuids: List[int],
+        tuuids: list[int],
         step: int,
         sender_id: str,
         sender_rank: int,
-        payloads: List[Any],
-        counts: List[int],
-        global_shapes: Optional[List[Optional[Tuple[int, ...]]]] = None,
-        meta_tensor_state_list: Optional[List[int]] = None,
-        slice_compact_desc_params: Optional[List[Optional[List[int]]]] = None,
+        payloads: list[Any],
+        counts: list[int],
+        global_shapes: list[tuple[int, ...] | None] | None = None,
+        meta_tensor_state_list: list[int] | None = None,
+        slice_compact_desc_params: list[list[int] | None] | None = None,
     ) -> Any:
         """
         Data Plane: Primary method for tensor shard transmission.
@@ -44,7 +44,7 @@ class DataPlaneCallable:
         )
 
     async def receive_control(
-        self, op_name: str, step: int, names: List[str], values: List[Any]
+        self, op_name: str, step: int, names: list[str], values: list[Any]
     ) -> Any:
         """
         Data Plane: Method for state data transmission.

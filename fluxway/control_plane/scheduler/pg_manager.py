@@ -11,7 +11,7 @@ Responsibilities:
 - Support multi-bundle PG for driver + workers
 """
 
-from typing import Dict, List, Optional, Any
+from typing import Any
 import logging
 
 try:
@@ -50,15 +50,15 @@ class PGManager:
 
     def __init__(self):
         # SPMD ID → PlacementGroup mapping
-        self._spmd_to_pg: Dict[str, PlacementGroup] = {}
+        self._spmd_to_pg: dict[str, PlacementGroup] = {}
         # SPMD ID → ResourceSpec mapping (single worker resource)
-        self._spmd_to_resource: Dict[str, ResourceSpec] = {}
+        self._spmd_to_resource: dict[str, ResourceSpec] = {}
         # SPMD ID → ResourcePriority mapping
-        self._spmd_to_priority: Dict[str, ResourcePriority] = {}
+        self._spmd_to_priority: dict[str, ResourcePriority] = {}
         # SPMD ID → worker count mapping
-        self._spmd_to_num_workers: Dict[str, int] = {}
+        self._spmd_to_num_workers: dict[str, int] = {}
         # SPMD ID → driver resource mapping
-        self._spmd_to_driver_resource: Dict[str, DriverResourceSpec] = {}
+        self._spmd_to_driver_resource: dict[str, DriverResourceSpec] = {}
 
     async def create_pg(
         self,
@@ -67,8 +67,8 @@ class PGManager:
         priority: ResourcePriority = ResourcePriority.MID,
         strategy: PlacementStrategy = PlacementStrategy.PACK,
         num_workers: int = 1,
-        driver_resource: Optional[DriverResourceSpec] = None,
-    ) -> Optional[PlacementGroup]:
+        driver_resource: DriverResourceSpec | None = None,
+    ) -> PlacementGroup | None:
         """
         Create a Placement Group for an SPMD with driver and worker bundles.
 
@@ -136,7 +136,7 @@ class PGManager:
         """Get the bundle index for the driver (always 0)."""
         return 0
 
-    def get_worker_bundle_indices(self, spmd_id: str) -> List[int]:
+    def get_worker_bundle_indices(self, spmd_id: str) -> list[int]:
         """
         Get the bundle indices for workers.
 
@@ -150,11 +150,11 @@ class PGManager:
         """Get the worker count for an SPMD."""
         return self._spmd_to_num_workers.get(spmd_id, 1)
 
-    def get_pg(self, spmd_id: str) -> Optional[PlacementGroup]:
+    def get_pg(self, spmd_id: str) -> PlacementGroup | None:
         """Get the PlacementGroup for an SPMD."""
         return self._spmd_to_pg.get(spmd_id)
 
-    def get_resource(self, spmd_id: str) -> Optional[ResourceSpec]:
+    def get_resource(self, spmd_id: str) -> ResourceSpec | None:
         """Get the resource allocation for an SPMD."""
         return self._spmd_to_resource.get(spmd_id)
 
@@ -225,11 +225,11 @@ class PGManager:
         logger.warning(f"evict called for {spmd_id} - not implemented")
         return False
 
-    def get_all_spmd_ids(self) -> List[str]:
+    def get_all_spmd_ids(self) -> list[str]:
         """Get all SPMD IDs with allocated resources."""
         return list(self._spmd_to_resource.keys())
 
-    def get_preemptable_spmds(self, required_resource: ResourceSpec) -> List[str]:
+    def get_preemptable_spmds(self, required_resource: ResourceSpec) -> list[str]:
         """
         Get SPMDs that could be preempted to free resources.
 
@@ -263,9 +263,9 @@ class PGManager:
 
         return [spmd_id for spmd_id, _ in candidates]
 
-    def _resource_to_bundle(self, resource: ResourceSpec) -> Dict[str, float]:
+    def _resource_to_bundle(self, resource: ResourceSpec) -> dict[str, float]:
         """Convert ResourceSpec to Ray bundle specification."""
-        bundle: Dict[str, float] = {}
+        bundle: dict[str, float] = {}
 
         if resource.num_cpus > 0:
             bundle["CPU"] = float(resource.num_cpus)
@@ -280,9 +280,9 @@ class PGManager:
 
     def _driver_resource_to_bundle(
         self, resource: DriverResourceSpec
-    ) -> Dict[str, float]:
+    ) -> dict[str, float]:
         """Convert DriverResourceSpec to Ray bundle specification."""
-        bundle: Dict[str, float] = {}
+        bundle: dict[str, float] = {}
 
         if resource.num_cpus > 0:
             bundle["CPU"] = float(resource.num_cpus)
@@ -292,7 +292,7 @@ class PGManager:
 
         return bundle
 
-    def get_pg_info(self, spmd_id: str) -> Optional[Dict[str, Any]]:
+    def get_pg_info(self, spmd_id: str) -> dict[str, Any] | None:
         """
         Get detailed placement group info for an SPMD.
 
@@ -311,7 +311,7 @@ class PGManager:
             "driver_resource": self._spmd_to_driver_resource.get(spmd_id),
         }
 
-    def get_resource_allocation_summary(self, spmd_id: str) -> Optional[Dict[str, Any]]:
+    def get_resource_allocation_summary(self, spmd_id: str) -> dict[str, Any] | None:
         """Return a stable, human-readable resource summary for one SPMD."""
         worker_resource = self._spmd_to_resource.get(spmd_id)
         if worker_resource is None:
@@ -343,7 +343,7 @@ class PGManager:
             "placement_group_ready": spmd_id in self._spmd_to_pg,
         }
 
-    def get_all_resource_allocation_summaries(self) -> Dict[str, Dict[str, Any]]:
+    def get_all_resource_allocation_summaries(self) -> dict[str, dict[str, Any]]:
         """Return resource summaries for every allocated SPMD."""
         return {
             spmd_id: summary
@@ -351,7 +351,7 @@ class PGManager:
             if (summary := self.get_resource_allocation_summary(spmd_id)) is not None
         }
 
-    def _bundle_summary(self, bundle: Dict[str, float]) -> Dict[str, float]:
+    def _bundle_summary(self, bundle: dict[str, float]) -> dict[str, float]:
         """Normalize raw Ray bundle fields into a stable summary shape."""
         return {
             "cpu": bundle.get("CPU", 0.0),
