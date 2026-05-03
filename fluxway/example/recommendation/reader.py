@@ -64,7 +64,7 @@ class RecommendationReader(GrainReader):
             "labels": {"type": "static", "axis": ["worker"]},
         },
     )
-    def read(self) -> UserBatch | None:
+    def read(self) -> UserBatch:
         static_args = getattr(self, "static_args", {})
         batch_size = static_args.get("batch_size", 24)
 
@@ -88,7 +88,7 @@ class RecommendationReader(GrainReader):
         active = ActiveFeatures(
             user_id=TransportTensor.from_lists(
                 [s["user_id"] for s in samples],
-                dtype=jnp.int32,
+                dtype=jnp.int64,
                 global_shape=g_shape,
                 origin_indices=origins,
             ),
@@ -121,7 +121,7 @@ class RecommendationReader(GrainReader):
         passive = PassiveFeatures(
             target_item_id=TransportTensor.from_lists(
                 [s["target_item_id"] for s in samples],
-                dtype=jnp.int32,
+                dtype=jnp.int64,
                 global_shape=g_shape,
                 origin_indices=origins,
             ),

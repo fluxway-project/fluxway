@@ -1,7 +1,5 @@
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
-os.environ["JAX_PLATFORMS"] = "cpu"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 import asyncio
@@ -37,7 +35,14 @@ async def _print_resource_allocation_summary(controller):
 
 
 async def run_training(args):
-    runtime_env = {"env_vars": {"CUDA_VISIBLE_DEVICES": "", "JAX_PLATFORMS": "cpu"}}
+    cpu_runtime_env = {
+        "env_vars": {
+            "CUDA_VISIBLE_DEVICES": "",
+            "JAX_PLATFORMS": "cpu",
+            "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+        }
+    }
+    gpu_runtime_env = {"env_vars": {"XLA_PYTHON_CLIENT_PREALLOCATE": "false"}}
 
     r"""
             reader
@@ -52,23 +57,41 @@ async def run_training(args):
             dense
     """
 
-    reader_mesh = DeviceMesh(device_shape=(5,), axis_names=("worker",))
-    input_mesh = DeviceMesh(device_shape=(6,), axis_names=("dp",))
-    table1_mesh = DeviceMesh(device_shape=(3,), axis_names=("shard",))
-    table2_mesh = DeviceMesh(device_shape=(4,), axis_names=("shard",))
-    dense_mesh = DeviceMesh(device_shape=(6,), axis_names=("dp",))
+    reader_mesh = DeviceMesh(device_shape=(1,), axis_names=("worker",))
+    input_mesh = DeviceMesh(device_shape=(args.dp,), axis_names=("dp",))
+    table1_mesh = DeviceMesh(device_shape=(args.table1_shards,), axis_names=("shard",))
+    table2_mesh = DeviceMesh(device_shape=(args.table2_shards,), axis_names=("shard",))
+    dense_mesh = DeviceMesh(device_shape=(args.dp,), axis_names=("dp",))
 
     with FunctionalGraph("End-to-End_Training_Flow") as graph:
-        reader = RecommendationReader(name="TrainingReader", mesh=reader_mesh)
-        input_node = InputSPMD(name="InputProcessor", mesh=input_mesh)
+        reader = RecommendationReader(
+            name="TrainingReader", mesh=reader_mesh, runtime_env=cpu_runtime_env
+        )
+        input_node = InputSPMD(
+            name="InputProcessor", mesh=input_mesh, runtime_env=cpu_runtime_env
+        )
         table1 = SparseEmbeddingSPMD(
-            name="EmbeddingTable1", mesh=table1_mesh, vocab_size=2000, embed_dim=16
+            name="EmbeddingTable1",
+            mesh=table1_mesh,
+            vocab_size=2000,
+            embed_dim=16,
+            runtime_env=cpu_runtime_env,
         )
         table2 = SparseEmbeddingSPMD(
-            name="EmbeddingTable2", mesh=table2_mesh, vocab_size=2000, embed_dim=16
+            name="EmbeddingTable2",
+            mesh=table2_mesh,
+            vocab_size=2000,
+            embed_dim=16,
+            runtime_env=cpu_runtime_env,
         )
         dense = DenseSPMD(
-            name="DenseLayers", mesh=dense_mesh, embed_dim=16, dense_stats_dim=2
+            name="DenseLayers",
+            mesh=dense_mesh,
+            embed_dim=16,
+            dense_stats_dim=2,
+            coordinator_address=args.coordinator_address,
+            runtime_env=gpu_runtime_env,
+            resource={"num_gpus": 1},
         )
 
         h_raw = reader.read()
@@ -105,7 +128,6 @@ async def run_training(args):
         task_graph,
         async_step_config=async_step_config,
         checkpoint_config=checkpoint_config,
-        runtime_env=runtime_env,
     )
     await _print_resource_allocation_summary(controller)
 
@@ -135,6 +157,33 @@ def main():
         default=2,
         dest="checkpoint_interval",
         help="Save a checkpoint every N steps",
+    )
+    parser.add_argument(
+        "--dp",
+        type=int,
+        default=4,
+        help="Number of data-parallel ranks for DenseSPMD (one GPU per rank)",
+    )
+    parser.add_argument(
+        "--table1-shards",
+        type=int,
+        default=2,
+        dest="table1_shards",
+        help="Number of shards for EmbeddingTable1",
+    )
+    parser.add_argument(
+        "--table2-shards",
+        type=int,
+        default=2,
+        dest="table2_shards",
+        help="Number of shards for EmbeddingTable2",
+    )
+    parser.add_argument(
+        "--coordinator-address",
+        type=str,
+        default="127.0.0.1:29500",
+        dest="coordinator_address",
+        help="JAX distributed coordinator address for DenseSPMD",
     )
     asyncio.run(run_training(parser.parse_args()))
 

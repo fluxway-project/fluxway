@@ -1229,12 +1229,12 @@ class SPMDWorker:
 
             # Execute operator in a thread to avoid blocking the worker event loop
             if isinstance(input_data, dict):
-                op_result = await asyncio.to_thread(
-                    self._op_manager.execute, op_name, step, **input_data
+                op_result = await self._op_manager.execute_async(
+                    op_name, step, **input_data
                 )
             else:
-                op_result = await asyncio.to_thread(
-                    self._op_manager.execute, op_name, step, input_data
+                op_result = await self._op_manager.execute_async(
+                    op_name, step, input_data
                 )
             logger.debug(
                 f"Execution finished op={op_name} step={step} spmd_id={self.spmd_id} rank={self.rank}"

@@ -1,7 +1,12 @@
+import asyncio
+
+import jax
 import jax.numpy as jnp
+import sparse_embedding as se
 
 from fluxway.common.decorators import spmd, operator
 from fluxway.common.types.tensor import TransportTensor
+from fluxway.common.index_descriptor import ExplicitIndex
 from .data_types import UserBatch, InputNodeOutput, DPFeatures
 
 
@@ -12,13 +17,46 @@ def hash_routing(tensor, mesh):
     return jnp.mod(val, mesh.size)
 
 
+async def _sparse_unique(
+    tt: TransportTensor,
+) -> tuple[TransportTensor, TransportTensor]:
+    """Uses sparse_embedding.async_unique (C++ high-perf) to deduplicate ids.
+
+    Returns (unique_tt, inverse_tt) with the same semantic as
+    TransportTensor.unique_with_routing() but backed by the C++ unique kernel.
+    """
+    ids_jax = tt.flat_values
+    unique_dlm, inv_dlm, first_index_dlm = await se.async_unique(
+        ids_jax.ravel(), return_inverse=True, return_first_indices=True
+    )
+
+    # Zero-copy DLPack transfer directly to JAX
+    unique_jax = jax.dlpack.from_dlpack(unique_dlm).astype(jnp.int64)
+    inv_jax = jax.dlpack.from_dlpack(inv_dlm).astype(jnp.int32)
+    first_jax = jax.dlpack.from_dlpack(first_index_dlm).astype(jnp.int32)
+
+    if tt.origin_indices is not None:
+        global_first_jax = jnp.take(tt.origin_indices_materialized, first_jax)
+    else:
+        global_first_jax = first_jax
+
+    unique_tt = TransportTensor(
+        flat_values=unique_jax,
+        routing_indices=ExplicitIndex(unique_jax),
+        origin_indices=ExplicitIndex(global_first_jax),
+        global_shape=tt.global_shape,
+    )
+    inv_tt = TransportTensor(flat_values=inv_jax, global_shape=tt.global_shape)
+    return unique_tt, inv_tt
+
+
 @spmd(
     resource={"num_cpus": 1, "memory_gb": 1},
     mesh_axis_names=("dp",),
     mesh_axis_shapes=(2,),
 )
 class InputSPMD:
-    """Deduplicates features and routes them to respective embedding tables."""
+    """Deduplicates features via sparse_embedding.async_unique and routes to embedding tables."""
 
     @operator(
         name="process",
@@ -39,9 +77,13 @@ class InputSPMD:
             "dp_data": {"type": "static", "axis": ["dp"]},
         },
     )
-    def process(self, data: UserBatch) -> InputNodeOutput:
-        u_user, inv_user = data.active.user_id.unique_with_routing()
-        u_item, inv_item = data.passive.target_item_id.unique_with_routing()
+    async def process(self, data: UserBatch) -> InputNodeOutput:
+        user_task = _sparse_unique(data.active.user_id)
+        item_task = _sparse_unique(data.passive.target_item_id)
+
+        (u_user, inv_user), (u_item, inv_item) = await asyncio.gather(
+            user_task, item_task
+        )
 
         print(
             f"[InputSPMD.process] rank={self.rank} "

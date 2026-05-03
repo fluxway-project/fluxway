@@ -1,0 +1,53 @@
+# Use a specific, tagged JAX base image for reproducibility
+FROM ghcr.io/nvidia/jax:maxtext-2026-04-29
+
+# Set environment variables for logging and system configuration
+ENV FLUXWAY_LOG_LEVEL=DEBUG \
+    FLUXWAY_LOG_FORCE=TRUE \
+    PYTHONUNBUFFERED=1 \
+    DEBIAN_FRONTEND=noninteractive
+
+# Configure APT sources for faster mirroring
+RUN chmod 1777 /tmp && \
+    sed -i 's@http://archive.ubuntu.com/ubuntu/@http://mirrors.aliyun.com/ubuntu/@g' /etc/apt/sources.list.d/ubuntu.sources && \
+    sed -i 's@http://security.ubuntu.com/ubuntu/@http://mirrors.aliyun.com/ubuntu/@g' /etc/apt/sources.list.d/ubuntu.sources
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    vim \
+    wget \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Configure pip index mirrors for faster resolution
+RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple && \
+    pip config set global.extra-index-url https://mirrors.aliyun.com/pypi/simple/ && \
+    pip config set global.trusted-host "pypi.tuna.tsinghua.edu.cn mirrors.aliyun.com"
+
+# Set the working directory
+WORKDIR /workspace
+
+# Install common Python dependencies required by the project
+RUN pip install -i https://mirrors.aliyun.com/pypi/simple/ --no-cache-dir \
+    minio \
+    "ray[all]==2.49.0" \
+    grain \
+    pylance \
+    orjson \
+    psutil \
+    flask \
+    zstandard \
+    fastparquet \
+    tabulate
+
+# Copy project files into the container
+# NOTE: Ensure you run `docker build` from the repository root, e.g.:
+# docker build -t fluxway -f docker/Dockerfile .
+COPY . /workspace/fluxway/
+
+# Install the project in editable mode
+RUN cd /workspace/fluxway && \
+    pip install -i https://mirrors.aliyun.com/pypi/simple/ --no-cache-dir -e .
+
+# Default command
+CMD ["/bin/bash"]
