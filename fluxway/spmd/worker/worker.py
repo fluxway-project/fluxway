@@ -354,7 +354,7 @@ class SPMDWorker:
                 instance.node_rank = 0 if node_rank is None else node_rank
                 instance.num_nodes = 1 if num_nodes is None else num_nodes
                 instance.static_args = static_args
-                instance.ctx = getattr(ctx, "operator_ctx", None)
+                instance.ctx = ctx.operator_ctx
                 logger.debug(
                     "operator_init_begin owner_class=%s rank=%s world_size=%s "
                     "local_rank=%s local_world_size=%s node_rank=%s num_nodes=%s",
@@ -1227,7 +1227,6 @@ class SPMDWorker:
                 )
                 raise e
 
-            # Execute operator in a thread to avoid blocking the worker event loop
             if isinstance(input_data, dict):
                 op_result = await self._op_manager.execute_async(
                     op_name, step, **input_data

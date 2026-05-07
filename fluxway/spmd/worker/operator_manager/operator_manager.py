@@ -1193,79 +1193,54 @@ class OperatorManager:
     # =========================================================================
 
     def execute(self, op_name: str, step: int, *args, **kwargs) -> Any:
-        """
-        Execute an operator.
-
-        Args:
-            op_name: Operator name to execute
-            step: Execution step
-            *args, **kwargs: Assembled input data (can be data_type object or kwargs)
-
-        Returns:
-            Operator output
-        """
         from fluxway.common.decorators import operator_context
 
         operator = self._operators.get(op_name)
         if operator is None:
-            logger.warning(f"No operator registered for {op_name}")
-            return None
+            raise ValueError(f"No operator registered for {op_name}")
 
-        # Generate Logical Context
         dispatcher = self.get_dispatcher(op_name)
         logical_ctx = dispatcher.get_logical_context(self._rank, self._world_size, step)
 
-        try:
-            with operator_context(
-                static_args=self._static_args,
-                rank=self._rank,
-                world_size=self._world_size,
-                operator_ctx=logical_ctx,
-                local_rank=self._local_rank,
-                local_world_size=self._local_world_size,
-                node_rank=self._node_rank,
-                num_nodes=self._num_nodes,
-            ):
-                if self.is_source_operator(op_name):
-                    return operator()
-                return operator(*args, **kwargs)
-        except Exception as e:
-            logger.error(f"Execution failed for {op_name}: {e}")
-            raise
+        with operator_context(
+            static_args=self._static_args,
+            rank=self._rank,
+            world_size=self._world_size,
+            operator_ctx=logical_ctx,
+            local_rank=self._local_rank,
+            local_world_size=self._local_world_size,
+            node_rank=self._node_rank,
+            num_nodes=self._num_nodes,
+        ):
+            if self.is_source_operator(op_name):
+                return operator()
+            return operator(*args, **kwargs)
 
     async def execute_async(self, op_name: str, step: int, *args, **kwargs) -> Any:
-        """
-        Execute an asynchronous operator directly in the event loop.
-        """
         from fluxway.common.decorators import operator_context
 
         operator = self._operators.get(op_name)
         if operator is None:
-            logger.warning(f"No operator registered for {op_name}")
-            return None
+            raise ValueError(f"No operator registered for {op_name}")
 
         dispatcher = self.get_dispatcher(op_name)
         logical_ctx = dispatcher.get_logical_context(self._rank, self._world_size, step)
 
-        try:
-            with operator_context(
-                static_args=self._static_args,
-                rank=self._rank,
-                world_size=self._world_size,
-                operator_ctx=logical_ctx,
-                local_rank=self._local_rank,
-                local_world_size=self._local_world_size,
-                node_rank=self._node_rank,
-                num_nodes=self._num_nodes,
-            ):
-                if self.is_source_operator(op_name):
-                    res = operator()
-                else:
-                    res = operator(*args, **kwargs)
+        with operator_context(
+            static_args=self._static_args,
+            rank=self._rank,
+            world_size=self._world_size,
+            operator_ctx=logical_ctx,
+            local_rank=self._local_rank,
+            local_world_size=self._local_world_size,
+            node_rank=self._node_rank,
+            num_nodes=self._num_nodes,
+        ):
+            if self.is_source_operator(op_name):
+                res = operator()
+            else:
+                res = operator(*args, **kwargs)
 
-                if _inspect.iscoroutine(res):
-                    return await res
-                return res
-        except Exception as e:
-            logger.error(f"Async execution failed for {op_name}: {e}")
-            raise
+            if _inspect.iscoroutine(res):
+                return await res
+            return res

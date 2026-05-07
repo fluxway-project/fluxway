@@ -42,6 +42,12 @@ async def run_training(args):
             "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
         }
     }
+    sparse_runtime_env = {
+        "env_vars": {
+            **cpu_runtime_env["env_vars"],
+            "JAX_ENABLE_X64": "1",
+        }
+    }
     gpu_runtime_env = {"env_vars": {"XLA_PYTHON_CLIENT_PREALLOCATE": "false"}}
 
     r"""
@@ -75,14 +81,14 @@ async def run_training(args):
             mesh=table1_mesh,
             vocab_size=2000,
             embed_dim=16,
-            runtime_env=cpu_runtime_env,
+            runtime_env=sparse_runtime_env,
         )
         table2 = SparseEmbeddingSPMD(
             name="EmbeddingTable2",
             mesh=table2_mesh,
             vocab_size=2000,
             embed_dim=16,
-            runtime_env=cpu_runtime_env,
+            runtime_env=sparse_runtime_env,
         )
         dense = DenseSPMD(
             name="DenseLayers",

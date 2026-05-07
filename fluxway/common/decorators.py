@@ -6,11 +6,13 @@ Provides @operator and @data_type decorators to manage metadata and transport.
 
 from typing import Any, TypeVar, Union, get_type_hints, Annotated
 from collections.abc import Callable
+from dataclasses import dataclass, field
+import contextvars
 import functools
 import inspect
 import importlib
-from contextlib import contextmanager
 import threading
+from contextlib import contextmanager
 import logging
 
 from fluxway.common.utils.tree import tree_flatten_type, _is_fluxway_data_type
@@ -18,14 +20,16 @@ from fluxway.common.utils.tree import tree_flatten_type, _is_fluxway_data_type
 logger = logging.getLogger(__name__)
 
 
-class PicklableThreadLocal(threading.local):
-    """A threading.local that can be pickled (state is lost)."""
-
-    def __getstate__(self):
-        return {}
-
-    def __setstate__(self, state):
-        pass
+@dataclass
+class _OperatorContextState:
+    static_args: dict[str, Any] = field(default_factory=dict)
+    rank: int = 0
+    world_size: int = 1
+    operator_ctx: Any = None
+    local_rank: int | None = None
+    local_world_size: int | None = None
+    node_rank: int = 0
+    num_nodes: int = 1
 
 
 class _PicklableLock:
@@ -53,8 +57,14 @@ class _PicklableLock:
         self._lock = threading.Lock()
 
 
-# Thread-local storage for operator execution context (per-call, must be thread-isolated)
-_operator_context = PicklableThreadLocal()
+_DEFAULT_CONTEXT_STATE = _OperatorContextState()
+
+# ContextVar provides per-coroutine and per-thread isolation simultaneously:
+# - Each asyncio.Task gets its own copy (no cross-coroutine pollution)
+# - asyncio.to_thread propagates the caller's snapshot into the worker thread
+_operator_context_var: contextvars.ContextVar[_OperatorContextState] = (
+    contextvars.ContextVar("operator_context", default=_DEFAULT_CONTEXT_STATE)
+)
 
 # Process-wide storage for operator class instances.
 # Instances are created once (in SPMDWorker._pre_instantiate_operators, before the
@@ -90,40 +100,31 @@ def operator_context(
     node_rank: int = 0,
     num_nodes: int = 1,
 ):
-    """Context manager to inject operator runtime context into current thread."""
-    prev_static = getattr(_operator_context, "static_args", {})
-    prev_rank = getattr(_operator_context, "rank", 0)
-    prev_world = getattr(_operator_context, "world_size", 1)
-    prev_operator_ctx = getattr(_operator_context, "operator_ctx", None)
-    prev_local_rank = getattr(_operator_context, "local_rank", None)
-    prev_local_world_size = getattr(_operator_context, "local_world_size", None)
-    prev_node_rank = getattr(_operator_context, "node_rank", 0)
-    prev_num_nodes = getattr(_operator_context, "num_nodes", 1)
+    """Context manager to inject operator runtime context into current coroutine/thread.
 
-    _operator_context.static_args = static_args
-    _operator_context.rank = rank
-    _operator_context.world_size = world_size
-    _operator_context.operator_ctx = operator_ctx
-    _operator_context.local_rank = local_rank
-    _operator_context.local_world_size = local_world_size
-    _operator_context.node_rank = node_rank
-    _operator_context.num_nodes = num_nodes
+    Uses contextvars.ContextVar so each asyncio Task and each to_thread worker
+    gets an isolated snapshot — no cross-coroutine state pollution.
+    """
+    state = _OperatorContextState(
+        static_args=static_args,
+        rank=rank,
+        world_size=world_size,
+        operator_ctx=operator_ctx,
+        local_rank=local_rank,
+        local_world_size=local_world_size,
+        node_rank=node_rank,
+        num_nodes=num_nodes,
+    )
+    token = _operator_context_var.set(state)
     try:
-        yield _operator_context
+        yield state
     finally:
-        _operator_context.static_args = prev_static
-        _operator_context.rank = prev_rank
-        _operator_context.world_size = prev_world
-        _operator_context.operator_ctx = prev_operator_ctx
-        _operator_context.local_rank = prev_local_rank
-        _operator_context.local_world_size = prev_local_world_size
-        _operator_context.node_rank = prev_node_rank
-        _operator_context.num_nodes = prev_num_nodes
+        _operator_context_var.reset(token)
 
 
-def get_current_context():
-    """Access current operator thread context."""
-    return _operator_context
+def get_current_context() -> _OperatorContextState:
+    """Return the operator context state for the current coroutine/thread."""
+    return _operator_context_var.get()
 
 
 def _get_fluxway_streams(tp: Any, prefix: str = "") -> tuple[list[str], list[str]]:
@@ -655,9 +656,7 @@ def _create_operator_wrapper(
             with lock:
                 if instance_key not in storage:
                     ctx = get_current_context()
-                    rank = getattr(ctx, "rank", 0)
-                    world_size = getattr(ctx, "world_size", 1)
-                    static_args = getattr(ctx, "static_args", {}) or {}
+                    static_args = ctx.static_args or {}
 
                     try:
                         init_sig = inspect.signature(cls.__init__)
@@ -677,27 +676,27 @@ def _create_operator_wrapper(
                         init_kwargs = {}
 
                     instance = cls.__new__(cls)
-                    instance.rank = rank
-                    instance.world_size = world_size
-                    instance.local_rank = getattr(ctx, "local_rank", None)
-                    instance.local_world_size = getattr(ctx, "local_world_size", None)
-                    instance.node_rank = getattr(ctx, "node_rank", 0)
-                    instance.num_nodes = getattr(ctx, "num_nodes", 1)
+                    instance.rank = ctx.rank
+                    instance.world_size = ctx.world_size
+                    instance.local_rank = ctx.local_rank
+                    instance.local_world_size = ctx.local_world_size
+                    instance.node_rank = ctx.node_rank
+                    instance.num_nodes = ctx.num_nodes
                     instance.static_args = static_args
-                    instance.ctx = getattr(ctx, "operator_ctx", None)
+                    instance.ctx = ctx.operator_ctx
                     instance.__init__(**init_kwargs)
                     storage[instance_key] = instance
 
         instance = storage[instance_key]
         ctx = get_current_context()
-        instance.static_args = getattr(ctx, "static_args", {})
-        instance.rank = getattr(ctx, "rank", 0)
-        instance.world_size = getattr(ctx, "world_size", 1)
-        instance.local_rank = getattr(ctx, "local_rank", None)
-        instance.local_world_size = getattr(ctx, "local_world_size", None)
-        instance.node_rank = getattr(ctx, "node_rank", 0)
-        instance.num_nodes = getattr(ctx, "num_nodes", 1)
-        instance.ctx = getattr(ctx, "operator_ctx", None)
+        instance.static_args = ctx.static_args
+        instance.rank = ctx.rank
+        instance.world_size = ctx.world_size
+        instance.local_rank = ctx.local_rank
+        instance.local_world_size = ctx.local_world_size
+        instance.node_rank = ctx.node_rank
+        instance.num_nodes = ctx.num_nodes
+        instance.ctx = ctx.operator_ctx
         return func(instance, *args, **kwargs)
 
     for target in (func, wrapper):

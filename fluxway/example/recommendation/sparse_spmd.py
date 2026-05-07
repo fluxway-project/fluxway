@@ -9,8 +9,6 @@ from fluxway.common.utils.logging import get_logger
 from fluxway.common.types.tensor import TransportTensor
 from fluxway.example.recommendation.data_types import LookupOutput
 
-jax.config.update("jax_enable_x64", True)
-
 logger = get_logger(__name__)
 
 

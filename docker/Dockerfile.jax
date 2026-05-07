@@ -8,9 +8,10 @@ ENV FLUXWAY_LOG_LEVEL=DEBUG \
     DEBIAN_FRONTEND=noninteractive
 
 # Configure APT sources for faster mirroring
+ARG APT_MIRROR=archive.ubuntu.com
 RUN chmod 1777 /tmp && \
-    sed -i 's@http://archive.ubuntu.com/ubuntu/@http://mirrors.aliyun.com/ubuntu/@g' /etc/apt/sources.list.d/ubuntu.sources && \
-    sed -i 's@http://security.ubuntu.com/ubuntu/@http://mirrors.aliyun.com/ubuntu/@g' /etc/apt/sources.list.d/ubuntu.sources
+    sed -i "s@http://archive.ubuntu.com/ubuntu/@http://${APT_MIRROR}/ubuntu/@g" /etc/apt/sources.list.d/ubuntu.sources && \
+    sed -i "s@http://security.ubuntu.com/ubuntu/@http://${APT_MIRROR}/ubuntu/@g" /etc/apt/sources.list.d/ubuntu.sources
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \

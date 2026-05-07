@@ -64,7 +64,7 @@ class RecommendationReader(GrainReader):
             "labels": {"type": "static", "axis": ["worker"]},
         },
     )
-    def read(self) -> UserBatch:
+    def read(self) -> UserBatch | None:
         static_args = getattr(self, "static_args", {})
         batch_size = static_args.get("batch_size", 24)
 
