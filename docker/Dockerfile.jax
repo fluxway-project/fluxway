@@ -33,21 +33,19 @@ RUN pip install -i https://mirrors.aliyun.com/pypi/simple/ --no-cache-dir \
     minio \
     "ray[all]==2.49.0" \
     grain \
-    pylance \
     orjson \
     psutil \
     flask \
     zstandard \
-    fastparquet \
-    tabulate
+    fastparquet
 
 # Copy project files into the container
 # NOTE: Ensure you run `docker build` from the repository root, e.g.:
 # docker build -t fluxway -f docker/Dockerfile .
-COPY . /workspace/fluxway/
+COPY . /workspace/
 
 # Install the project in editable mode
-RUN cd /workspace/fluxway && \
+RUN cd /workspace && \
     pip install -i https://mirrors.aliyun.com/pypi/simple/ --no-cache-dir -e .
 
 # Default command

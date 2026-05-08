@@ -1193,30 +1193,6 @@ class OperatorManager:
     # Execution
     # =========================================================================
 
-    def execute(self, op_name: str, step: int, *args, **kwargs) -> Any:
-        from fluxway.common.decorators import operator_context
-
-        operator = self._operators.get(op_name)
-        if operator is None:
-            raise ValueError(f"No operator registered for {op_name}")
-
-        dispatcher = self.get_dispatcher(op_name)
-        logical_ctx = dispatcher.get_logical_context(self._rank, self._world_size, step)
-
-        with operator_context(
-            static_args=self._static_args,
-            rank=self._rank,
-            world_size=self._world_size,
-            operator_ctx=logical_ctx,
-            local_rank=self._local_rank,
-            local_world_size=self._local_world_size,
-            node_rank=self._node_rank,
-            num_nodes=self._num_nodes,
-        ):
-            if self.is_source_operator(op_name):
-                return operator()
-            return operator(*args, **kwargs)
-
     async def execute_async(self, op_name: str, step: int, *args, **kwargs) -> Any:
         from fluxway.common.decorators import operator_context
 

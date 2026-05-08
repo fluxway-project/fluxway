@@ -8,6 +8,7 @@ from fluxway.common.mesh import DeviceMesh
 from fluxway.common.types.configs import SPMDConfig
 from fluxway.spmd.worker.operator_manager import OperatorManager
 from fluxway.spmd.worker.worker import SPMDWorker
+import pytest
 
 
 class TopologyAwareOperator:
@@ -115,7 +116,8 @@ def test_preinstantiate_operator_sets_topology_fields_in_init():
         assert instance.num_nodes == 2
 
 
-def test_operator_manager_execute_preserves_topology_fields():
+@pytest.mark.asyncio
+async def test_operator_manager_execute_preserves_topology_fields():
     _clear_operator_instance()
     meta = TopologyAwareOperator.inspect._fluxway_operator_meta
     config = SPMDConfig(
@@ -133,6 +135,6 @@ def test_operator_manager_execute_preserves_topology_fields():
         num_nodes=2,
     )
 
-    result = manager.execute("inspect", step=0)
+    result = await manager.execute_async("inspect", step=0)
 
     assert result == (3, 8, 1, 4, 0, 2)
