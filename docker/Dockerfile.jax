@@ -9,6 +9,8 @@ ENV FLUXWAY_LOG_LEVEL=DEBUG \
 
 # Configure APT sources for faster mirroring
 ARG APT_MIRROR=archive.ubuntu.com
+ARG PIP_INDEX_URL=https://pypi.org/simple
+ARG PIP_MIRROR=https://mirrors.aliyun.com/pypi/simple/
 RUN chmod 1777 /tmp && \
     sed -i "s@http://archive.ubuntu.com/ubuntu/@http://${APT_MIRROR}/ubuntu/@g" /etc/apt/sources.list.d/ubuntu.sources && \
     sed -i "s@http://security.ubuntu.com/ubuntu/@http://${APT_MIRROR}/ubuntu/@g" /etc/apt/sources.list.d/ubuntu.sources
@@ -21,15 +23,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Configure pip index mirrors for faster resolution
-RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple && \
-    pip config set global.extra-index-url https://mirrors.aliyun.com/pypi/simple/ && \
-    pip config set global.trusted-host "pypi.tuna.tsinghua.edu.cn mirrors.aliyun.com"
+RUN pip config set global.index-url ${PIP_INDEX_URL} && \
+    pip config set global.extra-index-url ${PIP_MIRROR} && \
+    pip config set global.trusted-host "$(echo ${PIP_INDEX_URL} | awk -F[/:] '{print $4}') $(echo ${PIP_MIRROR} | awk -F[/:] '{print $4}')"
 
 # Set the working directory
 WORKDIR /workspace
 
 # Install common Python dependencies required by the project
-RUN pip install -i https://mirrors.aliyun.com/pypi/simple/ --no-cache-dir \
+RUN pip install -i ${PIP_MIRROR} --no-cache-dir \
     minio \
     "ray[all]==2.49.0" \
     grain \
@@ -46,7 +48,7 @@ COPY . /workspace/
 
 # Install the project in editable mode
 RUN cd /workspace && \
-    pip install -i https://mirrors.aliyun.com/pypi/simple/ --no-cache-dir -e .
+    pip install -i ${PIP_MIRROR} --no-cache-dir -e .
 
 # Default command
 CMD ["/bin/bash"]
