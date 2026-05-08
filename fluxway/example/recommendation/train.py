@@ -81,6 +81,7 @@ async def run_training(args):
             mesh=table1_mesh,
             vocab_size=2000,
             embed_dim=16,
+            num_threads=args.num_threads,
             runtime_env=sparse_runtime_env,
         )
         table2 = SparseEmbeddingSPMD(
@@ -88,6 +89,7 @@ async def run_training(args):
             mesh=table2_mesh,
             vocab_size=2000,
             embed_dim=16,
+            num_threads=args.num_threads,
             runtime_env=sparse_runtime_env,
         )
         dense = DenseSPMD(
@@ -190,6 +192,13 @@ def main():
         default="127.0.0.1:29500",
         dest="coordinator_address",
         help="JAX distributed coordinator address for DenseSPMD",
+    )
+    parser.add_argument(
+        "--num-threads",
+        type=int,
+        default=None,
+        dest="num_threads",
+        help="Number of threads for SparseEmbedding store",
     )
     asyncio.run(run_training(parser.parse_args()))
 

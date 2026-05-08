@@ -25,7 +25,7 @@ class _OperatorContextState:
     static_args: dict[str, Any] = field(default_factory=dict)
     rank: int = 0
     world_size: int = 1
-    operator_ctx: Any = None
+    ctx: Any = None
     local_rank: int | None = None
     local_world_size: int | None = None
     node_rank: int = 0
@@ -101,7 +101,7 @@ def operator_context(
         static_args=static_args,
         rank=rank,
         world_size=world_size,
-        operator_ctx=operator_ctx,
+        ctx=operator_ctx,
         local_rank=local_rank,
         local_world_size=local_world_size,
         node_rank=node_rank,
@@ -445,55 +445,71 @@ def _normalize_sharding_values(sharding: dict) -> dict:
     return result
 
 
+_CONTEXT_ATTR_NAMES: frozenset[str] = frozenset(
+    {
+        "rank",
+        "world_size",
+        "local_rank",
+        "local_world_size",
+        "node_rank",
+        "num_nodes",
+        "static_args",
+        "ctx",
+    }
+)
+
+
+def _inject_context_properties(cls: type) -> None:
+    """Idempotently replace runtime-state attributes with ContextVar-backed properties.
+
+    This ensures each asyncio Task reads its own isolated context snapshot,
+    eliminating races where a shared instance's attributes are overwritten by a
+    concurrent coroutine after an `await` suspension point.
+    """
+    sentinel = f"_fluxway_ctx_props_{cls.__qualname__}"
+    if getattr(cls, sentinel, False):
+        return
+    for attr in _CONTEXT_ATTR_NAMES:
+        prop = property(lambda self, a=attr: getattr(get_current_context(), a))
+        setattr(cls, attr, prop)
+    setattr(cls, sentinel, True)
+
+
+def _build_init_kwargs(cls: type, static_args: dict) -> dict:
+    try:
+        init_sig = inspect.signature(cls.__init__)
+        init_params = set(init_sig.parameters.keys()) - {"self"}
+        has_var_kw = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in init_sig.parameters.values()
+        )
+        return (
+            dict(static_args)
+            if has_var_kw
+            else {k: v for k, v in static_args.items() if k in init_params}
+        )
+    except (ValueError, TypeError):
+        return {}
+
+
 def _build_instance_wrapper(func: Callable, meta: Any) -> Callable:
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         cls = _resolve_owner_class(meta.owner_class_module, meta.owner_class_qualname)
+        _inject_context_properties(cls)
+
         instance_key = id(cls)
         storage, lock = get_instance_storage()
         if instance_key not in storage:
             with lock:
                 if instance_key not in storage:
                     ctx = get_current_context()
-                    static_args = ctx.static_args or {}
-                    try:
-                        init_sig = inspect.signature(cls.__init__)
-                        init_params = set(init_sig.parameters.keys()) - {"self"}
-                        has_var_kw = any(
-                            p.kind == inspect.Parameter.VAR_KEYWORD
-                            for p in init_sig.parameters.values()
-                        )
-                        init_kwargs = (
-                            dict(static_args)
-                            if has_var_kw
-                            else {
-                                k: v for k, v in static_args.items() if k in init_params
-                            }
-                        )
-                    except (ValueError, TypeError):
-                        init_kwargs = {}
+                    init_kwargs = _build_init_kwargs(cls, ctx.static_args or {})
                     instance = cls.__new__(cls)
-                    instance.rank = ctx.rank
-                    instance.world_size = ctx.world_size
-                    instance.local_rank = ctx.local_rank
-                    instance.local_world_size = ctx.local_world_size
-                    instance.node_rank = ctx.node_rank
-                    instance.num_nodes = ctx.num_nodes
-                    instance.static_args = static_args
-                    instance.ctx = ctx.operator_ctx
                     instance.__init__(**init_kwargs)
                     storage[instance_key] = instance
-        instance = storage[instance_key]
-        ctx = get_current_context()
-        instance.static_args = ctx.static_args
-        instance.rank = ctx.rank
-        instance.world_size = ctx.world_size
-        instance.local_rank = ctx.local_rank
-        instance.local_world_size = ctx.local_world_size
-        instance.node_rank = ctx.node_rank
-        instance.num_nodes = ctx.num_nodes
-        instance.ctx = ctx.operator_ctx
-        return func(instance, *args, **kwargs)
+
+        return func(storage[instance_key], *args, **kwargs)
 
     return wrapper
 

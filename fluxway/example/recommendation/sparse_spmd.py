@@ -1,3 +1,4 @@
+import os
 import jax
 import jax.dlpack
 import jax.numpy as jnp
@@ -26,14 +27,20 @@ class SparseEmbeddingSPMD:
     optimizer_step once per training step.
     """
 
-    def __init__(self, vocab_size: int = 1000, embed_dim: int = 3):
+    def __init__(
+        self,
+        vocab_size: int = 1000,
+        embed_dim: int = 3,
+        num_threads: int | None = None,
+    ):
         self.embed_dim = embed_dim
         self.vocab_size = vocab_size
+        self.num_threads = num_threads or os.cpu_count() or 4
 
         self.store = se.EmbeddingStore(
             embedding_config=se.EmbeddingConfig(
                 slot_dims={0: embed_dim},
-                num_threads=4,
+                num_threads=self.num_threads,
                 dtype="float32",
             ),
             initializer_config=se.Uniform(min_val=-0.01, max_val=0.01),

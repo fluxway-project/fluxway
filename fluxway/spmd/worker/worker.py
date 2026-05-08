@@ -33,9 +33,9 @@ import ray
 from fluxway.common.backend import get_backend
 from fluxway.common.decorators import (
     operator_context,
-    get_current_context,
     get_instance_storage,
     _resolve_owner_class,
+    _inject_context_properties,
 )
 from fluxway.common.execution import compile
 from fluxway.common.types import (
@@ -317,7 +317,6 @@ class SPMDWorker:
             node_rank=0 if node_rank is None else node_rank,
             num_nodes=1 if num_nodes is None else num_nodes,
         ):
-            ctx = get_current_context()
             storage, lock = get_instance_storage()
             for op_meta in (config.operator_metas or {}).values():
                 if not op_meta.owner_class_qualname:
@@ -347,25 +346,7 @@ class SPMDWorker:
                     init_kwargs = {}
 
                 instance = cls.__new__(cls)
-                instance.rank = rank
-                instance.world_size = world_size
-                instance.local_rank = local_rank
-                instance.local_world_size = local_world_size
-                instance.node_rank = 0 if node_rank is None else node_rank
-                instance.num_nodes = 1 if num_nodes is None else num_nodes
-                instance.static_args = static_args
-                instance.ctx = ctx.operator_ctx
-                logger.debug(
-                    "operator_init_begin owner_class=%s rank=%s world_size=%s "
-                    "local_rank=%s local_world_size=%s node_rank=%s num_nodes=%s",
-                    cls.__qualname__,
-                    rank,
-                    world_size,
-                    local_rank,
-                    local_world_size,
-                    0 if node_rank is None else node_rank,
-                    1 if num_nodes is None else num_nodes,
-                )
+                _inject_context_properties(cls)
                 try:
                     instance.__init__(**init_kwargs)
                 except Exception:
