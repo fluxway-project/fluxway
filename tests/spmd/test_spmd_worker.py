@@ -1017,6 +1017,7 @@ async def test_spmd_worker_init():
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
     cls = cls.modified_class if cls else SPMDWorker
     worker = cls(config, rank=0)
+    worker.setup_and_start(local_rank=0, local_world_size=1, node_rank=0, num_nodes=1)
     assert worker._mesh is mesh
     assert worker._op_manager._mesh is mesh
 
@@ -1028,6 +1029,7 @@ async def test_receive_multi_tensor_data():
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
     cls = cls.modified_class if cls else SPMDWorker
     worker = cls(config, rank=0)
+    worker.setup_and_start(local_rank=0, local_world_size=1, node_rank=0, num_nodes=1)
 
     worker._mailbox.declare_step(
         "compute", step=1, expected_tensors={998: 1, 999: 1}, expected_states=[]

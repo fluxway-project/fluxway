@@ -105,6 +105,7 @@ async def test_multi_worker_interleaved_unit_mesh_inheritance():
             topology=_meta_to_topology(loader_meta),
         )
         w = cls(config, rank=rank)
+        w.setup_and_start(local_rank=rank, local_world_size=4, node_rank=0, num_nodes=1)
         w._successor_handlers = {"processor": {0: AsyncMock(), 1: AsyncMock()}}
         loader_workers.append(w)
 
@@ -119,6 +120,7 @@ async def test_multi_worker_interleaved_unit_mesh_inheritance():
             topology=_meta_to_topology(processor_meta),
         )
         w = cls(config, rank=rank)
+        w.setup_and_start(local_rank=rank, local_world_size=2, node_rank=0, num_nodes=1)
         processor_workers.append(w)
 
     shards_dict = processor_workers[0]._op_manager.get_expected_tensor_shards(
@@ -202,6 +204,7 @@ async def test_single_worker_interleaved_unit():
             topology=_meta_to_topology(loader_meta),
         )
         w = cls(config, rank=rank)
+        w.setup_and_start(local_rank=rank, local_world_size=4, node_rank=0, num_nodes=1)
         w._successor_handlers = {"processor": {0: AsyncMock()}}
         loader_workers.append(w)
 

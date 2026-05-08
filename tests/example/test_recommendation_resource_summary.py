@@ -1,8 +1,12 @@
 import ast
 from pathlib import Path
 
-TRAIN_FILE = Path(
-    "/Users/admin/Project/fluxway-antigravity/fluxway/example/recommendation/train.py"
+TRAIN_FILE = (
+    Path(__file__).resolve().parents[2]
+    / "fluxway"
+    / "example"
+    / "recommendation"
+    / "train.py"
 )
 
 

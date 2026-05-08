@@ -186,8 +186,13 @@ async def test_restore_snapshot_waits_for_all_drivers_ready(
 ):
     ready_gate = asyncio.Event()
     controller._heartbeat_manager = MagicMock()
+
+    async def mock_wait(*args, **kwargs):
+        await ready_gate.wait()
+        return True
+
     controller._heartbeat_manager.wait_until_all_drivers_ready = AsyncMock(
-        side_effect=ready_gate.wait
+        side_effect=mock_wait
     )
     controller._state_manager = MagicMock()
     controller._async_step_manager = MagicMock()
@@ -205,7 +210,9 @@ async def test_restore_snapshot_waits_for_all_drivers_ready(
     )
     await asyncio.sleep(0)
 
-    controller._heartbeat_manager.wait_until_all_drivers_ready.assert_awaited_once_with()
+    controller._heartbeat_manager.wait_until_all_drivers_ready.assert_awaited_once_with(
+        timeout=600
+    )
     controller.block_all_spmds.assert_not_called()
     mock_spmd_manager.mock_driver1.restore_from_disk.remote.assert_not_called()
     mock_spmd_manager.mock_driver2.restore_from_disk.remote.assert_not_called()

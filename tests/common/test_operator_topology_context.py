@@ -92,10 +92,27 @@ def test_preinstantiate_operator_sets_topology_fields_in_init():
     instance = storage[id(TopologyAwareOperator)]
 
     assert TopologyAwareOperator.seen_in_init == (3, 8, 1, 4, 0, 2)
-    assert instance.local_rank == 1
-    assert instance.local_world_size == 4
+
+    # Outside context: fields should evaluate to default/None
+    assert instance.local_rank is None
+    assert instance.local_world_size is None
     assert instance.node_rank == 0
-    assert instance.num_nodes == 2
+    assert instance.num_nodes == 1
+
+    # Inside context: fields should evaluate to the current context values
+    with operator_context(
+        static_args={},
+        rank=3,
+        world_size=8,
+        local_rank=1,
+        local_world_size=4,
+        node_rank=0,
+        num_nodes=2,
+    ):
+        assert instance.local_rank == 1
+        assert instance.local_world_size == 4
+        assert instance.node_rank == 0
+        assert instance.num_nodes == 2
 
 
 def test_operator_manager_execute_preserves_topology_fields():

@@ -21,16 +21,21 @@ class _FakeTreeDef:
         return dict(zip(self._keys, leaves, strict=True))
 
 
+class _ShapeDtypeStruct:
+    def __init__(self, shape=None, dtype=None, sharding=None):
+        self.shape = shape
+        self.dtype = dtype
+        self.sharding = sharding
+
+
 def _install_fake_orbax_runtime(monkeypatch):
     jax_module = types.ModuleType("jax")
 
     class _Array:
         def __init__(self, sharding=None):
             self.sharding = sharding
-
-    class _ShapeDtypeStruct:
-        def __init__(self, sharding=None):
-            self.sharding = sharding
+            self.shape = (1,)
+            self.dtype = np.float32
 
     class _SingleDeviceSharding:
         pass
@@ -40,25 +45,22 @@ def _install_fake_orbax_runtime(monkeypatch):
 
     tree_util_module = types.ModuleType("jax.tree_util")
 
-    def _tree_flatten(state):
-        if isinstance(state, dict):
-            keys = sorted(state.keys())
-            return [state[k] for k in keys], _FakeTreeDef(keys)
-        return [state], _FakeTreeDef([])
+    import jax.tree_util as real_jtu
 
-    def _tree_map(fn, value):
-        if isinstance(value, dict):
-            return {k: _tree_map(fn, v) for k, v in value.items()}
-        return fn(value)
-
-    tree_util_module.tree_flatten = _tree_flatten
-    tree_util_module.tree_map = _tree_map
-    tree_util_module.PyTreeDef = tuple
-    tree_util_module.tree_leaves = lambda x: _tree_flatten(x)[0]
+    tree_util_module.tree_flatten = real_jtu.tree_flatten
+    tree_util_module.tree_map = real_jtu.tree_map
+    tree_util_module.PyTreeDef = real_jtu.PyTreeDef
+    tree_util_module.tree_leaves = real_jtu.tree_leaves
+    tree_util_module.tree_flatten_with_path = real_jtu.tree_flatten_with_path
+    tree_util_module.tree_unflatten = real_jtu.tree_unflatten
+    tree_util_module.map = getattr(real_jtu, "map", real_jtu.tree_map)
+    tree_util_module.DictKey = real_jtu.DictKey
+    tree_util_module.SequenceKey = real_jtu.SequenceKey
 
     jax_module.Array = _Array
     jax_module.ShapeDtypeStruct = _ShapeDtypeStruct
     jax_module.tree_util = tree_util_module
+    jax_module.tree = tree_util_module
     jax_module.sharding = types.SimpleNamespace(
         SingleDeviceSharding=_SingleDeviceSharding, NamedSharding=_NamedSharding
     )
@@ -214,7 +216,7 @@ async def test_local_save_bypasses_orbax_checkpointer(monkeypatch, tmp_path):
     assert metadata["local_state_dir"] == str(expected_dir)
     assert expected_dir.exists()
     # Verify numpy files were written.
-    assert (expected_dir / "_treedef.pkl").exists()
+    assert (expected_dir / "_local_treedef.pkl").exists()
     assert any(expected_dir.glob("leaf_*.npy")) or any(expected_dir.glob("leaf_*.pkl"))
 
 
@@ -239,8 +241,8 @@ async def test_local_save_multiple_ranks_independent(monkeypatch, tmp_path):
     dir_rank5 = tmp_path / "9" / "DenseLayers" / "worker_5_local_state"
     assert dir_rank0.exists()
     assert dir_rank5.exists()
-    assert (dir_rank0 / "_treedef.pkl").exists()
-    assert (dir_rank5 / "_treedef.pkl").exists()
+    assert (dir_rank0 / "_local_treedef.pkl").exists()
+    assert (dir_rank5 / "_local_treedef.pkl").exists()
 
 
 @pytest.mark.asyncio
@@ -269,7 +271,7 @@ async def test_global_save_uses_checkpointer_atomic_save(monkeypatch, tmp_path):
     assert len(checkpointer_save_calls) == 1
     assert checkpointer_save_calls[0]["directory"] == expected_dir
     assert checkpointer_save_calls[0]["force"] is True
-    assert "operator_states" in checkpointer_save_calls[0]["args"]
+    assert "operator_states/DenseLayers/weights" in checkpointer_save_calls[0]["args"]
     assert metadata["orbax_final_path"] == str(expected_dir)
     assert "orbax_tmp_path" not in metadata
     assert expected_dir.exists()

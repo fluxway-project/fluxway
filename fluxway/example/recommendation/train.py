@@ -4,6 +4,7 @@ os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 import asyncio
 import argparse
+import ray
 
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.types.configs import AsyncStepConfig
@@ -155,6 +156,7 @@ async def run_training(args):
 
 
 def main():
+    ray.init(num_cpus=16)
     parser = argparse.ArgumentParser(description="Fluxway Recommendation Example")
     parser.add_argument(
         "--max-steps", type=int, default=10, help="Max number of steps to run"

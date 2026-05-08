@@ -347,6 +347,11 @@ class SPMDWorker:
 
                 instance = cls.__new__(cls)
                 _inject_context_properties(cls)
+                logger.debug(
+                    "operator_init_begin owner_class=%s rank=%s",
+                    cls.__qualname__,
+                    rank,
+                )
                 try:
                     instance.__init__(**init_kwargs)
                 except Exception:

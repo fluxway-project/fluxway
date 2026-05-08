@@ -28,7 +28,7 @@ async def test_driver_stop_waits_for_worker_shutdown():
     worker1.set_driver_handle.remote = AsyncMock(return_value=None)
 
     driver._worker_handles = {0: worker0, 1: worker1}
-    driver._stop_heartbeat = MagicMock()
+    driver._stop_heartbeat = AsyncMock()
 
     await driver.stop()
 
@@ -40,7 +40,8 @@ async def test_driver_stop_waits_for_worker_shutdown():
     assert driver._worker_handles == {}
 
 
-def test_stop_heartbeat_joins_background_thread():
+@pytest.mark.asyncio
+async def test_stop_heartbeat_joins_background_thread():
     driver = SPMDDriver.__ray_actor_class__(
         spmd_id="dense",
         config=SPMDConfig(mesh=SimpleNamespace(size=1)),
@@ -59,7 +60,7 @@ def test_stop_heartbeat_joins_background_thread():
     driver._heartbeat_running = True
     driver._heartbeat_thread = fake_thread
 
-    driver._stop_heartbeat()
+    await driver._stop_heartbeat()
 
     assert driver._heartbeat_running is False
     join_mock.assert_called_once()

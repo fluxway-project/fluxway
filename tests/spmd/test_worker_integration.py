@@ -42,6 +42,7 @@ async def test_worker_receive_shards_dispatches_to_mailbox(worker_config):
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
     cls = cls.modified_class if cls else SPMDWorker
     worker = cls(worker_config, rank=0, spmd_id="test_spmd")
+    worker.setup_and_start(local_rank=0, local_world_size=1, node_rank=0, num_nodes=1)
 
     from unittest.mock import MagicMock, AsyncMock
 
@@ -75,6 +76,7 @@ async def test_worker_receive_control_dispatches_to_mailbox(worker_config):
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
     cls = cls.modified_class if cls else SPMDWorker
     worker = cls(worker_config, rank=0, spmd_id="test_spmd")
+    worker.setup_and_start(local_rank=0, local_world_size=1, node_rank=0, num_nodes=1)
 
     worker._mailbox.deposit_control_arguments = AsyncMock()
     worker._ensure_step_declared = lambda *a, **kw: None
