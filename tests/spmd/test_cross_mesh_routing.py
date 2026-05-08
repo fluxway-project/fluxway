@@ -555,7 +555,7 @@ class TestOperatorManagerPhase2MeshCorrectness(unittest.TestCase):
 
         config = SPMDConfig(
             mesh=sender_mesh,
-            operators={sender_op: _lookup_fn},
+            operators={sender_op: sender_op},
             operator_metas={sender_op: meta},
             topology=topology,
         )
@@ -654,7 +654,7 @@ class TestOperatorManagerPhase2MeshCorrectness(unittest.TestCase):
         }
         config = SPMDConfig(
             mesh=receiver_mesh,
-            operators={"forward": lambda: None},
+            operators={"forward": "forward"},
             operator_metas={"forward": meta},
             topology=topology,
         )

@@ -4,16 +4,17 @@ Decorators for Fluxway framework.
 Provides @operator and @data_type decorators to manage metadata and transport.
 """
 
-from typing import Any, TypeVar, Union, get_type_hints, Annotated
-from collections.abc import Callable
-from dataclasses import dataclass, field
 import contextvars
+import copy
 import functools
-import inspect
 import importlib
-import threading
-from contextlib import contextmanager
+import inspect
 import logging
+import threading
+from collections.abc import Callable
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import Annotated, Any, TypeVar, Union, get_type_hints
 
 from fluxway.common.utils.tree import tree_flatten_type, _is_fluxway_data_type
 
@@ -120,8 +121,10 @@ def get_current_context() -> _OperatorContextState:
 
 
 def _unwrap_union_type(tp: Any) -> Any:
+    import types as _types
+
     origin = getattr(tp, "__origin__", None)
-    if origin is Union:
+    if origin is Union or isinstance(tp, _types.UnionType):
         for arg in getattr(tp, "__args__", []):
             if arg is not type(None) and _is_fluxway_data_type(arg):
                 return arg
@@ -378,6 +381,9 @@ def _resolve_output_sharding(
     output_param_map: dict = {}
     meta_output_treedef = None
 
+    # Unwrap Optional / X | None so all downstream code sees the concrete type.
+    return_tp = _unwrap_union_type(return_tp)
+
     if return_tp is not None and return_tp is not inspect.Signature.empty:
         if _is_fluxway_data_type(return_tp):
             out_data_fields, out_control_fields = _get_fluxway_streams(return_tp)
@@ -506,24 +512,35 @@ class _OperatorWrapper:
     def __get__(self, instance, owner):
         if self._cls is None:
             self._cls = owner
-            _inject_context_properties(self._cls)
+        if not hasattr(owner, "_fluxway_ctx_injected"):
+            _inject_context_properties(owner)
+            owner._fluxway_ctx_injected = True
 
-        @functools.wraps(self.func)
-        def bound_method(*args, **kwargs):
-            instance_key = id(self._cls)
+        def _get_or_create_instance():
+            instance_key = id(owner)
             storage, lock = get_instance_storage()
             if instance_key not in storage:
                 with lock:
                     if instance_key not in storage:
                         ctx = get_current_context()
-                        init_kwargs = _build_init_kwargs(
-                            self._cls, ctx.static_args or {}
-                        )
-                        inst = self._cls.__new__(self._cls)
+                        init_kwargs = _build_init_kwargs(owner, ctx.static_args or {})
+                        inst = owner.__new__(owner)
                         inst.__init__(**init_kwargs)
                         storage[instance_key] = inst
+            return storage[id(owner)]
 
-            return self.func(storage[instance_key], *args, **kwargs)
+        if inspect.iscoroutinefunction(self.func):
+
+            @functools.wraps(self.func)
+            async def async_bound_method(*args, **kwargs):
+                return await self.func(_get_or_create_instance(), *args, **kwargs)
+
+            async_bound_method._fluxway_operator_meta = self._fluxway_operator_meta
+            return async_bound_method
+
+        @functools.wraps(self.func)
+        def bound_method(*args, **kwargs):
+            return self.func(_get_or_create_instance(), *args, **kwargs)
 
         bound_method._fluxway_operator_meta = self._fluxway_operator_meta
         return bound_method
@@ -831,14 +848,20 @@ def spmd(
 
         def get_spmd_config(c) -> "SPMDConfig":
             from fluxway.common.types import SPMDConfig, OperatorMeta
-            import copy
 
             operators, metas = {}, {}
-            for attr_name in dir(c):
-                attr = getattr(c, attr_name, None)
-                meta = getattr(attr, "_fluxway_operator_meta", None)
-                if isinstance(meta, OperatorMeta):
-                    operators[meta.name] = attr
+            seen: set[str] = set()
+            for klass in c.__mro__:
+                for attr_name, attr in list(klass.__dict__.items()):
+                    if attr_name in seen:
+                        continue
+                    seen.add(attr_name)
+                    if not isinstance(attr, _OperatorWrapper):
+                        continue
+                    meta = attr._fluxway_operator_meta
+                    if not isinstance(meta, OperatorMeta):
+                        continue
+                    operators[meta.name] = attr_name
                     metas[meta.name] = copy.deepcopy(meta)
 
             return SPMDConfig(

@@ -206,18 +206,15 @@ class TestOperatorMetaSerialization:
         """
         SPMDConfig with explicit meta fields preserves OperatorMeta modifications.
         """
-        my_op = dummy_op
-
         meta = OperatorMeta(
             name="test_op",
             input_arguments={ArgumentType.DATA.value: ["input"]},
             output_arguments={ArgumentType.DATA.value: ["output"]},
         )
-        my_op._flux_operator_meta = meta
 
-        # Create config with explicit meta
+        # Create config with explicit meta; operators stores method name, not callable
         config = SPMDConfig(
-            operators={"test_op": my_op}, operator_metas={"test_op": meta}
+            operators={"test_op": "test_op"}, operator_metas={"test_op": meta}
         )
 
         # Modify meta after config creation (simulating Builder linking)

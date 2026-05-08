@@ -35,6 +35,7 @@ from fluxway.common.utils.logging import ensure_logging_configured
 
 # Import decorators for top-level access
 from fluxway.common.decorators import data_type, spmd, operator
+from fluxway.common.bind import bind_spmd
 
 # Import common types
 from fluxway.common.types import (
@@ -63,6 +64,7 @@ __all__ = [
     "data_type",
     "spmd",
     "operator",
+    "bind_spmd",
     # Types
     "PartitionSpec",
     "SPMDConfig",

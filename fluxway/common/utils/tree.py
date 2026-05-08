@@ -1,3 +1,4 @@
+import types as _types
 from typing import Any, Union
 from collections.abc import Callable
 
@@ -6,9 +7,9 @@ def _is_fluxway_data_type(tp: Any) -> bool:
     """Check if a type is marked with @data_type."""
     if tp is None:
         return False
-    # Handle Optional[T] or Union
+    # Handle both typing.Union/Optional[T] and Python 3.10+ X | Y (types.UnionType)
     origin = getattr(tp, "__origin__", None)
-    if origin is Union:
+    if origin is Union or isinstance(tp, _types.UnionType):
         args = getattr(tp, "__args__", [])
         return any(_is_fluxway_data_type(arg) for arg in args if arg is not type(None))
 

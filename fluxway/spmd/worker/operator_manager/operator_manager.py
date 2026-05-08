@@ -17,6 +17,7 @@ import asyncio
 import threading
 import inspect as _inspect
 
+from fluxway.common.decorators import _resolve_owner_class
 from fluxway.common.types.configs import ArgumentType
 from fluxway.common.types.sharding import ShardingSpec, PhysicalLayout
 from fluxway.common.types import EdgeShardingInfo
@@ -120,9 +121,19 @@ class OperatorManager:
         self._node_rank = node_rank
         self._num_nodes = num_nodes
 
-        # Register operators
-        # Register operators dynamically from config
-        self._operators: dict[str, Callable] = config.operators
+        # Resolve operator callables from operator_metas (owner class + method name).
+        # config.operators only provides the op_name → method_name mapping.
+        self._operators: dict[str, Callable] = {}
+        for op_name, meta in (config.operator_metas or {}).items():
+            method_name = config.operators.get(op_name, op_name)
+            if meta.owner_class_qualname:
+                owner_cls = _resolve_owner_class(
+                    meta.owner_class_module, meta.owner_class_qualname
+                )
+                self._operators[op_name] = getattr(owner_cls, method_name)
+            else:
+                # Free-function operator: no owner class, registered directly
+                self._operators[op_name] = None  # type: ignore[assignment]
 
         # Initialize per-operator dictionaries
         self._input_sharding: dict[str, dict[int, ShardingSpec]] = {}
@@ -455,10 +466,7 @@ class OperatorManager:
             raise ValueError(f"OperatorManager[{self._spmd_id}]: mesh is None")
 
         # Enrich with logical sharding from @operator
-        for op_name, operator in self._operators.items():
-            if operator is None:
-                continue
-
+        for op_name in self._operators:
             meta = self._get_operator_metadata(op_name)
             if meta is None:
                 continue

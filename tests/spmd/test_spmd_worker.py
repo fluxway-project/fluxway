@@ -40,10 +40,10 @@ def _make_null_meta(name: str) -> OperatorMeta:
 
 def _make_config(mesh: DeviceMesh, *op_names: str, **extra_ops) -> SPMDConfig:
     """
-    Build SPMDConfig with the given operator names (each with a null lambda + meta).
-    extra_ops allows passing named op->callable overrides.
+    Build SPMDConfig with the given operator names (each with a null meta).
+    operators maps op_name -> method_name (both identical here).
     """
-    ops = {op: (extra_ops.get(op) or (lambda *a, **kw: None)) for op in op_names}
+    ops = {op: op for op in op_names}
     metas = {op: _make_null_meta(op) for op in op_names}
     return SPMDConfig(mesh=mesh, operators=ops, operator_metas=metas)
 
@@ -1122,7 +1122,7 @@ def test_replicate_operator_manager():
         spmd_id="test",
         num_workers=4,
         mesh=mesh,
-        operators={"test_op": dummy_op},
+        operators={"test_op": "test_op"},
         operator_metas={"test_op": meta},
         topology={
             "test_op": SPMDTopology(

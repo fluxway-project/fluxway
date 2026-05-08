@@ -81,7 +81,7 @@ def test_preinstantiate_operator_sets_topology_fields_in_init():
     meta = TopologyAwareOperator.inspect._fluxway_operator_meta
     config = SPMDConfig(
         mesh=DeviceMesh(axis_names=("dp",), device_shape=(8,)),
-        operators={"inspect": TopologyAwareOperator.inspect},
+        operators={"inspect": "inspect"},
         operator_metas={"inspect": meta},
     )
 
@@ -122,7 +122,7 @@ async def test_operator_manager_execute_preserves_topology_fields():
     meta = TopologyAwareOperator.inspect._fluxway_operator_meta
     config = SPMDConfig(
         mesh=DeviceMesh(axis_names=("dp",), device_shape=(8,)),
-        operators={"inspect": TopologyAwareOperator.inspect},
+        operators={"inspect": "inspect"},
         operator_metas={"inspect": meta},
     )
     manager = OperatorManager(

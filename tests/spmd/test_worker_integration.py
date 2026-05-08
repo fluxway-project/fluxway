@@ -21,7 +21,7 @@ def _make_test_config(mesh: DeviceMesh, spmd_id: str = "") -> SPMDConfig:
     return SPMDConfig(
         mesh=mesh,
         spmd_id=spmd_id,
-        operators={"test_op": dummy_fn},
+        operators={"test_op": "test_op"},
         operator_metas={"test_op": meta},
     )
 

@@ -77,6 +77,10 @@ class Builder:
             description: Human-readable description of the node
             mesh: Optional DeviceMesh override. If provided, it takes precedence
                   over the mesh defined in the @spmd decorator.
+            resource: Optional resource dict override (e.g. {"num_gpus": 1}).
+            runtime_env: Optional Ray runtime_env dict override.
+            operator_configs: Optional dict of {op_name: {config_key: value}}
+                              to override or register operator configurations.
 
         Returns:
             Self for method chaining
@@ -96,13 +100,35 @@ class Builder:
                 f"Did you forget to add the @spmd decorator?"
             )
 
-        # Get resource and config from the decorated class
+        resource_override = kwargs.pop("resource", None)
+        runtime_env_override = kwargs.pop("runtime_env", None)
+        operator_configs = kwargs.pop("operator_configs", None)
+
         resource = copy.deepcopy(spmd_class.get_resource())
         spmd_config = copy.deepcopy(spmd_class.get_spmd_config())
 
+        if resource_override is not None:
+            resource = ResourceSpec(
+                num_cpus=resource_override.get(
+                    "num_cpus", resource.num_cpus if resource else 1
+                ),
+                num_gpus=resource_override.get(
+                    "num_gpus", resource.num_gpus if resource else 0
+                ),
+                memory_gb=resource_override.get(
+                    "memory_gb", resource.memory_gb if resource else 0.0
+                ),
+            )
+
+        if runtime_env_override is not None:
+            spmd_config.runtime_env = runtime_env_override
+
+        if operator_configs is not None:
+            from fluxway.common.bind import _apply_operator_configs
+
+            _apply_operator_configs(spmd_config, operator_configs, spmd_class)
+
         if mesh is not None:
-            # Structural Check: Ensure new mesh provides all axes required by operators.
-            # (Note: operator_metas currently stores raw dicts, so we'll check axis names)
             for op_name, meta in spmd_config.operator_metas.items():
                 for kind, sharding in [
                     ("input", meta.input_sharding),
@@ -111,7 +137,6 @@ class Builder:
                     if not sharding:
                         continue
                     for k, v in sharding.items():
-                        # Extract axis names from raw dict or ShardingSpec
                         required_axes = []
                         if isinstance(v, dict):
                             required_axes = v.get("axis", [])
@@ -120,7 +145,6 @@ class Builder:
                         elif isinstance(v, ShardingSpec) and isinstance(
                             v.routing, AlgebraicRouting
                         ):
-                            # It's a concrete ShardingSpec
                             required_axes = [
                                 ax
                                 for sub in v.routing.partition.partitions.values()
@@ -137,7 +161,6 @@ class Builder:
                                     f"  Fix: Ensure your DeviceMesh has matching axis names, or adjust the @operator sharding."
                                 )
 
-            # Re-bind the mesh at the config and spec level
             spmd_config.mesh = mesh
 
             for meta in spmd_config.operator_metas.values():
@@ -146,9 +169,6 @@ class Builder:
                         continue
                     for k, v in sharding_dict.items():
                         if isinstance(v, ShardingSpec):
-                            # In the new architecture, we don't 'with_mesh' on logical routing.
-                            # The mesh binding happens at runtime via PhysicalLayout.
-                            # However, we can validate or store it if needed.
                             pass
 
         if not isinstance(spmd_config.mesh, DeviceMesh):
@@ -176,7 +196,6 @@ class Builder:
         self._nodes[name] = node
         self._spmd_classes[name] = spmd_class
 
-        # Pre-assign UUIDs for all operator outputs to ensure stable ordered routing
         for op_name, meta in spmd_config.operator_metas.items():
             out_args = meta.get_arguments(is_output=True, arg_type=ArgumentType.DATA)
             tuuids = []

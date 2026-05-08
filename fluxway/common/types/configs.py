@@ -137,8 +137,10 @@ class SPMDConfig(FluxwayBaseSchema):
     spmd_id: str = ""
     mesh: Any = None  # DeviceMesh (use Any to avoid circular import)
 
-    # Generic operator registration
-    operators: dict[str, Callable] = Field(default_factory=dict)
+    # Maps operator name to its method name on the owner class.
+    # OperatorManager resolves callables from operator_metas once at worker
+    # initialization and caches them — zero per-call overhead.
+    operators: dict[str, str] = Field(default_factory=dict)
     # Explicit OperatorMeta storage - ensures metadata survives Ray serialization
     operator_metas: dict[str, "OperatorMeta"] = Field(default_factory=dict)
 

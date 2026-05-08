@@ -14,6 +14,21 @@ from fluxway.common.types.configs import (
 )
 from fluxway.common.types.sharding import ShardingSpec, PartitionSpec
 from fluxway.common.mesh import DeviceMesh
+from fluxway.common.decorators import spmd, operator as fw_operator
+
+
+@spmd(mesh_axis_names=("data", "mp"), mesh_axis_shapes=(2, 2))
+class _LoaderOp:
+    @fw_operator(name="loader", is_source=True)
+    def loader(self):
+        return {"t1": np.ones((10, 10))}
+
+
+@spmd(mesh_axis_names=("data",), mesh_axis_shapes=(2,))
+class _ProcessorOp:
+    @fw_operator(name="processor")
+    def processor(self, t1: np.ndarray = None):
+        pass
 
 
 def _meta_to_topology(meta: OperatorMeta) -> dict[str, SPMDTopology]:
@@ -79,6 +94,8 @@ async def test_multi_worker_interleaved_unit_mesh_inheritance():
         output_uuids=[1001],
         output_sharding={1001: sharding},
         output_post_sharding={"processor": [edge_info]},
+        owner_class_module=_LoaderOp.__module__,
+        owner_class_qualname=_LoaderOp.__qualname__,
     )
 
     processor_meta = OperatorMeta(
@@ -86,13 +103,12 @@ async def test_multi_worker_interleaved_unit_mesh_inheritance():
         input_arguments={ArgumentType.DATA.value: ["t1"]},
         input_sharding={"t1": ShardingSpec.chunk(PartitionSpec())},
         input_pre_sharding={"loader": [edge_info]},
+        owner_class_module=_ProcessorOp.__module__,
+        owner_class_qualname=_ProcessorOp.__qualname__,
     )
 
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
     cls = cls.modified_class if cls else SPMDWorker
-
-    def dummy_processor(t1: np.ndarray = None):
-        pass
 
     # Instantiate Loader Workers
     loader_workers = []
@@ -100,7 +116,7 @@ async def test_multi_worker_interleaved_unit_mesh_inheritance():
         config = SPMDConfig(
             mesh=loader_mesh,
             spmd_id="loader",
-            operators={"loader": lambda: {"t1": np.ones((10, 10))}},
+            operators={"loader": "loader"},
             operator_metas={"loader": loader_meta, "processor": processor_meta},
             topology=_meta_to_topology(loader_meta),
         )
@@ -115,7 +131,7 @@ async def test_multi_worker_interleaved_unit_mesh_inheritance():
         config = SPMDConfig(
             mesh=processor_mesh,
             spmd_id="processor",
-            operators={"processor": dummy_processor},
+            operators={"processor": "processor"},
             operator_metas={"loader": loader_meta, "processor": processor_meta},
             topology=_meta_to_topology(processor_meta),
         )
@@ -189,6 +205,8 @@ async def test_single_worker_interleaved_unit():
         output_uuids=[2001],
         output_sharding={2001: sharding},
         output_post_sharding={"processor": [edge]},
+        owner_class_module=_LoaderOp.__module__,
+        owner_class_qualname=_LoaderOp.__qualname__,
     )
 
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
@@ -199,7 +217,7 @@ async def test_single_worker_interleaved_unit():
         config = SPMDConfig(
             mesh=loader_mesh,
             spmd_id="loader",
-            operators={"loader": lambda: {"t1": np.zeros(1)}},
+            operators={"loader": "loader"},
             operator_metas={"loader": loader_meta},
             topology=_meta_to_topology(loader_meta),
         )

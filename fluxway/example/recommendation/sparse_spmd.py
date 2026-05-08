@@ -16,7 +16,6 @@ logger = get_logger(__name__)
 @spmd(
     resource={"num_cpus": 1, "memory_gb": 1},
     mesh_axis_names=("shard",),
-    mesh_axis_shapes=(4,),
 )
 class SparseEmbeddingSPMD:
     """Sharded embedding table backed by sparse_embedding.EmbeddingStore.
