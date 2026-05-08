@@ -138,3 +138,33 @@ async def test_operator_manager_execute_preserves_topology_fields():
     result = await manager.execute_async("inspect", step=0)
 
     assert result == (3, 8, 1, 4, 0, 2)
+
+
+def test_operator_wrapper_resolves_local_classes():
+    """
+    Test that the _OperatorWrapper descriptor correctly resolves the owner class
+    even if the class is defined inside a local scope (e.g. factory function),
+    where importlib string-based reflection would normally fail.
+    """
+
+    def make_local_spmd():
+        class LocalTopologyAwareOperator:
+            @operator(name="inspect_local")
+            def inspect_local(self):
+                return getattr(self, "rank", -1)
+
+        return LocalTopologyAwareOperator
+
+    LocalClass = make_local_spmd()
+
+    with operator_context(
+        static_args={},
+        rank=5,
+        world_size=8,
+    ):
+        # Trigger __get__(None, LocalClass) on the descriptor.
+        # This will resolve self._cls = LocalClass and successfully inject properties
+        # without crashing due to '<locals>' in __qualname__.
+        result = LocalClass.inspect_local()
+
+    assert result == 5

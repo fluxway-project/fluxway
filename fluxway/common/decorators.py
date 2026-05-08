@@ -496,26 +496,43 @@ def _build_init_kwargs(cls: type, static_args: dict) -> dict:
         return {}
 
 
-def _build_instance_wrapper(func: Callable, meta: Any) -> Callable:
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        cls = _resolve_owner_class(meta.owner_class_module, meta.owner_class_qualname)
-        _inject_context_properties(cls)
+class _OperatorWrapper:
+    def __init__(self, func: Callable, meta: Any):
+        self.func = func
+        self._fluxway_operator_meta = meta
+        self._cls = None
+        functools.update_wrapper(self, func)
 
-        instance_key = id(cls)
-        storage, lock = get_instance_storage()
-        if instance_key not in storage:
-            with lock:
-                if instance_key not in storage:
-                    ctx = get_current_context()
-                    init_kwargs = _build_init_kwargs(cls, ctx.static_args or {})
-                    instance = cls.__new__(cls)
-                    instance.__init__(**init_kwargs)
-                    storage[instance_key] = instance
+    def __get__(self, instance, owner):
+        if self._cls is None:
+            self._cls = owner
+            _inject_context_properties(self._cls)
 
-        return func(storage[instance_key], *args, **kwargs)
+        @functools.wraps(self.func)
+        def bound_method(*args, **kwargs):
+            instance_key = id(self._cls)
+            storage, lock = get_instance_storage()
+            if instance_key not in storage:
+                with lock:
+                    if instance_key not in storage:
+                        ctx = get_current_context()
+                        init_kwargs = _build_init_kwargs(
+                            self._cls, ctx.static_args or {}
+                        )
+                        inst = self._cls.__new__(self._cls)
+                        inst.__init__(**init_kwargs)
+                        storage[instance_key] = inst
 
-    return wrapper
+            return self.func(storage[instance_key], *args, **kwargs)
+
+        bound_method._fluxway_operator_meta = self._fluxway_operator_meta
+        return bound_method
+
+    def __call__(self, *args, **kwargs):
+        # Fallback if called directly without binding (should not happen in fluxway)
+        raise RuntimeError(
+            "Fluxway operators must be called as class/instance methods."
+        )
 
 
 def operator(
@@ -699,12 +716,13 @@ def _create_operator_wrapper(
         ),
     )
 
-    wrapper = _build_instance_wrapper(func, meta)
-    for target in (func, wrapper):
-        target._fluxway_operator_meta = meta
+    wrapper = _OperatorWrapper(func, meta)
 
-    if _is_class_method:
-        return staticmethod(wrapper)
+    # Expose meta on the wrapper for framework inspection
+    wrapper._fluxway_operator_meta = meta
+
+    # We return the descriptor directly. It will naturally act like a staticmethod
+    # while gaining access to the owner class via the __get__ protocol.
     return wrapper
 
 
@@ -842,6 +860,7 @@ def spmd_source(
     mesh_axis_shapes: tuple[int, ...] | None = None,
     interleaved: bool = False,
     interleave_unit_size: int = 1,
+    runtime_env: dict[str, Any] | None = None,
 ):
     """
     Configure a class as an SPMD source.
@@ -851,6 +870,7 @@ def spmd_source(
         resource=resource,
         mesh_axis_names=mesh_axis_names,
         mesh_axis_shapes=mesh_axis_shapes,
+        runtime_env=runtime_env,
     )
 
     def decorator(cls):
