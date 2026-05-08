@@ -262,8 +262,19 @@ if RAY_AVAILABLE:
             node_ids = dict(zip(ranks, node_id_values, strict=True))
             rank_info = self._compute_rank_info(node_ids)
 
+            # Gather IP of rank 0 to act as rendezvous address
+            if 0 in self._worker_handles:
+                rank0_ip = await self._worker_handles[0].get_node_ip.remote()
+                rank0_port = await self._worker_handles[0].find_free_port.remote()
+                rank0_address = f"{rank0_ip}:{rank0_port}"
+            else:
+                rank0_address = None
+
             for rank, worker in self._worker_handles.items():
-                worker.setup_and_start.remote(**rank_info[rank])
+                worker.setup_and_start.remote(
+                    **rank_info[rank],
+                    rank0_address=rank0_address,
+                )
 
             logger.debug(
                 f"All workers started worker_count={len(self._worker_handles)} spmd_id={self.spmd_id}"

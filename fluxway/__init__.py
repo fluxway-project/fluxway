@@ -57,9 +57,14 @@ from fluxway.common.types import (
 # Import control plane components
 from fluxway.control_plane import GraphParser, Builder
 
+# Import runner
+from fluxway.runner import launch
+
 __all__ = [
     # Version
     "__version__",
+    # Runner
+    "launch",
     # Decorators
     "data_type",
     "spmd",

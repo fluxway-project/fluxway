@@ -289,6 +289,7 @@ class SPMDWorker:
         local_world_size: int | None = None,
         node_rank: int | None = None,
         num_nodes: int | None = None,
+        rank0_address: str | None = None,
     ) -> None:
         """Eagerly instantiate all SPMD operator class instances.
 
@@ -316,6 +317,7 @@ class SPMDWorker:
             local_world_size=local_world_size,
             node_rank=0 if node_rank is None else node_rank,
             num_nodes=1 if num_nodes is None else num_nodes,
+            rank0_address=rank0_address,
         ):
             storage, lock = get_instance_storage()
             for op_meta in (config.operator_metas or {}).values():
@@ -382,8 +384,25 @@ class SPMDWorker:
         """Return the current Ray node identifier for topology-aware startup."""
         return ray.get_runtime_context().get_node_id()
 
+    def get_node_ip(self) -> str:
+        """Return the current Ray node IP address for distributed rendezvous."""
+        return ray.util.get_node_ip_address()
+
+    def find_free_port(self) -> int:
+        """Find an available port on the current node."""
+        import socket
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+
     def setup_and_start(
-        self, local_rank: int, local_world_size: int, node_rank: int, num_nodes: int
+        self,
+        local_rank: int,
+        local_world_size: int,
+        node_rank: int,
+        num_nodes: int,
+        rank0_address: str | None = None,
     ) -> None:
         """Finish topology-aware startup after the driver has all worker node IDs."""
         logger.debug(
@@ -409,6 +428,7 @@ class SPMDWorker:
                 local_world_size=local_world_size,
                 node_rank=node_rank,
                 num_nodes=num_nodes,
+                rank0_address=rank0_address,
             )
             logger.debug(
                 "setup_and_start_preinstantiate_complete spmd_id=%s rank=%s",

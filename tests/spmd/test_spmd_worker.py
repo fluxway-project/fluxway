@@ -423,7 +423,16 @@ def test_worker_setup_and_start_initializes_runtime(monkeypatch):
     worker.setup_and_start(local_rank=1, local_world_size=3, node_rank=0, num_nodes=2)
 
     assert calls["preinstantiate"] == [
-        (2, {"local_rank": 1, "local_world_size": 3, "node_rank": 0, "num_nodes": 2})
+        (
+            2,
+            {
+                "local_rank": 1,
+                "local_world_size": 3,
+                "node_rank": 0,
+                "num_nodes": 2,
+                "rank0_address": None,
+            },
+        )
     ]
     assert calls["heartbeat"] == 1
     assert calls["run_loop"] == 1

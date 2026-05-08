@@ -2,9 +2,7 @@ import os
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
-import asyncio
 import argparse
-import ray
 
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.types.configs import AsyncStepConfig
@@ -16,6 +14,8 @@ from fluxway.example.recommendation.reader import RecommendationReader
 from fluxway.example.recommendation.input_spmd import InputSPMD
 from fluxway.example.recommendation.sparse_spmd import SparseEmbeddingSPMD
 from fluxway.example.recommendation.dense_spmd import DenseSPMD
+
+from fluxway import launch
 
 
 async def _print_resource_allocation_summary(controller):
@@ -98,7 +98,6 @@ async def run_training(args):
             mesh=dense_mesh,
             embed_dim=16,
             dense_stats_dim=2,
-            coordinator_address=args.coordinator_address,
             runtime_env=gpu_runtime_env,
             resource={"num_gpus": 1},
         )
@@ -156,7 +155,6 @@ async def run_training(args):
 
 
 def main():
-    ray.init(num_cpus=16)
     parser = argparse.ArgumentParser(description="Fluxway Recommendation Example")
     parser.add_argument(
         "--max-steps", type=int, default=10, help="Max number of steps to run"
@@ -189,20 +187,16 @@ def main():
         help="Number of shards for EmbeddingTable2",
     )
     parser.add_argument(
-        "--coordinator-address",
-        type=str,
-        default="127.0.0.1:29500",
-        dest="coordinator_address",
-        help="JAX distributed coordinator address for DenseSPMD",
-    )
-    parser.add_argument(
         "--num-threads",
         type=int,
         default=None,
         dest="num_threads",
         help="Number of threads for SparseEmbedding store",
     )
-    asyncio.run(run_training(parser.parse_args()))
+    launch(
+        run_training,
+        parser.parse_args(),
+    )
 
 
 if __name__ == "__main__":

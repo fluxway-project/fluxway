@@ -31,6 +31,7 @@ class _OperatorContextState:
     local_world_size: int | None = None
     node_rank: int = 0
     num_nodes: int = 1
+    rank0_address: str | None = None
 
 
 class _PicklableLock:
@@ -92,6 +93,7 @@ def operator_context(
     local_world_size: int | None = None,
     node_rank: int = 0,
     num_nodes: int = 1,
+    rank0_address: str | None = None,
 ):
     """Context manager to inject operator runtime context into current coroutine/thread.
 
@@ -107,6 +109,7 @@ def operator_context(
         local_world_size=local_world_size,
         node_rank=node_rank,
         num_nodes=num_nodes,
+        rank0_address=rank0_address,
     )
     token = _operator_context_var.set(state)
     try:
@@ -465,6 +468,7 @@ _CONTEXT_ATTR_NAMES: frozenset[str] = frozenset(
         "num_nodes",
         "static_args",
         "ctx",
+        "rank0_address",
     }
 )
 

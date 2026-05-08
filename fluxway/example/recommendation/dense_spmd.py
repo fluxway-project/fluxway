@@ -21,17 +21,14 @@ class DenseSPMD:
         embed_dim: int = 3,
         dense_stats_dim: int = 2,
         grad_accum_steps: int = 2,
-        coordinator_address: str = "127.0.0.1:29500",
     ):
         self.embed_dim = embed_dim
         self.dense_stats_dim = dense_stats_dim
         self.grad_accum_steps = grad_accum_steps
         self._jax_initialized = False
 
-        # self.rank and self.world_size are injected by the framework before __init__
-        # is called, so jax.distributed.initialize is safe to call here.
         jax.distributed.initialize(
-            coordinator_address=coordinator_address,
+            coordinator_address=self.rank0_address,
             num_processes=self.world_size,
             process_id=self.rank,
         )
