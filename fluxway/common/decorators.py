@@ -192,12 +192,16 @@ def _build_hierarchical_map(
     return mapping
 
 
-def _dedup_preserve_order(lst: list) -> list:
-    seen: list = []
+def _validate_unique(lst: list, context: str) -> list:
+    seen: set = set()
     for x in lst:
-        if x not in seen:
-            seen.append(x)
-    return seen
+        if x in seen:
+            raise ValueError(
+                f"Fluxway Operator Error: Duplicate argument '{x}' in {context}.\n"
+                f"Fix: Remove the duplicate entry from your @operator configuration."
+            )
+        seen.add(x)
+    return lst
 
 
 def _classify_sig_params(
@@ -595,14 +599,20 @@ def _create_operator_wrapper(
         _infer_input_streams(sig, data_params, use_prefix)
     )
 
-    final_tensors = _dedup_preserve_order(
-        data_argument if data_argument is not None else all_data_fields
+    final_tensors = (
+        _validate_unique(data_argument, "data_argument")
+        if data_argument is not None
+        else all_data_fields
     )
-    final_states = _dedup_preserve_order(
-        control_argument if control_argument is not None else all_control_fields
+    final_states = (
+        _validate_unique(control_argument, "control_argument")
+        if control_argument is not None
+        else all_control_fields
     )
-    final_statics = _dedup_preserve_order(
-        static_argument if static_argument is not None else []
+    final_statics = (
+        _validate_unique(static_argument, "static_argument")
+        if static_argument is not None
+        else []
     )
 
     if has_var_keyword:

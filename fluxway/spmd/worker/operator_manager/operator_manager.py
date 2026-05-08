@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
 from collections.abc import Callable
 from fluxway.common.utils.logging import get_logger
+import asyncio
 import threading
 import inspect as _inspect
 
@@ -1236,11 +1237,13 @@ class OperatorManager:
             node_rank=self._node_rank,
             num_nodes=self._num_nodes,
         ):
-            if self.is_source_operator(op_name):
-                res = operator()
-            else:
-                res = operator(*args, **kwargs)
+            is_async = _inspect.iscoroutinefunction(operator)
 
-            if _inspect.iscoroutine(res):
-                return await res
-            return res
+            if is_async:
+                if self.is_source_operator(op_name):
+                    return await operator()
+                return await operator(*args, **kwargs)
+
+            if self.is_source_operator(op_name):
+                return await asyncio.to_thread(operator)
+            return await asyncio.to_thread(operator, *args, **kwargs)
