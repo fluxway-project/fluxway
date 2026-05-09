@@ -735,8 +735,14 @@ if RAY_AVAILABLE:
                     f"Refusing to persist incomplete manifest."
                 )
             manifest = {
-                sid: {str(rank): m for rank, m in per_rank.items()}
-                for sid, per_rank in snap_info["metadata"].items()
+                sid: {
+                    "spmd_state": per_rank_or_state["spmd_state"],
+                    "rank_storage": {
+                        str(rank): storage
+                        for rank, storage in per_rank_or_state["rank_storage"].items()
+                    },
+                }
+                for sid, per_rank_or_state in snap_info["metadata"].items()
             }
             return manifest
 
@@ -766,7 +772,18 @@ if RAY_AVAILABLE:
                 ranks = list(metadata_futures.keys())
                 refs = list(metadata_futures.values())
                 results = await asyncio.gather(*refs)
-                resolved = dict(zip(ranks, results, strict=True))
+                # Each result is a (spmd_state, rank_storage) tuple from save_state_to_disk.
+                # spmd_state is identical across all ranks (topology-independent);
+                # we use rank 0's (or the first resolved rank's) as the canonical value.
+                rank_storage_map: dict[int, dict] = {}
+                canonical_spmd_state: dict | None = None
+                for rank, (spmd_state, rank_storage) in zip(
+                    ranks, results, strict=True
+                ):
+                    if canonical_spmd_state is None:
+                        canonical_spmd_state = spmd_state
+                    if rank_storage:
+                        rank_storage_map[rank] = rank_storage
             except Exception as e:
                 logger.error(f"Failed to resolve snapshot metadata for {spmd_id}: {e}")
                 snap_info["errors"].append(spmd_id)
@@ -775,7 +792,10 @@ if RAY_AVAILABLE:
                     snap_info["event"].set()
                 return
 
-            snap_info["metadata"][spmd_id] = resolved
+            snap_info["metadata"][spmd_id] = {
+                "spmd_state": canonical_spmd_state or {},
+                "rank_storage": rank_storage_map,
+            }
             snap_info["received"] += 1
 
             if snap_info["received"] == snap_info["expected"]:
@@ -824,8 +844,7 @@ if RAY_AVAILABLE:
             Args:
                 snapshot_id: Snapshot identifier for bookkeeping.
                 step:        The logical step count of this snapshot.
-                manifest:    {spmd_id: {str(rank): metadata_dict}} where metadata_dict
-                             contains ``backend`` and backend-specific path fields.
+                manifest:    {spmd_id: {"spmd_state": {...}, "rank_storage": {str(rank): {...}}}}
             """
             logger.info(f"Controller restoring snapshot {snapshot_id} (step {step})")
 
@@ -846,23 +865,20 @@ if RAY_AVAILABLE:
                         f"Set FLUXWAY_SNAPSHOT_TIMEOUT_SECS to adjust."
                     )
 
-            # Important: update the baseline *before* waking up workers,
-            # so their `report_op_completed` pulses don't trigger a nested checkpoint.
             self._last_checkpointed_step = step
             self._last_requested_drain_target = step
 
             self._state_manager.save_snapshot(snapshot_id, manifest)
 
-            # Hydrate Control Plane metadata synchronously from manifest before unblocking
-            # to guarantee step watermarks are correct before any worker executes.
-            for spmd_id, rank_map_str in manifest.items():
-                for metadata in rank_map_str.values():
-                    for op_name, count in metadata.get(
-                        "completed_step_count", {}
-                    ).items():
-                        self._async_step_manager.report_op_completed(
-                            spmd_id, op_name, count
-                        )
+            # Hydrate Control Plane step watermarks from spmd_state before unblocking.
+            for spmd_id, spmd_entry in manifest.items():
+                spmd_state = spmd_entry.get("spmd_state", {})
+                for op_name, count in spmd_state.get(
+                    "completed_step_count", {}
+                ).items():
+                    self._async_step_manager.report_op_completed(
+                        spmd_id, op_name, count
+                    )
 
             await self._check_and_enforce_step_limits()
 
@@ -870,18 +886,19 @@ if RAY_AVAILABLE:
 
             try:
                 restore_tasks = []
-                for spmd_id, rank_metadata_map_str in manifest.items():
+                for spmd_id, spmd_entry in manifest.items():
                     driver = self._spmd_manager.get_driver_handle(spmd_id)
                     if driver is None:
                         raise RuntimeError(
                             f"restore_snapshot: driver for spmd_id '{spmd_id}' not found. "
                             f"Cannot perform partial restore — aborting to prevent split-brain."
                         )
-                    rank_metadata_map = {
-                        int(k): v for k, v in rank_metadata_map_str.items()
+                    spmd_state = spmd_entry["spmd_state"]
+                    rank_storage = {
+                        int(k): v for k, v in spmd_entry.get("rank_storage", {}).items()
                     }
                     restore_tasks.append(
-                        driver.restore_from_disk.remote(rank_metadata_map)
+                        driver.restore_from_disk.remote(spmd_state, rank_storage)
                     )
                 if restore_tasks:
                     await asyncio.gather(*restore_tasks)

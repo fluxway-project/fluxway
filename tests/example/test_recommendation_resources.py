@@ -39,22 +39,25 @@ def test_recommendation_spmd_classes_declare_resources():
             ), f"{path.name}:{cls.name} should declare explicit resource requirements"
 
 
-def test_recommendation_train_configures_ray_logical_cpus():
+def test_recommendation_train_uses_fluxway_launch():
     module = _load_module(EXAMPLE_DIR / "train.py")
-    ray_init_calls = []
+    launch_calls = []
 
     for node in ast.walk(module):
         if not isinstance(node, ast.Call):
             continue
-        if not isinstance(node.func, ast.Attribute):
-            continue
-        if not isinstance(node.func.value, ast.Name):
-            continue
-        if node.func.value.id == "ray" and node.func.attr == "init":
-            ray_init_calls.append(node)
+        func = node.func
+        # Accept both `launch(...)` and `fluxway.launch(...)` call styles
+        is_bare_launch = isinstance(func, ast.Name) and func.id == "launch"
+        is_attr_launch = (
+            isinstance(func, ast.Attribute)
+            and func.attr == "launch"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "fluxway"
+        )
+        if is_bare_launch or is_attr_launch:
+            launch_calls.append(node)
 
-    assert ray_init_calls, "expected train.py to call ray.init"
-    assert any(
-        any(keyword.arg == "num_cpus" for keyword in call.keywords)
-        for call in ray_init_calls
-    ), "train.py should set ray.init(num_cpus=...) for the local demo"
+    assert launch_calls, (
+        "expected train.py to call fluxway.launch() for zero-config Ray initialization"
+    )

@@ -200,9 +200,16 @@ async def test_restore_snapshot_waits_for_all_drivers_ready(
     controller.block_all_spmds = AsyncMock()
     controller.unblock_all_spmds = AsyncMock()
 
+    spmd_state = {"completed_step_count": {}, "static_args": {}}
     manifest = {
-        "op1": {"0": {"completed_step_count": {}}},
-        "op2": {"0": {"completed_step_count": {}}},
+        "op1": {
+            "spmd_state": spmd_state,
+            "rank_storage": {"0": {"ckpt_dir": "/tmp/ckpt"}},
+        },
+        "op2": {
+            "spmd_state": spmd_state,
+            "rank_storage": {"0": {"ckpt_dir": "/tmp/ckpt"}},
+        },
     }
 
     restore_task = asyncio.create_task(
@@ -223,8 +230,8 @@ async def test_restore_snapshot_waits_for_all_drivers_ready(
 
     controller.block_all_spmds.assert_awaited_once_with()
     mock_spmd_manager.mock_driver1.restore_from_disk.remote.assert_called_once_with(
-        {0: {"completed_step_count": {}}}
+        spmd_state, {0: {"ckpt_dir": "/tmp/ckpt"}}
     )
     mock_spmd_manager.mock_driver2.restore_from_disk.remote.assert_called_once_with(
-        {0: {"completed_step_count": {}}}
+        spmd_state, {0: {"ckpt_dir": "/tmp/ckpt"}}
     )

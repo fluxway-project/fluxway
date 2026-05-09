@@ -496,17 +496,12 @@ if RAY_AVAILABLE:
                 self._clear_drain_and_fail()
                 return
 
-            metadata_futures = {
+            save_futures: dict[int, Any] = {
                 rank: worker.save_state_to_disk.remote(
                     self._pending_ckpt_dir, self._pending_target_step_count
                 )
                 for rank, worker in self._worker_handles.items()
             }
-            # Submit snapshot metadata to controller.
-            # This is a fire-and-forget remote call. In Ray, `.remote()` does not block
-            # and will not raise network/actor-dead errors synchronously.
-            # Synchronous exceptions here only indicate local programmatic bugs (e.g. TypeError)
-            # and should fail-fast directly rather than being swallowed by generic exception handlers.
             if self.controller_handle is None:
                 logger.error(
                     f"controller_handle is None, cannot report snapshot metadata "
@@ -516,7 +511,7 @@ if RAY_AVAILABLE:
                 return
 
             self.controller_handle.receive_snapshot_metadata.remote(
-                self.spmd_id, self._pending_snapshot_id, metadata_futures
+                self.spmd_id, self._pending_snapshot_id, save_futures
             )
 
         def _clear_drain_and_fail(self) -> None:
@@ -562,27 +557,29 @@ if RAY_AVAILABLE:
             self.state_machine.trigger(DriverEvent.SNAPSHOT_COMPLETE)
 
         async def restore_from_disk(
-            self, rank_metadata_map: dict[int, dict[str, Any]]
+            self,
+            spmd_state: dict[str, Any],
+            rank_storage: dict[int, dict[str, Any]],
         ) -> None:
             """
             Fan out checkpoint restore to all workers in parallel.
 
-            Each Worker reads its own tensors directly from the shared filesystem.
+            Every worker in ``_worker_handles`` receives a ``load_state_from_disk``
+            call.  Workers whose rank is absent from ``rank_storage`` (e.g. newly
+            added data-parallel ranks) receive ``rank_storage=None`` and will inherit
+            the logical progress from ``spmd_state`` without loading on-disk tensors.
 
             Args:
-                rank_metadata_map: {rank: metadata_dict} where metadata_dict contains
-                                   ``backend`` and backend-specific path fields.
+                spmd_state:   SPMD-level logical state (``completed_step_count``,
+                              ``static_args``) shared by all ranks.
+                rank_storage: Per-rank physical storage paths keyed by integer rank.
             """
-            self.spmd_synchronizer.load_step_counts(rank_metadata_map)
+            self.spmd_synchronizer.load_spmd_state(spmd_state)
 
-            tasks = []
-            for rank, metadata in rank_metadata_map.items():
-                worker = self._worker_handles.get(rank)
-                if worker is None:
-                    raise RuntimeError(
-                        f"Worker rank {rank} not found spmd_id={self.spmd_id}"
-                    )
-                tasks.append(worker.load_state_from_disk.remote(metadata))
+            tasks = [
+                worker.load_state_from_disk.remote(spmd_state, rank_storage.get(rank))
+                for rank, worker in self._worker_handles.items()
+            ]
             await asyncio.gather(*tasks)
 
         # =====================================================================

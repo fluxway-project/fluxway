@@ -458,7 +458,7 @@ def _normalize_sharding_values(sharding: dict) -> dict:
     return result
 
 
-_CONTEXT_ATTR_NAMES: frozenset[str] = frozenset(
+_STATIC_CONTEXT_ATTR_NAMES: frozenset[str] = frozenset(
     {
         "rank",
         "world_size",
@@ -467,23 +467,28 @@ _CONTEXT_ATTR_NAMES: frozenset[str] = frozenset(
         "node_rank",
         "num_nodes",
         "static_args",
-        "ctx",
         "rank0_address",
     }
+)
+_DYNAMIC_CONTEXT_ATTR_NAMES: frozenset[str] = frozenset({"ctx"})
+_CONTEXT_ATTR_NAMES: frozenset[str] = (
+    _STATIC_CONTEXT_ATTR_NAMES | _DYNAMIC_CONTEXT_ATTR_NAMES
 )
 
 
 def _inject_context_properties(cls: type) -> None:
-    """Idempotently replace runtime-state attributes with ContextVar-backed properties.
+    """Inject ContextVar-backed property only for per-invocation dynamic attributes.
 
-    This ensures each asyncio Task reads its own isolated context snapshot,
-    eliminating races where a shared instance's attributes are overwritten by a
-    concurrent coroutine after an `await` suspension point.
+    Static attributes (rank, world_size, local_rank, …) are fixed for the
+    lifetime of a worker actor and are stored as plain instance attributes in
+    ``_get_or_create_instance``.  Only ``ctx`` (which carries per-step state
+    like ``step``) varies between concurrent coroutine invocations and
+    therefore needs a ContextVar property for isolation.
     """
     sentinel = f"_fluxway_ctx_props_{cls.__qualname__}"
     if getattr(cls, sentinel, False):
         return
-    for attr in _CONTEXT_ATTR_NAMES:
+    for attr in _DYNAMIC_CONTEXT_ATTR_NAMES:
         prop = property(lambda self, a=attr: getattr(get_current_context(), a))
         setattr(cls, attr, prop)
     setattr(cls, sentinel, True)
@@ -527,8 +532,16 @@ class _OperatorWrapper:
                 with lock:
                     if instance_key not in storage:
                         ctx = get_current_context()
-                        init_kwargs = _build_init_kwargs(owner, ctx.static_args or {})
+                        # Write static attributes directly into inst.__dict__
+                        # BEFORE __init__ so that self.rank / self.world_size
+                        # etc. are available as plain instance attributes
+                        # throughout the object's lifetime, including in
+                        # lifecycle hooks like save_state / restore_state that
+                        # run outside any active operator context.
                         inst = owner.__new__(owner)
+                        for attr in _STATIC_CONTEXT_ATTR_NAMES:
+                            inst.__dict__[attr] = getattr(ctx, attr)
+                        init_kwargs = _build_init_kwargs(owner, ctx.static_args or {})
                         inst.__init__(**init_kwargs)
                         storage[instance_key] = inst
             return storage[id(owner)]
@@ -853,20 +866,30 @@ def spmd(
         def get_spmd_config(c) -> "SPMDConfig":
             from fluxway.common.types import SPMDConfig, OperatorMeta
 
-            operators, metas = {}, {}
-            seen: set[str] = set()
-            for klass in c.__mro__:
-                for attr_name, attr in list(klass.__dict__.items()):
-                    if attr_name in seen:
-                        continue
-                    seen.add(attr_name)
+            # Pass 1: walk the full MRO to collect operator metadata from _OperatorWrapper.
+            # A subclass may override a method with a plain function, losing the wrapper.
+            # We scan from the bottom of MRO up so that the most-derived _OperatorWrapper
+            # (if any) wins, but we never discard metadata just because the attr was already
+            # seen as a plain function in a more-derived class.
+            wrapper_meta: dict[
+                str, tuple[str, OperatorMeta]
+            ] = {}  # attr_name -> (op_name, meta)
+            for klass in reversed(c.__mro__):
+                for attr_name, attr in klass.__dict__.items():
                     if not isinstance(attr, _OperatorWrapper):
                         continue
                     meta = attr._fluxway_operator_meta
                     if not isinstance(meta, OperatorMeta):
                         continue
-                    operators[meta.name] = attr_name
-                    metas[meta.name] = copy.deepcopy(meta)
+                    wrapper_meta[attr_name] = (meta.name, copy.deepcopy(meta))
+
+            # Pass 2: for each discovered operator, resolve the attr_name that the final
+            # class actually exposes (may be a plain override — that is fine, the framework
+            # only needs to know the correct attr_name for dispatch and the metadata).
+            operators, metas = {}, {}
+            for attr_name, (op_name, meta) in wrapper_meta.items():
+                operators[op_name] = attr_name
+                metas[op_name] = meta
 
             return SPMDConfig(
                 mesh=c._mesh,

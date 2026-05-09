@@ -105,38 +105,30 @@ class SPMDSynchronizer:
         self._drain_on_drained: Callable[[], None] | None = None
         self._drain_acked_ops: set = set()  # ops where all workers reached ceiling
 
-    def load_step_counts(self, rank_metadata_map: dict[int, dict[str, Any]]) -> None:
-        """Load step counts directly from metadata, skipping callback to avoid RPC storms."""
+    def load_spmd_state(self, spmd_state: dict[str, Any]) -> None:
+        """Load step counts for all workers uniformly from SPMD-level logical state.
+
+        Since ``completed_step_count`` in ``spmd_state`` is topology-independent
+        (all ranks share the same logical progress), this method broadcasts the
+        counts to every rank slot, ensuring no rank starts at step 0 after restore.
+        """
         with self._lock:
-            for rank, metadata in rank_metadata_map.items():
-                for op_name, count in metadata.get("completed_step_count", {}).items():
-                    old_count = self._worker_completed_count[rank].get(op_name, 0)
-                    self._worker_completed_count[rank][op_name] = max(old_count, count)
+            for op_name, count in spmd_state.get("completed_step_count", {}).items():
+                for rank in range(self.num_workers):
+                    self._worker_completed_count[rank][op_name] = count
+                self._spmd_completed_count[op_name] = count
+                if (
+                    op_name not in self._allowed_steps
+                    or self._allowed_steps[op_name] < count
+                ):
+                    self._allowed_steps[op_name] = count
 
-                    # Initialize _allowed_steps to prevent premature skew-blocking immediately after restore
-                    if (
-                        op_name not in self._allowed_steps
-                        or self._allowed_steps[op_name] < count
-                    ):
-                        self._allowed_steps[op_name] = count
-
-            if not self.num_workers:
-                return
-
-            all_ops = set()
-            for rank_ops in self._worker_completed_count.values():
-                all_ops.update(rank_ops.keys())
-
-            for op_name in all_ops:
-                min_count = min(
-                    self._worker_completed_count[r].get(op_name, 0)
-                    for r in range(self.num_workers)
-                )
-                if min_count > self._spmd_completed_count.get(op_name, 0):
-                    self._spmd_completed_count[op_name] = min_count
-                    logger.debug(
-                        f"SPMD {self.spmd_id} initialized {op_name} total_count {min_count} from manifest"
-                    )
+            logger.debug(
+                "SPMD %s loaded spmd_state steps=%s for %d workers",
+                self.spmd_id,
+                spmd_state.get("completed_step_count", {}),
+                self.num_workers,
+            )
 
     def register_expected_ops(self, ops: list[str]) -> None:
         """Register statically known operators to properly anchor drain ceilings.

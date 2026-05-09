@@ -33,9 +33,11 @@ import ray
 from fluxway.common.backend import get_backend
 from fluxway.common.decorators import (
     operator_context,
+    get_current_context,
     get_instance_storage,
     _resolve_owner_class,
     _inject_context_properties,
+    _STATIC_CONTEXT_ATTR_NAMES,
 )
 from fluxway.common.execution import compile
 from fluxway.common.types import (
@@ -349,6 +351,9 @@ class SPMDWorker:
 
                 instance = cls.__new__(cls)
                 _inject_context_properties(cls)
+                ctx = get_current_context()
+                for _attr in _STATIC_CONTEXT_ATTR_NAMES:
+                    instance.__dict__[_attr] = getattr(ctx, _attr)
                 logger.debug(
                     "operator_init_begin owner_class=%s rank=%s",
                     cls.__qualname__,
@@ -2548,88 +2553,113 @@ class SPMDWorker:
     # State Persistence (checkpoint I/O)
     # =========================================================================
 
-    async def save_state_to_disk(self, ckpt_dir: str, step: int) -> dict[str, Any]:
+    async def save_state_to_disk(
+        self, ckpt_dir: str, step: int
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         """
-        Persist this worker's state to disk and return lightweight path metadata.
-
-        The persisted state comprises:
-        - ``operator_states``: the dict returned by each operator's ``save_state()``
-        - ``completed_step_count``: current per-op training progress
-        - ``static_args``: current control-plane arguments
+        Persist this worker's state to disk.
 
         Returns:
-            Backend-specific path metadata plus ``completed_step_count`` for the
-            Controller manifest (so it can record per-worker progress without
-            reading from disk).
+            A ``(spmd_state, rank_storage)`` tuple:
+
+            - ``spmd_state``: SPMD-level logical state that is topology-independent
+              (``completed_step_count``, ``static_args``).  All ranks in the same
+              SPMD share identical values; the Driver stores this once per SPMD.
+            - ``rank_storage``: rank-specific physical storage paths returned by the
+              checkpoint backend (``ckpt_dir``, ``orbax_final_path``,
+              ``local_state_dir``, …).  Empty dict when this rank has no on-disk
+              tensors.
         """
-        # Snapshot completed_step_count on the calling coroutine before entering
-        # the thread; the returned metadata must be consistent with what was persisted.
         completed_step_count_snapshot = dict(self._completed_step_count)
         static_args_snapshot = self._op_manager.get_static_args()
 
         spmd_dir = str(Path(ckpt_dir) / str(step) / self.spmd_id)
         operator_states = self._call_operator_save_state(spmd_dir)
 
-        state = {"operator_states": operator_states}
-
         if operator_states:
-            metadata = await self._checkpoint_backend.save(
-                state, ckpt_dir, self.spmd_id, self.rank, step
+            rank_storage = await self._checkpoint_backend.save(
+                {"operator_states": operator_states},
+                ckpt_dir,
+                self.spmd_id,
+                self.rank,
+                step,
             )
         else:
-            metadata = {}
+            rank_storage = {}
 
-        # completed_step_count and static_args live in the manifest (Controller side) only;
-        # keeping them out of the on-disk blob avoids double-storage, avoids Orbax type errors,
-        # and prevents race conditions across multiple workers without JAX distributed.
-        metadata["completed_step_count"] = completed_step_count_snapshot
-        metadata["static_args"] = static_args_snapshot
+        spmd_state = {
+            "completed_step_count": completed_step_count_snapshot,
+            "static_args": static_args_snapshot,
+        }
 
         logger.debug(
-            f"State saved to disk spmd_id={self.spmd_id} rank={self.rank} step={step}"
+            "State saved to disk spmd_id=%s rank=%s step=%s",
+            self.spmd_id,
+            self.rank,
+            step,
         )
-        return metadata
+        return spmd_state, rank_storage
 
-    async def load_state_from_disk(self, metadata: dict[str, Any]) -> None:
-        """Restore this worker's state from disk using previously returned path metadata."""
-        if "completed_step_count" not in metadata:
+    async def load_state_from_disk(
+        self,
+        spmd_state: dict[str, Any],
+        rank_storage: dict[str, Any] | None,
+    ) -> None:
+        """
+        Restore this worker's state from the manifest.
+
+        Args:
+            spmd_state:   SPMD-level logical state shared by all ranks
+                          (``completed_step_count``, ``static_args``).
+            rank_storage: Rank-specific physical storage paths.  ``None`` when
+                          this rank has no on-disk checkpoint (e.g. scale-up to
+                          a larger worker count).
+        """
+        if "completed_step_count" not in spmd_state:
             raise RuntimeError(
-                f"load_state_from_disk: 'completed_step_count' missing from metadata "
+                f"load_state_from_disk: 'completed_step_count' missing from spmd_state "
                 f"for spmd_id={self.spmd_id} rank={self.rank}. "
                 f"The manifest may be corrupt or was produced by an incompatible version."
             )
-        for op_name, count in metadata["completed_step_count"].items():
+        for op_name, count in spmd_state["completed_step_count"].items():
             self._completed_step_count[op_name] = count
-            # Re-trigger source operators from their restored step count
             if self._op_manager.is_source_operator(op_name):
                 max_steps = self.config.max_steps
                 if max_steps is None or count < max_steps:
                     logger.info(
-                        f"Auto-triggering source op for restored step {count} op={op_name} "
-                        f"spmd_id={self.spmd_id} rank={self.rank}"
+                        "Auto-triggering source op for restored step %s op=%s "
+                        "spmd_id=%s rank=%s",
+                        count,
+                        op_name,
+                        self.spmd_id,
+                        self.rank,
                     )
                     self._spawn_background_task(self._enqueue(op_name, count))
 
-        if "static_args" not in metadata:
+        if "static_args" not in spmd_state:
             raise RuntimeError(
-                f"load_state_from_disk: 'static_args' missing from metadata "
-                f"for spmd_id={self.spmd_id} rank={self.rank}. "
+                f"load_state_from_disk: 'static_args' missing from spmd_state "
+                f"for spmd_id={self.spmd_id} rank={self.rank}."
             )
-        for name, value in metadata["static_args"].items():
+        for name, value in spmd_state["static_args"].items():
             self._op_manager.set_static_arg(name, value)
 
-        if "ckpt_dir" not in metadata:
+        if rank_storage is None:
             logger.debug(
-                f"No on-disk state for spmd_id={self.spmd_id} rank={self.rank}, skipping backend load"
+                "No on-disk state for spmd_id=%s rank=%s (scale-up rank), skipping backend load",
+                self.spmd_id,
+                self.rank,
             )
             return
 
-        state = await self._checkpoint_backend.load(metadata)
+        state = await self._checkpoint_backend.load(rank_storage)
 
-        ckpt_dir = metadata["ckpt_dir"]
+        ckpt_dir = rank_storage.get("ckpt_dir", "")
         if "operator_states" in state:
             self._call_operator_restore_state(state["operator_states"], ckpt_dir)
-        logger.debug(f"State loaded from disk spmd_id={self.spmd_id} rank={self.rank}")
+        logger.debug(
+            "State loaded from disk spmd_id=%s rank=%s", self.spmd_id, self.rank
+        )
 
     def _call_operator_save_state(self, ckpt_dir: str) -> dict[str, Any]:
         """Call save_state() on each operator instance and collect results."""

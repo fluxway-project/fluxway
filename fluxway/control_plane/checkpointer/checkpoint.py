@@ -130,14 +130,14 @@ class FluxwayCheckpointer:
     # =========================================================================
 
     def _persist(self, step: int, manifest: dict[str, Any]) -> None:
-        """Write the manifest that maps spmd_id/rank to Worker-written path metadata."""
+        """Write the manifest that maps spmd_id to {spmd_state, rank_storage}."""
         step_dir = Path(self._ckpt_dir) / str(step)
         manifest_path = step_dir / "manifest.json"
 
-        # 1. Deduplicate and commit (rename) all orbax temporary directories safely
+        # Commit (rename) all orbax temporary directories atomically.
         renamed_paths = set()
-        for spmd_id, ranks in manifest.items():
-            for rank, meta in ranks.items():
+        for spmd_entry in manifest.values():
+            for meta in spmd_entry.get("rank_storage", {}).values():
                 if "orbax_tmp_path" in meta and "orbax_final_path" in meta:
                     o_tmp = Path(meta["orbax_tmp_path"])
                     o_final = Path(meta["orbax_final_path"])

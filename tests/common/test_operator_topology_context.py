@@ -94,26 +94,29 @@ def test_preinstantiate_operator_sets_topology_fields_in_init():
 
     assert TopologyAwareOperator.seen_in_init == (3, 8, 1, 4, 0, 2)
 
-    # Outside context: fields should evaluate to default/None
-    assert instance.local_rank is None
-    assert instance.local_world_size is None
+    # Static attrs are plain instance attributes: they retain creation-time values
+    # regardless of the active context, because rank/world_size/local_rank etc.
+    # are fixed for the entire lifetime of a worker actor.
+    assert instance.rank == 3
+    assert instance.world_size == 8
+    assert instance.local_rank == 1
+    assert instance.local_world_size == 4
     assert instance.node_rank == 0
-    assert instance.num_nodes == 1
+    assert instance.num_nodes == 2
 
-    # Inside context: fields should evaluate to the current context values
+    # Inside a different context: static attrs still return creation-time values;
+    # only `ctx` (carrying per-step state) changes.
     with operator_context(
         static_args={},
-        rank=3,
-        world_size=8,
-        local_rank=1,
-        local_world_size=4,
+        rank=99,
+        world_size=1,
+        local_rank=0,
+        local_world_size=1,
         node_rank=0,
-        num_nodes=2,
+        num_nodes=1,
     ):
-        assert instance.local_rank == 1
-        assert instance.local_world_size == 4
-        assert instance.node_rank == 0
-        assert instance.num_nodes == 2
+        assert instance.rank == 3  # plain attr, ignores context
+        assert instance.local_rank == 1  # plain attr, ignores context
 
 
 @pytest.mark.asyncio
