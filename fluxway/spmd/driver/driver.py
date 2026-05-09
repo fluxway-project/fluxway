@@ -273,12 +273,33 @@ if RAY_AVAILABLE:
             # Gather IP of rank 0 to act as rendezvous address
             if 0 in self._worker_handles:
                 rank0_ip = await self._worker_handles[0].get_node_ip.remote()
-                rank0_port = await self._worker_handles[0].find_free_port.remote()
-                rank0_address = f"{rank0_ip}:{rank0_port}"
+                max_retries = 5
+                for attempt in range(max_retries):
+                    rank0_port = await self._worker_handles[0].find_free_port.remote()
+                    rank0_address = f"{rank0_ip}:{rank0_port}"
+                    try:
+                        # Initialize Rank 0 first to lock the port and avoid TOCTOU
+                        await self._worker_handles[0].setup_and_start.remote(
+                            **rank_info[0],
+                            rank0_address=rank0_address,
+                        )
+                        break
+                    except Exception as e:
+                        if (
+                            "already in use" in str(e).lower()
+                            or "address already in use" in str(e).lower()
+                            or "eaddrinuse" in str(e).lower()
+                        ):
+                            if attempt < max_retries - 1:
+                                await asyncio.sleep(0.1 * (2**attempt))
+                                continue
+                        raise
             else:
                 rank0_address = None
 
             for rank, worker in self._worker_handles.items():
+                if rank == 0:
+                    continue  # Already started
                 worker.setup_and_start.remote(
                     **rank_info[rank],
                     rank0_address=rank0_address,

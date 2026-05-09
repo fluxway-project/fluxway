@@ -54,9 +54,19 @@ class _FakeAsyncRemoteCall:
         self.remote = remote
 
 
+class _DummyFuture:
+    def __await__(self):
+        yield
+        return None
+
+
 class _FakeSyncRemoteCall:
     def __init__(self, func):
-        self.remote = func
+        def wrapper(*args, **kwargs):
+            func(*args, **kwargs)
+            return _DummyFuture()
+
+        self.remote = wrapper
 
 
 class FakeWorker:

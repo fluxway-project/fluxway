@@ -16,6 +16,25 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+class _EnvRestorer:
+    """Context manager to restore environment variables."""
+
+    def __init__(self, keys):
+        self.keys = keys
+        self.saved = {}
+
+    def __enter__(self):
+        for k in self.keys:
+            self.saved[k] = os.environ.get(k)
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        for k, v in self.saved.items():
+            if v is None and k in os.environ:
+                del os.environ[k]
+            elif v is not None:
+                os.environ[k] = v
+
+
 def launch(
     entry_fn: Callable[..., Awaitable[Any]],
     *args: Any,
@@ -60,7 +79,7 @@ def launch(
         )
 
     if not ray.is_initialized():
-        init_kw = ray_init_kwargs or {}
+        init_kw = (ray_init_kwargs or {}).copy()
         init_kw.setdefault("ignore_reinit_error", True)
         if "address" not in init_kw and os.environ.get("RAY_ADDRESS"):
             init_kw["address"] = os.environ["RAY_ADDRESS"]
@@ -84,9 +103,10 @@ def launch(
         # Apply sandbox environment variables locally to this task's process.
         # We do this here instead of in `runtime_env` to avoid polluting the
         # environment of child actors (which inherit runtime_env by default).
-        for k, v in sandbox_env.items():
-            os.environ[k] = v
-        return asyncio.run(fn(*a, **kw))
+        with _EnvRestorer(sandbox_env.keys()):
+            for k, v in sandbox_env.items():
+                os.environ[k] = v
+            return asyncio.run(fn(*a, **kw))
 
     ref = _sandbox.remote(entry_fn, args, kwargs)
     try:
