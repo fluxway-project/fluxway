@@ -14,7 +14,6 @@ import pickle
 from pathlib import Path
 from typing import Any
 
-import jax.tree_util as jtu
 import numpy as np
 from etils import epath
 
@@ -47,6 +46,8 @@ def _get_path_str(path: tuple) -> str:
     the standard JAX paradigm) and enforces our `_escape` protection on all node names,
     ensuring 100% data safety while maintaining human-readable folder structures in Orbax.
     """
+    import jax.tree_util as jtu
+
     parts = []
     for p in path:
         if isinstance(p, jtu.DictKey):
@@ -94,6 +95,7 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
     ) -> dict[str, Any]:
         import orbax.checkpoint as ocp
         import jax
+        import jax.tree_util as jtu
 
         leaves_with_path, treedef = jtu.tree_flatten_with_path(state)
 
@@ -178,17 +180,6 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
                 final_path.parent.mkdir, parents=True, exist_ok=True
             )
 
-            # Save the abstract structure of global_dict so that restore
-            # can use StandardRestore(target) for deterministic key types
-            # and tree structure, instead of relying on Orbax to infer
-            # them from directory names.
-            abstract_global = jax.tree.map(
-                lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), global_dict
-            )
-            metadata["global_abstract"] = base64.b64encode(
-                pickle.dumps(abstract_global)
-            ).decode("ascii")
-
             def _write_global():
                 # The global phase uses its own step-scoped prefix so it does
                 # not collide with either another checkpoint step or the local
@@ -208,7 +199,12 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
 
         return metadata
 
-    async def load(self, metadata: dict[str, Any]) -> dict[str, Any]:
+    async def load(
+        self, metadata: dict[str, Any], target_state: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        import jax
+        import jax.tree_util as jtu
+
         handler = self._get_handler()
 
         global_dict = {}
@@ -217,22 +213,38 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
 
             ckpt_path = epath.Path(metadata["orbax_final_path"])
 
-            abstract_target = None
-            if "global_abstract" in metadata:
-                try:
-                    abstract_target = pickle.loads(
-                        base64.b64decode(metadata["global_abstract"])
-                    )
-                except Exception:
-                    abstract_target = None
+            # If target_state is provided, extract target_global_dict to pass as `item`.
+            target_global_dict = None
+            if target_state is not None:
+                target_global_dict = {}
+                leaves_with_path, _ = jtu.tree_flatten_with_path(target_state)
+                for path, leaf in leaves_with_path:
+                    path_str = _get_path_str(path)
+                    if _is_global_leaf(leaf):
+                        target_global_dict[path_str] = leaf
 
             def _read_global():
                 ckptr = ocp.Checkpointer(handler)
-                if abstract_target is not None:
+                if target_global_dict is not None:
+                    # Pass the target_global_dict as `item` to support resharding automatically.
                     return ckptr.restore(
-                        ckpt_path, args=ocp.args.StandardRestore(abstract_target)
+                        ckpt_path,
+                        args=ocp.args.StandardRestore(
+                            item=target_global_dict,
+                        ),
                     )
-                return ckptr.restore(ckpt_path)
+                else:
+                    # Fallback to fully replicated if no target state is given.
+                    mesh = jax.sharding.Mesh(jax.devices(), ("_",))
+                    replicated = jax.sharding.NamedSharding(
+                        mesh, jax.sharding.PartitionSpec()
+                    )
+                    return ckptr.restore(
+                        ckpt_path,
+                        args=ocp.args.StandardRestore(
+                            fallback_sharding=replicated,
+                        ),
+                    )
 
             global_dict = await asyncio.to_thread(_read_global)
 

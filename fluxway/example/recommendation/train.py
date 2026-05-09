@@ -193,9 +193,21 @@ def main():
         dest="num_threads",
         help="Number of threads for SparseEmbedding store",
     )
+    parser.add_argument(
+        "--clear-ckpt",
+        action="store_true",
+        help="Clear existing checkpoints before starting",
+    )
+    args = parser.parse_args()
+    if getattr(args, "clear_ckpt", False):
+        import shutil
+
+        print("Clearing existing checkpoints in /tmp/fluxway_recsys_ckpt...")
+        shutil.rmtree("/tmp/fluxway_recsys_ckpt", ignore_errors=True)
+
     launch(
         run_training,
-        parser.parse_args(),
+        args,
     )
 
 

@@ -136,6 +136,7 @@ class SPMDManager:
         worker_bundle_indices: list[int] | None = None,
         driver_bundle_index: int = 0,
         checkpoint_id: str | None = None,
+        worker_resource: Any | None = None,
     ) -> SPMDHandle | None:
         """
         Start an SPMD instance by creating its driver.
@@ -198,6 +199,7 @@ class SPMDManager:
                 controller_handle=self._controller_handle,
                 graph_topology=graph_topology,
                 checkpoint_backend=self._checkpoint_backend,
+                worker_resource=worker_resource,
             )
 
             handle.set_driver_handle(driver)

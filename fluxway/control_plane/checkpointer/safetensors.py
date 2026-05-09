@@ -43,7 +43,9 @@ class SafeTensorsBackend(WorkerCheckpointBackend, backend_name="safetensors"):
             "meta_path": meta_path,
         }
 
-    async def load(self, metadata):
+    async def load(
+        self, metadata: dict[str, Any], target_state: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         return await asyncio.to_thread(
             load_worker_state, metadata["tensors_path"], metadata["meta_path"]
         )

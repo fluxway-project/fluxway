@@ -292,6 +292,7 @@ class Scheduler:
                         pg_info.get("driver_bundle_index", 0) if pg_info else 0
                     ),
                     checkpoint_id=None,
+                    worker_resource=pg_info.get("worker_resource") if pg_info else None,
                 )
             )
 

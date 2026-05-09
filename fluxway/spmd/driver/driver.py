@@ -67,6 +67,7 @@ if RAY_AVAILABLE:
             controller_handle: Any | None,
             graph_topology: dict[str, Any],
             checkpoint_backend: Any | None = None,
+            worker_resource: Any | None = None,
         ):
             """
             Initialize SPMD Driver.
@@ -91,6 +92,7 @@ if RAY_AVAILABLE:
             self.graph_topology = graph_topology
             self._checkpoint_backend = checkpoint_backend
             self._runtime_env = config.runtime_env
+            self.worker_resource = worker_resource
 
             # State machine
             self.state_machine = DriverStateMachine(self)
@@ -225,6 +227,12 @@ if RAY_AVAILABLE:
                 opts["placement_group_bundle_index"] = bundle_idx
             if self._runtime_env:
                 opts["runtime_env"] = self._runtime_env
+
+            if self.worker_resource is not None:
+                if getattr(self.worker_resource, "num_cpus", 0) > 0:
+                    opts["num_cpus"] = self.worker_resource.num_cpus
+                if getattr(self.worker_resource, "num_gpus", 0) > 0:
+                    opts["num_gpus"] = self.worker_resource.num_gpus
             return opts
 
         async def _start_workers(self) -> None:

@@ -69,7 +69,6 @@ def launch(
     sandbox_env = {
         "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
         "CUDA_VISIBLE_DEVICES": "",
-        "JAX_PLATFORMS": "cpu",
     }
     if runtime_env is not None and "env_vars" in runtime_env:
         sandbox_env.update(runtime_env["env_vars"])
@@ -77,14 +76,16 @@ def launch(
     task_options: dict[str, Any] = {
         "num_cpus": num_cpus,
         "num_gpus": 0,
-        "runtime_env": {
-            **(runtime_env or {}),
-            "env_vars": sandbox_env,
-        },
+        "runtime_env": runtime_env or {},
     }
 
     @ray.remote(**task_options)
     def _sandbox(fn, a, kw):
+        # Apply sandbox environment variables locally to this task's process.
+        # We do this here instead of in `runtime_env` to avoid polluting the
+        # environment of child actors (which inherit runtime_env by default).
+        for k, v in sandbox_env.items():
+            os.environ[k] = v
         return asyncio.run(fn(*a, **kw))
 
     ref = _sandbox.remote(entry_fn, args, kwargs)

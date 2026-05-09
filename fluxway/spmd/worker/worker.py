@@ -22,6 +22,8 @@ See: https://docs.ray.io/en/latest/ray-core/actors/async_api.html
 import asyncio
 from collections import defaultdict
 import logging
+import os
+import socket
 import time
 import inspect
 from pathlib import Path
@@ -391,12 +393,25 @@ class SPMDWorker:
 
     def get_node_ip(self) -> str:
         """Return the current Ray node IP address for distributed rendezvous."""
+        if "POD_IP" in os.environ:
+            return os.environ["POD_IP"]
+
+        try:
+            # Connect to Ray's GCS server to determine the cluster-routable IP
+            gcs_address = ray.get_runtime_context().gcs_address
+            if gcs_address:
+                head_ip, head_port = gcs_address.split(":")
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                    # Doesn't actually connect, just uses OS routing table
+                    s.connect((head_ip, int(head_port)))
+                    return s.getsockname()[0]
+        except Exception:
+            pass
+
         return ray.util.get_node_ip_address()
 
     def find_free_port(self) -> int:
         """Find an available port on the current node."""
-        import socket
-
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.bind(("", 0))
             return s.getsockname()[1]
@@ -2652,7 +2667,14 @@ class SPMDWorker:
             )
             return
 
-        state = await self._checkpoint_backend.load(rank_storage)
+        target_state = {
+            "completed_step_count": self._completed_step_count,
+            "static_args": self._op_manager.get_all_static_args(),
+            "operator_states": self._call_operator_save_state(""),
+        }
+        state = await self._checkpoint_backend.load(
+            rank_storage, target_state=target_state
+        )
 
         ckpt_dir = rank_storage.get("ckpt_dir", "")
         if "operator_states" in state:

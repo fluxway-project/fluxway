@@ -48,7 +48,9 @@ class WorkerCheckpointBackend(ABC):
         """Persist ``state`` and return opaque metadata needed by :meth:`load`."""
 
     @abstractmethod
-    async def load(self, metadata: dict[str, Any]) -> dict[str, Any]:
+    async def load(
+        self, metadata: dict[str, Any], target_state: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         """Reconstruct and return the state dict described by ``metadata``."""
 
     @abstractmethod

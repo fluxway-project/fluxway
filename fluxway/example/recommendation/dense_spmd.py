@@ -27,11 +27,25 @@ class DenseSPMD:
         self.grad_accum_steps = grad_accum_steps
         self._jax_initialized = False
 
-        jax.distributed.initialize(
-            coordinator_address=self.rank0_address,
-            num_processes=self.world_size,
-            process_id=self.rank,
+        print(
+            f"[DenseSPMD] init jax.distributed rank={self.rank} world_size={self.world_size} coordinator={self.rank0_address}",
+            flush=True,
         )
+        try:
+            jax.distributed.initialize(
+                coordinator_address=self.rank0_address,
+                num_processes=self.world_size,
+                process_id=self.rank,
+            )
+            print(
+                f"[DenseSPMD] init jax.distributed success rank={self.rank}", flush=True
+            )
+        except Exception as e:
+            print(
+                f"[DenseSPMD] init jax.distributed failed rank={self.rank} error={e}",
+                flush=True,
+            )
+            raise
 
     def _ensure_jax_init(self):
         if self._jax_initialized:
