@@ -534,43 +534,34 @@ if RAY_AVAILABLE:
                 return
 
             try:
-                # 1. Trigger snapshot begin
                 if 0 in self._worker_handles:
                     await self._worker_handles[0].trigger_snapshot_begin.remote(
                         self._pending_ckpt_dir, self._pending_target_step_count
                     )
 
-                # 2. Dispatch save to all workers
-                save_futures: dict[int, Any] = {
-                    rank: worker.save_state_to_disk.remote(
-                        self._pending_ckpt_dir, self._pending_target_step_count
-                    )
-                    for rank, worker in self._worker_handles.items()
-                }
-
-                # 3. Await completion and gather metadata
+                ranks = list(self._worker_handles.keys())
                 results = await asyncio.gather(
-                    *save_futures.values(), return_exceptions=True
+                    *(
+                        self._worker_handles[r].save_state_to_disk.remote(
+                            self._pending_ckpt_dir, self._pending_target_step_count
+                        )
+                        for r in ranks
+                    )
                 )
 
-                if not any(isinstance(r, Exception) for r in results):
-                    # Pivot operator states
-                    gathered_states: dict[str, dict[int, dict]] = {}
-                    for rank, res in zip(save_futures.keys(), results, strict=True):
-                        spmd_state, rank_storage = res
-                        op_states = rank_storage.get("operator_states", {})
-                        for op_name, op_state in op_states.items():
-                            if op_name not in gathered_states:
-                                gathered_states[op_name] = {}
-                            gathered_states[op_name][rank] = op_state
+                gathered_states: dict[str, dict[int, dict]] = defaultdict(dict)
+                for rank, (_, rank_storage) in zip(ranks, results, strict=True):
+                    for op_name, op_state in rank_storage.get(
+                        "operator_states", {}
+                    ).items():
+                        gathered_states[op_name][rank] = op_state
 
-                    # 4. Trigger snapshot commit
-                    if 0 in self._worker_handles:
-                        await self._worker_handles[0].trigger_snapshot_commit.remote(
-                            self._pending_ckpt_dir,
-                            self._pending_target_step_count,
-                            gathered_states,
-                        )
+                if 0 in self._worker_handles:
+                    await self._worker_handles[0].trigger_snapshot_commit.remote(
+                        self._pending_ckpt_dir,
+                        self._pending_target_step_count,
+                        dict(gathered_states),
+                    )
 
             except Exception as e:
                 logger.error(
@@ -580,7 +571,7 @@ if RAY_AVAILABLE:
                 return
 
             self.controller_handle.receive_snapshot_metadata.remote(
-                self.spmd_id, self._pending_snapshot_id, save_futures
+                self.spmd_id, self._pending_snapshot_id, dict(gathered_states)
             )
 
         def _clear_drain_and_fail(self) -> None:
