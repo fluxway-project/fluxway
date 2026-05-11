@@ -43,7 +43,11 @@ def tree_flatten(
         if _is_fluxway_data_type(type(v)):
             if template and template[0] == "dict":
                 # Convert the data_type to a dict and let it fall through to the dict branch below
-                v = v.as_dict() if hasattr(v, "as_dict") else v.__dict__
+                if not hasattr(v, "as_dict"):
+                    raise TypeError(
+                        f"Fluxway Data Error: data_type {type(v).__name__} lacks 'as_dict'."
+                    )
+                v = v.as_dict()
             else:
                 if template and template[0] != "data_type":
                     raise ValueError(
@@ -60,14 +64,22 @@ def tree_flatten(
                     try:
                         hints = get_type_hints(type(v))
                         public_keys = [k for k in hints.keys() if not k.startswith("_")]
-                    except Exception:
-                        data_map = v.as_dict() if hasattr(v, "as_dict") else v.__dict__
+                    except Exception as err:
+                        if not hasattr(v, "as_dict"):
+                            raise TypeError(
+                                f"Fluxway Data Error: data_type {type(v).__name__} lacks 'as_dict'."
+                            ) from err
+                        data_map = v.as_dict()
                         public_keys = sorted(
                             [k for k in data_map.keys() if not k.startswith("_")]
                         )
                     child_templates = [None] * len(public_keys)
 
-                data_map = v.as_dict() if hasattr(v, "as_dict") else v.__dict__
+                if not hasattr(v, "as_dict"):
+                    raise TypeError(
+                        f"Fluxway Data Error: data_type {type(v).__name__} lacks 'as_dict'."
+                    )
+                data_map = v.as_dict()
 
                 children = []
                 for k, child_template in zip(public_keys, child_templates, strict=True):
