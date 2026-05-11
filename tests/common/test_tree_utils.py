@@ -80,6 +80,21 @@ class TestTreeUtils(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "do not match declared sharding keys"):
             tree_flatten(data, treedef_template=template)
 
+    def test_dataclass_as_dict_template(self):
+        # Template: dict -> { a: None, b: None }
+        # Data is a dataclass Leaf(a=t1, b=10)
+        t1 = TransportTensor(np.array([1, 2, 3]))
+        data = Leaf(a=t1, b=10)
+        template = ("dict", ["a", "b"], [None, None])
+
+        leaves, treedef = tree_flatten(data, treedef_template=template)
+
+        self.assertEqual(len(leaves), 2)
+        self.assertIs(leaves[0], t1)
+        self.assertEqual(leaves[1], 10)
+        self.assertEqual(treedef[0], "dict")
+        self.assertEqual(treedef[1], ["a", "b"])
+
 
 if __name__ == "__main__":
     unittest.main()

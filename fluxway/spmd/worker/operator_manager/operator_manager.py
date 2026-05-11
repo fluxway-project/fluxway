@@ -130,7 +130,15 @@ class OperatorManager:
                 owner_cls = _resolve_owner_class(
                     meta.owner_class_module, meta.owner_class_qualname
                 )
-                self._operators[op_name] = getattr(owner_cls, method_name)
+                op_func = getattr(owner_cls, method_name)
+                if not hasattr(op_func, "_fluxway_operator_meta"):
+                    from fluxway.common.decorators import _OperatorWrapper
+
+                    wrapper = _OperatorWrapper(op_func, meta)
+                    # We bind the wrapper to the class using the descriptor protocol
+                    # without mutating the owner_cls globally!
+                    op_func = wrapper.__get__(None, owner_cls)
+                self._operators[op_name] = op_func
             else:
                 # Free-function operator: no owner class, registered directly
                 self._operators[op_name] = None  # type: ignore[assignment]
