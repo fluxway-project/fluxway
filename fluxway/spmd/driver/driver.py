@@ -477,7 +477,7 @@ if RAY_AVAILABLE:
             self._pending_snapshot_id = snapshot_id
             self._pending_target_step_count = target_count
             self._pending_ckpt_dir = ckpt_dir
-            self._persist_worker_states()
+            await self._persist_worker_states()
 
         def _on_drain_complete(self) -> None:
             if self.state_machine.state != DriverState.DRAINING:
@@ -489,7 +489,7 @@ if RAY_AVAILABLE:
             if self.controller_handle is not None:
                 self.controller_handle.report_driver_drained.remote(self.spmd_id)
 
-        def _persist_worker_states(self) -> None:
+        async def _persist_worker_states(self) -> None:
             if (
                 self._pending_ckpt_dir is None
                 or self._pending_target_step_count is None
@@ -525,16 +525,56 @@ if RAY_AVAILABLE:
                 self._clear_drain_and_fail()
                 return
 
-            save_futures: dict[int, Any] = {
-                rank: worker.save_state_to_disk.remote(
-                    self._pending_ckpt_dir, self._pending_target_step_count
-                )
-                for rank, worker in self._worker_handles.items()
-            }
             if self.controller_handle is None:
                 logger.error(
                     f"controller_handle is None, cannot report snapshot metadata "
                     f"spmd_id={self.spmd_id}"
+                )
+                self._clear_drain_and_fail()
+                return
+
+            try:
+                # 1. Trigger snapshot begin
+                if 0 in self._worker_handles:
+                    await self._worker_handles[0].trigger_snapshot_begin.remote(
+                        self._pending_ckpt_dir, self._pending_target_step_count
+                    )
+
+                # 2. Dispatch save to all workers
+                save_futures: dict[int, Any] = {
+                    rank: worker.save_state_to_disk.remote(
+                        self._pending_ckpt_dir, self._pending_target_step_count
+                    )
+                    for rank, worker in self._worker_handles.items()
+                }
+
+                # 3. Await completion and gather metadata
+                results = await asyncio.gather(
+                    *save_futures.values(), return_exceptions=True
+                )
+
+                if not any(isinstance(r, Exception) for r in results):
+                    # Pivot operator states
+                    gathered_states: dict[str, dict[int, dict]] = {}
+                    for rank, res in zip(save_futures.keys(), results, strict=True):
+                        spmd_state, rank_storage = res
+                        op_states = rank_storage.get("operator_states", {})
+                        for op_name, op_state in op_states.items():
+                            if op_name not in gathered_states:
+                                gathered_states[op_name] = {}
+                            gathered_states[op_name][rank] = op_state
+
+                    # 4. Trigger snapshot commit
+                    if 0 in self._worker_handles:
+                        await self._worker_handles[0].trigger_snapshot_commit.remote(
+                            self._pending_ckpt_dir,
+                            self._pending_target_step_count,
+                            gathered_states,
+                        )
+
+            except Exception as e:
+                logger.error(
+                    f"Snapshot lifecycle error for spmd_id={self.spmd_id}: {e}"
                 )
                 self._clear_drain_and_fail()
                 return

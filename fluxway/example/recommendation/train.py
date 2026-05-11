@@ -99,7 +99,7 @@ async def run_training(args):
             embed_dim=16,
             dense_stats_dim=2,
             runtime_env=gpu_runtime_env,
-            resource={"num_gpus": 1},
+            resource={"num_gpus": getattr(args, "num_gpus", 1)},
         )
 
         h_raw = reader.read()
@@ -170,7 +170,13 @@ def main():
         "--dp",
         type=int,
         default=4,
-        help="Number of data-parallel ranks for DenseSPMD (one GPU per rank)",
+        help="Number of data-parallel ranks for DenseSPMD",
+    )
+    parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=1,
+        help="Number of GPUs per DenseSPMD rank (default: 1, use 0 for CPU-only execution)",
     )
     parser.add_argument(
         "--table1-shards",

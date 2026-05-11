@@ -2568,6 +2568,31 @@ class SPMDWorker:
     # State Persistence (checkpoint I/O)
     # =========================================================================
 
+    async def trigger_snapshot_begin(self, ckpt_dir: str, step: int) -> None:
+        """
+        Trigger the snapshot begin hook for all operators on this worker.
+        Called on Rank 0 by the Driver before parallel saving starts.
+        """
+        spmd_dir = str(Path(ckpt_dir) / str(step) / self.spmd_id)
+        if self._op_manager:
+            for op in self._op_manager._operators.values():
+                if hasattr(op, "on_snapshot_begin"):
+                    op.on_snapshot_begin(spmd_dir)
+
+    async def trigger_snapshot_commit(
+        self, ckpt_dir: str, step: int, gathered_states: dict[str, dict[int, dict]]
+    ) -> None:
+        """
+        Trigger the snapshot commit hook for all operators on this worker.
+        Called on Rank 0 by the Driver after all ranks have saved successfully.
+        """
+        spmd_dir = str(Path(ckpt_dir) / str(step) / self.spmd_id)
+        if self._op_manager:
+            for op_name, op in self._op_manager._operators.items():
+                if hasattr(op, "on_snapshot_commit"):
+                    op_states = gathered_states.get(op_name, {})
+                    op.on_snapshot_commit(spmd_dir, op_states)
+
     async def save_state_to_disk(
         self, ckpt_dir: str, step: int
     ) -> tuple[dict[str, Any], dict[str, Any]]:

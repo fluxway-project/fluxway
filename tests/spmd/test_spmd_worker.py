@@ -1212,3 +1212,47 @@ async def test_send_output_none_mesh():
     await worker._send_output("compute", result, exec_step=0)
 
     assert handler.receive_shards.remote.called
+
+
+@pytest.mark.asyncio
+async def test_trigger_snapshot_hooks():
+    from pathlib import Path
+
+    worker_cls = SPMDWorker.__ray_metadata__.modified_class
+
+    config = MagicMock()
+    worker = worker_cls(
+        config=config,
+        rank=0,
+        spmd_id="test_spmd",
+        driver_handle=MagicMock(),
+        checkpoint_backend=MagicMock(),
+    )
+
+    # Mock operator manager and operators
+    mock_op1 = MagicMock()
+    mock_op2 = MagicMock()
+
+    # mock_op2 does not have snapshot hooks
+    del mock_op2.on_snapshot_begin
+    del mock_op2.on_snapshot_commit
+
+    worker._op_manager = MagicMock()
+    worker._op_manager._operators = {"op1": mock_op1, "op2": mock_op2}
+
+    ckpt_dir = "/tmp/ckpt"
+    step = 42
+
+    # Test trigger_snapshot_begin
+    await worker.trigger_snapshot_begin(ckpt_dir, step)
+
+    expected_spmd_dir = str(Path(ckpt_dir) / str(step) / "test_spmd")
+    mock_op1.on_snapshot_begin.assert_called_once_with(expected_spmd_dir)
+
+    # Test trigger_snapshot_commit
+    gathered_states = {"op1": {0: {"state": 1}}, "op2": {0: {"state": 2}}}
+    await worker.trigger_snapshot_commit(ckpt_dir, step, gathered_states)
+
+    mock_op1.on_snapshot_commit.assert_called_once_with(
+        expected_spmd_dir, {0: {"state": 1}}
+    )

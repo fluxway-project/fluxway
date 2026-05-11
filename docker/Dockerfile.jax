@@ -31,6 +31,7 @@ RUN pip config set global.index-url ${PIP_INDEX_URL} && \
 WORKDIR /workspace
 
 # Install common Python dependencies required by the project
+# pylance is not a vscode plugin, it's lance-format
 RUN pip install -i ${PIP_MIRROR} --no-cache-dir \
     minio \
     "ray[all]==2.49.0" \
@@ -38,6 +39,7 @@ RUN pip install -i ${PIP_MIRROR} --no-cache-dir \
     orjson \
     psutil \
     flask \
+    pylance \
     zstandard \
     fastparquet
 

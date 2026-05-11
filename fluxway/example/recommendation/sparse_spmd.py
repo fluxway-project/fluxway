@@ -4,6 +4,7 @@ import jax.dlpack
 import jax.numpy as jnp
 
 import sparse_embedding as se
+import sparse_embedding.checkpoint
 
 from fluxway.common.decorators import spmd, operator
 from fluxway.common.utils.logging import get_logger
@@ -59,24 +60,38 @@ class SparseEmbeddingSPMD:
     # Checkpoint helpers
     # ------------------------------------------------------------------
 
+    def on_snapshot_begin(self, ckpt_dir: str) -> None:
+        uri = f"{ckpt_dir}/sparse_lance"
+        backend = se.checkpoint.get_backend("lance")
+        backend.init_dataset(self.store, uri)
+
     def save_state(self, ckpt_dir: str) -> dict:
-        uri = f"{ckpt_dir}/sparse_shard_{self.rank}"
-        self.store.save_checkpoint(
-            uri=uri,
-            mode="full",
-            min_score=0,
-            include_optimizer_state=True,
-            use_compression=False,
-        )
-        return {"uri": uri}
+        uri = f"{ckpt_dir}/sparse_lance"
+        backend = se.checkpoint.get_backend("lance")
+        metas = backend.export_fragments(self.store, uri)
+        return {"uri": uri, "lance_meta": metas}
+
+    def on_snapshot_commit(
+        self, ckpt_dir: str, gathered_states: dict[int, dict]
+    ) -> None:
+        uri = f"{ckpt_dir}/sparse_lance"
+        backend = se.checkpoint.get_backend("lance")
+        all_metas = []
+        for state in gathered_states.values():
+            if "lance_meta" in state:
+                all_metas.extend(state["lance_meta"])
+        if all_metas:
+            backend.commit_fragments(uri, all_metas)
 
     def restore_state(self, state: dict, ckpt_dir: str) -> None:
-        uri = state.get("uri", f"{ckpt_dir}/sparse_shard_{self.rank}")
-        self.store.load_checkpoint(
-            uri=uri,
-            version=0,
-            clear=True,
-            load_optimizer_state=True,
+        uri = state.get("uri", f"{ckpt_dir}/sparse_lance")
+        backend = se.checkpoint.get_backend("lance")
+        partitioner = se.ModuloPartitioner(num_shards=self.world_size)
+        backend.load(
+            self.store,
+            uri,
+            filter_fn=partitioner,
+            target_shard_id=self.rank,
         )
 
     # ------------------------------------------------------------------
@@ -154,4 +169,6 @@ def hash_routing(tensor, mesh):
         val = tensor.routing_indices
     else:
         val = tensor.flat_values if isinstance(tensor, TransportTensor) else tensor
-    return jnp.mod(val, mesh.size)
+    partitioner = se.ModuloPartitioner(num_shards=mesh.size)
+    shard_ids_dlm = partitioner.partition(val)
+    return jnp.array(jax.dlpack.from_dlpack(shard_ids_dlm))
