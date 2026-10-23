@@ -317,6 +317,15 @@ def test_jax_asarray_transport_tensor_and_numba_zero_copy():
     except Exception:
         pytest.skip("JAX, CuPy, or Numba not available")
 
+    try:
+        jax_gpu_devices = jax.devices("gpu")
+    except RuntimeError as error:
+        if "no platforms that are instances of gpu are present" not in str(error):
+            raise
+        pytest.skip("JAX GPU backend not available")
+    if not jax_gpu_devices:
+        pytest.skip("JAX GPU backend has no devices")
+
     with use_backend("jax"):
         b = get_backend()
 

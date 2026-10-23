@@ -146,6 +146,9 @@ objective for weighted resource fairness; it is not a scalar hard constraint.
 
 ## Compilation and errors
 
+See [placement recipes](placement_recipe.md) for the sequence from solving to resource
+reservation and Worker attestation. Solving the model itself does not start Workers.
+
 The compiler freezes the expression tree and lowers it to CP-SAT variables.
 Resource profiles come from compiled SPMD declarations. After solving, an
 independent evaluator checks the materialized assignment against the constraints.

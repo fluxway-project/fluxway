@@ -223,6 +223,41 @@ stateDiagram-v2
     ABANDONED --> [*]
 ```
 
+```mermaid
+sequenceDiagram
+    participant L as Execution lifecycle
+    participant P as FluxwayCheckpointer
+    participant C as Controller
+    participant D as Drivers and Workers
+    participant R as Repository I/O lane
+    participant O as Control-side storage<br/>components
+    Note over L,D: All Drivers drained, source ACKs cover the same cut
+    L->>P: await save(request)
+    P->>R: Reconcile old transactions and issue permit
+    P->>C: request_snapshot(shared deadline)
+    C->>D: Prepare and capture all SPMDs concurrently
+    D-->>C: Component publications and runtime images
+    C-->>P: CheckpointAssembly
+    P->>C: prepare_checkpoint_transaction()
+    C-->>P: Validated in-memory tokens
+    P->>O: Reserve and publish retention cleanup<br/>reservations
+    P->>R: Stage transaction, manifest, and cleanup intents
+    P->>R: decide_transaction() → COMMIT_DECIDED
+    P->>C: await publish_snapshot()
+    C->>D: Concurrent publish_save()
+    D-->>P: Physical publication confirmed through<br/>Controller
+    P->>C: apply_prepared_checkpoint_transaction()
+    P->>R: mark_committed() → committed.checkpoint_id
+    P->>O: await acknowledge_save(permit)
+    P->>R: complete_transaction() → COMMITTED
+    P->>P: Schedule tracked physical cleanup
+    P-->>L: Committed manifest
+```
+
+One `deadline` covers every save phase; repository calls are awaited in order. A
+post-decision failure preserves the durable decision and propagates. Later
+reconciliation uses the global marker; it cannot treat the attempt as undecided.
+
 Publication follows this order:
 
 1. Capture immutable state and prepare all participants.
@@ -244,6 +279,30 @@ Both control methods must be idempotent and propagate errors so recovery can ret
 Only `COMMITTED` records are restorable and enter reference resolution, `latest`,
 or retention. Each global snapshot has one monotonic deadline passed to all
 participants in parallel. Controller integrations must accept that deadline.
+
+```mermaid
+sequenceDiagram
+    participant P as New checkpointer
+    participant R as Repository
+    participant O as Control-side components
+    P->>R: Read incomplete transactions and persisted<br/>permits
+    loop Each incomplete transaction
+        P->>R: is_committed(checkpoint_id)
+        alt Global commit marker exists
+            P->>O: acknowledge_save(original permit)
+            O-->>P: Idempotent acknowledgement complete
+            P->>R: complete_transaction() → COMMITTED
+        else No global commit marker
+            P->>O: abort_save(original permit)
+            O-->>P: Idempotent abort complete
+            P->>R: abandon_transaction() → ABANDONED
+        end
+    end
+    P->>R: Only then resolve a restorable manifest
+```
+
+A failed acknowledgement or abort stops reconciliation and propagates. Repeated
+reconciliation uses the original persisted permit.
 
 ### Repository I/O and shutdown
 
@@ -268,6 +327,34 @@ later operation or close.
 components, then stops and joins the repository thread. Repeated close calls
 observe the same result; cancellation of one waiter does not stop cleanup.
 This isolates scheduling capacity, not storage latency or Python GIL contention.
+
+```mermaid
+sequenceDiagram
+    participant A as Caller
+    participant P as Checkpointer
+    participant Q as Single-slot repository<br/>lane
+    participant R as Dedicated repository<br/>thread
+    A->>Q: Acquire capacity and submit metadata operation
+    Q->>R: Run accepted operation
+    opt Caller cancels its wait
+        A->>A: CancelledError
+        Note over Q,R: Operation continues, capacity remains occupied
+    end
+    R-->>Q: Result or error
+    Q->>Q: Release capacity and retain unobserved errors
+    A->>P: await close()
+    P->>P: Reject new saves, join active save and cleanup
+    P->>P: Close control-side components
+    P->>Q: await close()
+    Q->>R: Join accepted operations, then stop event loop
+    R-->>Q: Thread joined
+    Q-->>P: Completion or unobserved errors
+    P-->>A: Shared close result
+```
+
+Waiting for capacity has not submitted an operation. Only accepted work is protected
+from waiter cancellation. Repeated close shares its result; cancelling one close waiter
+leaves cleanup running.
 
 ## Component capabilities
 
@@ -299,6 +386,41 @@ FINALIZING -> FINALIZE callbacks -> SAVE.prepare -> PREPARED
 
 The Driver waits for every local rank to reach `PREPARED` before starting
 `save`. No Controller-wide finalize phase exists.
+
+```mermaid
+sequenceDiagram
+    participant D as One SPMD Driver
+    participant A as Worker rank 0
+    participant B as Other local ranks
+    participant C as Controller
+    par Per-rank finalization and preparation
+        D->>A: prepare_save()
+        A->>A: Run all FINALIZE hooks, then prepare storage by<br/>scope
+        A-->>D: PREPARED
+    and No global finalize barrier
+        D->>B: prepare_save()
+        B->>B: Run all FINALIZE hooks, then prepare storage by<br/>scope
+        B-->>D: PREPARED
+    end
+    Note over D,B: Start save only after every rank in this Driver is PREPARED
+    D->>A: Concurrent save()
+    D->>B: Concurrent save()
+    A-->>D: WorkerSaveResult
+    B-->>D: WorkerSaveResult
+    D->>A: Concurrent finish_save()
+    D->>B: Concurrent finish_save()
+    A-->>D: FINISHED
+    B-->>D: FINISHED
+    D->>D: Collect every rank's results
+    D->>A: Commit components by commit scope
+    D->>B: Commit components by commit scope
+    D-->>C: Report component publications after all complete
+```
+
+Callbacks run in component order within each Worker; calls across ranks remain
+concurrent. `LEADER` preparation or commit runs only on the leader, while registered
+finalizers run on every rank. Component commit still precedes global publication and
+does not make the checkpoint restorable.
 
 ### Finalize memory before reserving storage
 
@@ -548,6 +670,40 @@ A long reader must renew the hold
 with `renew_checkpoint_hold(spmd_id, lease, ttl_seconds)` and keep the returned
 lease. Holds are persistent, generation-checked read protection, not exclusive locks.
 
+```mermaid
+sequenceDiagram
+    participant A as Reader
+    participant P as Checkpointer
+    participant O as Object lifecycle<br/>component
+    participant M as Retention and<br/>maintenance
+    A->>P: await hold_checkpoint_object()
+    P->>O: Persist generation-checked read lease
+    O-->>A: Lease returned through checkpointer
+    A->>O: Read physical state within lease lifetime
+    M->>O: Try reserving cleanup for the whole restore<br/>artifact
+    O-->>M: Active hold blocks required candidate cleanup
+    opt Long read
+        A->>P: await renew_checkpoint_hold()
+        P-->>A: Use renewed lease
+    end
+    A->>A: Finish or join physical read, including on<br/>cancellation
+    A->>P: await release_checkpoint_hold()
+    M->>O: Reselect candidates and reserve cleanup
+    O-->>M: Durable cleanup reservations
+    M->>M: Persist complete cleanup intent in publication<br/>transaction
+    M->>O: Execute reserved physical cleanup in background
+    alt Deletion succeeds
+        O-->>M: Complete cleanup intent
+    else Deletion fails
+        O-->>M: Retain intent and propagate error
+        Note over M,O: repair_cleanup_intents() retries explicitly
+    end
+```
+
+Named references also protect checkpoints. A protected required candidate can make
+publication raise `CheckpointCleanupBlocked`. Reselecting candidates represents a later
+operation, not an automatic bypass.
+
 Names such as `best_model` protect their selected checkpoint until the name moves.
 Candidates are ordered by checkpoint sequence. If required candidates are held,
 publication raises `CheckpointCleanupBlocked`. Failed physical cleanup leaves a
@@ -620,6 +776,37 @@ async def resume_training(
 The caller owns the returned execution and must wait or cancel it as described in
 [execution lifecycle](execution_lifecycle.md#usage). Options require a restore
 request; unknown SPMDs or worker ranks fail instead of being skipped.
+
+```mermaid
+sequenceDiagram
+    participant A as Application
+    participant P as Checkpointer
+    participant C as Fresh Controller
+    participant D as Fresh Drivers
+    participant W as Fresh Workers
+    participant O as State components
+    A->>C: start(resume, restore_options)
+    C->>P: await restore(reference, restore_options)
+    P->>P: Reconcile transactions, resolve COMMITTED<br/>manifest, validate scope and topology
+    P->>C: restore_snapshot(manifest, restore_options)
+    C->>C: Restore source bookmarks, components, and joint<br/>cut
+    C->>C: Await Driver readiness and rebuild flow control
+    C->>D: Restore SPMDs concurrently with per-rank options
+    D->>W: Restore ranks concurrently with per-component<br/>bytes
+    W->>O: restore(RestoreSession)
+    O->>O: Decode and restore physical state under<br/>component contract
+    O-->>W: Component restore complete
+    W-->>D: READY
+    D-->>C: All restores complete
+    C-->>P: Restore complete with execution gates closed
+    P-->>C: restored_step
+    C->>D: Only then activate source layout and execution
+    C-->>A: GraphExecution
+```
+
+This path selects an existing checkpoint; `latest` returns `None` for an empty
+repository. Component options remain opaque in generic layers. Required options missing,
+unknown targets, or restore failures raise with execution admission closed.
 
 ### Sparse training state
 

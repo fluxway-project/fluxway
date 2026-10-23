@@ -1,64 +1,60 @@
-# fluxway
+# Fluxway
 
 [中文文档](README_zh.md)
 
-Fluxway breaks through the global synchronization barriers and rigid cluster topologies of traditional SPMD by adopting **asynchronous state-machine MPMD**. It not only decouples **CPU memory I/O and GPU/TPU compute**, but also decouples **heterogeneous GPUs across different generations and memory tiers**. Through **elastic M:N topology matching** and **lock-free, zero-bubble overlap**, Fluxway unlocks peak efficiency across heterogeneous clusters.
+Fluxway is a distributed computation orchestration library for heterogeneous
+clusters. It compiles Python operators into a graph and connects SPMD worker
+groups through an asynchronous data plane, with separate resources for reading,
+storage, and computation.
 
-### Key Workloads & Scenarios
+- Build graphs from functions, classes, and decorators; use JAX, PyTorch, DLPack,
+  or native extensions inside operators.
+- Place workers using resource declarations, node-affinity constraints, and
+  ordered optimization goals.
+- Bound concurrent execution with pipeline depth, state-access policies, phase
+  dependencies, and backpressure.
+- Coordinate source leases, whole-graph drain, checkpoint publication, and
+  recovery into fresh executions.
+- Export compiled graphs and performance traces to compare declared dependencies
+  with actual execution.
 
-* **Gigantic Recommendation Systems**: TB/PB-scale sparse embeddings with CPU-side deduplication & multi-hop transfer fully overlapped with GPU dense computation.
-* **Large-scale Conditional Memory & Engram Architectures**: Disaggregate static memory lookups ($\mathcal{O}(1)$ N-gram hash tables & external knowledge bases) from dynamic neural reasoning. Massive parameters reside in host/tiered storage with deterministic prefetching completely hidden behind GPU Transformer layers.
-* **Decoupled MoE (Mixture of Experts)**: Physically disaggregate Attention backbones and Expert pools across heterogeneous GPUs with zero-bubble dynamic token routing.
-* **Disaggregated Prefill & Decode (PD Separation)**: Elastic asymmetric scaling between compute-bound Prefill nodes and memory-bandwidth-bound Decode workers with zero-copy KV cache exchange.
-* **Multimodal World Models & End-to-End Networks (World Models & Omni)**: Asymmetric pipelining of spatiotemporal physics simulators/encoders and autoregressive LLM backbones across diverse accelerators without pipeline stalls.
-* **Asynchronous RL & Alignment (RLHF / Self-Play)**: Non-blocking concurrency between high-throughput Rollout generation workers and Learner training clusters.
-
-### Why Fluxway over Google Pathways?
-
-Unlike monolithic distributed graph runtimes like [Google Pathways](https://arxiv.org/abs/2203.12533) that enforce rigid static graph abstractions and opaque compilation pipelines, Fluxway offers:
-* **Flexible Native Python Component Orchestration**: Freely compose pipelines using standard Python functions, classes, and decorators. Operators seamlessly integrate with JAX, PyTorch, DLPack, and custom C++/CUDA kernels without proprietary walled-garden constraints.
-* **Eager Execution Mode**: Full support for intuitive eager workflows and interactive debugging. Developers can prototype, inspect intermediate tensors, and evolve models dynamically without suffering through tedious, black-box full-graph recompilations.
+The [recommendation training example](fluxway/example/recommendation/README.md)
+combines readers, CPU sparse tables, and data-parallel computation. Overlap and
+copy costs depend on operators, backends, and deployment; measure them for each
+workload. The public entry point submits a compiled graph; operators may use
+eager computation internally.
 
 ## Documentation
 
-- [Contributing](CONTRIBUTING.md) ([中文](CONTRIBUTING_zh.md)): local checks and CI coverage.
-- [Releasing](docs/releasing.md) ([中文](docs/releasing_zh.md)): version tags, wheel builds, and PyPI publishing.
+Start with the [documentation index](docs/README.md). Sequence diagrams for
+complex flows identify concurrent calls, barriers, cancellation, and commit boundaries.
 
-### Core Architecture & Execution
-- [Architecture](docs/ARCHITECTURE.md) ([中文](docs/ARCHITECTURE_zh.md)): control-plane and runtime ownership.
-- [Execution lifecycle and usage](docs/execution_lifecycle.md) ([中文](docs/execution_lifecycle_zh.md)): start, wait, cancel, checkpoint continuation, and readiness/activation contracts.
-- [Checkpoints](docs/checkpoint.md) ([中文](docs/checkpoint_zh.md)): durable progress cut, save/restore, and retention lifecycle.
-- [Data-plane runtime](docs/dataplane_runtime.md) ([中文](docs/dataplane_runtime_zh.md)): asynchronous transport, tensor ABI, DLPack boundaries, and lock-free delivery.
-- [Coherence protocol](docs/coherence_protocol.md) ([中文](docs/coherence_protocol_zh.md)): endpoint-local MESI directory tree, access intents, and formal invariants.
+| Topic | Guides |
+| --- | --- |
+| Architecture and execution | [Architecture](docs/ARCHITECTURE.md), [execution lifecycle](docs/execution_lifecycle.md), [checkpoints](docs/checkpoint.md) |
+| Reading data | [Source coordination](docs/source_coordination.md), [source work protocol](docs/source_spmd_formal_protocol.md), [reader API](docs/base_reader.md) |
+| Delivering data | [Transfer planning](docs/transfer_planning.md), [data-plane runtime](docs/dataplane_runtime.md), [coherence protocol](docs/coherence_protocol.md) |
+| Resources and operators | [Placement recipes](docs/placement_recipe.md), [placement mathematics](docs/placement_mathematics.md), [worker-process operators](docs/worker_process_operators.md) |
+| Observation and diagnostics | [User profiling](docs/user_profiler.md), [graph visualization](docs/graph_visualization.md) |
+| Development and releases | [Contributing](CONTRIBUTING.md), [releasing](docs/releasing.md) |
 
-### Data Ingestion & Transfer
-- [BaseReader and Source Ingestion API](docs/base_reader.md) ([中文](docs/base_reader_zh.md)): reader coordinate binding, row-sparse tensors, and custom adapters.
-- [Source coordination](docs/source_coordination.md) ([中文](docs/source_coordination_zh.md)): canonical work ownership and supported ingestion boundaries.
-- [Source SPMD formal protocol](docs/source_spmd_formal_protocol.md) ([中文](docs/source_spmd_formal_protocol_zh.md)): algebraic planning, leases, and checkpoint fencing.
-- [Compiled transfer plans](docs/transfer_planning.md) ([中文](docs/transfer_planning_zh.md)): shard intersections, execution groups, and whole-unit routing.
+## View a graph
 
-### Placement & Operators
-- [Placement Recipe](docs/placement_recipe.md) ([中文](docs/placement_recipe_zh.md)): declare per-SPMD resources and configure affinity, objectives, runtime limits, and diagnostics.
-- [Placement Mathematics](docs/placement_mathematics.md) ([中文](docs/placement_mathematics_zh.md)): formal semantics and solver boundaries for Recipe authors.
-- [Worker-process operators](docs/worker_process_operators.md) ([中文](docs/worker_process_operators_zh.md)): `@fluxway.requires_worker_process`, process-affine runtimes, and JAX initialization.
-
-### Observability & Tooling
-- [User profiler](docs/user_profiler.md) ([中文](docs/user_profiler_zh.md)): custom scopes, instant markers, and Perfetto trace correlation.
-- [Computation Graph Visualization](docs/graph_visualization.md) ([中文](docs/graph_visualization_zh.md)): Google Model Explorer export, dependency metadata, potential-overlap layout, remote viewing, trace correlation, and bundle semantics.
-
-## Computation Graph Visualization
+Install the viewer dependency:
 
 ```bash
-pip install "fluxway[visualization]"
+python -m pip install "fluxway[visualization]"
 ```
+
+This example needs an existing `graph` and a new output directory. Export does
+not execute the graph; the viewer blocks while running a local server.
 
 ```python
 import fluxway
 
-bundle = fluxway.visualize_graph(graph, "/tmp/training-graph")
+bundle = fluxway.visualize_graph(graph, "tmp/training-graph")
 fluxway.view_graph(bundle)
 ```
 
-See [Computation Graph Visualization](docs/graph_visualization.md) for Model
-Explorer usage, dependency metadata, potential-overlap layout,
-remote viewing, trace correlation, and bundle semantics.
+See [graph visualization](docs/graph_visualization.md) for a complete graph-building
+example, remote viewing, and trace correlation.

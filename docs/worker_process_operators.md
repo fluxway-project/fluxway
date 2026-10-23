@@ -106,14 +106,15 @@ even when several operators share it. The hook may be synchronous or return an
 awaitable. Shutdown attempts all owners and propagates cleanup errors. Forced
 process termination cannot guarantee a hook; buffered output is not a
 checkpoint or a crash-recovery guarantee. A resource registry does not close
-registered objects for you; see [resource ownership](placement_recipe.md#register-resources-created-inside-a-worker).
+registered objects for you; see [resource
+ownership](placement_recipe.md#register-resources-created-inside-a-worker).
 
 ## Where user code runs
 
 | Callable | Execution |
 | --- | --- |
 | Ordinary Python function | Submitted asynchronously to a named worker-local thread lane, from its first call |
-| Ordinary function returning an awaitable | The worker thread also completes the awaitable |
+| Ordinary function returning a coroutine object | The worker thread runs that coroutine to completion |
 | Coroutine function (`async def`) | Uses `COROUTINE_ASYNC` and runs cooperatively on the actor event loop |
 
 `@requires_worker_process` controls construction, not this choice. A coroutine
@@ -126,6 +127,69 @@ outbound delivery, and scheduler wakeups progress while ordinary operators run.
 CPU-bound Python still competes for the GIL on standard CPython. Native code
 that releases the GIL can overlap. Free-threaded CPython can also run Python
 bytecode in parallel, with the same lane and scheduling rules.
+
+```mermaid
+sequenceDiagram
+    participant P as Local step plan
+    participant E as UserCallableExecutor
+    participant T as Named thread lane
+    participant L as Worker event loop
+    P->>P: Acquire resources required by state policy
+    P->>E: execute(spec)
+    alt Ordinary Python function
+        E->>T: Submit function and context variables
+        par User function runs in thread
+            T->>T: fn()
+            opt Returns a coroutine object
+                T->>T: Run coroutine to completion in thread
+            end
+        and Event loop keeps progressing
+            L->>L: Ingress, mailboxes, delivery, scheduling
+        end
+        T-->>E: Result or exception
+    else Coroutine function
+        E->>L: await fn()
+        L->>L: Yield cooperatively at each await
+        L-->>E: Result or exception
+    end
+    E-->>P: Return result or fail the local plan
+    P->>P: Release state resources for this call
+```
+
+Thread lanes and state locks are separate boundaries. `thread_safe()` permits
+overlapping calls on the same owner; `exclusive()` preserves mutual exclusion. Blocking
+work inside a coroutine still blocks the event loop.
+
+### Concurrency during shutdown
+
+```mermaid
+sequenceDiagram
+    participant C as Close caller
+    participant W as Shared Worker close task
+    participant T as User-call runtime
+    participant O as Operator owners
+    participant P as Checkpoint coordinator
+    C->>W: await close()
+    W->>W: Stop scheduling, cancel and join plans,<br/>deliveries, background tasks
+    par Settle user calls
+        W->>T: await drain()
+        T-->>W: Call outcomes
+    and Clean up instances
+        W->>O: Call on_shutdown() once per unique instance
+        O-->>W: Return synchronously or await async hook
+    and Clean up checkpoint state
+        W->>P: Roll back active attempt and close
+        P-->>W: Cleanup outcome
+    end
+    W->>W: Close executors, invalidate tensors, fence<br/>protocol
+    W-->>C: Shared result or aggregated errors
+```
+
+Synchronous `on_shutdown()` runs directly on the Worker event loop; use an async hook
+and explicitly offload blocking cleanup. Owner hooks and user-call drain run
+concurrently; hooks are not guaranteed to start after every thread call ends. Owners
+must coordinate outstanding resource access. Cancelling a coroutine wait cannot stop a
+running Python thread. Forced process termination does not guarantee hooks.
 
 ## State and scheduling
 

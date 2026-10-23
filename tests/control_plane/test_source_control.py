@@ -152,6 +152,9 @@ async def test_controller_first_activation_uses_scan_result_capabilities(
     next_cursor = OpaqueSourceCursor.from_payload(b"terminal")
 
     class ScanAdapter:
+        def close(self) -> None:
+            pass
+
         def scan_next(self, requested, budget):
             assert requested == cursor
             return SourceScanResult(
@@ -250,8 +253,6 @@ async def test_controller_first_activation_uses_scan_result_capabilities(
         _source_layout_target=lambda: ("reader", "read", config),
         _require_ingestion_planner=lambda: planner,
         _require_source_control=lambda: runtime,
-        _source_scan_binding=None,
-        _source_scan_binding_lock=asyncio.Lock(),
         _source_window_activation_lock=asyncio.Lock(),
         dispatch_driver_component=dispatch,
     )
@@ -292,6 +293,9 @@ async def test_controller_reuses_binding_identity_across_activation(monkeypatch)
     )
 
     class Adapter:
+        def close(self) -> None:
+            pass
+
         def scan_next(self, requested, budget):
             return result
 
@@ -333,8 +337,6 @@ async def test_controller_reuses_binding_identity_across_activation(monkeypatch)
         _source_layout_target=lambda: ("reader", "read", config),
         _require_ingestion_planner=lambda: planner,
         _require_source_control=lambda: runtime,
-        _source_scan_binding=None,
-        _source_scan_binding_lock=asyncio.Lock(),
         _source_window_activation_lock=asyncio.Lock(),
         dispatch_driver_component=dispatch,
     )
@@ -373,6 +375,9 @@ async def test_controller_retries_empty_initial_source_without_fabricating_curso
     )
 
     class Adapter:
+        def close(self) -> None:
+            pass
+
         def scan_next(self, requested, budget):
             assert requested == cursor
             return result
@@ -418,8 +423,6 @@ async def test_controller_retries_empty_initial_source_without_fabricating_curso
         _source_layout_target=lambda: ("reader", "read", config),
         _require_ingestion_planner=lambda: planner,
         _require_source_control=lambda: runtime,
-        _source_scan_binding=None,
-        _source_scan_binding_lock=asyncio.Lock(),
         _source_window_activation_lock=asyncio.Lock(),
         dispatch_driver_component=dispatch,
     )
@@ -446,6 +449,9 @@ async def test_controller_binding_helper_serializes_construction():
     cursor = OpaqueSourceCursor.from_payload(b"initial")
 
     class Adapter:
+        def close(self) -> None:
+            pass
+
         def scan_next(self, requested, budget):
             raise AssertionError("scan is not part of binding construction")
 
@@ -477,10 +483,8 @@ async def test_controller_binding_helper_serializes_construction():
     config = SimpleNamespace(
         operator_specs={"read": SimpleNamespace(source=descriptor)}
     )
-    owner = SimpleNamespace(
-        _source_scan_binding=None,
-        _source_scan_binding_lock=asyncio.Lock(),
-    )
+    planner = IngestionLayoutPlanningComponent("binding-construction")
+    owner = SimpleNamespace(_require_ingestion_planner=lambda: planner)
     first, second = await asyncio.gather(
         _ensure_source_scan_binding(
             owner, node_id="reader", operator_name="read", config=config
@@ -492,6 +496,7 @@ async def test_controller_binding_helper_serializes_construction():
 
     assert first is second
     assert descriptor.calls == 1
+    await planner.close()
 
 
 @pytest.mark.asyncio

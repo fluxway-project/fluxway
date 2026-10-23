@@ -9,6 +9,46 @@ the data plane moves the tensors required by that work.
 Each SPMD graph node represents workers running the same program over a mesh.
 Edges connect operator outputs to inputs.
 
+```mermaid
+sequenceDiagram
+    participant A as Application
+    participant G as Compiled graph
+    participant C as Controller
+    participant D as Drivers
+    participant W as Workers
+    participant T as Data plane
+    A->>G: Build declarations and compile dependencies,<br/>routes, resources
+    G-->>A: Immutable graph and SPMD projections
+    A->>C: await start(graph, recipe)
+    C->>D: Allocate resources, create actors, register<br/>topology
+    D->>W: Install compiled projections
+    W-->>C: Readiness aggregated through Drivers
+    opt Restore requested
+        C->>D: Restore all selected state concurrently
+        D->>W: Restore components with execution gates closed
+        W-->>C: Restore completion through Drivers
+    end
+    C->>D: Activate execution and start sources when needed
+    C->>D: Deliver finite admission for controlled<br/>execution
+    C-->>A: GraphExecution
+    loop Admitted execution steps
+        W->>W: Invoke operators
+        W->>T: Publish tensors
+        T-->>W: Receiver ingress and mailbox delivery complete
+        W-->>C: Progress or drain reports through Drivers
+    end
+    A->>C: await wait() or cancel()
+    C->>D: Terminal cleanup and actor/resource reclamation
+    C-->>A: Completion, cancellation, or failure
+```
+
+This overview shows ordinary tensor delivery and collapses intermediate
+acknowledgements. Driver and Worker calls remain concurrent, and admitted work
+may begin before `start()` returns. Protocol-only paths and the delivery fence
+are covered in [data-plane runtime](dataplane_runtime.md); see [execution
+lifecycle](execution_lifecycle.md) for barriers
+and failure boundaries.
+
 ## Build and inspect a graph
 
 This complete example compiles two CPU operators without starting Ray. The edge
@@ -208,11 +248,11 @@ alone owns leases, ACK frontiers and committed cuts. Driver activation checkpoin
 state is empty. Restore reconstructs plans
 and bindings before applying the logical committed cut.
 
-`IngestionLayoutPlanningComponent` owns descriptor construction and adapter scans
-on a dedicated `IOLane`, and pure compilation on a persistent spawn process pool.
-Accepted operations survive cancellation of their callers. Close rejects new work,
-joins accepted operations, and joins the compiler on a separate lifecycle lane
-before closing the adapter lane. Planner and ledger publication is installed in
+`IngestionLayoutPlanningComponent` manages the lifecycle of source bindings and adapters. Binding construction, data scanning, and resource disposal run on a dedicated `IOLane`, while pure compilation uses a persistent process pool. On shutdown, the planner rejects new requests, drains in-flight operations, shuts down the adapter and compiler pool concurrently, and reclaims lane resources.
+
+The planner and `IOLane` use `AsyncOperationSupervisor` and `AsyncCloseOnce` for concurrency safety: cancelling a caller's wait does not leak background tasks or resources, closure executes idempotently, and reentrant self-awaits are prevented from deadlocking. See [source coordination](source_coordination.md) for sequence details.
+
+Planner and ledger publication is installed in
 one owner-loop section without suspension; validation and installation costs still
 scale with window size. I/O threads isolate blocking calls but do not remove the
 GIL for Python CPU work.
@@ -234,7 +274,9 @@ See [source coordination](source_coordination.md) and
 
 ## Process diagnostics and signal capture
 
-To reliably attribute worker process exits caused by external preemption, evictions, or operating system signals, Fluxway provides non-blocking process-level diagnostic interception in `fluxway.diagnostics`:
+To reliably attribute worker process exits caused by external preemption, evictions, or
+operating system signals, Fluxway provides non-blocking process-level diagnostic
+interception in `fluxway.diagnostics`:
 
 - **Bootstrap hook injection**: `prepare_worker_runtime_env` injects `worker_process_setup_hook` via Ray's `WORKER_PROCESS_SETUP_HOOK_ENV_VAR`, initializing signal interceptors before worker execution while chaining importable user hooks.
 - **Ray SIGTERM interception**: Intercepts Ray's internal `set_sigterm_handler` to record previous handlers and Ray's own SIGTERM callback without altering Ray's teardown protocol.
@@ -262,6 +304,26 @@ importable module paths; a callable object or a manually supplied Ray hook
 environment variable is rejected. The reporter preserves existing signal
 semantics; it cannot report signals that the operating system does not let a
 process intercept, such as `SIGKILL`.
+
+```mermaid
+sequenceDiagram
+    participant O as Operating system
+    participant H as Main-thread signal<br/>handler
+    participant E as Background emitter
+    participant P as Previous signal<br/>disposition
+    O->>H: Catchable system signal
+    H->>H: Record event
+    H->>E: Wake through a nonblocking pipe
+    H->>P: Delegate to previous disposition
+    par Diagnostic output
+        E->>E: Read event and emit diagnostics
+    and Original signal semantics
+        P->>P: Terminate, ignore, or invoke user handler
+    end
+```
+
+The signal handler does not await output. An immediate process exit may still
+prevent the diagnostic record from being written.
 
 ## Mechanism examples
 

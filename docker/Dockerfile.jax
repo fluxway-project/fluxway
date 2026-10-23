@@ -1,5 +1,5 @@
 # Use a specific, tagged JAX base image for reproducibility
-FROM ghcr.io/nvidia/jax:maxtext-2026-09-18
+FROM ghcr.io/nvidia/jax:maxtext-2026-10-20
 
 # Set environment variables for logging and system configuration
 ENV FLUXWAY_LOG_LEVEL=WARNING \

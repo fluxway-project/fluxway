@@ -32,7 +32,6 @@
 从仓库根目录运行以下检查。它们对应可移植的持续集成检查；
 排除的测试需要原生 `sparse_embedding` 和 Lance 依赖。
 
-
 ```bash
 bash scripts/format.sh --check
 JAX_PLATFORMS=cpu python -m pytest -ra --strict-markers --strict-config \
@@ -42,7 +41,6 @@ python -m pytest --confcutdir=tests/packaging tests/packaging
 ```
 
 检查发布版本时不需要创建标签。将预期标签作为下列函数的参数，它必须与 `project.version` 一致。
-
 
 ```bash
 check_release_tag() {
@@ -58,7 +56,6 @@ check_release_tag() {
 
 使用全新目录，避免混入旧产物。下列命令与贡献指南和持续集成使用相同校验器，
 输出保存在 `tmp/` 中。`mktemp` 创建父目录，构建命令创建其中的 `dist` 子目录。
-
 
 ```bash
 mkdir -p tmp
@@ -96,6 +93,34 @@ python -m venv "$release_check_dir/wheel-env"
 
 预发布版本会标记为预发布，不设置为最新版本。
 本文的本地命令不会创建标签、推送提交、上传包或发布版本。
+
+```mermaid
+sequenceDiagram
+    participant M as 已授权维护者
+    participant V as 标签验证任务
+    participant C as 共用持续集成工作流
+    participant A as 工作流产物
+    participant P as PyPI
+    participant G as GitHub Release
+    M->>V: 审核合并后推送 v* 标签
+    V->>V: 校验 main 可达性和版本一致性
+    V->>C: 成功后调用共用 CI
+    par 质量检查
+        C->>C: 格式与静态检查
+    and CPU 测试矩阵
+        C->>C: Python 3.12 / 3.13
+    and 分发产物检查
+        C->>A: 构建、验证并保存同一组 wheel 与源码包
+    end
+    C-->>M: 全部必需任务成功
+    Note over A,P: 发布任务依赖整个 CI 成功，并受 pypi 环境规则约束
+    A->>P: 下载已验证产物，通过 OIDC 上传
+    P-->>G: PyPI 发布任务成功后才允许版本发布
+    A->>G: 附加相同产物并生成发布说明
+    G-->>M: 正式版或预发布版就绪
+```
+
+箭头表示工作流依赖，不表示 PyPI 主动调用 GitHub。任何前置任务失败都会阻止后续发布；部分上传与重试规则见下表。
 
 ## 处理发布失败
 

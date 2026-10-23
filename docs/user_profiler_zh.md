@@ -11,7 +11,6 @@ Fluxway 会将整个算子调用记录为 `user_callable.execute`。
 下面的辅助函数可以在算子内部调用，并提供了本地检查所需的输入。
 直接调用只验证计算结果；只有 Fluxway 在启用分析的情况下调用算子时，才会记录事件。
 
-
 ```python
 import fluxway as fw
 
@@ -47,7 +46,6 @@ assert not fw.profiler.enabled()
 
 安装导出依赖：
 
-
 ```bash
 python -m pip install "fluxway[profiler]"
 ```
@@ -55,7 +53,6 @@ python -m pip install "fluxway[profiler]"
 下面的函数需要已初始化的 Ray 集群、包含有限数据源的完整计算图及其放置配方。
 轨迹目录需要由控制器和调用方共享，才能在函数最后检查同一个文件。
 所有节点必须满足项目的依赖和时钟同步要求。该函数会启动作业，不是本地记录示例。
-
 
 ```python
 from pathlib import Path
@@ -99,10 +96,34 @@ async def profile_job(
 默认启用严格的耗尽检查，容量不足时抛出 `ProfilerBufferExhausted`。
 时钟不确定度超过配置上限也会使采集失败，避免输出误导性的耗时。
 
+```mermaid
+sequenceDiagram
+    participant A as 应用
+    participant C as 控制器完成清理
+    participant D as 驱动器组
+    participant W as 工作进程记录器
+    participant F as 轨迹文件
+    Note over C,W: 执行期间在各进程固定缓冲区记录事件
+    A->>C: await execution.wait()
+    C->>C: 进入 COMPLETING，停止检查点并关闭协调器
+    C->>D: 并发请求性能快照
+    D->>W: 并发捕获各秩记录与时钟映射
+    W-->>D: ProfilerSnapshot
+    D-->>C: 全部 SPMD 快照
+    C->>D: 回收角色并释放资源
+    D-->>C: 回收完成
+    C->>C: 关闭来源规划器，合并控制器记录并解析符号
+    C->>F: 应用过滤并同步写出 Perfetto 文件
+    F-->>C: 文件写出完成
+    C->>C: 通知最终结果，发布终态
+    C-->>A: wait() 成功返回
+```
+
+图示正常完成的自动导出路径。取消与失败清理不自动导出轨迹；采集、回收或写出异常会使完成结果失败。记录区间含 CPU 排队与调用事实，设备实际完成时间仍需相应后端事件证明。
+
 ## 阅读轨迹
 
 工作进程轨道使用以下层级：
-
 
 ```text
 SPMDs/<spmd_id>/rank:<rank>/<subsystem>/<leaf>/lane:<lane>

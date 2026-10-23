@@ -140,24 +140,15 @@ async def _ensure_source_scan_binding(
     source = config.operator_specs[operator_name].source
     if source is None:
         raise ValueError("source scan binding requires a source descriptor")
-    async with owner._source_scan_binding_lock:
-        binding = owner._source_scan_binding
-        if binding is None:
-            build_binding = getattr(source, "build_source_scan_binding", None)
-            if not callable(build_binding):
-                raise TypeError("source descriptor must provide source scan binding")
-            binding = await asyncio.to_thread(
-                build_binding,
-                spmd_id=node_id,
-                operator_name=operator_name,
-                config=config,
-            )
-            if not isinstance(binding, SourceScanBinding):
-                raise TypeError("source descriptor must return SourceScanBinding")
-            owner._source_scan_binding = binding
-        elif not isinstance(binding, SourceScanBinding):
-            raise TypeError("controller source scan binding has invalid type")
-        return binding
+    build_binding = getattr(source, "build_source_scan_binding", None)
+    if not callable(build_binding):
+        raise TypeError("source descriptor must provide source scan binding")
+    return await owner._require_ingestion_planner().open_source_binding(
+        build_binding,
+        spmd_id=node_id,
+        operator_name=operator_name,
+        config=config,
+    )
 
 
 def require_manager(manager_attr: str) -> Callable[[_F], _F]:
@@ -425,8 +416,6 @@ class ControllerActor:
         self._drain_boundary = DrainBoundary()
         self._drain_boundary_lock = asyncio.Lock()
         self._source_window_activation_lock = asyncio.Lock()
-        self._source_scan_binding_lock = asyncio.Lock()
-        self._source_scan_binding: SourceScanBinding | None = None
         self._execution_generation = 0
         self._admission: DrainAdmission | None = None
         self._execution_lifecycle = ExecutionLifecycle(self)

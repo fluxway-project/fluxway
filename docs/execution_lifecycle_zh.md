@@ -106,16 +106,45 @@ asyncio.run(check_thread_lane())
 ## 启动与恢复
 
 ```mermaid
-flowchart TD
-    I[初始化资源与工作进程] --> R[READY：拓扑已登记]
-    R --> A[ACTIVATING]
-    A --> S[按需恢复检查点]
-    S --> L[激活来源布局]
-    L --> D[并发激活全部驱动器]
-    D --> W[在有限执行门后启动来源]
-    W --> U[RUNNING]
-    U --> G[交付当前准入或创建首次准入]
+sequenceDiagram
+    participant A as 应用
+    participant L as ExecutionLifecycle
+    participant C as 控制器
+    participant D as 驱动器组
+    participant W as 工作进程组
+    A->>L: await start(resume)
+    L->>C: 初始化并等待 READY
+    L->>C: START → ACTIVATING
+    opt 指定已提交检查点
+        L->>C: await restore()
+        C->>D: 并发恢复，驱动器仍为 READY
+        D->>W: READY → RESTORING → READY
+        D-->>L: 全部恢复完成
+    end
+    opt 图需要来源协调
+        L->>C: 激活来源布局
+        C->>D: 投递并安装窗口
+    end
+    L->>D: 并发 activate_execution()
+    D->>W: 并发激活工作进程
+    W-->>D: 全部激活确认
+    D-->>L: 全部驱动器进入 RUNNING
+    alt 已知来源终点为 0
+        Note over L,W: 跳过来源启动
+    else 仍有可执行工作
+        L->>D: 并发 start_source_operators()
+        D-->>L: 来源启动完成
+    end
+    L->>C: ACTIVATION_COMPLETE → RUNNING
+    opt 启用有限准入
+        L->>D: 交付当前准入或创建首次准入
+        D->>W: 应用准入，开放有限执行范围
+        D-->>L: 全部参与者应用完成
+    end
+    L-->>A: 返回 GraphExecution 及恢复位置
 ```
+
+获准的工作可能在 `start()` 返回前开始。图中聚合了经控制器和驱动器转发的确认；任一阶段失败都会进入统一故障路径。
 
 控制器的 `ACTIVATING` 包含恢复、来源布局激活、驱动器激活和来源启动。恢复发生在驱动器仍为 `READY` 时；驱动器进入 `ACTIVATING` 后并发激活工作进程，收到全部确认才进入 `RUNNING`，此时不接受恢复请求。
 
@@ -152,18 +181,39 @@ flowchart TD
 终止清理停止同一个监督器，在发布控制器终态前观察其失败。这是运行时职责约束，不是模型或来源数据协议。
 
 ```mermaid
-flowchart TD
-    A[当前准入] --> D[全部登记驱动器排空]
-    D --> C[来源任务确认完整]
-    C --> S[按配置和需要保存检查点]
-    S --> K[提交边界]
-    K --> T{到达终点或步骤上限？}
-    T -->|是| F[COMPLETING 后进入 COMPLETED]
-    T -->|否| R[RESUMING]
-    R --> W[并发继续全部驱动器，保留执行门]
-    W --> U[RUNNING]
-    U --> N[交付延迟终点或下一周期准入]
+sequenceDiagram
+    participant D as 全部登记驱动器
+    participant L as ExecutionLifecycle
+    participant S as 来源账本
+    participant P as 检查点协调器
+    participant C as 控制器状态与边界
+    D-->>L: 当前准入版本下全部排空
+    opt 存在受控来源
+        L->>S: await wait_for_work_cut(target)
+        S-->>L: 连续来源确认覆盖 target
+    end
+    alt 等待期间准入已改变
+        L->>L: 放弃旧边界，等待当前版本排空
+    else 准入仍一致
+        L->>C: SNAPSHOT_BEGIN
+        opt 已配置检查点且边界尚未提交
+            L->>P: await save(target)
+            P-->>L: 全局发布完成
+        end
+        L->>C: CHECKPOINT_COMMITTED
+        alt 到达终点或步骤上限
+            L->>C: COMPLETING，执行唯一清理
+        else 还有后续步骤
+            L->>C: RESUMING
+            L->>D: 并发 resume()，保留工作进程执行门
+            D-->>L: 全部继续操作完成
+            L->>C: RUNNING
+            L->>D: 交付延迟终点或下一周期准入
+        end
+    end
 ```
+
+未配置检查点时，边界提交只更新运行时进度，不产生持久恢复产物。
 
 驱动器继续执行时重置检查点记账和排空同步状态，不清除工作进程执行门。`RESUMING` 期间仍归约新观察，但全部驱动器完成继续操作后才交付。等待来源确认期间若准入变化，旧边界不能发起快照。
 
@@ -212,6 +262,35 @@ assert restored.admitted_cut is None
 
 ## 准入交接
 
+```mermaid
+sequenceDiagram
+    participant L as 生命周期
+    participant M as SPMDManager
+    participant F as 快驱动器
+    participant S as 慢驱动器
+    L->>M: 校验全部接口并提交准入 r
+    par 版本 r 的远程调用
+        M->>F: request_drain(r)
+        F-->>M: 应用完成
+    and 慢调用仍在途
+        M->>S: request_drain(r)
+    end
+    Note over L,S: 相同版本共享结果；取消等待者不撤销交付
+    L->>M: 终点缩短，提交准入 r+1
+    par 新版本交付
+        M->>F: request_drain(r+1)
+        F-->>M: 应用完成
+    and 无需等待旧汇总结果
+        M->>S: request_drain(r+1)
+        S->>S: 按版本校验；拒绝迟到的旧请求
+        S-->>M: 新版本应用完成
+    end
+    M-->>L: 版本 r+1 的汇总结果
+    Note over M,S: 仍跟踪版本 r 的慢调用及其结果
+```
+
+远端实际到达次序可不同。每个接收者都必须校验版本，所有远程失败仍传播到故障路径。
+
 生命周期选择当前不可变准入。`SPMDManager.enqueue_driver_calls` 先校验全部登记参与者及其远程接口，再排队调用，返回汇总异步结果。缺少角色句柄或接口无效时，整次预检失败，不跳过参与者。接收端驱动器状态机判断操作是否合法，管理器不另存就绪状态，也不另建接收者清单。
 
 提交或远程调用失败会在等待时抛出，不作为普通结果返回。相同版本的并发调用共享一个汇总结果。旧请求尚未完成时也可交付新版本，因此缩短终点不必等待慢接收者；接收端拒绝过期或冲突版本。
@@ -225,6 +304,36 @@ assert restored.admitted_cut is None
 完成过程中的失败会将结果改为 `FAILED`，不创建第二个清理任务。清理通过同一状态机报告 `CLEANUP_FINISHED` 或 `CLEANUP_FAILED`。
 
 `GraphExecution.cancel()` 请求取消并等待同一个受保护的清理任务。重复取消和完成后的取消观察同一结果；取消等待者不取消清理。成功回收进入 `CANCELLED`，回收失败进入 `FAILED`。`wait()` 分别抛出 `asyncio.CancelledError` 或 `ExecutionFailedError`。
+
+```mermaid
+sequenceDiagram
+    participant A as 一个或多个等待者
+    participant L as 生命周期
+    participant T as 唯一终止清理任务
+    participant C as 组件与运行时资源
+    A->>L: cancel()，或完成/失败事件
+    L->>T: 首次创建；后续请求共享结果
+    L->>L: 状态转移回调返回，不等待清理
+    A->>T: 受保护地等待结果
+    opt 某个等待者取消等待
+        A->>A: 结束本次等待
+        Note over T,C: 清理任务继续运行
+    end
+    T->>T: 非正常完成时取消并等待启动任务
+    T->>C: 通知终止阶段，停止检查点并回收资源
+    C-->>T: 完成或收集到的清理异常
+    T->>T: 结算剩余远程等待与准入监督任务
+    T->>C: 通知最终结果
+    alt 全部清理成功
+        T->>L: CLEANUP_FINISHED
+        L-->>A: COMPLETED / CANCELLED
+    else 任一清理或通知失败
+        T->>L: CLEANUP_FAILED
+        L-->>A: FAILED，保留异常
+    end
+```
+
+`wait()` 通过完成状态观察结果；`cancel()` 等待清理任务。仅等待超时不会触发图中的取消流程。
 
 取消不额外创建检查点，恢复只能使用已提交的协调检查点。启动任务同样由生命周期管理，失败或取消时先结算启动再回收，避免就绪等待悬挂；取消放置等待会释放已分配放置组。
 

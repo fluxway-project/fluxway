@@ -177,6 +177,12 @@ second schedule definition. Workers and exports use the shared
 function IDs in [Perfetto traces](user_profiler.md) to compare rules with measured
 execution.
 
+Static views express possible overlap. See [operator execution
+sequences](worker_process_operators.md) for calls, waits, and shutdown, and [profiling
+sequences](user_profiler.md) for capture and file export. `visualize_graph()` writes a
+static file synchronously; `view_graph()` blocks while serving it. Neither starts graph
+execution.
+
 ## Interpret overlap and scale
 
 Fluxway combines graph dependencies with same-step phase relations, collapses

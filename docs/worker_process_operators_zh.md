@@ -12,7 +12,6 @@
 `bind_spmd` 保留原始类供本地检查，并创建用于计算图执行的 SPMD 声明。
 写入器只有一个工作进程，因此输出路径只有一个所有者。该路径必须尚不存在。
 
-
 ```python
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -109,7 +108,7 @@ with TemporaryDirectory(dir="tmp") as directory:
 | 可调用对象 | 执行方式 |
 | --- | --- |
 | 普通 Python 函数 | 从第一次调用起，异步提交到工作进程内的命名线程通道 |
-| 返回可等待对象的普通函数 | 工作线程继续完成该可等待对象 |
+| 返回协程对象的普通函数 | 工作线程运行该协程至完成 |
 | 协程函数（`async def`） | 使用 `COROUTINE_ASYNC`，在执行器的事件循环上协作运行 |
 
 `@requires_worker_process` 控制构造位置，不改变上表中的选择。
@@ -120,6 +119,63 @@ with TemporaryDirectory(dir="tmp") as directory:
 标准 CPython 下，计算密集的 Python 代码仍然竞争 GIL。
 释放 GIL 的原生代码可以重叠；自由线程版 CPython 还可以并行执行 Python 字节码，
 通道和调度规则保持一致。
+
+```mermaid
+sequenceDiagram
+    participant P as 本地执行计划
+    participant E as UserCallableExecutor
+    participant T as 命名线程通道
+    participant L as 工作进程事件循环
+    P->>P: 按状态策略取得所需资源
+    P->>E: execute(spec)
+    alt 普通 Python 函数
+        E->>T: 提交函数及上下文变量
+        par 用户函数在线程运行
+            T->>T: fn()
+            opt 返回协程对象
+                T->>T: 在线程中运行协程至完成
+            end
+        and 事件循环继续推进
+            L->>L: 接收、邮箱、交付与调度
+        end
+        T-->>E: 结果或异常
+    else 协程函数
+        E->>L: await fn()
+        L->>L: 在每次 await 处协作让出控制权
+        L-->>E: 结果或异常
+    end
+    E-->>P: 返回结果或使本地计划失败
+    P->>P: 释放本次调用的状态资源
+```
+
+线程通道与状态锁是不同边界：`thread_safe()` 允许共用实例的调用重叠，`exclusive()` 保留互斥。协程内的同步阻塞工作仍会阻塞事件循环。
+
+### 关闭时的并发边界
+
+```mermaid
+sequenceDiagram
+    participant C as 关闭调用方
+    participant W as 工作进程唯一关闭任务
+    participant T as 用户调用运行时
+    participant O as 算子拥有者
+    participant P as 检查点协调器
+    C->>W: await close()
+    W->>W: 停止调度，取消并等待计划、交付与后台任务
+    par 结算用户调用
+        W->>T: await drain()
+        T-->>W: 调用结算结果
+    and 清理实例
+        W->>O: 每个唯一实例调用一次 on_shutdown()
+        O-->>W: 同步返回或等待异步钩子
+    and 清理检查点
+        W->>P: 回滚活动尝试并关闭
+        P-->>W: 清理结果
+    end
+    W->>W: 关闭执行器，使张量失效并封锁协议
+    W-->>C: 共享结果或汇总异常
+```
+
+同步 `on_shutdown()` 直接在工作进程事件循环调用；耗时清理应使用异步钩子并自行分派阻塞工作。实例钩子与用户调用排空并发执行，不保证钩子开始前所有线程调用已经结束。拥有者须协调仍在进行的资源访问；取消协程等待也不能终止已运行的 Python 线程。强制结束进程不保证执行钩子。
 
 ## 状态与调度
 

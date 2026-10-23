@@ -41,3 +41,19 @@ python -m pip install fluxway
 ## 文档范围
 
 这些文档说明 Fluxway 的公开接口与协议边界，内部接入示例会明确标注。本地示例用于解释行为，不能证明集群吞吐、崩溃恢复或模型收敛。具体业务配置、远程目录、凭据和验收结果由应用仓库维护。中英文版本覆盖相同机制，同步维护。
+
+## 时序图阅读约定
+
+时序图使用 Mermaid：实线箭头表示调用或消息提交，虚线箭头表示返回或完成通知；异步调用是否等待，以消息文字和屏障为准。`par` 分支可以并发推进，`alt` 表示互斥路径，`opt` 表示可选路径。纵向顺序表达必要的先后关系，不表示耗时比例；同一角色可以代表一组并发参与者。
+
+| 要核对的顺序 | 文档 |
+| --- | --- |
+| 启动、恢复、准入、排空与取消 | [执行生命周期](execution_lifecycle_zh.md) |
+| 扫描、编译、安装窗口与关闭 | [来源协调](source_coordination_zh.md) |
+| 批量领取、乱序确认与连续进度 | [来源任务协议](source_spmd_formal_protocol_zh.md) |
+| 异步读取与完整耗尽 | [读取接口](base_reader_zh.md) |
+| 快照准备、提交、崩溃协调与读取保护 | [检查点与恢复](checkpoint_zh.md) |
+| 计划交接、多目标交付与提交屏障 | [传输计划](transfer_planning_zh.md)、[数据面运行时](dataplane_runtime_zh.md) |
+| 共享归还、独占授权、有序退休与输入释放 | [一致性协议](coherence_protocol_zh.md) |
+| 放置就绪、线程执行与轨迹导出 | [放置配方](placement_recipe_zh.md)、[工作进程算子](worker_process_operators_zh.md)、[用户性能分析](user_profiler_zh.md) |
+| 持续集成、包发布与版本发布 | [版本发布](releasing_zh.md) |

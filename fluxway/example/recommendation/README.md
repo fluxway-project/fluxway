@@ -10,7 +10,7 @@ transport and coordinated source/model checkpoint recovery.
 ## Execution architecture
 
 ```mermaid
-flowchart LR
+flowchart TD
     R[Reader pools] -->|one complete microbatch per Input| I[Input: deduplicate IDs]
     I -->|user IDs, modulo routing| T1[Embedding table 1]
     I -->|item IDs, modulo routing| T2[Embedding table 2]
@@ -35,6 +35,52 @@ flowchart LR
 Deduplication is local to each Input batch; the same key can still be supplied by
 multiple Inputs. Mirror routing returns values and gradients using the transfer
 receipt. Neither deduplication nor node affinity proves zero-copy delivery.
+
+## Asynchronous interactions in one training step
+
+```mermaid
+sequenceDiagram
+    participant L as LogicalWorkLedger
+    participant R as Reader
+    participant I as Input
+    participant A as Embedding table 1
+    participant B as Embedding table 2
+    participant D as Dense
+    R->>L: Acquire source leases for published intervals
+    L-->>R: Exact source work items
+    R->>I: Read and deliver one complete microbatch
+    par Source acknowledgement
+        R->>L: ACK production through bounded asynchronous<br/>queue
+    and Downstream computation
+        I->>I: Deduplicate IDs, retain inverse indices and<br/>origins
+        par Independent table lookups
+            I->>A: Route user IDs by key
+            A-->>D: Return embeddings using receipt routing
+        and Item table lookup
+            I->>B: Route item IDs by key
+            B-->>D: Return embeddings using receipt routing
+        and Input metadata
+            I->>D: Inverse indices, features, labels
+        end
+        D->>D: prepare_dense_inputs → train_core →<br/>scatter_sparse_grads
+        par Sparse update 1
+            D->>A: Send gradients using receipt routing
+            A->>A: Sparse Adam update
+        and Sparse update 2
+            D->>B: Send gradients using receipt routing
+            B->>B: Sparse Adam update
+        and Dense update
+            D->>D: Accumulate gradients, apply SGD when due
+        end
+    end
+    Note over A,D: Next train_core depends on prior Dense update, sparse calls obey<br/>bounded staleness
+```
+
+Each data message collapses routing, transport, and ingress; arrows do not imply
+cross-process zero-copy. Source ACKs can precede downstream computation. A joint
+checkpoint still requires every branch to drain and publication to finish; see
+[execution lifecycle](../../../docs/execution_lifecycle.md) and [checkpoint
+transactions](../../../docs/checkpoint.md).
 
 ## Environment
 
@@ -160,7 +206,7 @@ establish copy-free Ray delivery between processes. See
 [transfer planning](../../../docs/transfer_planning.md) and
 [data-plane runtime](../../../docs/dataplane_runtime.md) for the memory boundaries.
 
-`--source-max-in-flight` bounds source steps ahead of the committed cut. Set it so
+`--source-max-in-flight` bounds source steps ahead of the contiguous acknowledged candidate cut. Set it so
 the next checkpoint boundary is reachable. Source work is acquired in batches,
 but grant size is also limited by credit and the Reader execution cycle. Increasing
 Reader count with fixed credit can reduce batching efficiency.
@@ -180,9 +226,9 @@ a deterministic replay mode or provide a convergence benchmark.
 
 The public entrypoint submits a compiled `FunctionalGraph`. Eager computation
 inside an operator uses the same execution authorization; there is no separate
-dynamic eager graph submission API. The synthetic source is finite. Custom adapter
-support and the absence of automatic unbounded discovery/refill are described in
-[BaseReader](../../../docs/base_reader.md).
+dynamic eager graph submission API. The synthetic source is finite. Adapter scanning and
+controller-owned event-driven refill follow the
+[source coordination contract](../../../docs/source_coordination.md).
 
 ## Graph export and profiling
 
@@ -195,7 +241,7 @@ python -m fluxway.example.recommendation.train \
   --reader-shards 16 --dp 4 --num-gpus 1 \
   --max-steps 10 --source-max-in-flight 40 \
   --checkpoint-dir /shared/checkpoints/recommendation-graph \
-  --graph-visualization-dir /tmp/recommendation-graph
+  --graph-visualization-dir tmp/recommendation-graph
 ```
 
 For Perfetto profiling, install the `profiler` extra and pass a trace root:
@@ -205,7 +251,7 @@ python -m fluxway.example.recommendation.train \
   --reader-shards 16 --dp 4 --num-gpus 1 \
   --max-steps 10 --source-max-in-flight 40 \
   --checkpoint-dir /shared/checkpoints/recommendation-profile \
-  --profiler-trace-dir /tmp/recommendation-traces
+  --profiler-trace-dir tmp/recommendation-traces
 ```
 
 See [graph visualization](../../../docs/graph_visualization.md) and

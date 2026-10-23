@@ -102,6 +102,36 @@ Prerelease versions create a prerelease and are not marked as the latest
 release. Local commands in this guide do not create tags, push commits, upload
 packages, or publish a release.
 
+```mermaid
+sequenceDiagram
+    participant M as Authorized maintainer
+    participant V as Tag validation job
+    participant C as Reusable CI workflow
+    participant A as Workflow artifacts
+    participant P as PyPI
+    participant G as GitHub Release
+    M->>V: Push v* tag after review and merge
+    V->>V: Validate main reachability and version match
+    V->>C: Invoke reusable CI after validation succeeds
+    par Quality checks
+        C->>C: Formatting and lint
+    and CPU test matrix
+        C->>C: Python 3.12 / 3.13
+    and Distribution checks
+        C->>A: Build, validate, and store wheel and source<br/>distribution
+    end
+    C-->>M: All required jobs succeed
+    Note over A,P: Publish depends on all CI jobs and the pypi environment rules
+    A->>P: Download verified artifacts and publish through<br/>OIDC
+    P-->>G: Release job starts only after PyPI job succeeds
+    A->>G: Attach the same artifacts and generate release<br/>notes
+    G-->>M: Release or prerelease ready
+```
+
+Arrows express workflow dependencies, not a PyPI callback to GitHub. A failed
+prerequisite blocks later publishing; partial uploads and retries follow the table
+below.
+
 ## Recover from a failed release
 
 Inspect the failed job and determine which files were actually published before

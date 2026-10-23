@@ -241,6 +241,34 @@ assert binding.resolve(2, logical_mesh=mesh) == "left"
 assert binding.resolve(3, logical_mesh=mesh) == "right"
 ```
 
+## From declaration to execution
+
+```mermaid
+sequenceDiagram
+    participant A as Application graph<br/>builder
+    participant G as CompiledGraph
+    participant P as CompiledSendPlan
+    participant W as Worker
+    participant T as Data plane
+    A->>G: Compile dependencies, execution groups, tensor<br/>declarations
+    G->>G: Bind whole-unit relations and validate rank<br/>domains
+    G-->>W: Immutable SPMD graph projection
+    W->>P: Build send instructions from compiled<br/>dependencies and rank
+    P-->>W: Frozen routes, ports, and coherence bindings
+    loop Each admitted step
+        W->>W: Run operator and produce TransportTensor
+        W->>P: Supply step and actual tensor metadata
+        P->>P: Build frames using whole-unit, receipt, or shard<br/>rules
+        P-->>W: Complete target-batch tuple
+        W->>T: Register one complete publication
+        T-->>W: Asynchronous delivery result
+    end
+```
+
+Layouts and static routes bind during initialization; dynamic indices and receipts are
+evaluated per execution. See [data-plane runtime](dataplane_runtime.md) for ordering,
+concurrent fanout, and acceptance proofs.
+
 ## Delivery and memory limits
 
 Complete-unit relations and provably equivalent static chunk geometry can

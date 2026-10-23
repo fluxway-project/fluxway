@@ -214,12 +214,45 @@ async def consume_layout(
 注入任务条目、调用读取器，再通过有界异步队列确认租约。应用不能替其他工作进程
 确认整个描述区间。
 
+```mermaid
+sequenceDiagram
+    participant A as 异步消费方
+    participant S as IngestionLayoutSession
+    participant T as 读取线程
+    participant R as IngestionReadSession
+    loop 直到完整耗尽
+        A->>S: await read()
+        S->>S: 取得会话异步锁
+        S->>T: to_thread(next)
+        T->>R: 推进阻塞区间迭代器
+        R-->>T: SegmentReadChunk
+        T->>T: 校验实际记录数与区间覆盖
+        T-->>S: 本批数据或流结束
+        alt 仍有数据
+            S-->>A: batch
+            A->>A: await consume(batch)
+        else 全部区间耗尽且计数一致
+            S->>S: 创建 SourceLayoutCompletion
+            S-->>A: None
+        end
+    end
+    A->>S: await close()
+    S->>T: to_thread(stream.close)
+    T->>R: close()
+    S-->>A: 读取资源已关闭
+```
+
+提前退出或读取异常不会生成布局完成信息；计数不符直接报错。调用方需等待消费完成并在 `finally` 中关闭会话，不能把 `close()` 当作租约确认或检查点提交。
+
 ## 来源注册与恢复
 
 来源适配器实现 `IngestionSourceAdapter.scan_next(cursor, budget)` 和纯位置运算
-`advance_cursor(cursor, records)`。来源描述提供 `build_source_scan_binding` 与
-`build_component`。控制器在会话内只创建并缓存一个绑定，统一拥有读取拓扑、适配器、
-尾部策略和初始不透明位置。可运行的扫描示例见[来源协调](source_coordination_zh.md)，
+`advance_cursor(cursor, records)`，并提供 `close()`，即使没有外部资源也必须实现。
+来源描述提供 `build_source_scan_binding` 与 `build_component`。控制器将绑定创建和缓存
+交给规划器，统一保存读取拓扑、适配器、尾部策略和初始不透明位置；绑定成功后由规划器
+负责适配器关闭，首次扫描前取消等待也不会丢弃资源。构造、初始位置、扫描和关闭可返回
+可等待对象，在适配器专用通道执行；位置运算保持同步。工作进程的 `IngestionReadSession.close()`
+仍是独立的同步读取会话契约，不替代控制侧适配器关闭。可运行的扫描与生命周期示例见[来源协调](source_coordination_zh.md)，
 完整接入见[推荐来源描述](../fluxway/example/recommendation/source_adapter.py)与
 [读取器](../fluxway/example/recommendation/reader.py)。
 

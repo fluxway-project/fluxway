@@ -91,6 +91,9 @@ class RecommendationSourceAdapter(IngestionSourceAdapter):
     def source_identity(self) -> str:
         return self._planner.source_identity
 
+    def close(self) -> None:
+        """The deterministic planner has no external resources."""
+
     @property
     def revision_id(self) -> int:
         return self._planner.revision_id

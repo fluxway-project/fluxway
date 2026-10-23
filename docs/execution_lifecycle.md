@@ -63,7 +63,7 @@ sequenceDiagram
     participant E as event caller
     participant F as FSM owner
     participant Q as bounded effect queue
-    participant L as async/thread/process lane
+    participant L as async/thread/process<br/>lane
     participant F2 as fact event
     E->>F: event
     F->>F: pure plan + state_revision commit
@@ -152,16 +152,47 @@ after registration is rejected before mutation.
 ## Startup and restore
 
 ```mermaid
-flowchart TD
-    I[Initialize resources and worker runtimes] --> R[READY: topology registered]
-    R --> A[ACTIVATING]
-    A --> S[Optional checkpoint restore]
-    S --> L[Activate source layouts]
-    L --> D[Activate every Driver concurrently]
-    D --> W[Start sources behind finite gates]
-    W --> U[RUNNING]
-    U --> G[Deliver current admission or create initial admission]
+sequenceDiagram
+    participant A as Application
+    participant L as ExecutionLifecycle
+    participant C as Controller
+    participant D as Drivers
+    participant W as Workers
+    A->>L: await start(resume)
+    L->>C: Initialize and await READY
+    L->>C: START → ACTIVATING
+    opt Committed checkpoint selected
+        L->>C: await restore()
+        C->>D: Restore concurrently while Drivers remain READY
+        D->>W: READY → RESTORING → READY
+        D-->>L: All restores complete
+    end
+    opt Graph requires source control
+        L->>C: Activate source layout
+        C->>D: Deliver and install windows
+    end
+    L->>D: Concurrent activate_execution()
+    D->>W: Activate Workers concurrently
+    W-->>D: All activation acknowledgements
+    D-->>L: All Drivers reach RUNNING
+    alt Known source terminal cut is 0
+        Note over L,W: Skip source startup
+    else Work remains
+        L->>D: Concurrent start_source_operators()
+        D-->>L: Source startup complete
+    end
+    L->>C: ACTIVATION_COMPLETE → RUNNING
+    opt Finite admission enabled
+        L->>D: Deliver current or initial admission
+        D->>W: Apply admission and open finite execution range
+        D-->>L: All participants applied admission
+    end
+    L-->>A: Return GraphExecution and restored position
 ```
+
+Admitted work may begin before `start()` returns. The diagram collapses acknowledgements
+forwarded through the Controller and Drivers. A failure at any stage enters the shared
+failure path.
 
 `ACTIVATING` includes restore, source layout activation, Driver `activate_execution`
 and source startup. A Driver moves READY → ACTIVATING before issuing concurrent
@@ -245,18 +276,40 @@ supervisor and observes its failure before publishing the terminal Controller st
 runtime ownership rule, not a training or source-data protocol.
 
 ```mermaid
-flowchart TD
-    A[Current admission] --> D[All registered Drivers drained]
-    D --> C[Canonical source ACK coverage]
-    C --> S[Save checkpoint when configured and needed]
-    S --> K[Commit boundary]
-    K --> T{Terminal cut or max steps reached?}
-    T -->|Yes| F[COMPLETING then COMPLETED]
-    T -->|No| R[RESUMING]
-    R --> W[Resume every Driver concurrently; retain Worker gates]
-    W --> U[RUNNING]
-    U --> N[Deliver deferred terminal boundary or next periodic admission]
+sequenceDiagram
+    participant D as All registered Drivers
+    participant L as ExecutionLifecycle
+    participant S as Source ledger
+    participant P as Checkpointer
+    participant C as Controller state and<br/>boundary
+    D-->>L: All drained under the current admission
+    opt Controlled source exists
+        L->>S: await wait_for_work_cut(target)
+        S-->>L: Contiguous source ACKs cover target
+    end
+    alt Admission changed while waiting
+        L->>L: Discard old boundary and await current drain
+    else Admission still matches
+        L->>C: SNAPSHOT_BEGIN
+        opt Checkpoint configured and boundary not yet committed
+            L->>P: await save(target)
+            P-->>L: Global publication complete
+        end
+        L->>C: CHECKPOINT_COMMITTED
+        alt Terminal cut or step limit reached
+            L->>C: COMPLETING, run shared cleanup
+        else More steps remain
+            L->>C: RESUMING
+            L->>D: Concurrent resume(), retain Worker gates
+            D-->>L: All resume calls complete
+            L->>C: RUNNING
+            L->>D: Deliver deferred terminal or next periodic<br/>admission
+        end
+    end
 ```
+
+Without checkpoint configuration, boundary commit updates runtime progress without
+creating a durable restore artifact.
 
 Driver resume resets checkpoint bookkeeping and synchronizer drain state. It does
 not clear the Worker execution gate. Observations during RESUMING are reduced but
@@ -316,6 +369,36 @@ but no new admission; the lifecycle must grant the next finite range.
 
 ## Admission handoff
 
+```mermaid
+sequenceDiagram
+    participant L as Lifecycle
+    participant M as SPMDManager
+    participant F as Fast Driver
+    participant S as Slow Driver
+    L->>M: Validate all endpoints and enqueue admission r
+    par Revision r calls
+        M->>F: request_drain(r)
+        F-->>M: Applied
+    and Slow call remains outstanding
+        M->>S: request_drain(r)
+    end
+    Note over L,S: Same revision shares a result, waiter cancellation leaves delivery<br/>running
+    L->>M: Terminal cut shortened, enqueue admission r+1
+    par New revision delivery
+        M->>F: request_drain(r+1)
+        F-->>M: Applied
+    and Without awaiting the old aggregate
+        M->>S: request_drain(r+1)
+        S->>S: Validate revisions, reject late stale requests
+        S-->>M: New revision applied
+    end
+    M-->>L: Aggregate result for revision r+1
+    Note over M,S: Revision r calls and their outcomes remain tracked
+```
+
+Remote arrival order can differ. Every recipient validates revisions, and all remote
+failures still enter the failure path.
+
 The lifecycle selects the current immutable admission. `SPMDManager.enqueue_driver_calls`
 validates every registered participant and remote endpoint, then enqueues the RPCs
 before returning an aggregate Future. Missing actor handles or invalid RPC endpoints
@@ -361,6 +444,37 @@ create a checkpoint; recovery uses the latest committed coordinated checkpoint.
 Startup is also lifecycle-owned. Failure or cancellation settles any pending startup
 before reclamation, so a readiness wait cannot outlive a terminal execution. A
 cancelled placement wait releases its allocated placement group.
+
+```mermaid
+sequenceDiagram
+    participant A as One or more waiters
+    participant L as Lifecycle
+    participant T as Shared terminal cleanup<br/>task
+    participant C as Components and runtime<br/>resources
+    A->>L: cancel(), or completion/failure event
+    L->>T: Create once, later requests share the result
+    L->>L: State callback returns without awaiting cleanup
+    A->>T: Await shielded result
+    opt One waiter is cancelled
+        A->>A: End this wait
+        Note over T,C: Cleanup continues
+    end
+    T->>T: Cancel and join startup unless completing<br/>normally
+    T->>C: Notify terminal phase, stop checkpointing,<br/>reclaim resources
+    C-->>T: Completion or collected cleanup errors
+    T->>T: Settle remaining remote waits and admission<br/>supervision
+    T->>C: Notify final outcome
+    alt Cleanup succeeds
+        T->>L: CLEANUP_FINISHED
+        L-->>A: COMPLETED / CANCELLED
+    else Cleanup or notification fails
+        T->>L: CLEANUP_FAILED
+        L-->>A: FAILED with retained errors
+    end
+```
+
+`wait()` observes terminal state; `cancel()` joins cleanup. A wait timeout alone does
+not trigger this cancellation path.
 
 Reducer mutation locks contain no RPC, checkpoint I/O or source ACK wait. Driver
 fan-out is concurrent; Worker execution and tensor traffic remain distributed.

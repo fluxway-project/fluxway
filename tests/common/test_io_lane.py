@@ -64,10 +64,13 @@ async def test_cancelled_waiter_retains_capacity_and_close_owns_cleanup():
         closing.cancel()
         with pytest.raises(asyncio.CancelledError):
             await closing
-        assert not lane._close_task.done()
+        waiting = asyncio.create_task(lane.close())
+        await asyncio.sleep(0)
+        assert not waiting.done()
         release.set()
         with pytest.raises(RuntimeError, match="closing"):
             await second
+        await waiting
     finally:
         release.set()
         await lane.close()
@@ -112,6 +115,21 @@ async def test_observed_failure_can_be_compensated_on_same_lane():
         with pytest.raises(ValueError, match="write failure"):
             await lane.call(fail)
         assert await lane.call(lambda: "rollback") == "rollback"
+    finally:
+        await lane.close()
+
+
+@pytest.mark.asyncio
+async def test_observed_operation_cancellation_allows_later_calls_and_close():
+    lane = IOLane("test-observed-cancellation", capacity=1)
+
+    async def operation():
+        raise asyncio.CancelledError("operation cancelled itself")
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await lane.call(operation)
+        assert await lane.call(lambda: "next operation") == "next operation"
     finally:
         await lane.close()
 

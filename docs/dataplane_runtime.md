@@ -106,6 +106,42 @@ failed enqueue cancels unfinished siblings and completes the registered receipts
 as failed in reverse order; the original exception propagates. No target retry
 or timeout substitutes for successful acceptance.
 
+```mermaid
+sequenceDiagram
+    participant W as Sending Worker
+    participant P as Publication runtime
+    participant D as Local directory and<br/>payload lifetime
+    participant A as Target A
+    participant B as Target B
+    Note over W,P: All tickets registered, intents sealed, sequencer admits publication
+    W->>P: Retirement callback executes complete target<br/>tuple
+    P->>D: Register each unique child delegation and<br/>receipt
+    par Enqueue A concurrently
+        P->>A: await enqueue(batch_A)
+        A->>A: Validate ingress and deposit in mailbox
+    and Enqueue B concurrently
+        P->>B: await enqueue(batch_B)
+        B->>B: Validate ingress and deposit in mailbox
+    end
+    alt All acceptance and carrier-release proofs valid
+        A-->>P: ReceiverIngressCompletion
+        B-->>P: ReceiverIngressCompletion
+        P->>D: Record all acceptances and release transport<br/>retention
+        P->>D: Complete directory receipts through sole owner
+        P-->>W: Publication delivery complete
+    else Any target fails or supplies an invalid proof
+        A-->>P: Error or invalid proof
+        P->>B: Cancel and join unfinished sibling deliveries
+        P->>D: Fence lifetime and fail receipts in reverse<br/>order
+        P-->>W: Propagate original error
+    end
+    Note over W,B: Consumer leases may remain active after acceptance, storage reuse is<br/>not implied
+```
+
+A represents whichever target fails first. Producer references remain retained until
+sibling deliveries settle. More targets do not create extra ordering boundaries for the
+same instance.
+
 ## Acceptance and payload lifetime
 
 A carrier returns `ReceiverIngressCompletion` only after receiver ingress and
@@ -268,17 +304,41 @@ comparisons between independent computations test a different property.
 
 ## Local commit and delivery locks
 
-`SEND` registers and starts delivery. `AWAIT_SEND` observes completion without
-the operator commit resource. `BARRIER/COMMIT` acquires the ordered commit lock
+`SEND` starts a send task. `AWAIT_SEND` awaits that task without the operator
+commit resource. `BARRIER/COMMIT` acquires the ordered commit lock
 only to publish the contiguous watermark. Drain, checkpoint, export and stop
 still await every registered delivery through the delivery fence.
 
 ```mermaid
-flowchart LR
-  S[SEND: register and start] --> W[AWAIT_SEND: wait without commit lock]
-  W --> C[COMMIT: ordered publication lock]
-  C --> M[contiguous committed watermark]
+sequenceDiagram
+    participant P as Local step plan
+    participant S as Send task
+    participant D as OutboundDeliveryRuntime
+    participant K as Ordered commit lock
+    participant R as Receiver
+    P->>S: SEND: start send task
+    P->>S: AWAIT_SEND: wait without commit lock
+    S->>S: Build frames, register all tickets, seal intents
+    S->>D: Register tracked deliveries
+    D->>R: Send frames and await acceptance proofs
+    R-->>D: Acceptance or failure
+    D-->>S: Publication tasks and local deliveries complete
+    S-->>P: Ordinary tensor send task complete
+    P->>K: BARRIER/COMMIT
+    K->>K: Publish contiguous step watermark
+    K-->>P: Release commit lock
+    P->>D: Fence all deliveries at<br/>drain/checkpoint/export/stop
+    D-->>P: All registered deliveries settled, or failure<br/>propagated
 ```
+
+This is the ordinary tensor path: its send task awaits complete publication and local
+delivery. Protocol-only frame paths can return after registration and are still joined
+by the drain fence. Send failures prevent normal commit or enter execution failure
+handling. Acceptance still does not imply consumer-lease return or physical storage
+reclamation.
+
+The ordered commit lock is not held across send registration or network waits. Step
+progress, receiver completion, and physical input release are distinct events.
 
 Protocol failure closes frame admission and propagates through the execution
 failure channel. Input release and payload retirement remain tracked

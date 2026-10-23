@@ -6,6 +6,41 @@ Fluxway 将算子声明编译为计算图，分配工作进程，协调执行与
 
 图中一个 SPMD 节点表示一组在网格上运行相同程序的工作进程，边连接算子输出与输入。
 
+```mermaid
+sequenceDiagram
+    participant A as 应用
+    participant G as 编译图
+    participant C as 控制器
+    participant D as 驱动器组
+    participant W as 工作进程组
+    participant T as 数据面
+    A->>G: 构建声明并编译依赖、路由和资源
+    G-->>A: 不可变图及各 SPMD 投影
+    A->>C: await start(图、放置配方)
+    C->>D: 分配资源、创建角色并登记拓扑
+    D->>W: 安装编译投影
+    W-->>C: 经驱动器汇总就绪状态
+    opt 请求恢复
+        C->>D: 并发恢复全部已选状态
+        D->>W: 恢复组件，保持执行门关闭
+        W-->>C: 经驱动器确认恢复完成
+    end
+    C->>D: 激活执行并按需启动来源
+    C->>D: 为受控执行交付有限准入
+    C-->>A: GraphExecution
+    loop 获准的执行步骤
+        W->>W: 调用算子
+        W->>T: 发布张量
+        T-->>W: 接收准入与邮箱交付完成
+        W-->>C: 经驱动器报告进度或排空
+    end
+    A->>C: await wait() 或 cancel()
+    C->>D: 终止清理并回收角色和资源
+    C-->>A: 完成、取消或失败
+```
+
+图示普通张量路径并聚合多级确认；驱动器和工作进程调用保持并发，获准工作可能在 `start()` 返回前开始。协议空帧等分支与统一交付屏障见[数据面运行时](dataplane_runtime_zh.md)。详细屏障与异常边界见[执行生命周期](execution_lifecycle_zh.md)。
+
 ## 构建并检查计算图
 
 下面是完整的本地例子，无需启动 Ray。依赖边将生产端的 `value` 输出连接到消费端的 `item` 输入。
@@ -124,7 +159,11 @@ flowchart LR
 
 适配器 `IngestionSourceAdapter` 按有界请求返回不可变的 `SourceScanResult`。控制器中的 `SourceProgressSupervisor` 负责事件驱动的扫描与激活发布。编译器先构建由 `SourceWorkKey(epoch, step, assignment_id)` 标识的规范任务，再按当前读取配额绑定为瞬态的 `WorkerLayoutDescriptor`。只有 `LogicalWorkLedger` 管理租约、确认前沿和已提交位置，驱动器不保存激活检查点状态。
 
-`IngestionLayoutPlanningComponent` 在独立的 `IOLane` 执行描述符构建和适配器扫描，在常驻的独立进程池执行纯编译。已接收操作不随调用方取消而丢弃。关闭时拒绝新请求，等待已接收操作与编译器结束，再关闭适配器通道。规划和账本发布在同一拥有者事件循环内完成，中间不挂起；其校验成本仍随窗口大小增加。输入输出线程隔离阻塞调用，不消除 Python 计算的 GIL 限制。
+`IngestionLayoutPlanningComponent` 统一管理来源绑定与适配器的生命周期。绑定构造、数据扫描和资源关闭均在专用 `IOLane` 中执行，纯编译使用常驻进程池。规划器关闭时拒绝新请求并等待已有任务落盘，随后并发释放适配器并退出编译池，最后彻底回收各通道。
+
+规划器与 `IOLane` 通过 `AsyncOperationSupervisor` 与 `AsyncCloseOnce` 保证并发安全：外部取消等待不会造成后台任务或资源泄漏，关闭逻辑保证幂等执行一次，且防止操作反向关闭拥有者导致的死锁。详情见[来源协调](source_coordination_zh.md)。
+
+规划和账本发布在同一拥有者事件循环内完成，中间不挂起；其校验成本仍随窗口大小增加。输入输出线程隔离阻塞调用，不消除 Python 计算的 GIL 限制。
 
 `SourceExecutionScope` 管理工作进程窗口安装、活跃步骤索引和瞬态授权。它按算子流水深度批量请求，只获取信用额度允许的完整步骤前缀。普通检查点继续使用当前作用域；恢复使用新的执行角色，随后才激活来源。确认通过有界异步队列提交，容量满时施加背压。
 
@@ -154,6 +193,25 @@ assert len(prepared["env_vars"]) == 2
 ```
 
 新增变量选择 Fluxway 启动挂钩。用户挂钩须使用可导入的模块路径；可调用对象或手动设置的 Ray 挂钩环境变量会被拒绝。`SIGKILL` 等无法拦截的信号不能由进程内部记录。
+
+```mermaid
+sequenceDiagram
+    participant O as 操作系统
+    participant H as 主线程信号处理函数
+    participant E as 后台输出线程
+    participant P as 原信号处理方式
+    O->>H: 可捕获的系统信号
+    H->>H: 登记事件
+    H->>E: 非阻塞管道唤醒
+    H->>P: 转交原处理方式
+    par 诊断输出
+        E->>E: 读取事件并输出诊断
+    and 原有信号语义
+        P->>P: 终止、忽略或执行用户处理函数
+    end
+```
+
+信号处理函数不等待输出完成。进程立即退出时，诊断记录仍可能来不及写出。
 
 ## 各机制示例
 

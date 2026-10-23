@@ -117,6 +117,33 @@ from the plan. Recoverable multi-node jobs also need shared checkpoint storage.
 See [placement mathematics](placement_mathematics.md) for selection, constraints,
 resource scaling, and objective order.
 
+```mermaid
+sequenceDiagram
+    participant C as Controller scheduler
+    participant P as Planner thread
+    participant R as Ray
+    participant D as Drivers
+    participant W as Workers
+    C->>R: Read nodes and available resources
+    R-->>C: ClusterSnapshot
+    C->>P: to_thread(PlacementPlanner.resolve)
+    P->>P: Solve constraints, optimize objectives,<br/>independently evaluate
+    P-->>C: ResolvedPlacementPlan
+    C->>R: Read relevant resources again and verify<br/>snapshot
+    C->>R: Create shared placement group pinned by NodeID
+    C->>R: await pg.ready()
+    R-->>C: All bundles ready
+    C->>D: Start SPMDs concurrently with rank-to-bundle<br/>mappings
+    D->>W: Create Workers in assigned bundles
+    W-->>D: Actual NodeIDs and topology
+    D-->>C: All started, with node attestations
+    C->>C: Recheck actual assignments against recipe and<br/>report READY
+```
+
+Offline `resolve()` ends after solving and reserves no Ray resources. A changed
+snapshot, infeasibility, or timeout fails. A failed or cancelled placement-group wait
+releases the group; a solved plan is not execution readiness.
+
 ## Register resources created inside a worker
 
 Hardware quotas belong in `ResourceProfile`. Live objects such as routing tables

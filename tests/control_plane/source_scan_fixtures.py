@@ -13,6 +13,9 @@ from fluxway.common.ingestion.source_scan import (
 class InMemorySourceScanAdapter:
     """Deterministic source scan fixture for control-plane tests."""
 
+    def close(self) -> None:
+        pass
+
     def __init__(self, scan_results: tuple[SourceScanResult, ...]) -> None:
         self._scan_results = tuple(scan_results)
         if not self._scan_results or any(

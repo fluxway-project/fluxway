@@ -109,7 +109,7 @@ stateDiagram-v2
   E --> S: 本地读取或下游共享
   S --> E: 最后一个共享释放
   E --> M: 本地写入
-  S --> M: 本地升级或获准 RFO
+  S --> M: 本地升级或获准 RFO(Read For Ownership)
   M --> E: 无父级所有权时释放写者
   M --> I: 交接使旧主体退休
   E --> I: 委派所有权
@@ -224,6 +224,29 @@ assert parent.is_quiescent(instance)
 开始归还时移除稳定权限并使访问失效，同时保留只能消费一次的事务令牌。
 完成后生成实例级证明，其他版本的活动不能代替该证明。
 
+```mermaid
+sequenceDiagram
+    participant P as 父端点
+    participant D as 父目录
+    participant C as 子端点与邮箱
+    participant U as 受控消费者与后代
+    P->>D: 发布本地载荷，委派共享并登记交付回执
+    P->>C: BUS_RD 携带张量载荷
+    C->>C: 校验并安装父级共享授权，再存入邮箱
+    C-->>P: ReceiverIngressCompletion
+    P->>D: 完成交付回执
+    Note over D,C: 共享位仍保留；交付结束不等于授权归还
+    C->>U: 授予受控读取或下游共享
+    U-->>C: 读取者、别名与后代全部释放
+    C->>C: 等待本地静默，开始父级归还并失效访问
+    C->>P: GRANT_RETURN
+    P->>D: 消费对应实例的子端点共享
+    P-->>C: 归还发送完成
+    C->>C: 消费归还令牌并取得实例级证明
+```
+
+图示正常顺序。归还与在途交付交错时，目录按同一实例合并状态，不能用另一版本的静默代替归还证明。
+
 ## 独占所有权、失效与取消
 
 只有当前共享者可以通过 `RFO` 请求所有权。`CALL` 前，子端点排队请求写权限，
@@ -274,6 +297,39 @@ assert parent.admit(instance).state is CoherenceState.INVALID
 `M` 不能满足共享失效请求。`OWNERSHIP_CANCEL` 只允许发生在 `CALL` 前；
 `CALL` 开始后的失败必须封锁执行，不能假设内容仍然干净。脏所有权归还始终让父端点保持 `I`。
 
+```mermaid
+sequenceDiagram
+    participant C as 请求写入的子端点
+    participant P as 直接父端点
+    participant A as 其他子端点 A
+    participant B as 其他子端点 B
+    C->>C: CALL 前排队写请求，释放读取令牌并排空别名
+    C->>P: RFO
+    P->>P: 阻止新共享，等待在途交付，收回请求者共享
+    par 撤销直接子端点 A
+        P->>A: SNOOP_INVALIDATE
+        A->>A: 阻止访问并排空读取者与后代
+        A-->>P: GRANT_RETURN
+    and 撤销直接子端点 B
+        P->>B: SNOOP_INVALIDATE
+        B->>B: 阻止访问并排空读取者与后代
+        B-->>P: GRANT_RETURN
+    end
+    P->>P: 所有冲突授权排空，委派所有权并进入 I
+    P->>C: OWNERSHIP_GRANT
+    C->>C: 接收所有权并获取写令牌
+    alt CALL 前取消
+        C->>P: OWNERSHIP_CANCEL
+        P->>P: 确认内容仍有效
+    else 开始 CALL
+        C->>C: 执行写入并释放写令牌
+        C->>P: GRANT_RETURN，脏所有权归还
+        P->>P: 保持 I，不执行远程写回
+    end
+```
+
+实际子端点数量由编译图决定。`CALL` 开始后失败会封锁执行，不能再使用干净取消路径。
+
 ## 发布排序与租约
 
 `CoherenceSequencer` 是唯一异步重排缓冲区。同一主体的意图按版本递增发出，
@@ -315,6 +371,33 @@ async def ordered_publications() -> None:
 
 asyncio.run(ordered_publications())
 ```
+
+```mermaid
+sequenceDiagram
+    participant W as 工作进程
+    participant S as CoherenceSequencer
+    participant B as 并发帧构建
+    participant R as 退休运行时
+    W->>S: issue_intent(epoch=7)
+    W->>S: issue_intent(epoch=8)
+    W->>B: 并发构建两个版本的帧
+    B-->>W: 版本 8 先构建完成
+    W->>S: commit_payload(epoch=8)
+    W->>S: close_intent(epoch=8)
+    Note over S,R: 版本 7 尚未封闭，版本 8 等待
+    B-->>W: 版本 7 构建完成
+    W->>S: 登记版本 7 的全部发布与本地票据
+    W->>S: close_intent(epoch=7)
+    W->>S: 并发等待两个版本结果
+    S->>R: 准入版本 7，执行完整扇出
+    R-->>S: 交付完成
+    S->>S: 满足消费租约等退休条件后有序退休
+    S->>R: 版本 8 成为可执行的通道首部
+    R-->>S: 交付完成
+    S-->>W: 按主体顺序完成结果
+```
+
+图示同一主体；独立主体可以并发。必须先登记并封闭意图，再等待结果；不能等待当前版本退休后才补登记同一意图的票据。
 
 一个发布票据负责完整子端点扇出。退休运行时并发启动所有入队，校验承载方接收证明和发送引用释放证明，
 通过同一责任者完成所有子端点回执。任一失败会取消未完成同级任务并传播异常。
@@ -450,6 +533,36 @@ async def release_inputs(
 交付完成与有序退休是两种独立的类型化证明，接收成功后接收端仍可能持有授权。
 `PayloadLifetime` 负责出站帧引用与物理释放，等待全部回执、传输保留引用和本地租约完成。
 分配身份、裸地址、远程调用超时或只有其中一种完成证明，都不能授权复用内存。
+
+```mermaid
+sequenceDiagram
+    participant W as 步骤提交者
+    participant R as 受跟踪的输入释放任务
+    participant D as 本地目录与分配表
+    participant U as 别名、后代与在途回执
+    participant P as 直接父端点组
+    W->>R: 提交 InputCoherenceRelease.complete()
+    par 步骤进度继续
+        W->>W: 推进连续步骤水位
+    and 释放可能继续等待
+        R->>D: 释放本地访问令牌并接管资源
+        R->>U: 等待授权与分配别名静默
+        U-->>R: 全部依赖静默
+        R->>R: 使受控张量访问失效
+        opt 存在需要归还的父级授权
+            R->>D: 开始归还，取得唯一令牌
+            R->>P: 按父端点分组并发发送 GRANT_RETURN
+            P-->>R: 全部归还发送完成
+            R->>D: 消费令牌，完成实例级归还
+        end
+        R->>R: 释放张量载荷引用
+        R->>D: 验证归还/退休证明，再解除分配绑定
+    end
+    W->>R: 停止或失败屏障取消并等待任务结算
+    R-->>W: 观察已完成、取消或失败结果
+```
+
+归还失败时不能继续解除绑定或复用存储。正常释放和失败清理由同一资源拥有者结算，步骤水位本身不授权物理回收。
 
 ## 精确交接存储
 

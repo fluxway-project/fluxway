@@ -7,6 +7,9 @@ from concurrent.futures import Future
 from threading import Thread
 from typing import Any
 
+from fluxway.common.async_close import AsyncCloseOnce
+from fluxway.common.async_operations import AsyncOperationSupervisor
+
 
 class IOLane:
     def __init__(self, name: str, *, capacity: int) -> None:
@@ -18,10 +21,8 @@ class IOLane:
         self._ready: asyncio.Future[asyncio.AbstractEventLoop] | None = None
         self._exited: asyncio.Future[None] | None = None
         self._thread: Thread | None = None
-        self._operations: set[asyncio.Task[Any]] = set()
-        self._abandoned: set[asyncio.Task[Any]] = set()
-        self._unobserved: dict[asyncio.Task[Any], BaseException] = {}
-        self._close_task: asyncio.Task[None] | None = None
+        self._operations = AsyncOperationSupervisor()
+        self._close_once = AsyncCloseOnce(self._close)
 
     def _bind_owner(self) -> asyncio.AbstractEventLoop:
         owner = asyncio.get_running_loop()
@@ -63,32 +64,26 @@ class IOLane:
 
     async def call(self, operation: Callable[..., Any], /, *args, **kwargs) -> Any:
         self._bind_owner()
-        if self._close_task is not None:
+        if not self._operations.accepting:
             raise RuntimeError("I/O lane is closing")
-        if self._unobserved:
-            raise BaseExceptionGroup(
-                "unobserved I/O lane failure", list(self._unobserved.values())
-            )
+        self._operations.raise_unobserved()
         await self._capacity.acquire()
-        if self._close_task is not None:
+        if not self._operations.accepting:
             self._capacity.release()
             raise RuntimeError("I/O lane is closing")
-        if self._unobserved:
-            self._capacity.release()
-            raise BaseExceptionGroup(
-                "unobserved I/O lane failure", list(self._unobserved.values())
-            )
-        task = asyncio.create_task(self._dispatch(operation, args, kwargs))
-        self._operations.add(task)
-        task.add_done_callback(self._settled)
         try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
-            if task.done():
-                self._record_abandoned_failure(task)
-            else:
-                self._abandoned.add(task)
+            self._operations.raise_unobserved()
+        except BaseException:
+            self._capacity.release()
             raise
+
+        async def dispatch():
+            try:
+                return await self._dispatch(operation, args, kwargs)
+            finally:
+                self._capacity.release()
+
+        return await self._operations.run(dispatch)
 
     async def _dispatch(self, operation, args, kwargs):
         lane = await asyncio.shield(self._start())
@@ -102,36 +97,13 @@ class IOLane:
         submitted: Future[Any] = asyncio.run_coroutine_threadsafe(invoke(), lane)
         return await asyncio.wrap_future(submitted)
 
-    def _settled(self, task: asyncio.Task[Any]) -> None:
-        self._operations.remove(task)
-        self._capacity.release()
-        if task in self._abandoned:
-            self._abandoned.remove(task)
-            self._record_abandoned_failure(task)
-        elif not task.cancelled():
-            task.exception()
-
-    def _record_abandoned_failure(self, task: asyncio.Task[Any]) -> None:
-        if task.cancelled():
-            self._unobserved[task] = asyncio.CancelledError()
-        elif (error := task.exception()) is not None:
-            self._unobserved[task] = error
-
     async def close(self) -> None:
         self._bind_owner()
-        if self._close_task is None:
-            self._close_task = asyncio.create_task(self._close())
-            self._close_task.add_done_callback(self._observe_close)
-        await asyncio.shield(self._close_task)
-
-    @staticmethod
-    def _observe_close(task: asyncio.Task[None]) -> None:
-        if not task.cancelled():
-            task.exception()
+        self._operations.stop_accepting()
+        await self._close_once.close()
 
     async def _close(self) -> None:
-        if self._operations:
-            await asyncio.gather(*tuple(self._operations), return_exceptions=True)
+        failures = await self._operations.drain()
         if self._ready is not None:
             try:
                 lane = await asyncio.shield(self._ready)
@@ -142,10 +114,8 @@ class IOLane:
                     await asyncio.shield(self._exited)
                 finally:
                     await self._join_thread()
-        if self._unobserved:
-            raise BaseExceptionGroup(
-                "unobserved I/O lane failure", list(self._unobserved.values())
-            )
+        if failures:
+            raise BaseExceptionGroup("unobserved I/O lane failure", list(failures))
 
     async def _join_thread(self) -> None:
         owner = self._bind_owner()

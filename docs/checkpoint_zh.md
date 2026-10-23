@@ -183,6 +183,39 @@ stateDiagram-v2
     ABANDONED --> [*]
 ```
 
+```mermaid
+sequenceDiagram
+    participant L as 执行生命周期
+    participant P as FluxwayCheckpointer
+    participant C as 控制器
+    participant D as 驱动器与工作进程
+    participant R as 仓库输入输出通道
+    participant O as 控制侧存储组件
+    Note over L,D: 全部驱动器排空，来源确认覆盖同一切点
+    L->>P: await save(request)
+    P->>R: 隔离旧事务并取得本次许可
+    P->>C: request_snapshot(同一 deadline)
+    C->>D: 并发准备并捕获全部 SPMD
+    D-->>C: 组件发布记录与运行时图像
+    C-->>P: CheckpointAssembly
+    P->>C: prepare_checkpoint_transaction()
+    C-->>P: 已验证的内存令牌
+    P->>O: 预留并发布保留策略所需的清理授权
+    P->>R: 暂存事务、清单和清理意图
+    P->>R: decide_transaction() → COMMIT_DECIDED
+    P->>C: await publish_snapshot()
+    C->>D: 并发 publish_save()
+    D-->>P: 经控制器确认物理发布完成
+    P->>C: apply_prepared_checkpoint_transaction()
+    P->>R: mark_committed() → committed.checkpoint_id
+    P->>O: await acknowledge_save(permit)
+    P->>R: complete_transaction() → COMMITTED
+    P->>P: 登记后台物理清理
+    P-->>L: 已提交清单
+```
+
+图中同一 `deadline` 覆盖全部保存阶段，仓库调用按序等待。`COMMIT_DECIDED` 后的失败保留持久决策并传播异常，由后续隔离流程根据全局标记协调；不能直接当作未提交尝试撤销。
+
 发布依次完成：
 
 1. 捕获不可变状态，准备全部参与者。
@@ -197,6 +230,29 @@ stateDiagram-v2
 
 只有 `COMMITTED` 记录可以恢复，并进入引用解析、最新记录和保留流程。一次全局快照使用同一个单调时钟截止时间，并行传给全部参与者；控制器接入必须接受该参数。
 
+```mermaid
+sequenceDiagram
+    participant P as 新协调器
+    participant R as 仓库
+    participant O as 控制侧组件
+    P->>R: 查询未完成事务及其持久许可
+    loop 每个未完成事务
+        P->>R: is_committed(checkpoint_id)
+        alt 存在全局提交标记
+            P->>O: acknowledge_save(原 permit)
+            O-->>P: 幂等确认完成
+            P->>R: complete_transaction() → COMMITTED
+        else 没有全局提交标记
+            P->>O: abort_save(原 permit)
+            O-->>P: 幂等撤销完成
+            P->>R: abandon_transaction() → ABANDONED
+        end
+    end
+    P->>R: 之后才解析可恢复清单
+```
+
+组件确认或撤销失败会阻止本次协调，异常继续传播；重复协调使用原持久许可。
+
 ### 仓库输入输出与关闭
 
 控制器在自己的事件循环调用 `prepare_checkpoint_transaction` 和 `apply_prepared_checkpoint_transaction`。存储线程不能修改其账本，也不能唤醒其异步等待者。
@@ -208,6 +264,32 @@ stateDiagram-v2
 取消等待不会丢弃已接收的仓库操作，容量在操作结束时才释放。等待取消后发生的异常会保留，并在后续操作或关闭时报告。
 
 `close()` 拒绝新保存，等待当前保存与清理结束，关闭组件，最后停止并等待仓库线程。重复关闭观察同一结果，取消其中一个等待者不会取消清理。这隔离的是调度容量，不保证存储延迟，也不能消除 Python 的 GIL 竞争。
+
+```mermaid
+sequenceDiagram
+    participant A as 调用方
+    participant P as 协调器
+    participant Q as 单槽仓库通道
+    participant R as 独立仓库线程
+    A->>Q: 等待容量后提交元数据操作
+    Q->>R: 执行已接受操作
+    opt 调用方取消等待
+        A->>A: CancelledError
+        Note over Q,R: 不取消操作，不提前归还容量
+    end
+    R-->>Q: 结果或异常
+    Q->>Q: 释放容量，保留未观察异常
+    A->>P: await close()
+    P->>P: 拒绝新保存，等待当前保存及清理
+    P->>P: 关闭控制侧组件
+    P->>Q: await close()
+    Q->>R: 等待已接受操作，再停止事件循环
+    R-->>Q: 线程已退出
+    Q-->>P: 完成或未观察异常
+    P-->>A: 共享关闭结果
+```
+
+容量等待尚未提交操作；只有已接受操作受取消保护。重复关闭共享结果，取消一个关闭等待者不会中断清理。
 
 ## 组件能力
 
@@ -233,6 +315,38 @@ FINALIZING -> FINALIZE 回调 -> SAVE.prepare -> PREPARED
 ```
 
 驱动器等本地全部秩到达 `PREPARED` 后才开始保存，不存在控制器范围的统一内存归整阶段。
+
+```mermaid
+sequenceDiagram
+    participant D as 单个 SPMD 驱动器
+    participant A as 工作进程 rank 0
+    participant B as 其余本地秩
+    participant C as 控制器
+    par 各秩独立归整与准备
+        D->>A: prepare_save()
+        A->>A: 全部 FINALIZE，然后按 scope 准备存储
+        A-->>D: PREPARED
+    and 不要求跨 SPMD 统一归整
+        D->>B: prepare_save()
+        B->>B: 全部 FINALIZE，然后按 scope 准备存储
+        B-->>D: PREPARED
+    end
+    Note over D,B: 本驱动器全部秩 PREPARED 后才开始 save
+    D->>A: 并发 save()
+    D->>B: 并发 save()
+    A-->>D: WorkerSaveResult
+    B-->>D: WorkerSaveResult
+    D->>A: 并发 finish_save()
+    D->>B: 并发 finish_save()
+    A-->>D: FINISHED
+    B-->>D: FINISHED
+    D->>D: 汇总全部秩结果
+    D->>A: 按 commit scope 提交组件
+    D->>B: 按 commit scope 提交组件
+    D-->>C: 全部完成后报告组件发布记录
+```
+
+各工作进程内部按组件顺序执行回调，跨秩调用保持并发；`LEADER` 准备或提交仅在主秩执行，但每秩都要执行已注册的归整回调。之后仍需全局发布事务，组件提交不代表全局可恢复。
 
 ### 先归整内存，再预留存储
 
@@ -437,6 +551,38 @@ async def read_protected(
 
 读取回调返回或抛出异常前，必须结束或等待底层读取完成，取消时也一样。读取必须在租约有效期内完成。长时间读取需调用 `renew_checkpoint_hold(spmd_id, lease, ttl_seconds)` 续期，并使用返回的新租约。保护记录持久化并检查代次，属于共享读取保护，不是互斥锁。
 
+```mermaid
+sequenceDiagram
+    participant A as 读取消费者
+    participant P as 检查点协调器
+    participant O as 对象生命周期组件
+    participant M as 保留与维护任务
+    A->>P: await hold_checkpoint_object()
+    P->>O: 持久化带代次的读取租约
+    O-->>A: 经协调器返回租约
+    A->>O: 在租约有效期内读取物理状态
+    M->>O: 尝试预留整个恢复产物的清理
+    O-->>M: 活跃读取保护阻止必要候选清理
+    opt 读取时间较长
+        A->>P: await renew_checkpoint_hold()
+        P-->>A: 使用返回的新租约
+    end
+    A->>A: 完成或等待底层读取结束，包括取消路径
+    A->>P: await release_checkpoint_hold()
+    M->>O: 重新选择候选并预留清理
+    O-->>M: 持久化清理授权
+    M->>M: 在发布事务中持久化完整清理意图
+    M->>O: 后台执行已预留的物理删除
+    alt 删除成功
+        O-->>M: 完成清理意图
+    else 删除失败
+        O-->>M: 保留意图并传播异常
+        Note over M,O: repair_cleanup_intents() 显式重试
+    end
+```
+
+名称引用也会保护检查点。候选受保护时发布可能抛出 `CheckpointCleanupBlocked`；图中再次选择候选表示后续操作，不表示自动绕过保护。
+
 `best_model` 等名称在移动到新检查点前保护当前选中记录。清理候选按检查点序号排序；必要候选仍有读取保护时，发布抛出 `CheckpointCleanupBlocked`。物理清理失败会留下持久化的 `CheckpointCleanupIntent`，由 `repair_cleanup_intents()` 重试并传播错误。一条意图包含删除一个完整恢复产物所需的全部预留，清理在控制维护通道执行。
 
 ## 拓扑
@@ -495,6 +641,35 @@ async def resume_training(
 ```
 
 调用方持有返回的执行对象，需按[执行生命周期](execution_lifecycle_zh.md#使用方式)等待或取消。恢复选项必须伴随恢复请求；未知 SPMD 或工作进程秩会报错，不会被跳过。
+
+```mermaid
+sequenceDiagram
+    participant A as 应用
+    participant P as 检查点协调器
+    participant C as 新控制器
+    participant D as 新驱动器组
+    participant W as 新工作进程组
+    participant O as 状态组件
+    A->>C: start(resume, restore_options)
+    C->>P: await restore(reference, restore_options)
+    P->>P: 协调未完成事务，解析 COMMITTED 清单并校验范围和<br/>拓扑
+    P->>C: restore_snapshot(manifest, restore_options)
+    C->>C: 恢复来源书签、组件和共同切点
+    C->>C: 等待驱动器就绪并重建流量控制
+    C->>D: 按 SPMD 并发恢复，转发对应秩选项
+    D->>W: 按秩并发恢复，转发对应组件字节
+    W->>O: restore(RestoreSession)
+    O->>O: 按组件契约解码并恢复物理状态
+    O-->>W: 组件恢复完成
+    W-->>D: READY
+    D-->>C: 全部恢复完成
+    C-->>P: 恢复完成，执行门仍关闭
+    P-->>C: restored_step
+    C->>D: 之后才激活来源布局与执行
+    C-->>A: GraphExecution
+```
+
+图示为选中检查点的路径；空仓库的 `latest` 返回 `None`。组件选项在通用层保持不透明；缺失所需选项、未知目标或恢复失败均直接报错，执行准入保持关闭。
 
 ### 稀疏训练状态
 

@@ -165,6 +165,36 @@ asyncio.run(demonstrate_leases(original))
 
 ## 区分生产完成与持久提交
 
+```mermaid
+sequenceDiagram
+    participant A as 步骤 0 的读取者
+    participant B as 步骤 1 的读取者
+    participant L as LogicalWorkLedger
+    participant C as 检查点协调器
+    Note over A,C: 已发布步骤 0、1；candidate_cut=0，committed_cut=0
+    par 独立领取区间
+        A->>L: acquire(step=0)
+        L-->>A: 步骤 0 的租约
+    and 下一步骤可并发
+        B->>L: acquire(step=1)
+        L-->>B: 步骤 1 的租约
+    end
+    C->>L: await wait_for_candidate_cut(2)
+    B->>L: 步骤 1 全部区间确认
+    L->>L: 步骤 0 尚有缺口，候选切点仍为 0
+    A->>L: 步骤 0 部分区间确认
+    L->>L: candidate_cut=0
+    A->>L: 步骤 0 其余区间确认
+    L-->>C: 连续确认前沿到达 2，唤醒等待
+    Note over L,C: committed_cut 仍为 0；模型排空与共同事务尚未完成
+    C->>C: 整图已排空，准备事务并持久化提交决策
+    C->>L: 经准备/应用契约推进共同切点
+    L->>L: 内存 committed_cut=2，回收旧租约
+    C->>C: 写全局标记、确认组件，完成 COMMITTED
+```
+
+候选切点只跨越连续完成的步骤。已回收租约的迟到确认报错，不能再次推进进度。
+
 `SourceWorkItem` 包含任务及本次领取的精确区间，`SourceWorkLease` 增加不透明的
 运行时租约标识。`SourceWorkAcknowledgement(key, lease_id)` 只确认该区间，不能
 替其他进程确认整个原始描述。
@@ -243,6 +273,35 @@ async def acquire_pipeline_steps(
 缓存未命中仍需要访问控制器，批量化不能证明控制器没有吞吐瓶颈。已编译执行布局
 统一定义物理成员和逻辑组内编号，分发与发送计划使用同一份定义；两者不负责发现
 来源修订、管理租约或推进检查点。同机零拷贝还需单独满足放置与传输条件。
+
+```mermaid
+sequenceDiagram
+    participant A as 并发步骤调用方
+    participant R as SourceWorkRuntime
+    participant L as 控制器账本
+    participant Q as 有界确认队列
+    A->>R: 同一批次内不同步骤的 take(step)
+    R->>L: 共享批量获取任务
+    opt 额度耗尽
+        L->>L: 异步等待确认推进或新窗口
+    end
+    L-->>R: 额度内完整连续步骤前缀
+    R->>R: 校验租约与覆盖，缓存已获前缀
+    R-->>A: 逐步骤返回租约；未获后缀后续再取
+    Note over A,R: 取消一个等待者不会放弃共享获取任务
+    A->>A: 读取、发布并完成来源步骤
+    A->>Q: await submit(acknowledgements)
+    alt 队列有容量
+        Q-->>A: 本地接收后返回
+    else 队列已满
+        Q->>Q: 等待容量释放或失败
+        Q-->>A: 入队成功或抛出异常
+    end
+    Q->>L: 后台合并并发送确认
+    L-->>Q: 整批校验并应用确认
+    A->>Q: 检查点排空时 await flush()
+    Q-->>A: 全部已提交确认完成，或传播失败
+```
 
 ## 在应用边界验证恢复
 

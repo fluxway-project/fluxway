@@ -26,7 +26,6 @@
 下面的完整 CPU 示例让 `left` 的两个进程位于不同节点，并让 `right` 使用相同的节点集合。
 代码不会启动 Ray 执行器。
 
-
 <!-- test:placement-logical-mapping -->
 ```python
 import fluxway as fw
@@ -110,7 +109,6 @@ assert all(result.satisfied for result in plan.constraint_results)
 份数记作 `q` 时，单个进程的需求为 `base + q * step`，且 `0 <= q <= max_steps`。
 资源量使用整数或精确的 `Decimal`，不能使用浮点数。内存以字节为单位。
 
-
 <!-- test:placement-resource-scaling -->
 ```python
 from decimal import Decimal
@@ -139,6 +137,8 @@ assert profile.placement_resources_at(1)["CPU"] == Decimal("2.25")
 `resource_fragmentation()` 是标量，可以用于约束或最小化目标。
 
 ## 编译与错误
+
+从求解到资源预留、工作进程节点校验的时序见[放置配方](placement_recipe_zh.md)。本节的模型求解本身不启动工作进程。
 
 编译器冻结表达式树，并将其转换为 CP-SAT 变量。资源配置来自编译后的 SPMD 声明。
 求解结束后，独立的求值器会重新检查分配结果是否满足约束。

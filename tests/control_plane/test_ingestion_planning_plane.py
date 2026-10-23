@@ -494,6 +494,9 @@ async def test_scan_result_planner_idle_preserves_cursor_and_pending_tail(
     cursor = OpaqueSourceCursor.from_payload(b"idle")
 
     class IdleAdapter:
+        def close(self) -> None:
+            pass
+
         def scan_next(self, requested, budget):
             assert requested == cursor
             return SourceScanResult(
@@ -550,6 +553,9 @@ async def test_scan_result_planner_allows_empty_continuous_view_transition(
     unit = compiled.request.units[0]
 
     class ContinuousAdapter:
+        def close(self) -> None:
+            pass
+
         def scan_next(self, requested, budget):
             if requested == first_cursor:
                 return SourceScanResult(
@@ -616,6 +622,9 @@ async def test_scan_result_planner_rejects_view_transition_with_pending_units(
     unit = replace(compiled.request.units[0], cardinality=1)
 
     class ContinuousAdapter:
+        def close(self) -> None:
+            pass
+
         def scan_next(self, requested, budget):
             if requested == first_cursor:
                 return SourceScanResult(
@@ -950,7 +959,7 @@ async def test_close_joins_accepted_publication(source_layout) -> None:
     await publication
     await closing
     assert len(planner.windows) == 1
-    with pytest.raises(RuntimeError, match="closed"):
+    with pytest.raises(RuntimeError, match="closing"):
         await planner.plan_and_publish(
             ledger, compiled.request, epoch=0, start_position=0
         )
@@ -965,6 +974,9 @@ async def test_close_settles_capture_and_publication(source_layout, cancel_waite
     release = threading.Event()
 
     class Adapter:
+        def close(self) -> None:
+            pass
+
         def scan_next(self, cursor, budget):
             loop.call_soon_threadsafe(entered.set)
             if not release.wait(20):
@@ -1033,7 +1045,10 @@ async def test_close_settles_capture_and_publication(source_layout, cancel_waite
             == OpaqueSourceCursor.from_payload((0).to_bytes(8, "big")).to_checkpoint()
         )
         assert len(planner.windows) == len(ledger.epochs) == 1
-        assert not planner._operations
+        with pytest.raises(RuntimeError, match="closing"):
+            await planner.plan_and_publish(
+                ledger, compiled.request, epoch=1, start_position=1
+            )
         assert not planner._adapter_lane._thread.is_alive()
         assert not planner._lifecycle_lane._thread.is_alive()
     finally:
@@ -1052,6 +1067,9 @@ async def test_cancelled_scan_result_waiter_failure_is_reported_after_resource_c
     compiled = source_layout(demands=(1,), cardinality=1, terminal=True)
 
     class Adapter:
+        def close(self) -> None:
+            pass
+
         async def scan_next(self, cursor, budget):
             loop.call_soon_threadsafe(entered.set)
             await asyncio.wrap_future(released)
@@ -1171,6 +1189,9 @@ async def test_checkpoint_bookmark_is_stable_when_prefetch_advances(source_layou
     }
 
     class Source:
+        def close(self) -> None:
+            pass
+
         def scan_next(self, cursor, budget):
             index = 0 if cursor == cursors["initial"] else 1
             assert cursor == cursors["initial" if index == 0 else "after-a"]

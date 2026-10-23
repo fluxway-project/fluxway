@@ -243,6 +243,31 @@ state. Beginning return removes stable authority and invalidates access while
 retaining a linear transaction token. Completion produces an instance-scoped
 proof; another epoch's activity cannot stand in for that proof.
 
+```mermaid
+sequenceDiagram
+    participant P as Parent endpoint
+    participant D as Parent directory
+    participant C as Child endpoint and<br/>mailbox
+    participant U as Controlled consumers and<br/>descendants
+    P->>D: Publish local payload, delegate share, register<br/>delivery receipt
+    P->>C: BUS_RD with tensor payload
+    C->>C: Validate/install parent share, then deposit in<br/>mailbox
+    C-->>P: ReceiverIngressCompletion
+    P->>D: Complete delivery receipt
+    Note over D,C: Share remains active, delivery completion is not grant return
+    C->>U: Grant controlled reads or downstream shares
+    U-->>C: All readers, aliases, and descendants release
+    C->>C: Await quiescence, begin parent return,<br/>invalidate access
+    C->>P: GRANT_RETURN
+    P->>D: Consume child share for this instance
+    P-->>C: Return send complete
+    C->>C: Consume return token and obtain instance-scoped<br/>proof
+```
+
+This is the normal ordering. If return overlaps an in-flight delivery, the directory
+reconciles that instance; quiescence in another epoch cannot substitute for its return
+proof.
+
 ## Exclusive ownership, invalidation and cancellation
 
 Only an existing current sharer can request ownership through `RFO`. Before
@@ -298,6 +323,40 @@ satisfy shared invalidation. `OWNERSHIP_CANCEL` is valid only before `CALL`;
 after `CALL` starts, failure fences the run because modified bytes cannot be
 assumed clean. A dirty ownership return always leaves the parent `I`.
 
+```mermaid
+sequenceDiagram
+    participant C as Requesting child
+    participant P as Direct parent
+    participant A as Other child A
+    participant B as Other child B
+    C->>C: Before CALL, queue writer, release read token,<br/>drain aliases
+    C->>P: RFO
+    P->>P: Block new shares, await deliveries, reclaim<br/>requester's share
+    par Invalidate direct child A
+        P->>A: SNOOP_INVALIDATE
+        A->>A: Block access and drain readers/descendants
+        A-->>P: GRANT_RETURN
+    and Invalidate direct child B
+        P->>B: SNOOP_INVALIDATE
+        B->>B: Block access and drain readers/descendants
+        B-->>P: GRANT_RETURN
+    end
+    P->>P: Drain conflicting grants, delegate ownership,<br/>enter I
+    P->>C: OWNERSHIP_GRANT
+    C->>C: Accept ownership and acquire writer
+    alt Cancelled before CALL
+        C->>P: OWNERSHIP_CANCEL
+        P->>P: Retain valid parent data
+    else CALL begins
+        C->>C: Execute write and release writer
+        C->>P: GRANT_RETURN for dirty ownership
+        P->>P: Remain I, no remote writeback
+    end
+```
+
+The compiled graph determines the child set. Failure after `CALL` starts fences
+execution and cannot use the clean cancellation path.
+
 ## Sequence publications and leases
 
 `CoherenceSequencer` is the only asynchronous reorder buffer. Intent issuance
@@ -341,6 +400,35 @@ async def ordered_publications() -> None:
 
 asyncio.run(ordered_publications())
 ```
+
+```mermaid
+sequenceDiagram
+    participant W as Worker
+    participant S as CoherenceSequencer
+    participant B as Concurrent frame<br/>builders
+    participant R as Retirement runtime
+    W->>S: issue_intent(epoch=7)
+    W->>S: issue_intent(epoch=8)
+    W->>B: Build both epochs concurrently
+    B-->>W: Epoch 8 built first
+    W->>S: commit_payload(epoch=8)
+    W->>S: close_intent(epoch=8)
+    Note over S,R: Epoch 8 waits for the unsealed epoch 7
+    B-->>W: Epoch 7 built
+    W->>S: Register all publication/local tickets for epoch<br/>7
+    W->>S: close_intent(epoch=7)
+    W->>S: Await both results concurrently
+    S->>R: Admit epoch 7 and execute complete fanout
+    R-->>S: Delivery complete
+    S->>S: Retire in order once consumer leases and other<br/>conditions settle
+    S->>R: Epoch 8 becomes runnable at lane head
+    R-->>S: Delivery complete
+    S-->>W: Results complete in subject order
+```
+
+This diagram uses one subject; independent subjects can overlap. Register and seal
+before awaiting results. Do not wait for retirement before registering another ticket
+for the same intent.
 
 One publication ticket owns the complete child fanout. The retirement runtime
 starts all enqueues concurrently, validates carrier acceptance and producer
@@ -491,6 +579,38 @@ may still hold grants after acceptance. `PayloadLifetime` owns outbound frame
 references and physical release; it waits for all receipts, transport retention
 and local leases. Allocation identity, a raw address, an RPC timeout or one of
 the two completion proofs alone cannot authorize reuse.
+
+```mermaid
+sequenceDiagram
+    participant W as Step committer
+    participant R as Tracked input-release<br/>task
+    participant D as Local directory and<br/>allocation registry
+    participant U as Aliases, descendants,<br/>in-flight receipts
+    participant P as Direct parents
+    W->>R: Schedule InputCoherenceRelease.complete()
+    par Step progress continues
+        W->>W: Advance contiguous step watermark
+    and Release may remain pending
+        R->>D: Release local access tokens and own release<br/>resources
+        R->>U: Await grant and allocation-alias quiescence
+        U-->>R: All dependencies quiescent
+        R->>R: Invalidate controlled tensor access
+        opt Parent returns required
+            R->>D: Begin returns and obtain linear tokens
+            R->>P: Send grouped GRANT_RETURN messages concurrently
+            P-->>R: All return sends complete
+            R->>D: Consume tokens and complete instance returns
+        end
+        R->>R: Release tensor payload references
+        R->>D: Validate return/retirement proof, then detach<br/>allocation
+    end
+    W->>R: Stop/failure fence cancels and joins tracked<br/>task
+    R-->>W: Observe completion, cancellation, or failure
+```
+
+A failed return cannot authorize detachment or storage reuse. The same resource owner
+settles normal release and failure cleanup; the step watermark does not authorize
+physical reclamation.
 
 ## Hand off exact storage
 

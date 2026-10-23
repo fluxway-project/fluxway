@@ -220,6 +220,32 @@ assert binding.resolve(2, logical_mesh=mesh) == "left"
 assert binding.resolve(3, logical_mesh=mesh) == "right"
 ```
 
+## 从声明交接到执行
+
+```mermaid
+sequenceDiagram
+    participant A as 应用构图
+    participant G as CompiledGraph
+    participant P as CompiledSendPlan
+    participant W as 工作进程
+    participant T as 数据面
+    A->>G: 编译依赖、执行组及张量声明
+    G->>G: 绑定完整单元关系并校验编号范围
+    G-->>W: 不可变 SPMD 图投影
+    W->>P: 用编译依赖和当前秩构建发送指令
+    P-->>W: 冻结路由、端口和一致性身份绑定
+    loop 每个已获准步骤
+        W->>W: 运行算子，得到 TransportTensor
+        W->>P: 传入步骤及实际张量元数据
+        P->>P: 按完整单元、回执或分片规则生成帧
+        P-->>W: 完整目标批次元组
+        W->>T: 一次登记完整发布
+        T-->>W: 异步交付结果
+    end
+```
+
+布局和静态路由在初始化时绑定；动态索引与回执在每次执行时求值。交付排序、并发扇出及接收证明见[数据面运行时](dataplane_runtime_zh.md)。
+
 ## 交付与内存边界
 
 完整单元关系以及可证明等价的静态连续分片可以编译为直达目标，复用现有分发器和传输帧格式。

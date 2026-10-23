@@ -12,7 +12,6 @@
 第二个目标在不影响第一个目标的前提下，减少占用的节点总数。
 集群快照是离线检查的示例输入，代码不会启动 Ray，也不会预留资源。
 
-
 <!-- test:placement-offline-recipe -->
 ```python
 import fluxway as fw
@@ -86,7 +85,6 @@ assert {item.node_id for item in plan.assignments} == {"node-a", "node-b"}
 在已初始化的 Ray 集群上，将包含有限数据源的完整计算图及其配方传给 `start`。
 配方引用的类必须与计算图中的类一致。各节点应安装项目声明的依赖。
 
-
 <!-- test:placement-controller-entry -->
 ```python
 from fluxway import Graph, GraphExecution, PlacementRecipe, start
@@ -112,11 +110,35 @@ CPU、GPU 和自定义加速器的预留量来自规划结果；可恢复的多�
 
 选择表达式、约束、资源扩展及目标顺序见[放置数学](placement_mathematics_zh.md)。
 
+```mermaid
+sequenceDiagram
+    participant C as 控制器调度器
+    participant P as 规划线程
+    participant R as Ray
+    participant D as 驱动器组
+    participant W as 工作进程组
+    C->>R: 读取集群节点与可用资源
+    R-->>C: ClusterSnapshot
+    C->>P: to_thread(PlacementPlanner.resolve)
+    P->>P: 求解约束、按目标优化、独立复核
+    P-->>C: ResolvedPlacementPlan
+    C->>R: 再次读取相关资源并核对快照
+    C->>R: 创建按 NodeID 固定的共享放置组
+    C->>R: await pg.ready()
+    R-->>C: 全部资源包就绪
+    C->>D: 并发启动 SPMD，传入 rank-to-bundle 映射
+    D->>W: 在指定资源包创建工作进程
+    W-->>D: 实际 NodeID 与拓扑
+    D-->>C: 全部启动完成及节点校验结果
+    C->>C: 按原配方复核实际分配，报告 READY
+```
+
+离线 `resolve()` 到求解结束为止，不预留 Ray 资源。资源快照变化、无解或超时都会失败；放置组等待失败或取消时释放该组，不能把“已求解”视为“可执行”。
+
 ## 注册工作进程内创建的资源
 
 硬件配额由 `ResourceProfile` 声明。路由表、设备网格等运行时对象由
 `ResourceRegistry` 管理。`ResourceHandle` 只标识对象，不把对象本身放入配方。
-
 
 <!-- test:placement-resource-registry -->
 ```python

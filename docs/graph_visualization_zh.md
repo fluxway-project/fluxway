@@ -10,7 +10,6 @@ Fluxway 将编译后的计算图导出到 Google Model Explorer。
 
 安装可选的查看器依赖：
 
-
 ```bash
 python -m pip install "fluxway[visualization]"
 ```
@@ -18,7 +17,6 @@ python -m pip install "fluxway[visualization]"
 从仓库根目录运行下例。输出目录 `tmp/graph-example` 必须尚不存在。
 代码构建一条张量依赖和一条仅控制顺序的依赖，再检查导出的两个视图。
 不需要 Ray 集群或 GPU。
-
 
 ```python
 import json
@@ -94,7 +92,6 @@ print(bundle.resolve())
 没有桌面环境的机器可以使用下列函数，参数是已有导出目录。
 服务器仅监听本机回环地址，不打开浏览器。
 
-
 ```python
 from pathlib import Path
 
@@ -113,7 +110,6 @@ def serve_graph(bundle_directory: str | Path) -> None:
 在保存导出包的机器上调用 `serve_graph("tmp/graph-example")`。
 在自己的机器上，将平时使用的 SSH 目标作为下面函数的参数：
 
-
 ```bash
 forward_graph() {
     ssh -N -L 8080:127.0.0.1:8080 "$1"
@@ -123,7 +119,6 @@ forward_graph() {
 保持终端打开，然后访问 `http://127.0.0.1:8080`。两端的 8080 端口都需要可用。
 如果希望复制文件后直接查看，不保持远程服务器运行，可以使用下列函数。
 三个参数依次为 SSH 目标、远程导出目录的绝对路径和本地 JSON 输出路径；本地机器需要安装 Model Explorer。
-
 
 ```bash
 copy_and_view_graph() {
@@ -168,6 +163,8 @@ Model Explorer 可能折叠只含一个算子的命名空间；需要显示每�
 工作进程与导出共用 `compile_phase_schedule` 的语义。
 可以在 [Perfetto 执行轨迹](user_profiler_zh.md)中搜索相同的计算图、SPMD、算子和函数标识，
 对照调度规则与实际执行。
+
+静态视图只表达可能的并发关系。实际调用、等待和关闭顺序见[算子执行时序](worker_process_operators_zh.md)；记录采集与文件写出顺序见[性能分析时序](user_profiler_zh.md)。`visualize_graph()` 同步写出静态文件，`view_graph()` 阻塞运行查看服务器，二者都不启动图执行。
 
 ## 理解重叠分组与规模边界
 

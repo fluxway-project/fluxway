@@ -104,6 +104,34 @@ insufficient capacity raises `ProfilerBufferExhausted`. Clock uncertainty beyond
 the configured limit also fails collection instead of presenting misleading
 timings.
 
+```mermaid
+sequenceDiagram
+    participant A as Application
+    participant C as Controller completion<br/>cleanup
+    participant D as Drivers
+    participant W as Worker recorders
+    participant F as Trace file
+    Note over C,W: Each process records events in a fixed buffer during execution
+    A->>C: await execution.wait()
+    C->>C: Enter COMPLETING, stop checkpointing and close<br/>checkpointer
+    C->>D: Request snapshots concurrently
+    D->>W: Capture rank records and clock mappings<br/>concurrently
+    W-->>D: ProfilerSnapshot
+    D-->>C: Snapshots from all SPMDs
+    C->>D: Reclaim actors and resources
+    D-->>C: Reclamation complete
+    C->>C: Close source planner, merge Controller records,<br/>resolve symbols
+    C->>F: Apply filters and write Perfetto file<br/>synchronously
+    F-->>C: File written
+    C->>C: Notify final outcome and publish terminal state
+    C-->>A: wait() returns successfully
+```
+
+This is automatic export on normal completion. Cancellation and failure cleanup do not
+automatically export a trace. Capture, reclamation, or write errors fail completion.
+Records show CPU queueing and invocation facts; device completion requires corresponding
+backend events.
+
 ## Read the trace
 
 Worker tracks follow this hierarchy:

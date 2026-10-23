@@ -53,3 +53,24 @@ they do not establish cluster throughput, crash recovery, or model convergence.
 Application configuration, remote catalogs, credentials, and acceptance results
 belong in the application repository. English and Chinese companions cover the
 same mechanisms and are maintained together.
+
+## Reading sequence diagrams
+
+Diagrams use Mermaid. Solid arrows show calls or message submission; dashed
+arrows show returns or completion notifications. Message labels and barriers
+state whether an asynchronous call is awaited. `par` branches may progress
+concurrently, `alt` selects mutually exclusive paths, and `opt` marks an optional
+path. Vertical order expresses required ordering, not elapsed time. One participant
+may represent a group of concurrent actors.
+
+| Ordering to inspect | Guide |
+| --- | --- |
+| Startup, restore, admission, drain, and cancellation | [Execution lifecycle](execution_lifecycle.md) |
+| Scanning, compilation, window installation, and shutdown | [Source coordination](source_coordination.md) |
+| Batched acquisition, out-of-order ACKs, and contiguous progress | [Source work protocol](source_spmd_formal_protocol.md) |
+| Asynchronous reads and complete exhaustion | [Reader API](base_reader.md) |
+| Snapshot preparation, commit, crash reconciliation, and read protection | [Checkpoints](checkpoint.md) |
+| Plan handoff, fanout delivery, and commit barriers | [Transfer planning](transfer_planning.md), [data-plane runtime](dataplane_runtime.md) |
+| Share returns, exclusive ownership, ordered retirement, and input release | [Coherence protocol](coherence_protocol.md) |
+| Placement readiness, thread execution, and trace export | [Placement recipes](placement_recipe.md), [worker-process operators](worker_process_operators.md), [user profiling](user_profiler.md) |
+| CI, package publishing, and release creation | [Releasing](releasing.md) |

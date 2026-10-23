@@ -11,9 +11,19 @@
 ## 扫描记录与定位消费前缀
 
 `IngestionSourceAdapter` 实现有界的 `scan_next(cursor, budget)` 和纯位置运算
-`advance_cursor(cursor, records)`。适配器负责来源身份、修订选择、物理位置与位置编码。
+`advance_cursor(cursor, records)`，并提供资源释放方法 `close()`。适配器负责来源身份、修订选择、物理位置与位置编码。
 Fluxway 不解析这些字节，也不替读取器发现另一个最新修订。
 扫描返回不可变的 `SourceScanResult`，包含有序区间与不透明位置。
+
+| 回调 | 结果与执行位置 |
+| --- | --- |
+| 来源描述的 `build_source_scan_binding(...)` | 返回 `SourceScanBinding`，或返回产生该绑定的可等待对象；在适配器专用输入输出通道中构造。 |
+| `SourceScanBinding.initial_cursor_factory()` | 返回 `OpaqueSourceCursor`、`None`，或产生这些结果的可等待对象；在同一通道执行。 |
+| `scan_next(cursor, budget)` | 返回 `SourceScanResult` 或产生该结果的可等待对象；在同一通道执行。 |
+| `close()` | 返回 `None` 或产生 `None` 的可等待对象；在同一通道释放客户端、句柄等资源，失败直接传播。 |
+| `advance_cursor(cursor, records)` | 同步返回 `OpaqueSourceCursor`，保持纯运算，不访问存储。 |
+
+专用通道在自己的线程和事件循环执行并等待异步回调，不把它们移回控制器事件循环。无外部资源的适配器也必须实现 `close()`；直接调用适配器而未交给规划器时，由调用方负责最终关闭。
 
 下面的独立示例使用项目自带的内存推荐来源。先扫描四条记录，再计算消费前三条记录后
 的书签，整个位置计算不访问存储：
@@ -73,10 +83,37 @@ for records, exhausted, finite, expected in (
 
 ## 绑定一个来源会话
 
-`SourceScanBinding` 统一拥有适配器、稳定绑定身份、读取拓扑、尾部策略和
-`initial_cursor_factory`。控制器只创建并缓存一次。空的持续来源尚无可读视图时，
+`SourceScanBinding` 汇集适配器、稳定绑定身份、读取拓扑、尾部策略和
+`initial_cursor_factory`。控制器委托 `IngestionLayoutPlanningComponent.open_source_binding()`
+创建并缓存首次成功绑定。规划器串行处理构造请求，并在首次扫描前接管适配器。
+后续并发请求返回同一绑定，不重新构造。空的持续来源尚无可读视图时，
 初始位置工厂可以返回 `None`，后续仍使用同一个绑定重试。初始位置确定后，会话
 不会再用新快照替换它。
+
+```mermaid
+sequenceDiagram
+    participant C as 控制器调用方
+    participant P as 规划器
+    participant I as 适配器专用通道
+    C->>P: 并发请求 open_source_binding(factory)
+    P->>P: 监管已接受操作，串行检查绑定缓存
+    P->>I: build_source_scan_binding(...)
+    opt 调用方取消等待
+        C->>C: CancelledError
+        Note over P,I: 已接受构造继续运行，关闭时仍须等待它
+    end
+    alt 工厂成功返回有效绑定
+        I-->>P: SourceScanBinding
+        P->>P: 校验并缓存绑定，接管适配器
+        P-->>C: 向仍在等待的调用方返回同一绑定
+        Note over P,I: 即使尚未扫描，规划器关闭也会释放适配器
+    else 工厂失败或结果无效
+        I-->>P: 异常或无效结果
+        P-->>C: 传播构造或校验异常
+    end
+```
+
+工厂成功交接有效绑定前，部分初始化资源由工厂负责清理。取消等待不会撤销成功交接；规划器关闭会等待构造结算后再释放资源。直接绑定适配器的接入不能再混用绑定工厂。
 
 下面的独立配置把每个逻辑训练步的四条记录分给两个读取进程。来源共十二条记录，
 因此严格尾部策略能够接受最后一个完整训练步：
@@ -137,6 +174,37 @@ assert binding.topology.global_cardinality == 4
 已提交书签重放所需的来源历史。
 
 ## 限制规划与领取范围
+
+```mermaid
+sequenceDiagram
+    participant S as 来源进度监督器
+    participant P as 窗口规划器
+    participant I as 适配器输入输出线程
+    participant C as 编译进程池
+    participant L as LogicalWorkLedger
+    participant W as 驱动器与读取工作进程
+    S->>P: 启动或事件唤醒后规划下一窗口
+    loop 有界扫描，直到形成完整步骤或观察到暂停/终点
+        P->>I: scan_next(cursor, budget)
+        I-->>P: SourceScanResult
+        P->>P: 校验身份与预算，保留非终态尾部
+    end
+    alt 暂时没有可发布窗口
+        P-->>S: None
+        Note over S,W: 等待下一次显式唤醒；空结果不等于结束
+    else 可以发布
+        P->>C: 提交纯编译请求
+        C-->>P: 逻辑任务与物理绑定
+        P->>L: 同一事件循环内校验并安装窗口与账本
+        Note over P,L: 安装期间不挂起；不在控制器状态锁内扫描
+        P-->>S: SourceLayoutActivation
+        S->>W: 投递已编译描述
+        W->>W: 读取器安装成功后发布窗口并唤醒等待者
+        W-->>S: 安装完成
+    end
+```
+
+扫描预算约束单次调用，窗口和描述字节预算另行约束。来源结束后的不足批次按声明的尾部策略处理。
 
 | 配置字段 | 上限 |
 | --- | --- |
@@ -244,10 +312,52 @@ asyncio.run(demonstrate_wakeup())
 在控制器中，规划在状态机锁外执行，边界只传递有界唤醒与类型化失败。发布激活后会
 唤醒所有受影响的领取等待者。检查点暂停后的继续执行不会再次启动来源。
 
-阻塞扫描使用适配器输入输出执行通道，编译使用进程池。调用方取消等待不撤销已接受
-操作。会话拥有者停止并等待进度任务，再等待 `planner.close()` 拒绝新工作、完成已接受
-操作并释放执行资源。失败必须可见。没有新记录的元数据扫描能否有界推进，仍须由
+扫描及其异步等待使用适配器专用通道，编译使用进程池。调用方取消等待不撤销已接受
+操作。会话拥有者停止并等待进度任务，再调用 `planner.close()`：先拒绝新工作并等待
+已接受操作，随后并发关闭适配器和退出编译池，最后关闭两个执行通道。没有新记录的元数据扫描能否有界推进，仍须由
 适配器与控制器的联合验证证明。
+
+```mermaid
+sequenceDiagram
+    participant A as 会话拥有者
+    participant S as 进度监督器
+    participant P as 规划器
+    participant I as 适配器通道
+    participant C as 编译池与生命周期通道
+    participant R as 来源适配器
+    A->>P: 提交规划并等待
+    P->>I: 已接受的扫描
+    opt 调用方取消等待
+        A->>A: CancelledError
+        Note over P,C: 已接受操作仍受监督并继续完成
+    end
+    A->>S: await stop()
+    S-->>A: 唯一进度任务已结束
+    A->>P: await close()
+    P->>P: 拒绝新请求，等待已接受操作
+    I-->>P: 扫描完成，后续编译与安装仍需完成
+    par 释放已绑定适配器
+        P->>I: call(adapter.close)
+        I->>R: close()，等待可等待结果
+        R-->>I: 关闭完成或异常
+        I-->>P: 适配器关闭结果
+    and 退出已创建编译池
+        P->>C: shutdown(wait=True)
+        C-->>P: 编译池退出结果
+    end
+    par 关闭适配器通道
+        P->>I: await close()
+        I-->>P: 通道线程已退出
+    and 关闭生命周期通道
+        P->>C: await close()
+        C-->>P: 通道线程已退出
+    end
+    P-->>A: 返回或汇总操作与关闭异常
+```
+
+适配器关闭失败也会继续关闭通道，最后汇总异常。重复关闭复用同一结果，适配器只关闭一次；取消关闭等待者不会中断释放。已由调用方观察的操作异常或操作自身取消不会在关闭时重复报告；调用方取消等待后发生的未观察失败仍由规划器保留并在关闭时报告。
+
+构造、扫描等受监管操作及其子任务不能关闭自己的规划器，关闭回调也不能递归等待同一次关闭；这些自等待会直接抛出 `RuntimeError`。
 
 ## 从共同检查点恢复
 

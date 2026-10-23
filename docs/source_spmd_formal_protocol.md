@@ -176,6 +176,37 @@ IDs. A delayed acknowledgement with an old lease ID raises `RuntimeError`.
 
 ## Distinguish production from durable commit
 
+```mermaid
+sequenceDiagram
+    participant A as Step 0 readers
+    participant B as Step 1 readers
+    participant L as LogicalWorkLedger
+    participant C as Checkpoint coordinator
+    Note over A,C: Steps 0 and 1 published, candidate_cut=0, committed_cut=0
+    par Independent interval acquisition
+        A->>L: acquire(step=0)
+        L-->>A: Step 0 leases
+    and Next step can overlap
+        B->>L: acquire(step=1)
+        L-->>B: Step 1 leases
+    end
+    C->>L: await wait_for_candidate_cut(2)
+    B->>L: ACK every step 1 interval
+    L->>L: Step 0 has a gap, candidate cut remains 0
+    A->>L: ACK part of step 0
+    L->>L: candidate_cut=0
+    A->>L: ACK remaining step 0 intervals
+    L-->>C: Contiguous ACK frontier reaches 2, wake waiter
+    Note over L,C: committed_cut is still 0, model drain and joint transaction remain
+    C->>C: Whole graph drained, prepare transaction and<br/>persist commit decision
+    C->>L: Advance joint cut through prepare/apply contract
+    L->>L: In-memory committed_cut=2, retire old leases
+    C->>C: Write global marker, acknowledge components,<br/>finish COMMITTED
+```
+
+The candidate cut advances only across consecutive complete steps. Late ACKs for retired
+leases fail rather than advancing progress again.
+
 `SourceWorkItem` contains the assignment and exact acquired interval.
 `SourceWorkLease` adds the opaque runtime lease ID.
 `SourceWorkAcknowledgement(key, lease_id)` confirms only that interval, never the
@@ -272,6 +303,35 @@ single source of physical membership and logical group ranks for dispatch and
 send-plan lowering. Neither layer discovers source revisions, manages leases or
 owns checkpoint cuts. Local zero-copy depends separately on placement and
 transport conditions.
+
+```mermaid
+sequenceDiagram
+    participant A as Concurrent step callers
+    participant R as SourceWorkRuntime
+    participant L as Controller ledger
+    participant Q as Bounded ACK queue
+    A->>R: take(step) for distinct steps in one chunk
+    R->>L: Shared batched acquisition task
+    opt Credit exhausted
+        L->>L: Await ACK progress or a new window
+    end
+    L-->>R: Complete consecutive step prefix within credit
+    R->>R: Validate leases and coverage, cache granted<br/>prefix
+    R-->>A: Return per-step leases, acquire remaining suffix<br/>later
+    Note over A,R: Cancelling one waiter leaves the shared fetch supervised
+    A->>A: Read, publish, and finish source step
+    A->>Q: await submit(acknowledgements)
+    alt Capacity available
+        Q-->>A: Return after local acceptance
+    else Queue full
+        Q->>Q: Await capacity or failure
+        Q-->>A: Enqueued or error raised
+    end
+    Q->>L: Merge and send ACKs in background
+    L-->>Q: Batch validated and applied
+    A->>Q: await flush() at checkpoint drain
+    Q-->>A: All submitted ACKs complete, or failure<br/>propagated
+```
 
 ## Validate recovery at the application boundary
 

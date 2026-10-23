@@ -92,6 +92,40 @@ def publication_callback(
 `_ChildDeliveryReceipts` 统一拥有目录回执的终态转换。任一入队失败时，取消尚未完成的同级任务，
 按相反顺序将已登记回执完成为失败，并传播原始异常。目标重试或超时不能代替接收成功证明。
 
+```mermaid
+sequenceDiagram
+    participant W as 发送工作进程
+    participant P as 完整发布运行时
+    participant D as 本地目录与载荷生命周期
+    participant A as 目标 A
+    participant B as 目标 B
+    Note over W,P: 全部票据已登记且意图已封闭，排序器允许发布
+    W->>P: 退休回调执行完整目标批次
+    P->>D: 每个唯一子端点登记委派与回执
+    par 并发投递 A
+        P->>A: await enqueue(batch_A)
+        A->>A: 校验准入并存入邮箱
+    and 并发投递 B
+        P->>B: await enqueue(batch_B)
+        B->>B: 校验准入并存入邮箱
+    end
+    alt 全部接收及发送引用释放证明有效
+        A-->>P: ReceiverIngressCompletion
+        B-->>P: ReceiverIngressCompletion
+        P->>D: 记录全部接收回执并释放传输保留引用
+        P->>D: 由唯一拥有者完成目录回执
+        P-->>W: 发布交付完成
+    else 任一目标失败或证明无效
+        A-->>P: 异常或无效证明
+        P->>B: 取消并等待尚未结束的同级交付
+        P->>D: 封锁生命周期，逆序完成失败回执
+        P-->>W: 传播原始异常
+    end
+    Note over W,B: 接收完成后消费租约仍可能活跃，不能据此复用存储
+```
+
+图用 A 表示最先失败的任意目标。生产端引用保留到同批交付全部结算；目标数量不会增加同一实例的排序边界。
+
 ## 接收证明与载荷生命周期
 
 承载方证明接收准入完成，并且不再保留发送端引用后，才返回 `ReceiverIngressCompletion`。
@@ -233,16 +267,35 @@ assert policy.commit == "relaxed"
 
 ## 本地提交与交付锁
 
-`SEND` 登记并启动交付，`AWAIT_SEND` 不持有算子提交资源等待完成，
+`SEND` 启动发送任务，`AWAIT_SEND` 不持有算子提交资源等待该任务完成，
 `BARRIER/COMMIT` 只在发布连续水位时获取有序提交锁。
 排空、检查点、导出和停止仍通过交付屏障等待全部已登记交付。
 
 ```mermaid
-flowchart LR
-  S[SEND: 登记并启动] --> W[AWAIT_SEND: 不持有提交锁等待]
-  W --> C[COMMIT: 有序发布锁]
-  C --> M[连续提交水位]
+sequenceDiagram
+    participant P as 本地步骤计划
+    participant S as 发送任务
+    participant D as OutboundDeliveryRuntime
+    participant K as 有序提交锁
+    participant R as 接收端
+    P->>S: SEND：启动发送任务
+    P->>S: AWAIT_SEND：不持提交锁等待
+    S->>S: 构建帧，登记全部票据并封闭意图
+    S->>D: 登记受跟踪的交付
+    D->>R: 发送帧并等待接收证明
+    R-->>D: 接收完成或失败
+    D-->>S: 发布任务与本地交付全部完成
+    S-->>P: 普通张量发送任务完成
+    P->>K: BARRIER/COMMIT
+    K->>K: 发布连续步骤水位
+    K-->>P: 释放提交锁
+    P->>D: 排空/检查点/导出/停止时再次等待全部交付
+    D-->>P: 全部已登记交付结算，或传播失败
 ```
+
+图示普通张量路径：发送任务会等待完整发布和本地交付。仅协议空帧等分支可以在登记后返回，统一排空屏障仍会等待它们。发送失败阻止正常提交或经执行失败通道传播；接收完成仍不等于消费租约归还或物理存储回收。
+
+有序提交锁不跨发送登记等待或网络等待持有。步骤水位推进、接收完成和输入物理释放是不同事件。
 
 协议失败后关闭帧准入，并通过执行失败通道传播错误。输入释放和载荷退休仍是受跟踪的异步操作，
 仅仅启动它们不能证明已经完成。见[一致性协议](coherence_protocol_zh.md)和[架构](ARCHITECTURE_zh.md)。

@@ -1,15 +1,12 @@
-# Fluxway 贡献指南
+# 参与 Fluxway 开发
 
 [English](CONTRIBUTING.md)
 
-感谢你对 Fluxway 的关注与贡献！本文档简明扼要地介绍如何搭建本地开发环境、执行代码规范检查、运行单元测试以及提交高质量 Pull Request。
+本文说明开发环境、本地检查和拉取请求要求。
 
----
+## 开发环境
 
-## 1. 环境准备
-
-* **系统与 Python 版本**：Linux，**Python 3.12 或 3.13**。
-* 建议创建独立的 Python 虚拟环境，并安装开发所需的测试与构建依赖：
+使用 Linux 和 Python 3.12 或 3.13，在独立虚拟环境中安装依赖：
 
 ```bash
 python3 -m venv .venv
@@ -18,51 +15,47 @@ python -m pip install --upgrade pip
 python -m pip install -e '.[jax,profiler,visualization]' --group test --group lint --group build
 ```
 
----
+## 本地检查
 
-## 2. 本地自检与预提交验证
+从仓库根目录运行格式检查和可移植 CPU 测试：
 
-在提交代码或开 PR 前，请确保本地通过以下三道校验（与 GitHub CI 流程完全一致）：
-
-### 第一步：代码规范与格式化 (Lint & Format)
 ```bash
 bash scripts/format.sh --check
-# 应用 lint 修复与格式化：
-bash scripts/format.sh
-```
-
-### 第二步：运行单元测试 (CPU 矩阵)
-```bash
 JAX_PLATFORMS=cpu python -m pytest -ra --strict-markers --strict-config \
   --ignore=tests/checkpointer/test_retention.py \
   --ignore=tests/example/test_sparse_checkpoint_e2e.py
 ```
-> *注*：上述两个忽略的文件涉及可选的私有原生 `sparse_embedding` 库及 Lance 驱动，通用 CPU 自动化测试默认跳过。
 
-### 第三步：打包与包完整性校验
+需要应用格式修复时运行 `bash scripts/format.sh`。排除的两个文件依赖可选的原生 `sparse_embedding` 和 Lance 环境；相关功能变更还需在具备依赖的环境中验证。
+
+打包检查使用新的临时目录，避免混入旧产物：
+
 ```bash
-# 清空旧产物
-rm -rf dist/
-python -m build
-python -m twine check --strict dist/*
-python scripts/distribution.py check dist
-
-# 可选：在完全隔离的干净环境中验证安装与导入
-python -m venv tmp/wheel-env
-tmp/wheel-env/bin/python -m pip install dist/*.whl
-tmp/wheel-env/bin/python -m pip check
-tmp/wheel-env/bin/python -I scripts/check_installed.py
+mkdir -p tmp
+package_check_dir=$(mktemp -d "$PWD/tmp/package-check.XXXXXX")
+python -m build --outdir "$package_check_dir/dist"
+python -m twine check --strict "$package_check_dir"/dist/*
+python scripts/distribution.py check "$package_check_dir/dist"
+python -m pytest --confcutdir=tests/packaging tests/packaging
 ```
 
----
+隔离安装和完整发布验证见[版本发布](docs/releasing_zh.md)。本地单个 Python 环境的成功不能代替持续集成的 Python 3.12/3.13 矩阵。
 
-## 3. Pull Request 提交规范
+## 拉取请求
 
-1. **聚焦单一职责**：每个 PR 仅解决一个具体功能或 Bug，切勿掺杂不相关的无关改动。
-2. **测试与文档齐备**：任何行为变更或代码修复，均须附带对应的单元测试，并同步更新中英文档。
-3. **明示破坏性变更**：如有 API 破坏性改动（Breaking Changes），必须在 PR 说明中详细附上升级迁移指南。
-4. **CI 必须全绿**：合并入主分支前，GitHub Actions 所有 CI 任务必须在最新 commit 上完全通过。
+- 每次变更聚焦一个问题，说明触发条件、最终行为和验证结果。
+- 行为变更提供适当的测试，并同步更新中英文文档。
+- 破坏性 API 变更说明迁移步骤。
+- 合并前，最终提交必须通过所有必需的持续集成检查。
 
-关于版本 Tag、PyPI 发布机制与 Trusted Publisher 权限，请参阅 [版本发布指南](docs/releasing_zh.md) ([English](docs/releasing.md))。
+## 文档要求
 
-定时的 [Nightly wheel](.github/workflows/nightly.yml) 工作流复用完整 CI 流程，并将验证过的 wheel 与源码包保存在 `python-distributions` Actions artifact 中 14 天。工作流进入 `main` 后可以手动运行；修改 CI 或 nightly 工作流时，也会在 PR 中运行 nightly 验证。
+- 中文正文和图中说明优先使用中文，保留 API、类型、字段和命令原名；中英文覆盖相同契约。
+- 复杂流程使用 Mermaid 时序图，标明并发、等待、取消、背压、提交和失败边界；静态关系使用表格或结构图。
+- 区分调用返回、任务完成、接收准入和持久提交；按当前实现核对责任归属与消息顺序。
+- 示例注明依赖、输入、预期结果和适用范围，本地协议检查不能作为分布式恢复或性能证据。
+- 修改后检查链接、代码块与图示渲染。图示约定和流程入口见[文档总览](docs/README_zh.md)。
+
+## 持续集成产物
+
+[夜间构建](.github/workflows/nightly.yml)复用完整持续集成流程，将已验证的 wheel 和源码包保存在 `python-distributions` 工作流产物中 14 天。工作流进入 `main` 后可手动运行；修改 CI 或夜间构建工作流的拉取请求也会运行夜间构建验证。版本标签、可信发布权限和发布顺序见[版本发布](docs/releasing_zh.md)。
