@@ -232,7 +232,7 @@ class SparseEmbeddingSPMD:
         )
 
         self.store.accumulate_gradients(keys_np, grads_np)
-        self.store.optimizer_step()
+        self.store.optimizer_step(1)
 
         print(
             f"[SparseEmbeddingSPMD.update] rank={self.rank} step={step} "
