@@ -5,6 +5,7 @@ Based on ARCHITECTURE.md sections 2.1.1, 3.2.1, 4.2, 4.3
 """
 
 import os
+from collections.abc import Callable
 from enum import StrEnum
 from typing import Annotated, Any, TypeVar
 
@@ -205,6 +206,24 @@ class OperatorContext(FluxwayBaseSchema):
     global_source_offset: int | None = None
     is_interleaved: bool = False
     source_work_items: Any | None = None
+
+    async def run_in_lane(
+        self,
+        fn: Callable[..., Any],
+        *args: Any,
+        lane: str = "default",
+        **kwargs: Any,
+    ) -> Any:
+        """Execute a blocking or CPU-bound callable in a worker-managed thread lane."""
+        from fluxway.common.decorators import get_current_context
+
+        state = get_current_context()
+        if state.lane_runner is None:
+            raise RuntimeError(
+                f"Cannot run in lane {lane!r}: no active lane runner configured "
+                "in current operator context."
+            )
+        return await state.lane_runner(fn, *args, lane=lane, **kwargs)
 
 
 class Graph(FluxwayBaseSchema):

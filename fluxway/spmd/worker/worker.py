@@ -1281,6 +1281,7 @@ class SPMDWorker:
                 local_world_size=local_world_size,
                 node_rank=node_rank,
                 num_nodes=num_nodes,
+                worker_process_runtime=self._worker_process_call_runtime,
             )
             if self._control_plane_handle is not None:
                 manager_kwargs["control_plane_handle"] = self._control_plane_handle
@@ -4994,10 +4995,7 @@ class SPMDWorker:
         *,
         background_prepare: bool,
     ) -> "TransportTensor":
-        if not background_prepare:
-            return await self._assemble_tensor(
-                op_name, transfer_code, step, shards, arrivals
-            )
+        del background_prepare
         return await self._input_prepare_runtime.run_assemble(
             op_name,
             step,
@@ -5290,31 +5288,17 @@ class SPMDWorker:
         shards: dict[Any, list[Any]],
         arrivals: dict[Any, dict[str, Any]],
     ) -> "TransportTensor":
-        profiler_recorder = (
-            self._profiler_runtime.recorder if self._profiler_runtime.enabled else None
+        return await self._input_prepare_runtime.run_assemble(
+            op_name,
+            step,
+            lambda: self._assemble_tensor_sync_traced(
+                op_name,
+                transfer_code,
+                step,
+                shards,
+                arrivals,
+            ),
         )
-        if profiler_recorder is None:
-            return self._assemble_tensor_sync(
-                op_name, transfer_code, step, shards, arrivals
-            )
-        shard_count = (
-            sum(len(items) for items in shards.values())
-            if _profiler_enabled(self)
-            else 0
-        )
-        async with profiler_recorder.worker_assemble_tensor(
-            op_name=op_name,
-            transfer_code=transfer_code,
-            logical_tuuid=self._compiled_assemble_plan(
-                op_name, transfer_code
-            ).transfer.logical_tuuid,
-            step=step,
-            sender_count=len(shards),
-            shard_count=shard_count,
-        ):
-            return self._assemble_tensor_sync(
-                op_name, transfer_code, step, shards, arrivals
-            )
 
     def _assemble_tensor_sync_traced(
         self,

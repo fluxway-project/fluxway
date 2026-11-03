@@ -225,6 +225,64 @@ with a `Fluxway Worker Process Error`. Use the decorator instead of setting the
 internal `__fluxway_process_affine__` field. The marker does not supply JAX,
 create a distributed coordinator, or make mismatched worker topology valid.
 
+## Managed execution lanes and CPU compute offloading
+
+In distributed SPMD computation, `async def` coroutine operators are often used to orchestrate network communication and asynchronous IPC (e.g. `async_unique` cross-device exchanges). However, when a coroutine operator needs to execute heavy CPU tasks (such as Numba JIT kernels, DLPack conversions, tensor materialization, or metric writes), running them directly on the event loop blocks the single event loop thread, stalling heartbeats and message routing.
+
+Fluxway provides **Managed Worker Process Lanes** to safely offload CPU-bound tasks:
+
+```mermaid
+flowchart TD
+    subgraph SPMDWorker["SPMD Worker Actor"]
+        direction TB
+        subgraph EventLoop["AsyncIO Event Loop"]
+            CoroutineOp["async def Operator\n(Coordination, network, await IPC)"]
+            Heartbeat["Node Heartbeat & Cluster Coordination"]
+        end
+
+        subgraph WorkerProcessRuntime["WorkerProcessCallRuntime (Managed Thread Pools)"]
+            ComputeLane["'compute' Lane Thread Pool\n(Numba JIT, DLPack, Sparse/Dense Materialization)"]
+            IOLane["'io' Lane Thread Pool\n(Disk flush, Arrow decoding, metric persistence)"]
+        end
+    end
+
+    CoroutineOp -- "await ctx.run_in_lane(fn, lane='compute')" --> ComputeLane
+    CoroutineOp -. "Event loop stays fully responsive" .-> Heartbeat
+    ComputeLane -- "Returns materialized result" --> CoroutineOp
+```
+
+### 1. Core capabilities of `ctx.run_in_lane`
+* **Bounded lane thread pools**: Obtains/creates dedicated, bounded thread pools per named lane (`"compute"`, `"io"`, `"default"`), eliminating thread explosion and thread thrashing without requiring ad-hoc `asyncio.Semaphore` guards in user code.
+* **ContextVars transparent propagation**: Context variables (including operator runtime context and tracing baggage) are copied and preserved across thread boundaries.
+* **Integrated profiler recording**: Queue wait times and thread run times are automatically recorded into Chrome Trace profiling logs.
+
+```python
+# Example: Offloading CPU kernels from an async operator
+@operator("process")
+async def process(self, batch: UserBatch) -> NodeOutput:
+    # Phase 1: Asynchronous distributed unique on the event loop
+    unique_ids, inv_index = await self.async_dedup(batch)
+
+    # Phase 2: Safely offload Numba JIT and tensor materialization to compute lane
+    tensors = await self.ctx.run_in_lane(
+        self._numba_materialize_kernel,
+        unique_ids,
+        inv_index,
+        lane="compute",
+    )
+    return NodeOutput(tensors=tensors)
+```
+
+### 2. Unified invoker `invoke_callable_async`
+For dataloader executors or generic pipeline adapters that accept arbitrary user callables: if the function is a coroutine, it is directly awaited; if it is synchronous, it is automatically routed to the active operator context's managed worker thread lane, completely eliminating boilerplate `inspect.iscoroutinefunction` checks:
+
+```python
+from fluxway.common.asyncio_runtime import invoke_callable_async
+
+# Automatically adapts to both coroutine and synchronous functions
+result = await invoke_callable_async(custom_transform_fn, data, lane="compute")
+```
+
 ## Checkpoint extension boundary
 
 Operators do not implement checkpoint hooks. Register a

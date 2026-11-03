@@ -30,6 +30,8 @@ Usage:
             return process(data)
 """
 
+import ml_dtypes  # noqa: F401
+
 # Force logging to be visible across driver + Ray worker processes.
 # Users of this repo want INFO logs by default.
 from fluxway.common.utils.logging import ensure_logging_configured

@@ -25,8 +25,8 @@ flowchart TD
 
 | 阶段 | 计算与所有权 |
 | --- | --- |
-| Reader | 读取从 `LogicalWorkLedger` 获取的规范区间；物理秩不是持久化数据游标。 |
-| Input | 使用 `async_unique` 对自身小批次内的 ID 去重，保留反向索引和样本来源信息。 |
+| Reader | 同步算子 `def read(self)` 声明 `AsyncPolicy.pipelined(depth=4)`，在工作线程泳道自动流水线预取；读取从 `LogicalWorkLedger` 获取的规范区间。 |
+| Input | 使用 `async_unique` 对自身小批次内的 ID 去重，并通过 `ctx.run_in_lane("compute")` 在受控工作线程泳道并发物化张量，保留反向索引和样本来源信息。 |
 | 嵌入表 | 按 `key % shard_count` 拥有键，执行查询与稀疏 Adam 更新。两个分区时，分区 0 拥有偶数键，分区 1 拥有奇数键。 |
 | Dense | 重建与池化嵌入值，拼接稠密特征，计算单层线性输出和均方误差；参数使用梯度累积与 SGD 更新。 |
 | 检查点 | 协调来源切点、Dense 模型及稀疏参数和优化器状态；恢复时先还原新角色，再授权执行。 |

@@ -260,3 +260,80 @@ sequenceDiagram
 的切点生成消费书签，恢复后从书签重新规划；读取器不另存独立持久位置，也不恢复旧窗口。
 外部副作用需要独立事务或幂等契约。仅实现读取器不能证明补充窗口、整图排空和恢复
 流程已经完整接通，这些边界由[来源协调](source_coordination_zh.md)定义。
+
+## 高性能执行范式与流水线重叠
+
+`BaseReader` 作为 Source SPMD，是 MPMD 计算图的一等生产者节点，完全复用框架生命周期管理、步进编排和分布式数据面能力。
+
+```mermaid
+flowchart LR
+    subgraph ControlLane["控制面泳道 (AsyncIO Loop)"]
+        direction TB
+        Sched["步进准入调度器"]
+        Mailbox["数据面邮箱与网络"]
+    end
+
+    subgraph WorkerLanes["受控工作线程泳道 (WorkerProcess Threads)"]
+        direction TB
+        IO["来源数据读取 (I/O)"]
+        ArrowConcat["BaseReader.concatenate_batches"]
+        ArrowParse["BaseReader.create_tensors_from_batch"]
+        Tensor["TransportTensor 物化"]
+        IO --> ArrowConcat --> ArrowParse --> Tensor
+    end
+
+    subgraph DownstreamLanes["下游算子计算泳道 (InputSPMD)"]
+        direction TB
+        AsyncUnique["GPU/网络通信 async_unique"]
+        CpuFinalize["ctx.run_in_lane('compute')\nNumba/物化计算"]
+        AsyncUnique --> CpuFinalize
+    end
+
+    Sched -- "pipelined(depth=K) 并发派发" --> IO
+    Tensor -- "跨节点流水发送" --> Mailbox
+    Mailbox -- "输入邮箱交付" --> AsyncUnique
+```
+
+### 1. 同步执行契约与非阻塞泳道隔离
+* **普通同步函数（`def read(self)`）**：用户编写纯粹的同步业务逻辑。运行时调度器（`UserCallableExecutor`）自动将普通函数分发到 `WORKER_PROCESS` 线程泳道。
+* **硬件级多核并行**：PyArrow、NumPy、Numba 等底层计算在进入 C/C++ 核心时会自动释放 GIL，实现真正的多核物理加速，同时彻底解放主事件循环，消除对集群心跳与网络路由的延迟阻塞。
+* **避免在协程中执行 CPU 密集物化**：严禁在 `async def` 算子中直接执行重度 Arrow/NumPy 转换或张量构造。若必须在异步算子中进行 CPU 物化，必须使用 `await self.ctx.run_in_lane(...)` 委托到专用工作线程。
+
+### 2. 零成本流水预取
+* 无需额外实现专门的 `Prefetcher`、队列或后台线程环形缓冲区。
+* 直接在算子上声明 `async_policy=AsyncPolicy.pipelined(depth=K)`，框架调度引擎会自动前瞻推进 $K$ 个步进的租约获取与数据生产，将已物化的 `TransportTensor` 通过数据面自动存入下游节点的输入邮箱，实现天然的分布式流水线预取。
+
+### 3. 一等公民的 Arrow 批处理物化与拼接
+
+`BaseReader` 内建了开箱即用的大规模特征物化与拼接能力，无需在业务代码中反复手写 Arrow 到 NumPy/Tensor 的转换逻辑：
+
+| 接口 | 输入类型 | 输出类型 | 特性与底层优化 |
+| :--- | :--- | :--- | :--- |
+| `create_tensors_from_batch(batch, ...)` | `pa.Table`, `pa.RecordBatch`, 字典映射 | `dict[str, TransportTensor]` | 自动解析全局坐标与批次维度；密集列自动转张量；List/LargeList 变长列自动提取 offsets 生成带 `nested_splits` 的稀疏张量。 |
+| `create_tensor(data, ...)` | `pa.Array`, `pa.ChunkedArray`, `ndarray`, `list` | `TransportTensor` | 统一抽象，支持原生 Arrow 数组零拷贝解析，支持指定 `dtype` 与均匀密集切分标记。 |
+| `concatenate_batches(batches)` | `Sequence[pa.Table]`, `Sequence[RecordBatch]`, `Sequence[Mapping]` | `pa.Table` 或拼接字典 | 范围读取器（Range Worker）与分片合并的首选，采用 Permissive Schema 快速合并，避免反复内存碎片化。 |
+
+```python
+# 示例：直接在 Reader 中消费 Arrow Table
+class ParquetRecommendationReader(BaseReader):
+    @operator("read", async_policy=AsyncPolicy.pipelined(depth=4))
+    def read(self) -> dict[str, TransportTensor]:
+        table: pa.Table = self.load_next_parquet_table()
+        # 自动将稠密与非均匀 List 列转换为标准的 TransportTensor 映射
+        return self.create_tensors_from_batch(
+            table,
+            column_dtypes={"user_id": np.int32, "item_id": np.int32},
+            uniform_dense_partition=True,
+        )
+```
+
+### 4. 运行时范式对照表
+
+| 算子/任务编写模式 | 声明形式 | 运行物理宿主 | 适用场景 | 架构优势 |
+| :--- | :--- | :--- | :--- | :--- |
+| **同步普通算子** | `def read(self)` / `def op(self)` | `WORKER_PROCESS` 线程池 | 来源读取、数据解包、密集矩阵计算、Arrow/NumPy 处理 | 零异步样板代码，C 扩展完全释放 GIL，不阻塞 Event Loop。 |
+| **纯异步通信算子** | `async def op(self)` | `COROUTINE_ASYNC` 事件循环 | 跨节点通信调度、异步分布式搜寻、事件流驱动 | 极致上下文切换性能，高并发 IO。 |
+| **异步算子内计算卸载** | `await self.ctx.run_in_lane(fn, *args, lane="compute")` | 指定的受控线程泳道 | 异步算子在拿到网络数据后需要进行复杂 Numba 计算或张量组装 | 线程池配额受控（避免线程爆炸），保留 ContextVar 链路追踪与 Profiler 事件记录。 |
+| **通用异步调用器** | `await invoke_callable_async(fn, *args, lane="default")` | 自动根据签名自适应调度 | 管道通用适配层、统一装饰器、回调执行 | 彻底消除业务代码中繁琐且脆弱的 `inspect.iscoroutinefunction` 分支。 |
+
+

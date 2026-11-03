@@ -206,6 +206,64 @@ sequenceDiagram
 `Fluxway Worker Process Error`。应使用装饰器，不要直接设置内部字段
 `__fluxway_process_affine__`。该标记不会安装 JAX、创建分布式协调器或修正不一致的工作进程拓扑。
 
+## 受控执行泳道与异步计算卸载
+
+在分布式与高性能计算中，`async def` 协程算子通常用于编排网络传输与异步 IPC（如 `async_unique` 跨设备通信）。然而，当协程算子需要执行繁重的 CPU 计算（如 Numba JIT 内核、DLPack 索引转换、复杂的张量物化或指标导出）时，直接在事件循环线程上执行会导致主事件循环严重卡顿，破坏集群心跳与数据包投递。
+
+Fluxway 提供了**内建的受控工作线程泳道（Managed Worker Process Lanes）**机制：
+
+```mermaid
+flowchart TD
+    subgraph SPMDWorker["SPMD 工作进程 (Worker Actor)"]
+        direction TB
+        subgraph EventLoop["AsyncIO 主事件循环"]
+            CoroutineOp["async def 算子\n(调度、网络、等待 IPC)"]
+            Heartbeat["节点心跳 & 控制面协作"]
+        end
+
+        subgraph WorkerProcessRuntime["WorkerProcessCallRuntime (受控线程池)"]
+            ComputeLane["'compute' 泳道线程池\n(Numba JIT, DLPack, 稠密/稀疏物化)"]
+            IOLane["'io' 泳道线程池\n(磁盘刷写, Arrow 解码, 检查点导出)"]
+        end
+    end
+
+    CoroutineOp -- "await ctx.run_in_lane(fn, lane='compute')" --> ComputeLane
+    CoroutineOp -. "主循环始终保持空闲响应" .-> Heartbeat
+    ComputeLane -- "返回物化结果" --> CoroutineOp
+```
+
+### 1. `ctx.run_in_lane` 核心能力
+* **线程池配额隔离**：根据指定的 `lane`（如 `"compute"`、`"io"`、`"default"`）自动获取并复用工作进程专属的有界线程池，无需用户在业务层通过 `asyncio.Semaphore` 手动限制并发，杜绝线程过度创建与上下文切换抖动。
+* **ContextVars 自动穿透**：运行时在提交到工作线程时自动复制当前的 `ContextVar` 环境，使得算子内部的元数据与链路追踪在线程中无缝透明流转。
+* **内建 Profiler 集成**：自动将任务排队等待时间、线程实际运行耗时记录到统一的 Chrome Trace 分析数据中。
+
+```python
+# 示例：在异步算子中卸载密集 CPU 运算
+@operator("process")
+async def process(self, batch: UserBatch) -> NodeOutput:
+    # 阶段 1：在主事件循环上并发执行异步分布式去重
+    unique_ids, inv_index = await self.async_dedup(batch)
+
+    # 阶段 2：安全卸载 Numba JIT 与张量物化到 compute 泳道，释放主循环
+    tensors = await self.ctx.run_in_lane(
+        self._numba_materialize_kernel,
+        unique_ids,
+        inv_index,
+        lane="compute",
+    )
+    return NodeOutput(tensors=tensors)
+```
+
+### 2. 统一异步调用器 `invoke_callable_async`
+在数据管道执行器或高阶包装器中，用户传入的方法可能是普通的同步函数，也可能是异步协程函数。使用 `invoke_callable_async` 可自动识别：若为协程则直接 `await`；若为普通函数则自动调度到当前算子上下文绑定的工作线程泳道，无需手写繁琐的 `inspect.iscoroutinefunction` 分支代码：
+
+```python
+from fluxway.common.asyncio_runtime import invoke_callable_async
+
+# 自动自适应协程与同步函数，彻底消除下游反模式样板代码
+result = await invoke_callable_async(custom_transform_fn, data, lane="compute")
+```
+
 ## 检查点扩展边界
 
 算子不实现检查点钩子。通过 SPMD 的 `checkpoint_components` 注册

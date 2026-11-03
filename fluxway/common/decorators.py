@@ -41,6 +41,7 @@ class _OperatorContextState:
     instance_container: OperatorInstanceContainer = field(
         default_factory=OperatorInstanceContainer
     )
+    lane_runner: Any = None
 
 
 _DEFAULT_CONTEXT_STATE = _OperatorContextState()
@@ -66,6 +67,7 @@ def operator_context(
     rank0_address: str | None = None,
     ray_component_limits: Mapping[str, Decimal] | None = None,
     instance_container: OperatorInstanceContainer | None = None,
+    lane_runner: Any = None,
 ):
     """Context manager to inject operator runtime context into current coroutine/thread.
 
@@ -98,6 +100,7 @@ def operator_context(
             if instance_container is None
             else instance_container
         ),
+        lane_runner=lane_runner,
     )
     token = _operator_context_var.set(state)
     try:
@@ -915,6 +918,7 @@ def spmd(
         cls.get_driver_runtime_env = classmethod(lambda c: c._driver_runtime_env)  # type: ignore
         cls.get_num_workers = classmethod(lambda c: c._mesh.size if c._mesh else 1)  # type: ignore
         cls.is_fluxway_spmd = classmethod(lambda c: True)  # type: ignore
+        _inject_context_properties(cls)
 
         original_new = cls.__new__
 

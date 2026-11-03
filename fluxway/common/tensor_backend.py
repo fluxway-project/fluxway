@@ -1,10 +1,13 @@
+import contextlib
+import ctypes
+import operator
+import threading
 from abc import ABC, abstractmethod
 from functools import wraps
 from math import prod
-import operator
 from typing import Any
-import contextlib
-import threading
+
+import ml_dtypes  # noqa: F401
 import numpy as np
 
 from fluxway.common.allocation import AllocationDescriptor, AllocationIdentity
@@ -14,6 +17,155 @@ from fluxway.common.coherence import (
     UnsupportedAllocationHandoffError,
 )
 from fluxway.common.numba_runtime import call_numba_cached
+
+
+class _DLDevice(ctypes.Structure):
+    _fields_ = [("device_type", ctypes.c_int), ("device_id", ctypes.c_int)]
+
+
+class _DLDataType(ctypes.Structure):
+    _fields_ = [
+        ("type_code", ctypes.c_uint8),
+        ("bits", ctypes.c_uint8),
+        ("lanes", ctypes.c_uint16),
+    ]
+
+
+class _DLTensor(ctypes.Structure):
+    _fields_ = [
+        ("data", ctypes.c_void_p),
+        ("device", _DLDevice),
+        ("ndim", ctypes.c_int),
+        ("dtype", _DLDataType),
+        ("shape", ctypes.POINTER(ctypes.c_int64)),
+        ("strides", ctypes.POINTER(ctypes.c_int64)),
+        ("byte_offset", ctypes.c_uint64),
+    ]
+
+
+class _DLManagedTensor(ctypes.Structure):
+    pass
+
+
+_DLManagedTensorDeleter = ctypes.CFUNCTYPE(None, ctypes.POINTER(_DLManagedTensor))
+
+_DLManagedTensor._fields_ = [
+    ("dl_tensor", _DLTensor),
+    ("manager_ctx", ctypes.c_void_p),
+    ("deleter", _DLManagedTensorDeleter),
+]
+
+ctypes.pythonapi.PyCapsule_GetPointer.restype = ctypes.c_void_p
+ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
+ctypes.pythonapi.PyCapsule_New.restype = ctypes.py_object
+ctypes.pythonapi.PyCapsule_New.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_char_p,
+    ctypes.c_void_p,
+]
+
+
+_ACTIVE_DL_PACK_CONTEXTS: list[Any] = []
+
+
+class DLPackCompatibleNDArray(np.ndarray):
+    """NumPy ndarray subclass providing standard __dlpack__ for bfloat16 arrays."""
+
+    def __dlpack__(self, stream=None):
+        if self.dtype == np.dtype("bfloat16"):
+            ndim = self.ndim
+            shape_arr = (ctypes.c_int64 * ndim)(*self.shape)
+            itemsize = self.itemsize
+            if self.strides:
+                strides_arr = (ctypes.c_int64 * ndim)(
+                    *[s // itemsize for s in self.strides]
+                )
+            else:
+                strides_arr = None
+
+            managed = _DLManagedTensor()
+            managed.dl_tensor.data = ctypes.c_void_p(
+                int(self.__array_interface__["data"][0])
+            )
+            managed.dl_tensor.device = _DLDevice(1, 0)
+            managed.dl_tensor.ndim = ndim
+            managed.dl_tensor.dtype = _DLDataType(4, 16, 1)
+            managed.dl_tensor.shape = shape_arr
+            managed.dl_tensor.strides = strides_arr
+            managed.dl_tensor.byte_offset = 0
+            managed.manager_ctx = None
+            managed.deleter = _DLManagedTensorDeleter(0)
+
+            _ACTIVE_DL_PACK_CONTEXTS.append((managed, shape_arr, strides_arr, self))
+            if len(_ACTIVE_DL_PACK_CONTEXTS) > 1024:
+                del _ACTIVE_DL_PACK_CONTEXTS[:512]
+
+            return ctypes.pythonapi.PyCapsule_New(
+                ctypes.pointer(managed),
+                b"dltensor",
+                None,
+            )
+        return super().__dlpack__(stream=stream)
+
+    def __dlpack_device__(self):
+        return (1, 0)
+
+
+def _adopt_dlpack_cpu(capsule_or_obj: Any) -> np.ndarray:
+    """Zero-copy adopt a CPU array or DLPack capsule into a NumPy ndarray."""
+    if hasattr(capsule_or_obj, "__dlpack__") or not hasattr(
+        capsule_or_obj, "__array__"
+    ):
+        capsule = (
+            capsule_or_obj.__dlpack__()
+            if hasattr(capsule_or_obj, "__dlpack__")
+            else capsule_or_obj
+        )
+        ptr = ctypes.pythonapi.PyCapsule_GetPointer(capsule, b"dltensor")
+        if not ptr:
+            raise ValueError("Invalid dltensor capsule pointer.")
+
+        managed = _DLManagedTensor.from_address(ptr)
+        dlt = managed.dl_tensor
+        if dlt.device.device_type != 1:
+            raise ValueError(
+                f"_adopt_dlpack_cpu requires CPU tensor (device_type=1), got {dlt.device.device_type}."
+            )
+
+        if dlt.dtype.type_code == 4 and dlt.dtype.bits == 16:
+            shape = tuple(dlt.shape[i] for i in range(dlt.ndim))
+            if dlt.strides:
+                itemsize = (dlt.dtype.bits + 7) // 8
+                strides = tuple(dlt.strides[i] * itemsize for i in range(dlt.ndim))
+            else:
+                strides = None
+            data_ptr = dlt.data + dlt.byte_offset
+
+            class _DLPackHolder:
+                def __init__(self):
+                    iface = {
+                        "data": (data_ptr, False),
+                        "shape": shape,
+                        "typestr": "|V2",
+                        "version": 3,
+                    }
+                    if strides is not None:
+                        iface["strides"] = strides
+                    self.__array_interface__ = iface
+                    self._keepalive = capsule
+
+            raw_arr = np.asarray(_DLPackHolder())
+            return raw_arr.view(np.dtype("bfloat16")).view(DLPackCompatibleNDArray)
+
+        obj = DLPackObject(
+            capsule, device=(dlt.device.device_type, dlt.device.device_id)
+        )
+        return np.from_dlpack(obj)
+
+    arr = capsule_or_obj.__array__()
+    if arr.dtype == np.dtype("bfloat16"):
+        return arr.view(DLPackCompatibleNDArray)
+    return arr
 
 
 def force_writable(arr: Any) -> Any:
@@ -45,9 +197,17 @@ def force_writable(arr: Any) -> Any:
 
     if isinstance(arr, np.ndarray):
         if arr.flags.writeable:
+            if arr.dtype == np.dtype("bfloat16") and not isinstance(
+                arr, DLPackCompatibleNDArray
+            ):
+                return arr.view(DLPackCompatibleNDArray)
             return arr
         try:
             arr.flags.writeable = True
+            if arr.dtype == np.dtype("bfloat16") and not isinstance(
+                arr, DLPackCompatibleNDArray
+            ):
+                return arr.view(DLPackCompatibleNDArray)
             return arr
         except ValueError:
             pass
@@ -64,7 +224,12 @@ def force_writable(arr: Any) -> Any:
                 self.__array_interface__ = new_iface
                 self._source = source  # prevent GC → prevents DLPack free
 
-        return np.asarray(_WritableCPUView(arr))
+        res = np.asarray(_WritableCPUView(arr))
+        if res.dtype == np.dtype("bfloat16") and not isinstance(
+            res, DLPackCompatibleNDArray
+        ):
+            return res.view(DLPackCompatibleNDArray)
+        return res
 
     if not hasattr(arr, "__cuda_array_interface__"):
         return arr
@@ -95,7 +260,14 @@ def force_writable(arr: Any) -> Any:
 
 
 def prepare_dlpack_input(value: Any) -> Any:
-    return force_writable(value)
+    writable = force_writable(value)
+    if (
+        isinstance(writable, np.ndarray)
+        and writable.dtype == np.dtype("bfloat16")
+        and not isinstance(writable, DLPackCompatibleNDArray)
+    ):
+        return writable.view(DLPackCompatibleNDArray)
+    return writable
 
 
 def ensure_cpu_serializable(arr: Any) -> Any:
@@ -132,7 +304,7 @@ def ensure_cpu_serializable(arr: Any) -> Any:
         return np.asarray(arr)
 
     if hasattr(arr, "__dlpack__"):
-        return np.from_dlpack(arr)
+        return _adopt_dlpack_cpu(arr)
 
     return arr
 
@@ -218,6 +390,10 @@ def as_native_zerocopy(x: Any) -> Any:
     """
     # numpy fast-path
     if isinstance(x, np.ndarray):
+        if x.dtype == np.dtype("bfloat16") and not isinstance(
+            x, DLPackCompatibleNDArray
+        ):
+            return x.view(DLPackCompatibleNDArray)
         return x
 
     cp_mod = None
@@ -237,7 +413,7 @@ def as_native_zerocopy(x: Any) -> Any:
             )
         source_device, _ = x.__dlpack_device__()
         if source_device == 1:
-            return np.from_dlpack(x)
+            return _adopt_dlpack_cpu(x)
         if source_device in (2, 10):
             if cp_mod is None:
                 raise RuntimeError(
@@ -2007,7 +2183,7 @@ class HybridBackend(TensorBackend):
                 assert cp_mod is not None
                 result = cp_mod.from_dlpack(x)
                 return result.copy() if copy else result
-            result = np.from_dlpack(x)
+            result = _adopt_dlpack_cpu(x)
             return result.copy() if copy else result
 
         if copy is False:
@@ -2554,6 +2730,8 @@ class HybridBackend(TensorBackend):
             lib = self._cp if (self._cp is not None and device_type == 2) else np
         else:
             lib = np
+        if lib is np:
+            return force_writable(_adopt_dlpack_cpu(dlpack_capsule))
         capsule_obj = (
             dlpack_capsule
             if hasattr(dlpack_capsule, "__dlpack__")
@@ -2562,7 +2740,7 @@ class HybridBackend(TensorBackend):
         return force_writable(lib.from_dlpack(capsule_obj))
 
     def to_dlpack(self, x: Any) -> Any:
-        return x.__dlpack__()
+        return prepare_dlpack_input(x).__dlpack__()
 
 
 _BACKEND: TensorBackend | None = None

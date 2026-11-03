@@ -604,3 +604,33 @@ class TestEdgeCases:
             assert result[1] == 1
             assert result[2] == 1
             assert np.sum(result[3:]) == 0
+
+
+class TestHalfPrecisionSupport:
+    """Half-precision (bfloat16, float16) tests across HybridBackend."""
+
+    def test_bfloat16_creation_and_conversion(self, cpu_backend, gpu_backend):
+        for b in [cpu_backend, gpu_backend]:
+            arr = b.tensor([1.5, 2.5], dtype="bfloat16")
+            assert str(arr.dtype) == "bfloat16"
+            np_arr = b.to_numpy(arr)
+            assert str(np_arr.dtype) == "bfloat16"
+            assert np_arr.shape == (2,)
+
+    def test_float16_creation_and_conversion(self, cpu_backend, gpu_backend):
+        for b in [cpu_backend, gpu_backend]:
+            arr = b.tensor([1.5, 2.5], dtype="float16")
+            assert str(arr.dtype) == "float16"
+            np_arr = b.to_numpy(arr)
+            assert str(np_arr.dtype) == "float16"
+            assert np_arr.shape == (2,)
+
+    def test_dlpack_bfloat16_cpu_round_trip(self, cpu_backend):
+        arr = np.array([1.5, 2.5, 3.5], dtype="bfloat16")
+        cap = cpu_backend.to_dlpack(arr)
+        adopted = cpu_backend.from_dlpack(cap)
+        assert str(adopted.dtype) == "bfloat16"
+        assert adopted.shape == (3,)
+        np.testing.assert_array_equal(
+            adopted.astype(np.float32), arr.astype(np.float32)
+        )

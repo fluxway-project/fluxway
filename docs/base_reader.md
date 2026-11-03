@@ -282,3 +282,78 @@ cursors or restore old windows. External side effects need their own transaction
 or idempotency contract. A reader implementation alone does not establish a
 complete refill, drain or recovery loop; those boundaries are defined by
 [source coordination](source_coordination.md).
+
+## High-performance execution paradigm and pipeline overlap
+
+`BaseReader` as a Source SPMD is a first-class producer node in the MPMD DAG, fully reusing the framework's lifecycle management, step orchestration, and distributed data plane.
+
+```mermaid
+flowchart LR
+    subgraph ControlLane["Control Lane (AsyncIO Loop)"]
+        direction TB
+        Sched["Step Admission Scheduler"]
+        Mailbox["Data Plane Mailbox & Network"]
+    end
+
+    subgraph WorkerLanes["Managed Worker Process Lanes (WorkerProcess Threads)"]
+        direction TB
+        IO["Source Data Ingestion (I/O)"]
+        ArrowConcat["BaseReader.concatenate_batches"]
+        ArrowParse["BaseReader.create_tensors_from_batch"]
+        Tensor["TransportTensor Materialization"]
+        IO --> ArrowConcat --> ArrowParse --> Tensor
+    end
+
+    subgraph DownstreamLanes["Downstream Operator Lanes (InputSPMD)"]
+        direction TB
+        AsyncUnique["GPU/Network Communication async_unique"]
+        CpuFinalize["ctx.run_in_lane('compute')\nNumba & Tensor Materialization"]
+        AsyncUnique --> CpuFinalize
+    end
+
+    Sched -- "pipelined(depth=K) concurrent dispatch" --> IO
+    Tensor -- "Cross-node pipelined transfer" --> Mailbox
+    Mailbox -- "Delivered to input mailbox" --> AsyncUnique
+```
+
+### 1. Synchronous operator contract and non-blocking lane isolation
+* **Plain synchronous methods (`def read(self)`)**: Users write clean, idiomatic Python logic. The runtime scheduler (`UserCallableExecutor`) automatically dispatches standard synchronous functions to the `WORKER_PROCESS` thread pool lane.
+* **Hardware-level multi-core concurrency**: Underlying PyArrow, NumPy, and Numba C/C++ routines release the GIL during execution, achieving true hardware-level multi-core speedup while keeping the main asyncio event loop completely unblocked for cluster heartbeats and network coordination.
+* **Avoid CPU-heavy work in coroutines**: Never execute heavy Arrow/NumPy conversions or `TransportTensor` materializations directly on the asyncio event loop thread (`async def`). When CPU work must be conducted inside an async operator, offload it using `await self.ctx.run_in_lane(...)`.
+
+### 2. Zero-cost pipeline prefetching
+* No custom prefetcher classes, background queues, or circular buffers are required.
+* Declaring `async_policy=AsyncPolicy.pipelined(depth=K)` on the operator enables the DAG scheduler to proactively admit and execute $K$ steps ahead in the background worker threads. Materialized `TransportTensor` instances flow directly into downstream Mailboxes, achieving automatic pipelined prefetching.
+
+### 3. First-Class Arrow batch materialization and concatenation
+
+`BaseReader` provides built-in high-performance utilities for materializing and concatenating feature batches:
+
+| Method | Input Types | Output Type | Optimization Highlights |
+| :--- | :--- | :--- | :--- |
+| `create_tensors_from_batch(batch, ...)` | `pa.Table`, `pa.RecordBatch`, `Mapping` | `dict[str, TransportTensor]` | Automatically computes global coordinates; converts dense columns to tensors; extracts variable-length List/LargeList column offsets directly into ragged `TransportTensor` with `nested_splits`. |
+| `create_tensor(data, ...)` | `pa.Array`, `pa.ChunkedArray`, `ndarray`, `list` | `TransportTensor` | Unified tensor constructor supporting zero-copy parsing of primitive and ragged Arrow arrays. |
+| `concatenate_batches(batches)` | `Sequence[pa.Table]`, `Sequence[RecordBatch]`, `Sequence[Mapping]` | `pa.Table` or merged dict | Preferred for Range Workers and chunked parallel scans; uses permissive schema concatenation to minimize memory fragmentation. |
+
+```python
+# Example: Consuming Arrow Table directly inside a Reader
+class ParquetRecommendationReader(BaseReader):
+    @operator("read", async_policy=AsyncPolicy.pipelined(depth=4))
+    def read(self) -> dict[str, TransportTensor]:
+        table: pa.Table = self.load_next_parquet_table()
+        return self.create_tensors_from_batch(
+            table,
+            column_dtypes={"user_id": np.int32, "item_id": np.int32},
+            uniform_dense_partition=True,
+        )
+```
+
+### 4. Execution Paradigm Matrix
+
+| Paradigm / API | Signature | Execution Host | Best For | Architectural Advantages |
+| :--- | :--- | :--- | :--- | :--- |
+| **Sync Operator** | `def read(self)` / `def op(self)` | `WORKER_PROCESS` thread pool | Ingestion IO, unpacking, Arrow / NumPy parsing, matrix math | Zero async boilerplate, C extensions release GIL, event loop never blocked. |
+| **Async Operator** | `async def op(self)` | `COROUTINE_ASYNC` event loop | Network transfers, async IPC, lightweight event dispatch | Minimal context switch overhead for IO-bound concurrency. |
+| **Lane Offload** | `await self.ctx.run_in_lane(fn, *args, lane="compute")` | Dedicated bounded thread lane | Heavy CPU postprocessing (Numba, DLPack, indexing) within an async op | Bounded thread pool prevents CPU thrashing; propagates `contextvars` and profiler scopes without manual semaphores. |
+| **Unified Invoker** | `await invoke_callable_async(fn, *args, lane="default")` | Self-adapting dispatcher | Pipeline wrappers, generic adapters, custom transforms | Completely eliminates fragile `inspect.iscoroutinefunction` branching in client code. |
+

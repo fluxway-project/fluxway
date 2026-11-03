@@ -138,6 +138,15 @@ def _gather_2d_kernel(src, indices, out):
 
 
 @njit(nogil=True, cache=True)
+def _gather_2d_kernel_u16(src, indices, out):
+    """Bitwise 16-bit 2D gather for half-precision floating point types."""
+    for i in range(indices.shape[0]):
+        idx = indices[i]
+        for d in range(src.shape[1]):
+            out[i, d] = src[idx, d]
+
+
+@njit(nogil=True, cache=True)
 def _scatter_add_2d_kernel(out, idx, vals):
     """In-place ``out[idx] += vals`` for 2D ``out``/``vals`` and 1D ``idx``.
 
@@ -243,7 +252,14 @@ def _gather_sparse_input(emb_flat, inv, batch_size, emb_dim, gname=""):
         rec = emb_for_gather[inv_1d]
     else:
         rec = np.empty((inv_1d.shape[0], emb_dim), dtype=emb_2d.dtype)
-        _gather_2d_kernel(np.asarray(emb_for_gather), np.asarray(inv_1d), rec)
+        if rec.itemsize == 2:
+            _gather_2d_kernel_u16(
+                np.asarray(emb_for_gather).view(np.uint16),
+                np.asarray(inv_1d),
+                rec.view(np.uint16),
+            )
+        else:
+            _gather_2d_kernel(np.asarray(emb_for_gather), np.asarray(inv_1d), rec)
     return rec.reshape(batch_size, -1, emb_dim)
 
 
@@ -287,15 +303,32 @@ def _scatter_add_grad(emb_2d, inv_1d, grad_local):
             "This indicates a bug in the fluxway routing layer."
         )
 
-    g_unique = xp.zeros_like(emb_2d)
-
     if xp is not np:
         import cupyx
 
+        if emb_2d.dtype == xp.dtype("bfloat16"):
+            g_f32 = xp.zeros(emb_2d.shape, dtype=xp.float32)
+            cupyx.scatter_add(
+                g_f32,
+                xp.asarray(inv_1d),
+                xp.asarray(grad_local).astype(xp.float32),
+            )
+            return g_f32.astype(emb_2d.dtype)
+
+        g_unique = xp.zeros_like(emb_2d)
         cupyx.scatter_add(
             g_unique,
             xp.asarray(inv_1d),
             grad_local,
+        )
+        return g_unique
+
+    g_unique = xp.zeros_like(emb_2d)
+    if emb_2d.dtype in (np.float16, np.dtype("bfloat16")):
+        np.add.at(
+            np.asarray(g_unique),
+            np.asarray(inv_1d),
+            np.asarray(grad_local),
         )
     else:
         _scatter_add_2d_kernel(

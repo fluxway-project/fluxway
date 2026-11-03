@@ -228,6 +228,7 @@ class OperatorManager:
         node_rank: int = 0,
         num_nodes: int = 1,
         control_plane_handle: Any | None = None,
+        worker_process_runtime: Any | None = None,
     ):
         """
         Initialize OperatorManager.
@@ -254,6 +255,7 @@ class OperatorManager:
         self._node_rank = node_rank
         self._num_nodes = num_nodes
         self._control_plane_handle = control_plane_handle
+        self._worker_process_runtime = worker_process_runtime
         if not isinstance(instance_container, OperatorInstanceContainer):
             raise TypeError("OperatorManager requires an OperatorInstanceContainer")
         self._instance_container = instance_container
@@ -1168,6 +1170,25 @@ class OperatorManager:
             source_work_items=source_work_items,
         )
 
+        lane_runner = None
+        if self._worker_process_runtime is not None:
+
+            async def _run_in_lane(
+                fn: Any,
+                *args: Any,
+                lane: str = "default",
+                **kwargs: Any,
+            ) -> Any:
+                target = (lambda: fn(*args, **kwargs)) if (args or kwargs) else fn
+                return await self._worker_process_runtime.submit(
+                    target,
+                    callable_id=f"{self._spmd_id}.{op_name}.lane.{lane}",
+                    resource_id=0,
+                    execution_lane=lane,
+                )
+
+            lane_runner = _run_in_lane
+
         with operator_context(
             static_args=self._static_args,
             rank=self._rank,
@@ -1182,6 +1203,7 @@ class OperatorManager:
             control_plane=self._control_plane_handle,
             ray_component_limits=self._ray_component_limits,
             instance_container=self._instance_container,
+            lane_runner=lane_runner,
         ):
             yield
 
