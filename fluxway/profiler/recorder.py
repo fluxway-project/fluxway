@@ -363,6 +363,12 @@ USER_CALLABLE_EXECUTE = TraceEventSpec(
     ),
     "step",
 )
+USER_CALLABLE_LAUNCH = TraceEventSpec(
+    "user_callable.launch",
+    "compute/user_callable",
+    ("op_id", "step", "rank", "execution_mode"),
+    "step",
+)
 USER_CALLABLE_FUNCTION_RUN = TraceEventSpec(
     "user_callable.function_run",
     "compute/user_callable",
@@ -690,13 +696,52 @@ class TraceRecorder:
         process_name: str,
         clock_calibration: ClockCalibration | None = None,
         skip_initial_steps: int = 0,
+        step_interval: int = 1,
+        target_steps: frozenset[int] | None = None,
+        max_steps: int | None = None,
     ) -> None:
-        if skip_initial_steps < 0:
+        if (
+            isinstance(skip_initial_steps, bool)
+            or not isinstance(skip_initial_steps, int)
+            or skip_initial_steps < 0
+        ):
             raise ValueError("skip_initial_steps must be non-negative.")
+        if (
+            isinstance(step_interval, bool)
+            or not isinstance(step_interval, int)
+            or step_interval <= 0
+        ):
+            raise ValueError("step_interval must be positive.")
+        if target_steps is not None:
+            if not isinstance(target_steps, frozenset):
+                raise TypeError("target_steps must be a frozenset of integers or None.")
+            if any(
+                isinstance(s, bool) or not isinstance(s, int) or s < 0
+                for s in target_steps
+            ):
+                raise ValueError("target_steps elements must be non-negative integers.")
+        if max_steps is not None:
+            if (
+                isinstance(max_steps, bool)
+                or not isinstance(max_steps, int)
+                or max_steps <= 0
+            ):
+                raise ValueError("max_steps must be positive.")
         self._arena = arena
         self._run_id = run_id
         self._process_name = process_name
         self._skip_initial_steps = skip_initial_steps
+        self._step_interval = step_interval
+        self._target_steps = target_steps
+        self._max_steps = max_steps
+        self._collected_steps: set[int] = set()
+        self._step_lock = threading.Lock()
+        self._has_step_filter = (
+            skip_initial_steps > 0
+            or step_interval > 1
+            or target_steps is not None
+            or max_steps is not None
+        )
         self._clock_calibration = clock_calibration or ClockCalibration(
             monotonic_to_epoch_offset_ns=0,
             uncertainty_ns=0,
@@ -706,6 +751,28 @@ class TraceRecorder:
         self._payload_fields_by_name_id: dict[int, tuple[str, ...]] = {}
         self._intern_lock = threading.RLock()
         self._root_carrier = TraceCarrier.root(run_id)
+
+    def is_step_profiled(self, step: int) -> bool:
+        if not self._has_step_filter:
+            return True
+        if step < self._skip_initial_steps:
+            return False
+        if self._target_steps is not None and step not in self._target_steps:
+            return False
+        if self._step_interval > 1:
+            if (step - self._skip_initial_steps) % self._step_interval != 0:
+                return False
+        if self._max_steps is not None:
+            if step in self._collected_steps:
+                return True
+            with self._step_lock:
+                if step in self._collected_steps:
+                    return True
+                if len(self._collected_steps) >= self._max_steps:
+                    return False
+                self._collected_steps.add(step)
+                return True
+        return True
 
     @property
     def arena(self) -> TraceArena:
@@ -1262,6 +1329,24 @@ class TraceRecorder:
             ),
         )
 
+    def user_callable_launch(
+        self,
+        *,
+        op_name: str,
+        step: int,
+        rank: int,
+        execution_mode: str,
+    ) -> AbstractContextManager[None]:
+        return self._span(
+            USER_CALLABLE_LAUNCH,
+            payload=(
+                self.intern(op_name),
+                step,
+                rank,
+                self.intern(execution_mode),
+            ),
+        )
+
     def user_callable_function_run(
         self,
         *,
@@ -1292,6 +1377,31 @@ class TraceRecorder:
     ) -> AbstractContextManager[None]:
         return self._span(
             self._user_custom_spec(name=name, execution_mode=execution_mode),
+            payload=(
+                self.intern(op_name),
+                step,
+                rank,
+                self.intern(execution_mode),
+                self.intern(attrs_json),
+            ),
+        )
+
+    def user_custom_slice(
+        self,
+        *,
+        name: str,
+        op_name: str,
+        step: int,
+        rank: int,
+        execution_mode: str,
+        attrs_json: str,
+        start_ns: int,
+        dur_ns: int,
+    ) -> None:
+        self._slice(
+            self._user_custom_spec(name=name, execution_mode=execution_mode),
+            start_ns=start_ns,
+            dur_ns=dur_ns,
             payload=(
                 self.intern(op_name),
                 step,
@@ -1764,8 +1874,33 @@ class TraceRecorder:
                     payload=payload,
                 )
 
+    def _slice(
+        self,
+        spec: TraceEventSpec,
+        *,
+        start_ns: int,
+        dur_ns: int,
+        carrier: TraceCarrier | None = None,
+        payload: tuple[int, ...] = EMPTY_TRACE_PAYLOAD,
+    ) -> None:
+        if self._skip_record(spec, payload):
+            return
+        active = self._root_carrier if carrier is None else carrier
+        track_id, name_id = self._register_spec(spec)
+        self._arena.append(
+            kind=TraceEventKind.SLICE_BEGIN,
+            ts_ns=start_ns,
+            dur_ns=dur_ns,
+            track_id=track_id,
+            name_id=name_id,
+            flow_id=active.flow_id,
+            task_id=active.task_id,
+            parent_task_id=active.parent_task_id,
+            payload=payload,
+        )
+
     def _skip_record(self, spec: TraceEventSpec, payload: tuple[int, ...]) -> bool:
-        if self._skip_initial_steps <= 0:
+        if not self._has_step_filter:
             return False
         if spec.step_payload_field is None:
             return False
@@ -1781,7 +1916,8 @@ class TraceRecorder:
                 f"event={spec.name!r} payload length {len(payload)} does not contain "
                 f"step field {spec.step_payload_field!r} at index {step_index}."
             )
-        return payload[step_index] < self._skip_initial_steps
+        step = payload[step_index]
+        return not self.is_step_profiled(step)
 
     @asynccontextmanager
     async def _async_span(

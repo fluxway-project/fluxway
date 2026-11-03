@@ -49,6 +49,36 @@ assert not fw.profiler.enabled()
 分析未启用时，作用域和事件不执行记录，也不校验、驻留或序列化属性。
 大型张量和结构化数据应写入应用日志。
 
+### 异步操作与发射耗时采集
+
+当用户自定义算子或函数包含异步操作时，`fw.profiler.scope` 和 `fw.profiler.async_scope` 同时支持同步与异步上下文管理器（`with` 与 `async with`）。
+
+针对具有同步阻塞发射（例如向队列派发任务或发射 GPU Kernel）并在异步回调后完成的操作，可以调用 `op.launched()` 显式区分发射耗时与实际完成耗时：
+
+```python
+async def async_lookup(ids: list[int]):
+    async with fw.profiler.async_scope("async_embedding_lookup") as op:
+        # 1. 同步阻塞发射阶段
+        future = launch_request(ids)
+        op.launched()  # 记录 user.async_embedding_lookup.launch 的短耗时
+
+        # 2. 异步回调等待阶段
+        values = await future
+    # 代码块退出时自动记录完整的 user.async_embedding_lookup 真耗时
+    return values
+```
+
+基于回调形式的异步操作：
+
+```python
+op = fw.profiler.start_async_operation("callback_lookup")
+future = launch_request(ids)
+op.launched()
+future.add_done_callback(lambda _: op.complete())
+```
+
+在算子层面，使用 `async def` 声明的异步算子在执行时会自动分别记录 `user_callable.launch`（同步发射短耗时）与 `user_callable.function_run`（异步回调完成的真耗时）。
+
 ## 为作业启用采集
 
 安装导出依赖：
@@ -75,12 +105,18 @@ async def profile_job(
     run_id: str,
     *,
     skip_initial_steps: int = 0,
+    step_interval: int = 1,
+    target_steps: tuple[int, ...] | None = None,
+    max_steps: int | None = None,
     steady_state_only: bool = False,
 ) -> Path:
     config = ProfilerConfig(
         trace_dir=str(trace_directory),
         run_id=run_id,
         skip_initial_steps=skip_initial_steps,
+        step_interval=step_interval,
+        target_steps=target_steps,
+        max_steps=max_steps,
         steady_state_only=steady_state_only,
     )
     execution = await start(graph, placement_recipe=recipe, profiler_config=config)
@@ -97,7 +133,13 @@ async def profile_job(
 用 [Perfetto](https://ui.perfetto.dev/) 打开该文件。
 没有共享存储时，应从控制器所在机器取回文件，不能检查调用方本地的同名路径。
 
-`skip_initial_steps` 排除最初若干执行步，`steady_state_only` 只保留稳定执行区间内的记录。
+步数采集控制参数包括：
+- `skip_initial_steps`：跳过最初若干执行步（如 warmup 预热阶段）。
+- `step_interval`：控制采集步数间隔（例如 `step_interval=2` 每隔 2 步采集一次）。
+- `target_steps`：显式指定仅采集列表或集合中的具体步数。
+- `max_steps`：控制最大采集步数上限，累计达到该步数后自动停止采样。
+
+`steady_state_only` 只保留稳定执行区间内的记录。
 若过滤移除了全部记录，导出将抛出异常。
 采集使用固定大小的进程缓冲区，由 `buffer_bytes_per_process` 配置。
 默认启用严格的耗尽检查，容量不足时抛出 `ProfilerBufferExhausted`。

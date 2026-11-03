@@ -53,6 +53,36 @@ When profiling is inactive, scopes and events do nothing and do not validate,
 intern, or serialize attributes. Large tensors and structured payloads belong
 in application logs.
 
+### Asynchronous operations and launch latency
+
+When user custom operators or functions perform asynchronous operations, `fw.profiler.scope` and `fw.profiler.async_scope` support both synchronous and asynchronous context managers (`with` and `async with`).
+
+For async operations with a synchronous blocking launch (e.g. kernel submission or queue dispatch) followed by async callback completion, call `op.launched()`:
+
+```python
+async def async_lookup(ids: list[int]):
+    async with fw.profiler.async_scope("async_embedding_lookup") as op:
+        # 1. Synchronous blocking launch
+        future = launch_request(ids)
+        op.launched()  # Records user.async_embedding_lookup.launch
+
+        # 2. Asynchronous wait until callback / completion
+        values = await future
+    # Exiting the block records user.async_embedding_lookup true completion
+    return values
+```
+
+For callback-based async operations:
+
+```python
+op = fw.profiler.start_async_operation("callback_lookup")
+future = launch_request(ids)
+op.launched()
+future.add_done_callback(lambda _: op.complete())
+```
+
+At the operator level, declaring an operator with `async def` automatically records both `user_callable.launch` (the synchronous launch duration) and `user_callable.function_run` (the true completion duration).
+
 ## Enable collection for a job
 
 Install the export dependency:
@@ -81,12 +111,18 @@ async def profile_job(
     run_id: str,
     *,
     skip_initial_steps: int = 0,
+    step_interval: int = 1,
+    target_steps: tuple[int, ...] | None = None,
+    max_steps: int | None = None,
     steady_state_only: bool = False,
 ) -> Path:
     config = ProfilerConfig(
         trace_dir=str(trace_directory),
         run_id=run_id,
         skip_initial_steps=skip_initial_steps,
+        step_interval=step_interval,
+        target_steps=target_steps,
+        max_steps=max_steps,
         steady_state_only=steady_state_only,
     )
     execution = await start(graph, placement_recipe=recipe, profiler_config=config)
@@ -104,8 +140,13 @@ can override that location. Open the file with [Perfetto](https://ui.perfetto.de
 Without shared storage, retrieve it from the controller machine instead of
 checking a caller-local path.
 
-`skip_initial_steps` excludes early operator steps. `steady_state_only` keeps
-records in the steady-state execution interval; a filter that removes every
+Step-based collection is configured through:
+- `skip_initial_steps`: excludes early operator steps (e.g. warmup).
+- `step_interval`: controls the sampling interval (e.g. `step_interval=2` collects every 2 steps).
+- `target_steps`: restricts collection to an explicit list or set of steps.
+- `max_steps`: limits the total number of distinct steps collected before sampling stops.
+
+`steady_state_only` keeps records in the steady-state execution interval; a filter that removes every
 record raises an error. Collection uses a fixed per-process buffer configured
 by `buffer_bytes_per_process`. With its default strict exhaustion policy,
 insufficient capacity raises `ProfilerBufferExhausted`. Clock uncertainty beyond

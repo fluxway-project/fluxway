@@ -45,6 +45,9 @@ class ProfilerRuntimeFactory:
                 max_uncertainty_ns=config.max_clock_uncertainty_ns,
             ),
             skip_initial_steps=config.skip_initial_steps,
+            step_interval=config.step_interval,
+            target_steps=cast(frozenset[int] | None, config.target_steps),
+            max_steps=config.max_steps,
         )
         return cls(
             recorder,
