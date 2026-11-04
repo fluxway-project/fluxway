@@ -4995,7 +4995,35 @@ class SPMDWorker:
         *,
         background_prepare: bool,
     ) -> "TransportTensor":
-        del background_prepare
+        r"""Assemble tensor shards according to the operator prepare policy.
+
+        Execution Flow:
+        +-------------------------------------------------------------+
+        |                _assemble_tensor_for_prepare_policy          |
+        +-------------------------------------------------------------+
+                                       |
+                       [background_prepare == True?]
+                                      / \
+                                     /   \
+                             (Yes)  /     \  (No: sync operator)
+                                   v       v
+            +------------------------------+ +-----------------------+
+            |  _input_prepare_runtime      | |  _assemble_tensor     |
+            |  (PriorityThreadExecutor)    | |  (Event loop inline)  |
+            +------------------------------+ +-----------------------+
+                           |                             |
+                           +-------------> <-------------+
+                                          |
+                                          v
+                           +------------------------------+
+                           |  _assemble_tensor_sync       |
+                           |  (Numba concatenate/assemble)|
+                           +------------------------------+
+        """
+        if not background_prepare:
+            return await self._assemble_tensor(
+                op_name, transfer_code, step, shards, arrivals
+            )
         return await self._input_prepare_runtime.run_assemble(
             op_name,
             step,
@@ -5288,17 +5316,31 @@ class SPMDWorker:
         shards: dict[Any, list[Any]],
         arrivals: dict[Any, dict[str, Any]],
     ) -> "TransportTensor":
-        return await self._input_prepare_runtime.run_assemble(
-            op_name,
-            step,
-            lambda: self._assemble_tensor_sync_traced(
-                op_name,
-                transfer_code,
-                step,
-                shards,
-                arrivals,
-            ),
+        profiler_recorder = (
+            self._profiler_runtime.recorder if self._profiler_runtime.enabled else None
         )
+        if profiler_recorder is None:
+            return self._assemble_tensor_sync(
+                op_name, transfer_code, step, shards, arrivals
+            )
+        shard_count = (
+            sum(len(items) for items in shards.values())
+            if _profiler_enabled(self)
+            else 0
+        )
+        async with profiler_recorder.worker_assemble_tensor(
+            op_name=op_name,
+            transfer_code=transfer_code,
+            logical_tuuid=self._compiled_assemble_plan(
+                op_name, transfer_code
+            ).transfer.logical_tuuid,
+            step=step,
+            sender_count=len(shards),
+            shard_count=shard_count,
+        ):
+            return self._assemble_tensor_sync(
+                op_name, transfer_code, step, shards, arrivals
+            )
 
     def _assemble_tensor_sync_traced(
         self,
