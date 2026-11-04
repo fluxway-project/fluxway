@@ -79,25 +79,15 @@ def test_combined_step_filters():
 
 
 def test_step_control_validation():
-    with pytest.raises(
-        ValueError, match="ProfilerConfig.step_interval must be positive"
-    ):
+    with pytest.raises(ValueError, match="step_interval must be positive"):
         ProfilerConfig(trace_dir="/tmp", run_id="bad", step_interval=0)
-    with pytest.raises(
-        ValueError, match="ProfilerConfig.step_interval must be positive"
-    ):
+    with pytest.raises(ValueError, match="step_interval must be positive"):
         ProfilerConfig(trace_dir="/tmp", run_id="bad", step_interval=True)
-    with pytest.raises(
-        ValueError, match="ProfilerConfig.max_steps must be a positive integer"
-    ):
+    with pytest.raises(ValueError, match="max_steps must be positive"):
         ProfilerConfig(trace_dir="/tmp", run_id="bad", max_steps=-1)
-    with pytest.raises(
-        ValueError, match="ProfilerConfig.max_steps must be a positive integer"
-    ):
+    with pytest.raises(ValueError, match="max_steps must be positive"):
         ProfilerConfig(trace_dir="/tmp", run_id="bad", max_steps=True)
-    with pytest.raises(
-        ValueError, match="ProfilerConfig.target_steps elements must be non-negative"
-    ):
+    with pytest.raises(ValueError, match="target_steps elements must be non-negative"):
         ProfilerConfig(trace_dir="/tmp", run_id="bad", target_steps=[-1])
     with pytest.raises(
         TypeError, match="ProfilerConfig.target_steps must be an iterable"
@@ -173,6 +163,34 @@ async def test_async_scope_launch_and_completion():
     assert full_dur_ms >= 20.0
 
 
+def test_user_scope_records_through_public_slice_api(monkeypatch):
+    rec = TraceRecorder(
+        TraceArena(1024 * 1024), run_id="scope_api", process_name="rank:0"
+    )
+    calls = []
+    original = rec.user_custom_slice
+
+    def record_slice(**kwargs):
+        calls.append(kwargs)
+        original(**kwargs)
+
+    monkeypatch.setattr(rec, "user_custom_slice", record_slice)
+    with activate_user_profiler(
+        recorder=rec,
+        op_name="lookup",
+        step=3,
+        rank=0,
+        execution_mode="coroutine_async",
+    ):
+        with fw.profiler.scope("kernel", count=4) as scope:
+            scope.launched()
+
+    assert [call["name"] for call in calls] == ["user.kernel.launch", "user.kernel"]
+    assert all(
+        call["step"] == 3 and call["attrs_json"] == '{"count":4}' for call in calls
+    )
+
+
 @pytest.mark.asyncio
 async def test_callback_async_operation():
     rec = TraceRecorder(
@@ -206,7 +224,7 @@ async def test_callback_async_operation():
 
 
 @pytest.mark.asyncio
-async def test_coroutine_operator_records_launch_and_function_run():
+async def test_coroutine_operator_records_body_without_creation_span():
     rec = TraceRecorder(
         TraceArena(1024 * 1024), run_id="coro_op", process_name="rank:0"
     )
@@ -230,10 +248,8 @@ async def test_coroutine_operator_records_launch_and_function_run():
     snap = rec.snapshot()
     records = snap["records"]
     names = [snap["metadata"].name_for(int(r[4])) for r in records]
-    assert names == ["user_callable.launch", "user_callable.function_run"]
-    launch_dur_ms = records[0][2] / 1e6
-    func_dur_ms = records[1][2] / 1e6
-    assert launch_dur_ms < 5.0
+    assert names == ["user_callable.function_run"]
+    func_dur_ms = records[0][2] / 1e6
     assert func_dur_ms >= 20.0
 
 

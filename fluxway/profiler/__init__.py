@@ -17,7 +17,6 @@ from fluxway.profiler.user_api import (
     enabled,
     event,
     function_scope,
-    launch_scope,
     scope,
     start_async_operation,
 )
@@ -40,7 +39,6 @@ __all__ = [
     "enabled",
     "event",
     "function_scope",
-    "launch_scope",
     "scope",
     "start_async_operation",
 ]

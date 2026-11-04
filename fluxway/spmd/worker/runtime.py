@@ -12,7 +12,7 @@ import heapq
 import inspect
 import queue
 import threading
-from typing import Any
+from typing import Any, cast
 import weakref
 
 from fluxway.common import asyncio_runtime
@@ -192,7 +192,16 @@ def _wake_priority_thread_executors_on_interpreter_exit() -> None:
         executor.shutdown(wait=False, cancel_futures=True)
 
 
-threading._register_atexit(_wake_priority_thread_executors_on_interpreter_exit)
+def _register_threading_atexit(callback: Callable[[], Any]) -> None:
+    register_fn = getattr(threading, "_register_atexit", None)
+    if not callable(register_fn):
+        raise RuntimeError(
+            "threading._register_atexit is required for clean worker shutdown."
+        )
+    cast(Callable[[Callable[[], Any]], None], register_fn)(callback)
+
+
+_register_threading_atexit(_wake_priority_thread_executors_on_interpreter_exit)
 
 
 class WorkerProcessCallRuntime:

@@ -81,7 +81,13 @@ op.launched()
 future.add_done_callback(lambda _: op.complete())
 ```
 
-At the operator level, declaring an operator with `async def` automatically records both `user_callable.launch` (the synchronous launch duration) and `user_callable.function_run` (the true completion duration).
+At the operator level, `user_callable.execute` measures the whole call and
+`user_callable.function_run` measures the function body, including awaits in
+an `async def` operator. Coroutine creation does not launch the operation;
+use `op.launched()` inside a custom scope when there is a real launch boundary.
+If existing code calls `profiler.launch_scope()`, replace that call with a named
+`profiler.scope()` around the actual submission and call `op.launched()` at its
+completion. The automatic `user_callable.launch` slice is no longer emitted.
 
 ## Enable collection for a job
 
@@ -218,20 +224,30 @@ uses the same compiled graph as the [graph screenshots](graph_visualization.md).
 ## Match events to the compiled graph
 
 The surrounding `user_callable.execute` slice carries `graph_id`, `spmd_id`,
-`op_id`, `function_id`, `input_signature_id`, and `output_signature_id`.
-Search the same values in [Model Explorer](graph_visualization.md). Step and
-execution mode are runtime facts, not compiled graph fields.
+and `op_id` to locate the operator in
+[Model Explorer](graph_visualization.md). The exported `operator.function`
+annotation identifies its function. Step and execution mode are runtime facts,
+not compiled graph fields.
 
-At export, `CompiledGraph` supplies operator functions, declared data/control/
-static port names, and explicit parameter-to-field paths. An empty parameter map
-stays empty; names are not guessed. A `transfer_code` identifies one source-to-
+The compiled graph owns operator functions, declared data/control/static port
+names, signatures, and explicit parameter-to-field paths. The trace repeats
+only the function name for readability; inspect static port and parameter
+details in Model Explorer. A `transfer_code` identifies one source-to-
 target port transfer; `logical_tuuid` identifies the producer output. One output
 may feed multiple target ports, sharing a logical tensor ID but using separate
 transfer codes.
 
 The recorder stores fixed-width integer records on the hot path. Graph names
-are resolved once during export through the frozen symbol projection. Explicit
-operator, transfer, or tensor IDs must resolve or raise `MissingGraphTraceSymbol`.
+are resolved during export through the frozen symbol projection. Slice-ending
+packets only close the slice; annotations are stored on the start packet.
+Explicit operator, transfer, or tensor IDs must resolve or raise `MissingGraphTraceSymbol`.
 Lifecycle events such as `execution.phase` may intentionally have no operator
 ID and remain non-operator metadata. Controller records use a separate entry
 point with the same recorder format and export pipeline.
+
+For trace consumers migrating from the older schema, join `graph_id`,
+`spmd_id`, and `op_id` to the compiled graph for function signatures, ports,
+and parameter paths. The per-slice `function_id`, signature IDs, and
+`operator.input.*` / `operator.output.*` annotations are no longer emitted.
+Read slice annotations from `TYPE_SLICE_BEGIN` and match `TYPE_SLICE_END` by
+track UUID; the end packet has no event name or annotations.

@@ -77,7 +77,11 @@ op.launched()
 future.add_done_callback(lambda _: op.complete())
 ```
 
-在算子层面，使用 `async def` 声明的异步算子在执行时会自动分别记录 `user_callable.launch`（同步发射短耗时）与 `user_callable.function_run`（异步回调完成的真耗时）。
+在算子层面，`user_callable.execute` 记录整个调用，`user_callable.function_run`
+记录函数体耗时；`async def` 算子的等待也计入函数体。仅创建 coroutine 对象并未发射操作；
+需要区分真实发射阶段时，在自定义作用域内显式调用 `op.launched()`。
+已有代码若调用 `profiler.launch_scope()`，应改为在真实提交操作的位置建立具名
+`profiler.scope()`，并在提交完成时调用 `op.launched()`。不再自动生成 `user_callable.launch` 切片。
 
 ## 为作业启用采集
 
@@ -201,17 +205,23 @@ Controller/<subsystem>/<leaf>
 
 ## 将事件对应到编译后的计算图
 
-外围的 `user_callable.execute` 切片携带 `graph_id`、`spmd_id`、`op_id`、
-`function_id`、`input_signature_id` 和 `output_signature_id`。
-可以在 [Model Explorer](graph_visualization_zh.md) 中搜索相同值。
+外围的 `user_callable.execute` 切片携带 `graph_id`、`spmd_id` 和 `op_id`，
+可据此在 [Model Explorer](graph_visualization_zh.md) 中定位算子。
+导出的 `operator.function` 注解显示函数名。
 执行步和调用模式属于运行时事实，不属于编译后的计算图字段。
 
-导出时，`CompiledGraph` 提供算子函数、已声明的数据端口、控制端口、静态端口名称，
-以及显式的参数到字段路径。参数映射为空时保持为空，不猜测名称。
+`CompiledGraph` 保存算子函数、已声明的数据端口、控制端口、静态端口名称、签名，
+以及显式的参数到字段路径。trace 只重复函数名以方便阅读；静态端口和参数细节在 Model Explorer 中查看。
 `transfer_code` 标识从源端口到目标端口的一次传输，`logical_tuuid` 标识生产者输出。
 同一个输出可以供给多个目标端口：它们共享逻辑张量标识，但具有各自的传输编码。
 
 记录器在热路径上保存定宽整数记录，图名称在导出时通过冻结的符号投影统一解析。
+切片结束包只负责闭合切片，属性保存在开始包。
 显式的算子、传输或张量标识必须能解析，否则抛出 `MissingGraphTraceSymbol`。
 `execution.phase` 等生命周期事件可以不携带算子标识，按非算子元数据处理。
 控制器使用独立的记录入口，但共用同一记录格式和导出流程。
+
+旧版 trace 消费端应使用 `graph_id`、`spmd_id` 和 `op_id` 关联编译图，
+从编译图读取函数签名、端口和参数路径。切片中不再逐次写出 `function_id`、
+签名 ID 以及 `operator.input.*` / `operator.output.*` 注解。
+读取 `TYPE_SLICE_BEGIN` 的属性，再按轨道 UUID 匹配 `TYPE_SLICE_END`；结束包不带事件名或属性。

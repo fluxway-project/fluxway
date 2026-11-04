@@ -61,8 +61,6 @@ class UserScopeContext:
         "_name",
         "_attrs_json",
         "_start_ns",
-        "_launch_start_ns",
-        "_launch_dur_ns",
         "_launched",
         "_completed",
     )
@@ -86,14 +84,11 @@ class UserScopeContext:
         self._name = name
         self._attrs_json = attrs_json
         self._start_ns = 0
-        self._launch_start_ns = 0
-        self._launch_dur_ns = 0
         self._launched = False
         self._completed = False
 
     def __enter__(self) -> UserScopeContext:
         self._start_ns = time.perf_counter_ns()
-        self._launch_start_ns = self._start_ns
         return self
 
     def __exit__(
@@ -102,16 +97,11 @@ class UserScopeContext:
         exc: BaseException | None,
         traceback: Any,
     ) -> bool:
-        if not self._completed and self._start_ns > 0:
-            dur_ns = time.perf_counter_ns() - self._start_ns
-            self._record_slice(self._name, self._start_ns, dur_ns)
-            self._completed = True
+        self.complete()
         return False
 
     async def __aenter__(self) -> UserScopeContext:
-        self._start_ns = time.perf_counter_ns()
-        self._launch_start_ns = self._start_ns
-        return self
+        return self.__enter__()
 
     async def __aexit__(
         self,
@@ -119,18 +109,12 @@ class UserScopeContext:
         exc: BaseException | None,
         traceback: Any,
     ) -> bool:
-        if not self._completed and self._start_ns > 0:
-            dur_ns = time.perf_counter_ns() - self._start_ns
-            self._record_slice(self._name, self._start_ns, dur_ns)
-            self._completed = True
-        return False
+        return self.__exit__(exc_type, exc, traceback)
 
     def launched(self) -> None:
-        if not self._launched and self._launch_start_ns > 0:
-            self._launch_dur_ns = time.perf_counter_ns() - self._launch_start_ns
-            self._record_slice(
-                f"{self._name}.launch", self._launch_start_ns, self._launch_dur_ns
-            )
+        if not self._launched and self._start_ns > 0:
+            dur_ns = time.perf_counter_ns() - self._start_ns
+            self._record_slice(f"{self._name}.launch", self._start_ns, dur_ns)
             self._launched = True
 
     def complete(self) -> None:
@@ -140,20 +124,15 @@ class UserScopeContext:
             self._completed = True
 
     def _record_slice(self, event_name: str, start_ns: int, dur_ns: int) -> None:
-        spec = self._recorder._user_custom_spec(
-            name=event_name, execution_mode=self._execution_mode
-        )
-        self._recorder._slice(
-            spec,
+        self._recorder.user_custom_slice(
+            name=event_name,
+            op_name=self._op_name,
+            step=self._step,
+            rank=self._rank,
+            execution_mode=self._execution_mode,
+            attrs_json=self._attrs_json,
             start_ns=start_ns,
             dur_ns=dur_ns,
-            payload=(
-                self._recorder.intern(self._op_name),
-                self._step,
-                self._rank,
-                self._recorder.intern(self._execution_mode),
-                self._recorder.intern(self._attrs_json),
-            ),
         )
 
 
@@ -210,14 +189,6 @@ class UserProfilerHandle:
             execution_mode=self._execution_mode,
         )
 
-    def launch_scope(self) -> Any:
-        return self._recorder.user_callable_launch(
-            op_name=self._op_name,
-            step=self._step,
-            rank=self._rank,
-            execution_mode=self._execution_mode,
-        )
-
     def start_async_operation(
         self, name: str, attrs: dict[str, Any]
     ) -> UserScopeContext:
@@ -263,13 +234,6 @@ def function_scope() -> Any:
     if handle is None or not handle.enabled:
         return _NOOP_SCOPE
     return handle.function_scope()
-
-
-def launch_scope() -> Any:
-    handle = _ACTIVE_USER_PROFILER.get()
-    if handle is None or not handle.enabled:
-        return _NOOP_SCOPE
-    return handle.launch_scope()
 
 
 @contextmanager

@@ -45,18 +45,6 @@ class ProfilerConfig:
             raise ValueError(
                 "ProfilerConfig.max_clock_uncertainty_ns must be non-negative."
             )
-        if (
-            isinstance(self.skip_initial_steps, bool)
-            or not isinstance(self.skip_initial_steps, int)
-            or self.skip_initial_steps < 0
-        ):
-            raise ValueError("ProfilerConfig.skip_initial_steps must be non-negative.")
-        if (
-            isinstance(self.step_interval, bool)
-            or not isinstance(self.step_interval, int)
-            or self.step_interval <= 0
-        ):
-            raise ValueError("ProfilerConfig.step_interval must be positive.")
         if self.target_steps is not None:
             if not isinstance(self.target_steps, Iterable) or isinstance(
                 self.target_steps, (str, bytes)
@@ -65,19 +53,8 @@ class ProfilerConfig:
                     "ProfilerConfig.target_steps must be an iterable of integers."
                 )
             target_steps_set = frozenset(self.target_steps)
-            for step in target_steps_set:
-                if isinstance(step, bool) or not isinstance(step, int) or step < 0:
-                    raise ValueError(
-                        "ProfilerConfig.target_steps elements must be non-negative integers."
-                    )
             object.__setattr__(self, "target_steps", target_steps_set)
-        if self.max_steps is not None:
-            if (
-                isinstance(self.max_steps, bool)
-                or not isinstance(self.max_steps, int)
-                or self.max_steps <= 0
-            ):
-                raise ValueError("ProfilerConfig.max_steps must be a positive integer.")
+        self.create_step_filter()
         if not isinstance(self.diagnostics, frozenset):
             raise TypeError("ProfilerConfig.diagnostics must be a frozenset")
         if any(not isinstance(item, ProfilerDiagnostic) for item in self.diagnostics):

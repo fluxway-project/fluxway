@@ -221,7 +221,7 @@ flowchart TB
 
 #### 5. Diagnostics, profiling & cross-cutting plane (`fluxway.diagnostics`, `fluxway.profiler`, `fluxway.common`)
 - **Non-blocking Diagnostics**: `prepare_worker_runtime_env` injects `worker_process_setup_hook` into Ray workers. Intercepts Ray SIGTERM handlers, delegating signals through a non-blocking pipe (`os.pipe2(O_NONBLOCK | O_CLOEXEC)`) to a background daemon emitter (`_SignalEventEmitter`), ensuring zero deadlock in interrupt context. `report_actor_exit` attributes process terminations.
-- **High-Resolution Distributed Profiler**: `ProfilerRuntimeFactory` and `PerfettoTraceWriter` output Perfetto `.pftrace` files and Google Model Explorer graph bundles. Synchronizes events across nodes using Hybrid Logical Clocks (`TraceClockSource`), with hierarchical scopes (`async_scope`, `function_scope`, `launch_scope`).
+- **High-Resolution Distributed Profiler**: `ProfilerRuntimeFactory` and `PerfettoTraceWriter` output Perfetto `.pftrace` files and Google Model Explorer graph bundles. Synchronizes events across nodes using Hybrid Logical Clocks (`TraceClockSource`), with hierarchical scopes (`async_scope`, `function_scope`) and explicit user launch boundaries via `scope().launched()`.
 - **Dynamic Resource Registry**: `ResourceRegistry` and `LogicalPartitionBinding` bind dynamic runtime resources (`ResourceHandle(namespace, resource_id)`) across partitions.
 - **Framework & Serialization Support**: Zero-copy DLPack tensor protocol bridging JAX, PyTorch, and NumPy, and binary MessagePack serialization via `msgpack_codec.py`.
 

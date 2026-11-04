@@ -65,13 +65,13 @@ class BaseReader:
         first = batches[0]
         if len(batches) == 1:
             return first
-        import pyarrow as pa
+        pa = _pyarrow()
 
-        if isinstance(first, pa.Table):
+        if pa is not None and isinstance(first, pa.Table):
             if any(not isinstance(b, pa.Table) for b in batches[1:]):
                 raise TypeError("All batches must be pyarrow.Table instances")
             return pa.concat_tables(batches, promote_options="permissive")
-        if isinstance(first, pa.RecordBatch):
+        if pa is not None and isinstance(first, pa.RecordBatch):
             if any(not isinstance(b, pa.RecordBatch) for b in batches[1:]):
                 raise TypeError("All batches must be pyarrow.RecordBatch instances")
             return pa.Table.from_batches(batches)
@@ -83,7 +83,9 @@ class BaseReader:
                     result[key] = np.concatenate(vals, axis=0)
                 elif all(isinstance(v, list) for v in vals):
                     result[key] = [item for sub in vals for item in sub]
-                elif all(isinstance(v, (pa.Array, pa.ChunkedArray)) for v in vals):
+                elif pa is not None and all(
+                    isinstance(v, (pa.Array, pa.ChunkedArray)) for v in vals
+                ):
                     result[key] = pa.chunked_array(vals)
                 else:
                     raise TypeError(
@@ -102,9 +104,9 @@ class BaseReader:
         uniform_dense_partition: bool = False,
     ) -> dict[str, TransportTensor]:
         """Materialize an Arrow Table, RecordBatch, or column mapping into TransportTensors."""
-        import pyarrow as pa
+        pa = _pyarrow()
 
-        if isinstance(batch, (pa.Table, pa.RecordBatch)):
+        if pa is not None and isinstance(batch, (pa.Table, pa.RecordBatch)):
             column_items = [(name, batch[name]) for name in batch.column_names]
             row_count = batch.num_rows
         elif isinstance(batch, Mapping):
@@ -122,7 +124,7 @@ class BaseReader:
         tensors: dict[str, TransportTensor] = {}
         for name, col in column_items:
             expected_dtype = None if column_dtypes is None else column_dtypes.get(name)
-            if isinstance(col, (pa.Array, pa.ChunkedArray)):
+            if pa is not None and isinstance(col, (pa.Array, pa.ChunkedArray)):
                 col_type = col.type
                 if pa.types.is_list(col_type) or pa.types.is_large_list(col_type):
                     chunk = (
@@ -191,9 +193,9 @@ class BaseReader:
         origin_indices, global_rows = self._source_batch_coordinates(
             _outer_length(data)
         )
-        import pyarrow as pa
+        pa = _pyarrow()
 
-        if isinstance(data, (pa.Array, pa.ChunkedArray)):
+        if pa is not None and isinstance(data, (pa.Array, pa.ChunkedArray)):
             col_type = data.type
             if pa.types.is_list(col_type) or pa.types.is_large_list(col_type):
                 chunk = (
@@ -286,15 +288,24 @@ class BaseReader:
         ), batches.pop()
 
 
+def _pyarrow() -> Any:
+    try:
+        import pyarrow as pa
+
+        return pa
+    except (ImportError, TypeError):
+        return None
+
+
 def _outer_length(data: Any) -> int:
     if isinstance(data, (list, tuple)):
         return len(data)
     shape = getattr(data, "shape", None)
     if shape is not None and len(shape) > 0:
         return int(shape[0])
-    import pyarrow as pa
+    pa = _pyarrow()
 
-    if isinstance(data, (pa.Array, pa.ChunkedArray)):
+    if pa is not None and isinstance(data, (pa.Array, pa.ChunkedArray)):
         return len(data)
     raise TypeError(
         f"reader tensor data must have an outer batch dimension, got {type(data).__name__}"

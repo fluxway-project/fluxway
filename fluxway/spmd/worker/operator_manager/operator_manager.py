@@ -32,7 +32,7 @@ from fluxway.common.types.sharding import (
 )
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.operator_spec import OperatorSpec
-from fluxway.profiler.user_api import function_scope, launch_scope
+from fluxway.profiler.user_api import function_scope
 from fluxway.common.operator_instances import OperatorInstanceContainer
 from fluxway.common.ingestion import SourceWorkItem
 from fluxway.spmd.worker.operator_manager.dispatcher import (
@@ -1119,8 +1119,7 @@ class OperatorManager:
         operator = self._operator_for_execution(op_name, coroutine_function=True)
         call_args, call_kwargs = self._operator_arguments(op_name, args, kwargs)
         with self._operator_execution_context(op_name, step, source_work_items):
-            with launch_scope():
-                coro = operator(*call_args, **call_kwargs)
+            coro = operator(*call_args, **call_kwargs)
             with function_scope():
                 return await coro
 

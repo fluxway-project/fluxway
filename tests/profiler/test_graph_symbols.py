@@ -84,7 +84,7 @@ def _graph():
     )
 
 
-def test_graph_trace_symbols_preserve_fanout_endpoints_and_parameter_paths():
+def test_graph_trace_symbols_preserve_fanout_endpoints_and_data_ports():
     graph = _graph()
     symbols = GraphTraceSymbols.from_compiled_graph(graph)
     first, second = graph.dependencies[0].transfers
@@ -97,14 +97,7 @@ def test_graph_trace_symbols_preserve_fanout_endpoints_and_parameter_paths():
     operator = symbols.operator(OperatorKey("target", "consume"))
     assert operator.function_id == "training.Target.consume"
     assert operator.input_data_ports == ("left.ids", "right.ids")
-    assert operator.input_control_ports == ("step",)
-    assert operator.input_static_arguments == ("training",)
-    assert operator.input_parameter_paths == (
-        ("left", ("left.ids",)),
-        ("right", ("right.ids",)),
-        ("step", ("step",)),
-        ("training", ("training",)),
-    )
+    assert operator.output_data_ports == ()
 
 
 def test_graph_trace_symbols_raise_typed_errors_for_unknown_identity():
@@ -250,11 +243,13 @@ async def test_perfetto_writer_adds_graph_symbols_without_widening_records(tmp_p
     source_ports = set()
     source_functions = set()
     operator_functions = set()
-    input_parameters = set()
     logical_tensor_producers = set()
     for packet in trace.packet:
         event = packet.track_event
-        if event.name != "worker.assemble_tensor":
+        if (
+            event.type != proto.TrackEvent.TYPE_SLICE_BEGIN
+            or event.name != "worker.assemble_tensor"
+        ):
             continue
         values = {
             annotation.name: annotation.string_value
@@ -265,17 +260,14 @@ async def test_perfetto_writer_adds_graph_symbols_without_widening_records(tmp_p
         source_ports.add(values["transfer.source.port"])
         source_functions.add(values["transfer.source.function"])
         operator_functions.add(values["operator.function"])
-        input_parameters.add(values["operator.input.parameters"])
+        assert not any(key.startswith("operator.input.") for key in values)
+        assert not any(key.startswith("operator.output.") for key in values)
         logical_tensor_producers.add(values["logical_tensor.producer"])
 
     assert target_ports == {"left.ids", "right.ids"}
     assert source_ports == {"batch.ids"}
     assert source_functions == {"training.Source.emit"}
     assert operator_functions == {"training.Target.consume"}
-    assert input_parameters == {
-        "left -> [left.ids]; right -> [right.ids]; step -> [step]; "
-        "training -> [training]"
-    }
     assert logical_tensor_producers == {"source.emit:batch.ids"}
 
 
@@ -339,24 +331,16 @@ async def test_graph_annotation_resolver_reuses_cold_path_projection(monkeypatch
             return symbols.tensor(logical_tuuid)
 
     counting_symbols = CountingSymbols()
-    format_calls = 0
     hierarchy_calls = 0
     from fluxway.profiler import perfetto_writer
 
-    original_format = perfetto_writer.format_parameter_paths
     original_hierarchy = perfetto_writer.TraceTrackHierarchy.from_track_name
-
-    def counted_format(paths):
-        nonlocal format_calls
-        format_calls += 1
-        return original_format(paths)
 
     def counted_hierarchy(track_name: str):
         nonlocal hierarchy_calls
         hierarchy_calls += 1
         return original_hierarchy(track_name)
 
-    monkeypatch.setattr(perfetto_writer, "format_parameter_paths", counted_format)
     monkeypatch.setattr(
         perfetto_writer.TraceTrackHierarchy,
         "from_track_name",
@@ -387,7 +371,6 @@ async def test_graph_annotation_resolver_reuses_cold_path_projection(monkeypatch
         "transfer": 1,
         "tensor": 1,
     }
-    assert format_calls == 1
     assert hierarchy_calls == 1
 
 

@@ -9,6 +9,7 @@ from fluxway.common.tensor_components import (
     TensorRouting,
     dense_path_strides,
     fill_nested_dense_inv_kernel,
+    fill_nested_dense_inv_with_pad,
     nested_global_positions_kernel,
     nested_path_position_maps,
     row_partition_sparse_feature,
@@ -159,3 +160,41 @@ def test_nested_sparse_padding_inv_uses_dense_slot_holes():
         [[10, 11], [12, 3]],
         [[14, 15], [6, 7]],
     ]
+
+
+def test_fill_nested_dense_inv_with_pad_multilevel():
+    tensor = TransportTensor.from_lists(
+        [[[11, 12], [13]], [[21, 22]]],
+        dtype=np.uint64,
+    )
+    sparse_layout = row_partition_sparse_feature("nested_sparse_dim_8", tensor)
+    out = np.empty((2, 2, 2), dtype=np.int64)
+
+    fill_nested_dense_inv_with_pad(
+        np.array([10, 11, 12, 14, 15], dtype=np.int64),
+        sparse_layout.nested_splits,
+        dense_path_strides(sparse_layout.widths),
+        -1,
+        out,
+    )
+
+    assert out.tolist() == [
+        [[10, 11], [12, -1]],
+        [[14, 15], [-1, -1]],
+    ]
+
+
+def test_fill_nested_dense_inv_with_pad_empty_splits_raises():
+    import pytest
+
+    out = np.empty((2, 2), dtype=np.int64)
+    with pytest.raises(
+        ValueError, match="nested_splits must contain at least one level"
+    ):
+        fill_nested_dense_inv_with_pad(
+            np.array([1, 2], dtype=np.int64),
+            (),
+            np.array([2, 1], dtype=np.int64),
+            -1,
+            out,
+        )

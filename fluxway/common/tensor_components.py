@@ -545,29 +545,226 @@ def scatter_inv_local_kernel(
         out[i] = global_positions[inv_1d[i]] - global_start
 
 
-@_numba_kernel(nogil=True, cache=True)
+_MAX_NESTED_LEVELS = 16
+
+
+@njit(nogil=True)
+def _walk_forward_tree_pad(
+    b: int,
+    nested_splits: tuple[np.ndarray, ...],
+    strides: np.ndarray,
+    widths: np.ndarray,
+    flat_to_unique_local: np.ndarray,
+    pad_index: int,
+    out_flat: np.ndarray,
+) -> None:
+    levels = len(nested_splits)
+    stride0 = strides[0]
+    base0 = b * stride0
+
+    for slot in range(stride0):
+        out_flat[base0 + slot] = pad_index
+
+    if levels == 1:
+        start = nested_splits[0][b]
+        end = nested_splits[0][b + 1]
+        length = end - start
+        width = widths[0]
+        limit = length if length < width else width
+        stride1 = strides[1]
+        for i in range(limit):
+            out_flat[base0 + i * stride1] = flat_to_unique_local[start + i]
+        return
+
+    node_idx = np.zeros(_MAX_NESTED_LEVELS, dtype=np.int64)
+    node_end = np.zeros(_MAX_NESTED_LEVELS, dtype=np.int64)
+    local_idx = np.zeros(_MAX_NESTED_LEVELS, dtype=np.int64)
+    offset_base = np.zeros(_MAX_NESTED_LEVELS, dtype=np.int64)
+
+    offset_base[0] = base0
+    node_idx[0] = b
+    node_end[0] = b + 1
+
+    node_idx[1] = nested_splits[0][b]
+    node_end[1] = nested_splits[0][b + 1]
+    local_idx[1] = 0
+    offset_base[1] = base0
+
+    curr_level = 1
+    while curr_level > 0:
+        if (
+            node_idx[curr_level] < node_end[curr_level]
+            and local_idx[curr_level] < widths[curr_level - 1]
+        ):
+            curr_node = node_idx[curr_level]
+            curr_local = local_idx[curr_level]
+            curr_offset = offset_base[curr_level] + curr_local * strides[curr_level]
+
+            if curr_level == levels - 1:
+                leaf_start = nested_splits[curr_level][curr_node]
+                leaf_end = nested_splits[curr_level][curr_node + 1]
+                leaf_len = leaf_end - leaf_start
+                leaf_stride = strides[curr_level + 1]
+                w_leaf = widths[curr_level]
+                limit = leaf_len if leaf_len < w_leaf else w_leaf
+                for i in range(limit):
+                    out_flat[curr_offset + i * leaf_stride] = flat_to_unique_local[
+                        leaf_start + i
+                    ]
+                node_idx[curr_level] += 1
+                local_idx[curr_level] += 1
+            else:
+                next_level = curr_level + 1
+                node_idx[next_level] = nested_splits[curr_level][curr_node]
+                node_end[next_level] = nested_splits[curr_level][curr_node + 1]
+                local_idx[next_level] = 0
+                offset_base[next_level] = curr_offset
+                curr_level = next_level
+        else:
+            curr_level -= 1
+            if curr_level > 0:
+                node_idx[curr_level] += 1
+                local_idx[curr_level] += 1
+
+
+@njit(nogil=True)
+def _walk_forward_tree_slot_holes(
+    b: int,
+    nested_splits: tuple[np.ndarray, ...],
+    strides: np.ndarray,
+    widths: np.ndarray,
+    flat_to_unique_local: np.ndarray,
+    out_flat: np.ndarray,
+) -> None:
+    levels = len(nested_splits)
+    stride0 = strides[0]
+    base0 = b * stride0
+
+    for slot in range(stride0):
+        out_flat[base0 + slot] = base0 + slot
+
+    if levels == 1:
+        start = nested_splits[0][b]
+        end = nested_splits[0][b + 1]
+        length = end - start
+        width = widths[0]
+        limit = length if length < width else width
+        stride1 = strides[1]
+        for i in range(limit):
+            out_flat[base0 + i * stride1] = flat_to_unique_local[start + i]
+        return
+
+    node_idx = np.zeros(_MAX_NESTED_LEVELS, dtype=np.int64)
+    node_end = np.zeros(_MAX_NESTED_LEVELS, dtype=np.int64)
+    local_idx = np.zeros(_MAX_NESTED_LEVELS, dtype=np.int64)
+    offset_base = np.zeros(_MAX_NESTED_LEVELS, dtype=np.int64)
+
+    offset_base[0] = base0
+    node_idx[0] = b
+    node_end[0] = b + 1
+
+    node_idx[1] = nested_splits[0][b]
+    node_end[1] = nested_splits[0][b + 1]
+    local_idx[1] = 0
+    offset_base[1] = base0
+
+    curr_level = 1
+    while curr_level > 0:
+        if (
+            node_idx[curr_level] < node_end[curr_level]
+            and local_idx[curr_level] < widths[curr_level - 1]
+        ):
+            curr_node = node_idx[curr_level]
+            curr_local = local_idx[curr_level]
+            curr_offset = offset_base[curr_level] + curr_local * strides[curr_level]
+
+            if curr_level == levels - 1:
+                leaf_start = nested_splits[curr_level][curr_node]
+                leaf_end = nested_splits[curr_level][curr_node + 1]
+                leaf_len = leaf_end - leaf_start
+                leaf_stride = strides[curr_level + 1]
+                w_leaf = widths[curr_level]
+                limit = leaf_len if leaf_len < w_leaf else w_leaf
+                for i in range(limit):
+                    out_flat[curr_offset + i * leaf_stride] = flat_to_unique_local[
+                        leaf_start + i
+                    ]
+                node_idx[curr_level] += 1
+                local_idx[curr_level] += 1
+            else:
+                next_level = curr_level + 1
+                node_idx[next_level] = nested_splits[curr_level][curr_node]
+                node_end[next_level] = nested_splits[curr_level][curr_node + 1]
+                local_idx[next_level] = 0
+                offset_base[next_level] = curr_offset
+                curr_level = next_level
+        else:
+            curr_level -= 1
+            if curr_level > 0:
+                node_idx[curr_level] += 1
+                local_idx[curr_level] += 1
+
+
+@_numba_kernel(parallel=True, nogil=True, cache=True)
+def _fill_nested_dense_inv_kernel(
+    flat_to_unique_local: np.ndarray,
+    nested_splits: tuple[np.ndarray, ...],
+    strides: np.ndarray,
+    widths: np.ndarray,
+    out: np.ndarray,
+) -> None:
+    batch_size = nested_splits[0].shape[0] - 1
+    out_flat = out.ravel()
+    for b in prange(batch_size):  # type: ignore
+        _walk_forward_tree_slot_holes(
+            b,
+            nested_splits,
+            strides,
+            widths,
+            flat_to_unique_local,
+            out_flat,
+        )
+
+
 def fill_nested_dense_inv_kernel(
     flat_to_unique_local: np.ndarray,
     nested_splits: tuple[np.ndarray, ...],
     strides: np.ndarray,
     out: np.ndarray,
 ) -> None:
-    for dense_slot in range(out.size):
-        out.flat[dense_slot] = dense_slot
-    for flat_index in range(flat_to_unique_local.shape[0]):
-        child = flat_index
-        dense_slot = 0
-        for level in range(len(nested_splits) - 1, -1, -1):
-            splits = nested_splits[level]
-            parent = np.searchsorted(splits, child, side="right") - 1
-            offset = child - splits[parent]
-            dense_slot += offset * strides[level + 1]
-            child = parent
-        dense_slot += child * strides[0]
-        out.flat[dense_slot] = flat_to_unique_local[flat_index]
+    widths = np.asarray(out.shape[1:], dtype=np.int64)
+    _fill_nested_dense_inv_kernel(
+        flat_to_unique_local,
+        nested_splits,
+        strides,
+        widths,
+        out,
+    )
 
 
-@_numba_kernel(nogil=True, cache=True)
+@_numba_kernel(parallel=True, nogil=True, cache=True)
+def _fill_nested_dense_inv_with_pad_kernel(
+    flat_to_unique_local: np.ndarray,
+    nested_splits: tuple[np.ndarray, ...],
+    strides: np.ndarray,
+    widths: np.ndarray,
+    pad_index: int,
+    out: np.ndarray,
+) -> None:
+    batch_size = nested_splits[0].shape[0] - 1
+    out_flat = out.ravel()
+    for b in prange(batch_size):  # type: ignore
+        _walk_forward_tree_pad(
+            b,
+            nested_splits,
+            strides,
+            widths,
+            flat_to_unique_local,
+            pad_index,
+            out_flat,
+        )
+
+
 def fill_nested_dense_inv_with_pad_kernel(
     flat_to_unique_local: np.ndarray,
     nested_splits: tuple[np.ndarray, ...],
@@ -575,19 +772,15 @@ def fill_nested_dense_inv_with_pad_kernel(
     pad_index: int,
     out: np.ndarray,
 ) -> None:
-    for dense_slot in range(out.size):
-        out.flat[dense_slot] = pad_index
-    for flat_index in range(flat_to_unique_local.shape[0]):
-        child = flat_index
-        dense_slot = 0
-        for level in range(len(nested_splits) - 1, -1, -1):
-            splits = nested_splits[level]
-            parent = np.searchsorted(splits, child, side="right") - 1
-            offset = child - splits[parent]
-            dense_slot += offset * strides[level + 1]
-            child = parent
-        dense_slot += child * strides[0]
-        out.flat[dense_slot] = flat_to_unique_local[flat_index]
+    widths = np.asarray(out.shape[1:], dtype=np.int64)
+    _fill_nested_dense_inv_with_pad_kernel(
+        flat_to_unique_local,
+        nested_splits,
+        strides,
+        widths,
+        pad_index,
+        out,
+    )
 
 
 @_numba_kernel(parallel=True, nogil=True, cache=True)
@@ -617,6 +810,13 @@ def fill_nested_dense_inv_with_pad(
     pad_index: int,
     out: np.ndarray,
 ) -> None:
+    if not nested_splits:
+        raise ValueError("nested_splits must contain at least one level.")
+    if len(nested_splits) > _MAX_NESTED_LEVELS:
+        raise ValueError(
+            f"nested_splits depth {len(nested_splits)} exceeds maximum "
+            f"supported depth {_MAX_NESTED_LEVELS}."
+        )
     if len(nested_splits) == 1 and out.ndim == 2:
         splits = nested_splits[0]
         if splits.ndim != 1:

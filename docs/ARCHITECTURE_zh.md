@@ -213,7 +213,7 @@ flowchart TB
 
 #### 5. 观测、性能分析与横切基础设施 (`fluxway.diagnostics`、`fluxway.profiler`、`fluxway.common`)
 - **非阻塞诊断与信号捕获**：`prepare_worker_runtime_env` 向 Ray 工作进程注入 `worker_process_setup_hook`，拦截 Ray SIGTERM 处理，通过无锁非阻塞管道（`os.pipe2(O_NONBLOCK | O_CLOEXEC)`）向后台守护输出线程（`_SignalEventEmitter`）投递事件，杜绝信号处理上下文死锁；`report_actor_exit` 精准归因外部驱逐与抢占。
-- **高精分布式 Profiler**：`ProfilerRuntimeFactory` 与 `PerfettoTraceWriter` 输出 Perfetto `.pftrace` 跟踪文件与 Google Model Explorer 计算图，基于混合逻辑时钟（`TraceClockSource` HLC）对齐多节点时间戳，提供分层跟踪作用域（`async_scope`、`function_scope`、`launch_scope`）。
+- **高精分布式 Profiler**：`ProfilerRuntimeFactory` 与 `PerfettoTraceWriter` 输出 Perfetto `.pftrace` 跟踪文件与 Google Model Explorer 计算图，基于混合逻辑时钟（`TraceClockSource` HLC）对齐多节点时间戳，提供分层跟踪作用域（`async_scope`、`function_scope`）和由 `scope().launched()` 显式标记的用户发射边界。
 - **动态资源注册中心**：`ResourceRegistry` 与 `LogicalPartitionBinding` 在运行时跨分片绑定动态资源句柄（`ResourceHandle(namespace, resource_id)`）。
 - **多框架与序列化适配**：通过 DLPack 协议统一适配 JAX、PyTorch 与 NumPy 张量后端；通过 `msgpack_codec.py` 二进制序列化事务清单与持久化元数据。
 

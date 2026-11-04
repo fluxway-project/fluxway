@@ -22,6 +22,7 @@ from fluxway.profiler.record import (
     stable_u64,
 )
 from fluxway.profiler.clock import ClockCalibration
+from fluxway.profiler.filtering import StepFilter
 
 if TYPE_CHECKING:
     from fluxway.common.compiled_graph import CompiledOperator
@@ -355,18 +356,9 @@ USER_CALLABLE_EXECUTE = TraceEventSpec(
         "graph_id",
         "spmd_id",
         "op_id",
-        "function_id",
         "step",
-        "input_signature_id",
-        "output_signature_id",
         "execution_mode",
     ),
-    "step",
-)
-USER_CALLABLE_LAUNCH = TraceEventSpec(
-    "user_callable.launch",
-    "compute/user_callable",
-    ("op_id", "step", "rank", "execution_mode"),
     "step",
 )
 USER_CALLABLE_FUNCTION_RUN = TraceEventSpec(
@@ -695,53 +687,14 @@ class TraceRecorder:
         run_id: str,
         process_name: str,
         clock_calibration: ClockCalibration | None = None,
-        skip_initial_steps: int = 0,
-        step_interval: int = 1,
-        target_steps: frozenset[int] | None = None,
-        max_steps: int | None = None,
+        step_filter: StepFilter | None = None,
     ) -> None:
-        if (
-            isinstance(skip_initial_steps, bool)
-            or not isinstance(skip_initial_steps, int)
-            or skip_initial_steps < 0
-        ):
-            raise ValueError("skip_initial_steps must be non-negative.")
-        if (
-            isinstance(step_interval, bool)
-            or not isinstance(step_interval, int)
-            or step_interval <= 0
-        ):
-            raise ValueError("step_interval must be positive.")
-        if target_steps is not None:
-            if not isinstance(target_steps, frozenset):
-                raise TypeError("target_steps must be a frozenset of integers or None.")
-            if any(
-                isinstance(s, bool) or not isinstance(s, int) or s < 0
-                for s in target_steps
-            ):
-                raise ValueError("target_steps elements must be non-negative integers.")
-        if max_steps is not None:
-            if (
-                isinstance(max_steps, bool)
-                or not isinstance(max_steps, int)
-                or max_steps <= 0
-            ):
-                raise ValueError("max_steps must be positive.")
+        if step_filter is not None and not isinstance(step_filter, StepFilter):
+            raise TypeError("step_filter must be a StepFilter or None.")
         self._arena = arena
         self._run_id = run_id
         self._process_name = process_name
-        self._skip_initial_steps = skip_initial_steps
-        self._step_interval = step_interval
-        self._target_steps = target_steps
-        self._max_steps = max_steps
-        self._collected_steps: set[int] = set()
-        self._step_lock = threading.Lock()
-        self._has_step_filter = (
-            skip_initial_steps > 0
-            or step_interval > 1
-            or target_steps is not None
-            or max_steps is not None
-        )
+        self._step_filter = StepFilter() if step_filter is None else step_filter
         self._clock_calibration = clock_calibration or ClockCalibration(
             monotonic_to_epoch_offset_ns=0,
             uncertainty_ns=0,
@@ -753,26 +706,7 @@ class TraceRecorder:
         self._root_carrier = TraceCarrier.root(run_id)
 
     def is_step_profiled(self, step: int) -> bool:
-        if not self._has_step_filter:
-            return True
-        if step < self._skip_initial_steps:
-            return False
-        if self._target_steps is not None and step not in self._target_steps:
-            return False
-        if self._step_interval > 1:
-            if (step - self._skip_initial_steps) % self._step_interval != 0:
-                return False
-        if self._max_steps is not None:
-            if step in self._collected_steps:
-                return True
-            with self._step_lock:
-                if step in self._collected_steps:
-                    return True
-                if len(self._collected_steps) >= self._max_steps:
-                    return False
-                self._collected_steps.add(step)
-                return True
-        return True
+        return self._step_filter.is_step_profiled(step)
 
     @property
     def arena(self) -> TraceArena:
@@ -1321,28 +1255,7 @@ class TraceRecorder:
                 self.intern(graph_id),
                 self.intern(compiled_operator.key.spmd_id),
                 self.intern(compiled_operator.key.op_id),
-                self.intern(compiled_operator.function_id),
                 step,
-                self.intern(compiled_operator.input_signature_id),
-                self.intern(compiled_operator.output_signature_id),
-                self.intern(execution_mode),
-            ),
-        )
-
-    def user_callable_launch(
-        self,
-        *,
-        op_name: str,
-        step: int,
-        rank: int,
-        execution_mode: str,
-    ) -> AbstractContextManager[None]:
-        return self._span(
-            USER_CALLABLE_LAUNCH,
-            payload=(
-                self.intern(op_name),
-                step,
-                rank,
                 self.intern(execution_mode),
             ),
         )
@@ -1362,27 +1275,6 @@ class TraceRecorder:
                 step,
                 rank,
                 self.intern(execution_mode),
-            ),
-        )
-
-    def user_custom_scope(
-        self,
-        *,
-        name: str,
-        op_name: str,
-        step: int,
-        rank: int,
-        execution_mode: str,
-        attrs_json: str,
-    ) -> AbstractContextManager[None]:
-        return self._span(
-            self._user_custom_spec(name=name, execution_mode=execution_mode),
-            payload=(
-                self.intern(op_name),
-                step,
-                rank,
-                self.intern(execution_mode),
-                self.intern(attrs_json),
             ),
         )
 
@@ -1900,7 +1792,7 @@ class TraceRecorder:
         )
 
     def _skip_record(self, spec: TraceEventSpec, payload: tuple[int, ...]) -> bool:
-        if not self._has_step_filter:
+        if not self._step_filter.has_filter:
             return False
         if spec.step_payload_field is None:
             return False
@@ -1917,7 +1809,7 @@ class TraceRecorder:
                 f"step field {spec.step_payload_field!r} at index {step_index}."
             )
         step = payload[step_index]
-        return not self.is_step_profiled(step)
+        return not self._step_filter.is_step_profiled(step)
 
     @asynccontextmanager
     async def _async_span(
