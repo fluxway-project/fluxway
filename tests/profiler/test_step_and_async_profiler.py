@@ -192,7 +192,8 @@ async def test_callback_async_operation():
         fut = asyncio.get_running_loop().create_future()
         fut.add_done_callback(lambda _: op.complete())
         asyncio.get_running_loop().call_later(0.015, fut.set_result, 42)
-        await fut
+        res = await fut
+        assert res == 42
 
     snap = rec.snapshot()
     records = snap["records"]

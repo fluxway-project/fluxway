@@ -7,7 +7,7 @@ from functools import wraps
 from math import prod
 from typing import Any
 
-import ml_dtypes  # noqa: F401
+import ml_dtypes
 import numpy as np
 
 from fluxway.common.allocation import AllocationDescriptor, AllocationIdentity
@@ -65,6 +65,7 @@ ctypes.pythonapi.PyCapsule_New.argtypes = [
 ]
 
 
+_BFLOAT16_DTYPE = np.dtype(ml_dtypes.bfloat16)
 _ACTIVE_DL_PACK_CONTEXTS: list[Any] = []
 
 
@@ -72,7 +73,7 @@ class DLPackCompatibleNDArray(np.ndarray):
     """NumPy ndarray subclass providing standard __dlpack__ for bfloat16 arrays."""
 
     def __dlpack__(self, stream=None):
-        if self.dtype == np.dtype("bfloat16"):
+        if self.dtype == _BFLOAT16_DTYPE:
             ndim = self.ndim
             shape_arr = (ctypes.c_int64 * ndim)(*self.shape)
             itemsize = self.itemsize
@@ -155,7 +156,7 @@ def _adopt_dlpack_cpu(capsule_or_obj: Any) -> np.ndarray:
                     self._keepalive = capsule
 
             raw_arr = np.asarray(_DLPackHolder())
-            return raw_arr.view(np.dtype("bfloat16")).view(DLPackCompatibleNDArray)
+            return raw_arr.view(_BFLOAT16_DTYPE).view(DLPackCompatibleNDArray)
 
         obj = DLPackObject(
             capsule, device=(dlt.device.device_type, dlt.device.device_id)
@@ -163,7 +164,7 @@ def _adopt_dlpack_cpu(capsule_or_obj: Any) -> np.ndarray:
         return np.from_dlpack(obj)
 
     arr = capsule_or_obj.__array__()
-    if arr.dtype == np.dtype("bfloat16"):
+    if arr.dtype == _BFLOAT16_DTYPE:
         return arr.view(DLPackCompatibleNDArray)
     return arr
 
@@ -197,14 +198,14 @@ def force_writable(arr: Any) -> Any:
 
     if isinstance(arr, np.ndarray):
         if arr.flags.writeable:
-            if arr.dtype == np.dtype("bfloat16") and not isinstance(
+            if arr.dtype == _BFLOAT16_DTYPE and not isinstance(
                 arr, DLPackCompatibleNDArray
             ):
                 return arr.view(DLPackCompatibleNDArray)
             return arr
         try:
             arr.flags.writeable = True
-            if arr.dtype == np.dtype("bfloat16") and not isinstance(
+            if arr.dtype == _BFLOAT16_DTYPE and not isinstance(
                 arr, DLPackCompatibleNDArray
             ):
                 return arr.view(DLPackCompatibleNDArray)
@@ -225,7 +226,7 @@ def force_writable(arr: Any) -> Any:
                 self._source = source  # prevent GC → prevents DLPack free
 
         res = np.asarray(_WritableCPUView(arr))
-        if res.dtype == np.dtype("bfloat16") and not isinstance(
+        if res.dtype == _BFLOAT16_DTYPE and not isinstance(
             res, DLPackCompatibleNDArray
         ):
             return res.view(DLPackCompatibleNDArray)
@@ -263,7 +264,7 @@ def prepare_dlpack_input(value: Any) -> Any:
     writable = force_writable(value)
     if (
         isinstance(writable, np.ndarray)
-        and writable.dtype == np.dtype("bfloat16")
+        and writable.dtype == _BFLOAT16_DTYPE
         and not isinstance(writable, DLPackCompatibleNDArray)
     ):
         return writable.view(DLPackCompatibleNDArray)
@@ -390,9 +391,7 @@ def as_native_zerocopy(x: Any) -> Any:
     """
     # numpy fast-path
     if isinstance(x, np.ndarray):
-        if x.dtype == np.dtype("bfloat16") and not isinstance(
-            x, DLPackCompatibleNDArray
-        ):
+        if x.dtype == _BFLOAT16_DTYPE and not isinstance(x, DLPackCompatibleNDArray):
             return x.view(DLPackCompatibleNDArray)
         return x
 

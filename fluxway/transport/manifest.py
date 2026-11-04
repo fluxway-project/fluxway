@@ -8,7 +8,7 @@ import struct
 from typing import Any, cast
 
 import numpy as np
-import ml_dtypes  # noqa: F401
+import ml_dtypes
 
 from fluxway.common.coherence import CoherenceAction
 from fluxway.common.tensor_protocol import DLPackTensor, dlpack_tensor_shape
@@ -222,7 +222,7 @@ def dtype_from_code(code: int) -> np.dtype:
     if payload_dtype is PayloadDType.FLOAT64:
         return np.dtype(np.float64)
     if payload_dtype is PayloadDType.BFLOAT16:
-        return np.dtype("bfloat16")
+        return np.dtype(ml_dtypes.bfloat16)
     if payload_dtype is PayloadDType.BOOL:
         return np.dtype(np.bool_)
     raise ValueError(f"Unsupported transport payload dtype code {code}.")

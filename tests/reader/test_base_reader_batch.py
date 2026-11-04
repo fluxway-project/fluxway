@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import numpy as np
-import pyarrow as pa
 import pytest
 
 from fluxway.common.decorators import operator_context
 from fluxway.common.types.configs import OperatorContext
 from fluxway.reader.base_reader import BaseReader
+
+pa = pytest.importorskip("pyarrow")
 
 
 def _make_operator_context(
