@@ -53,6 +53,42 @@ When profiling is inactive, scopes and events do nothing and do not validate,
 intern, or serialize attributes. Large tensors and structured payloads belong
 in application logs.
 
+### Asynchronous operations and launch latency
+
+When user custom operators or functions perform asynchronous operations, `fw.profiler.scope` and `fw.profiler.async_scope` support both synchronous and asynchronous context managers (`with` and `async with`).
+
+For async operations with a synchronous blocking launch (e.g. kernel submission or queue dispatch) followed by async callback completion, call `op.launched()`:
+
+```python
+async def async_lookup(ids: list[int]):
+    async with fw.profiler.async_scope("async_embedding_lookup") as op:
+        # 1. Synchronous blocking launch
+        future = launch_request(ids)
+        op.launched()  # Records user.async_embedding_lookup.launch
+
+        # 2. Asynchronous wait until callback / completion
+        values = await future
+    # Exiting the block records user.async_embedding_lookup true completion
+    return values
+```
+
+For callback-based async operations:
+
+```python
+op = fw.profiler.start_async_operation("callback_lookup")
+future = launch_request(ids)
+op.launched()
+future.add_done_callback(lambda _: op.complete())
+```
+
+At the operator level, `user_callable.execute` measures the whole call and
+`user_callable.function_run` measures the function body, including awaits in
+an `async def` operator. Coroutine creation does not launch the operation;
+use `op.launched()` inside a custom scope when there is a real launch boundary.
+If existing code calls `profiler.launch_scope()`, replace that call with a named
+`profiler.scope()` around the actual submission and call `op.launched()` at its
+completion. The automatic `user_callable.launch` slice is no longer emitted.
+
 ## Enable collection for a job
 
 Install the export dependency:
@@ -81,12 +117,18 @@ async def profile_job(
     run_id: str,
     *,
     skip_initial_steps: int = 0,
+    step_interval: int = 1,
+    target_steps: tuple[int, ...] | None = None,
+    max_steps: int | None = None,
     steady_state_only: bool = False,
 ) -> Path:
     config = ProfilerConfig(
         trace_dir=str(trace_directory),
         run_id=run_id,
         skip_initial_steps=skip_initial_steps,
+        step_interval=step_interval,
+        target_steps=target_steps,
+        max_steps=max_steps,
         steady_state_only=steady_state_only,
     )
     execution = await start(graph, placement_recipe=recipe, profiler_config=config)
@@ -104,8 +146,13 @@ can override that location. Open the file with [Perfetto](https://ui.perfetto.de
 Without shared storage, retrieve it from the controller machine instead of
 checking a caller-local path.
 
-`skip_initial_steps` excludes early operator steps. `steady_state_only` keeps
-records in the steady-state execution interval; a filter that removes every
+Step-based collection is configured through:
+- `skip_initial_steps`: excludes early operator steps (e.g. warmup).
+- `step_interval`: controls the sampling interval (e.g. `step_interval=2` collects every 2 steps).
+- `target_steps`: restricts collection to an explicit list or set of steps.
+- `max_steps`: limits the total number of distinct steps collected before sampling stops.
+
+`steady_state_only` keeps records in the steady-state execution interval; a filter that removes every
 record raises an error. Collection uses a fixed per-process buffer configured
 by `buffer_bytes_per_process`. With its default strict exhaustion policy,
 insufficient capacity raises `ProfilerBufferExhausted`. Clock uncertainty beyond
@@ -177,20 +224,30 @@ uses the same compiled graph as the [graph screenshots](graph_visualization.md).
 ## Match events to the compiled graph
 
 The surrounding `user_callable.execute` slice carries `graph_id`, `spmd_id`,
-`op_id`, `function_id`, `input_signature_id`, and `output_signature_id`.
-Search the same values in [Model Explorer](graph_visualization.md). Step and
-execution mode are runtime facts, not compiled graph fields.
+and `op_id` to locate the operator in
+[Model Explorer](graph_visualization.md). The exported `operator.function`
+annotation identifies its function. Step and execution mode are runtime facts,
+not compiled graph fields.
 
-At export, `CompiledGraph` supplies operator functions, declared data/control/
-static port names, and explicit parameter-to-field paths. An empty parameter map
-stays empty; names are not guessed. A `transfer_code` identifies one source-to-
+The compiled graph owns operator functions, declared data/control/static port
+names, signatures, and explicit parameter-to-field paths. The trace repeats
+only the function name for readability; inspect static port and parameter
+details in Model Explorer. A `transfer_code` identifies one source-to-
 target port transfer; `logical_tuuid` identifies the producer output. One output
 may feed multiple target ports, sharing a logical tensor ID but using separate
 transfer codes.
 
 The recorder stores fixed-width integer records on the hot path. Graph names
-are resolved once during export through the frozen symbol projection. Explicit
-operator, transfer, or tensor IDs must resolve or raise `MissingGraphTraceSymbol`.
+are resolved during export through the frozen symbol projection. Slice-ending
+packets only close the slice; annotations are stored on the start packet.
+Explicit operator, transfer, or tensor IDs must resolve or raise `MissingGraphTraceSymbol`.
 Lifecycle events such as `execution.phase` may intentionally have no operator
 ID and remain non-operator metadata. Controller records use a separate entry
 point with the same recorder format and export pipeline.
+
+For trace consumers migrating from the older schema, join `graph_id`,
+`spmd_id`, and `op_id` to the compiled graph for function signatures, ports,
+and parameter paths. The per-slice `function_id`, signature IDs, and
+`operator.input.*` / `operator.output.*` annotations are no longer emitted.
+Read slice annotations from `TYPE_SLICE_BEGIN` and match `TYPE_SLICE_END` by
+track UUID; the end packet has no event name or annotations.

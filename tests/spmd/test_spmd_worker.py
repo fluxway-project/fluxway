@@ -383,6 +383,7 @@ def test_worker_setup_and_start_initializes_runtime(monkeypatch):
             local_world_size=None,
             node_rank=0,
             num_nodes=1,
+            worker_process_runtime=None,
         ):
             self.payload = (
                 config,
@@ -393,6 +394,7 @@ def test_worker_setup_and_start_initializes_runtime(monkeypatch):
                 node_rank,
                 num_nodes,
                 instance_container,
+                worker_process_runtime,
             )
             calls["manager_static_args"] = static_args
 

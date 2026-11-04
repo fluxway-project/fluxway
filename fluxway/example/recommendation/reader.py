@@ -121,7 +121,7 @@ class RecommendationReader(BaseReader):
             "labels": {"type": "static", "axis": ["worker"]},
         },
     )
-    async def read(self) -> UserBatch | None:
+    def read(self) -> UserBatch | None:
         if self.ctx is None:
             raise RuntimeError(
                 "RecommendationReader.read requires an active OperatorContext"

@@ -49,6 +49,182 @@ are covered in [data-plane runtime](dataplane_runtime.md); see [execution
 lifecycle](execution_lifecycle.md) for barriers
 and failure boundaries.
 
+## Layered architecture
+
+Fluxway is organized into five specialized planes:
+
+1. **Control plane**: owns global graph compilation, placement optimization, lifecycle coordination, ingestion layouts, and distributed checkpoint transactions.
+2. **Driver / coordination plane**: supervises each SPMD mesh, coordinating step synchronization, flow-control credit, and worker health.
+3. **Worker / execution plane**: executes partitioned user operators, managing local step pipelines, input assembly, and local checkpoint state.
+4. **Data / transport plane**: handles peer-to-peer tensor delivery, cache coherence (MESI), frame batching, and high-performance carriers (`AxonDataPlane`, `RayActorDataPlane`).
+5. **Diagnostics, profiling & cross-cutting plane**: provides non-blocking OS signal interception, actor exit attribution, HLC-synchronized Perfetto tracing, and dynamic resource binding.
+
+```mermaid
+flowchart TB
+    subgraph ControlPlane["Control Plane"]
+        direction TB
+        CP_Ctrl["ControllerActor / Controller<br/>(Global Lifecycle & Orchestrator)"]
+        CP_FSM["ControllerStateMachine (FSM)<br/>& BoundedEffectScheduler (Async/Thread/Process)"]
+        CP_SPMD["SPMDManager & SPMDHandle<br/>(Mesh Topology & Actor Lifecycle)"]
+        CP_Sched["PlacementPlanner & Scheduler (PGManager)<br/>(PlacementRecipe, STRICT_SPREAD)"]
+        CP_HBFc["HeartbeatManager, Monitor<br/>& FlowControlManager (Credit & Health)"]
+        CP_Ing["IngestionLayoutPlanningComponent<br/>& SourceProgressSupervisor (IOLane)"]
+        CP_Ledger["LogicalWorkLedger & AlgebraicLayoutCompiler<br/>(Leases, ACK Frontiers, Cuts)"]
+        CP_Ckpt["FluxwayCheckpointer & CheckpointRepository<br/>(2PC: STAGED -> COMMIT_DECIDED -> COMMITTED)"]
+        CP_CkptReg["CheckpointComponentRegistry & Retention<br/>(SafeTensors, Orbax, WorkerLocal, Inline)"]
+        
+        CP_Ctrl --- CP_FSM
+        CP_Ctrl --> CP_SPMD
+        CP_Ctrl --> CP_Sched
+        CP_Ctrl --> CP_HBFc
+        CP_Ctrl --> CP_Ing
+        CP_Ing --> CP_Ledger
+        CP_Ctrl --> CP_Ckpt
+        CP_Ckpt --> CP_CkptReg
+    end
+
+    subgraph DriverPlane["Driver / Coordination Plane (Per SPMD Mesh)"]
+        direction TB
+        DR_Driver["SPMDDriver (Ray Actor)<br/>(Mesh Supervisor & Admission Coordinator)"]
+        DR_FSM["DriverStateMachine (FSM)<br/>& BoundedEffectScheduler"]
+        DR_Exec["RayWorkerExecutor<br/>& DriverComponentRegistry (Worker Supervision)"]
+        DR_Credit["CreditManager (CreditWindow/Edges)<br/>& SPMDSynchronizer (MaxSkewSyncPolicy)"]
+        DR_Mon["SnapshotOrchestrator, SPMDMonitor<br/>& HeartbeatManager (Readiness Aggregator)"]
+        
+        DR_Driver --- DR_FSM
+        DR_Driver --> DR_Exec
+        DR_Driver --> DR_Credit
+        DR_Driver --> DR_Mon
+    end
+
+    subgraph WorkerPlane["Worker / Execution Plane (Per Rank / Shard)"]
+        direction TB
+        WK_Worker["SPMDWorker (Ray Actor)<br/>(Sharded Operator Execution)"]
+        WK_Lifecycle["WorkerExecutionLifecycle<br/>& StepAdmissionState (Admission Gate)"]
+        WK_SourcePipe["SourcePipelineMaintenance<br/>& SourceExecutionScope (Leases & ACKs)"]
+        WK_PlanExec["LocalStepPlanExecutor & LocalStepPlan<br/>(WAIT_INPUTS -> CALL_USER -> COMMIT -> SEND -> AWAIT)"]
+        WK_Mailbox["WorkerMailbox<br/>(StepBarrier & Dependency Barriers)"]
+        WK_Assemble["LocalInputPrepareRuntime & AssemblyRouteResolver<br/>(CompiledAssemblePlan: Gather/De-unique/Concat)"]
+        WK_OpMgr["OperatorManager & ExecutionDispatcher<br/>(State, Arguments, Lifecycle)"]
+        WK_UserCall["UserCallableExecutor (In-Process Lane)<br/>& WorkerProcessCallRuntime (BaseReader / Subprocess Ops)"]
+        WK_Ckpt["WorkerCheckpointCoordinator<br/>& CheckpointActivity (Component Save/Restore)"]
+        
+        WK_Worker --> WK_Lifecycle
+        WK_Lifecycle --> WK_SourcePipe
+        WK_SourcePipe --> WK_PlanExec
+        WK_Mailbox --> WK_Assemble
+        WK_Assemble --> WK_PlanExec
+        WK_PlanExec --> WK_OpMgr
+        WK_OpMgr --> WK_UserCall
+        WK_Worker --> WK_Ckpt
+    end
+
+    subgraph DataPlane["Data / Transport Plane (P2P High-Performance)"]
+        direction TB
+        DP_Out["LocalWorkerDataPlane<br/>& BatchingDataPlaneExecutor (Outbound Queue)"]
+        DP_Coherence["CoherenceDirectory (Local MESI Directory)<br/>& CoherenceSequencer (ConsumerLeases)"]
+        DP_Retire["CoherenceAdmissionRuntime & BatchRetireRuntime<br/>(Multi-Target Concurrent Enqueue & Child Receipts)"]
+        DP_Routing["CompiledSendPlan & CompiledTensorRoute<br/>(Dense, Sparse/MoE, Replicated, Unit Routing)"]
+        DP_Wire["TransportTensor ABI & TransportFrame Envelope<br/>(Packed Flags, Headers, DLPack Segments)"]
+        DP_Distrib["AsyncDataDistributor & TransportReceiver<br/>(AggregatedTransportGroup)"]
+        DP_Backends["DataPlaneCallable Backends:<br/>AxonDataPlane (P2P / Local Deposit) & RayActorDataPlane"]
+        DP_Kernels["Assembly & Frame Table Kernels<br/>(FrameTableKernel, Numba JIT, Ragged Tensor)"]
+        
+        DP_Out --> DP_Coherence
+        DP_Coherence --> DP_Retire
+        DP_Retire --> DP_Routing
+        DP_Routing --> DP_Wire
+        DP_Wire --> DP_Distrib
+        DP_Distrib --> DP_Backends
+        DP_Backends --> DP_Kernels
+    end
+
+    subgraph CrossCutting["Diagnostics, Profiling & Cross-Cutting Infrastructure"]
+        direction LR
+        CC_Diag["fluxway.diagnostics<br/>(prepare_worker_runtime_env, Hook Injection,<br/>Ray SIGTERM Intercept, Pipe2 Emitter, Actor Exit)"]
+        CC_Prof["fluxway.profiler<br/>(ProfilerRuntimeFactory, PerfettoTraceWriter,<br/>HLC Clock Sync, Scopes: Async/Function/Launch)"]
+        CC_Res["fluxway.common Infrastructure<br/>(ResourceRegistry, LogicalPartitionBinding, msgpack_codec)"]
+    end
+
+    %% Inter-plane control and supervision flows
+    CP_SPMD ==>|"Supervise Drivers & Distribute Projections"| DR_Driver
+    CP_Sched -.->|"Allocate Placement Groups"| DR_Driver
+    DR_Exec ==>|"Supervise Workers & Forward Control Admissions"| WK_Lifecycle
+    DR_Credit -.->|"Manage Stage Credit & Skew Bounds"| WK_SourcePipe
+    WK_SourcePipe -.->|"Async Source ACKs & Step Reports"| CP_Ledger
+    WK_Ckpt -.->|"Component Manifests & 2PC Permits"| CP_Ckpt
+    DR_Mon -.->|"Driver / Worker Readiness & Telemetry"| CP_HBFc
+
+    %% Worker to Data Plane flows
+    WK_PlanExec ==>|"1. Publish Tensor Outputs (SEND_OUTPUT)"| DP_Out
+    DP_Backends ==>|"2. P2P Transport (Axon / Ray Carrier) to Remote Workers"| WK_Mailbox
+    WK_PlanExec -.->|"3. Return Leases & Retires (InputGrant / MESI)"| DP_Coherence
+
+    %% Cross-cutting observability
+    CC_Diag -.-|"Signal Intercept & Exit Attribution"| WorkerPlane
+    CC_Prof -.-|"Perfetto Tracing & Unified HLC Clock"| WorkerPlane
+    CC_Prof -.-|"Trace Carrier Context"| DataPlane
+    CC_Res -.-|"Runtime Handles & DLPack Device Context"| WorkerPlane
+
+```
+
+### Architectural planes and component breakdown
+
+#### 1. Control plane (`fluxway.control_plane`)
+- **Controller Core & Lifecycle**: `ControllerActor` / `Controller` acts as the global orchestrator. `ExecutionLifecycle` manages the strict ordering of startup, restore, drain, checkpoint transactions, admission delivery, and failure propagation.
+- **State Machine & Effect Scheduler**: `ControllerStateMachine` (`ControllerFSM`) reduces cluster state via pure transition relations. Side-effects are dispatched via `BoundedLifecycleEffectScheduler` across bounded concurrency lanes (`ASYNC` for awaitable I/O, `THREAD` for blocking calls, and `PROCESS` for CPU-intensive compilation).
+- **SPMD & Driver Management**: `SPMDManager` and `SPMDHandle` maintain the SPMD mesh topology, supervise driver actor lifecycles, and handle driver registration.
+- **Placement & Scheduling**: `PlacementPlanner` solves multi-dimensional placement constraints and lexicographical objectives (`PlacementRecipe`), compiling them into heterogeneous Ray Placement Groups with `STRICT_SPREAD` pinning (`PGManager`, `Scheduler`).
+- **Health & Flow Control**: `HeartbeatManager` aggregates driver readiness and monitors node liveness. `FlowControlManager` regulates global step admission and buffer quotas.
+- **Data Ingestion Subsystem**: `IngestionLayoutPlanningComponent` isolates data scanning and layout planning on a dedicated `IOLane`. `SourceProgressSupervisor` drives event-driven refills, while `LogicalWorkLedger` manages work epochs, leases, ACK frontiers, and committed cuts. `AlgebraicLayoutCompiler` compiles assignments into `CompiledIngestionLayout` and `WorkerCompiledLayout`.
+- **Checkpoint Coordination**: `FluxwayCheckpointer` orchestrates distributed two-phase commit transactions (`STAGED` -> `COMMIT_DECIDED` -> `COMMITTED` / `ABANDONED`) with `CheckpointRepository`. `CheckpointRetentionCoordinator` manages version retention, while `CheckpointComponentRegistry` integrates pluggable storage components (`SafeTensors`, `Orbax`, `WorkerLocalCheckpointComponent`, `StateCheckpointComponent`).
+
+#### 2. Driver / coordination plane (`fluxway.spmd.driver`)
+- **SPMD Driver Actor**: `SPMDDriver` serves as the supervisory root for an entire SPMD mesh node.
+- **Driver State Machine**: `DriverStateMachine` (`DriverFSM`) processes local mesh state transitions, scheduling effects via `BoundedLifecycleEffectScheduler`.
+- **Worker Supervision**: `RayWorkerExecutor` and `DriverComponentRegistry` install graph projections on worker actors and forward control admissions.
+- **Credit & Flow Control**: `CreditManager` tracks inter-stage dependency buffers (`CreditWindow`, `CreditEdge`, `UpstreamCreditState`) to prevent buffer bloat.
+- **Step Synchronization**: `SPMDSynchronizer` enforces step progression policies such as `MaxSkewSyncPolicy` to prevent stragglers across parallel stages.
+- **Snapshot & Health Monitoring**: `SnapshotOrchestrator` coordinates local worker state snapshots during checkpoints, while `SPMDMonitor` and `HeartbeatManager` aggregate worker health and execution metrics.
+
+#### 3. Worker / execution plane (`fluxway.spmd.worker`)
+- **SPMD Worker Actor**: `SPMDWorker` represents a physical rank/shard in the SPMD mesh, executing partitioned user operators.
+- **Worker Execution Lifecycle**: `WorkerExecutionLifecycle` manages worker states and enforces execution gates via `StepAdmissionState` (`AdmissionAction`, `AdmissionDecision`).
+- **Source Ingestion Pipeline**: `SourcePipelineMaintenance` and `SourceExecutionScope` maintain the worker's active step queue, checking credit and pipeline depth before step acquisition. `SourceWorkRuntime` and `SourceAcknowledgementRuntime` report work leases and submit ACKs asynchronously.
+- **Local Step Plan Executor**: `LocalStepPlanExecutor` runs the 5-phase operator micro-step lifecycle:
+  1. `WAIT_INPUTS`: Waits for required tensor frames to arrive in `WorkerMailbox` and fulfills `StepBarrier` requirements.
+  2. `CALL_USER`: Prepares operator arguments and invokes user callables.
+  3. `COMMIT`: Commits operator outputs and state.
+  4. `SEND_OUTPUT`: Submits outputs to outbound transport queues.
+  5. `AWAIT_SEND`: Confirms that carrier ingress completed.
+- **Worker Mailbox & Input Assembly**: `WorkerMailbox` buffers inbound tensor frames by step. `LocalInputPrepareRuntime` and `AssemblyRouteResolver` use `CompiledAssemblePlan` to unpack, de-duplicate/gather, slice, sort, and concatenate shards into contiguous tensors.
+- **Operator Management & Dispatch**: `OperatorManager` and `ExecutionDispatcher` manage operator instances, lifecycle hooks, and dependency route resolution.
+- **Execution Lanes**: `UserCallableExecutor` runs in-process operators on `UserCallableLane`. For operators requiring process isolation (such as `BaseReader` and `GrainReader`), `WorkerProcessCallRuntime` coordinates subprocess worker execution.
+- **Local Checkpoint Persistence**: `WorkerCheckpointCoordinator` and `CheckpointActivity` persist local component state to storage while holding execution gates closed at the checkpoint cut.
+
+#### 4. Data / transport plane (`fluxway.transport` & `fluxway.rpc`)
+- **Outbound Data Plane**: `LocalWorkerDataPlane` and `BatchingDataPlaneExecutor` coalesce outbound frames into batches for efficient transport.
+- **MESI Cache Coherence Subsystem**:
+  - `CoherenceDirectory`: Endpoint-local MESI directory maintaining entry states (`Modified`, `Exclusive`, `Shared`, `Invalid`).
+  - `CoherenceSequencer`: Enforces epoch admission and intent ordering, granting `ConsumerLease` reservations.
+  - `CoherenceAdmissionRuntime` & `CoherenceBatchRetireRuntime`: Provides atomic admission for multi-target publications, concurrent destination enqueue, and child delivery receipt aggregation.
+  - `ParentGrantReturnRuntime`: Returns input grants to upstream producers upon retirement.
+- **Routing & Sharding Plans**: `CompiledSendPlan`, `CompiledAssemblePlan`, and `CompiledTensorRoute` lower logical sharding specs: Dense (regular slicing), Sparse (hash/MoE routing), Replicated (broadcast), and Unit routing.
+- **Wire Protocol & Physical Transport**:
+  - Canonical ABI: `TransportTensor` with DLPack integration.
+  - Wire Format: `TransportFrame`, `TransportFrameEnvelope`, and `TransportFrameHeader` with bitpacked `entry_state_flags`.
+  - Distribution: `AsyncDataDistributor`, `TransportReceiver`, and `AggregatedTransportGroup`.
+  - Transport Backends (`DataPlaneCallable`):
+    - `RayActorDataPlane`: Standard Ray actor RPC and object store carrier.
+    - `AxonDataPlane`: Direct peer-to-peer high-performance transport supporting CPU and CUDA memory with strict Local Deposit Boundary semantics (`invoke_transport_frames`).
+  - Assembly Kernels: `FrameTableKernel`, `ragged.py`, and Numba JIT kernels for accelerated frame table assembly.
+
+#### 5. Diagnostics, profiling & cross-cutting plane (`fluxway.diagnostics`, `fluxway.profiler`, `fluxway.common`)
+- **Non-blocking Diagnostics**: `prepare_worker_runtime_env` injects `worker_process_setup_hook` into Ray workers. Intercepts Ray SIGTERM handlers, delegating signals through a non-blocking pipe (`os.pipe2(O_NONBLOCK | O_CLOEXEC)`) to a background daemon emitter (`_SignalEventEmitter`), ensuring zero deadlock in interrupt context. `report_actor_exit` attributes process terminations.
+- **High-Resolution Distributed Profiler**: `ProfilerRuntimeFactory` and `PerfettoTraceWriter` output Perfetto `.pftrace` files and Google Model Explorer graph bundles. Synchronizes events across nodes using Hybrid Logical Clocks (`TraceClockSource`), with hierarchical scopes (`async_scope`, `function_scope`) and explicit user launch boundaries via `scope().launched()`.
+- **Dynamic Resource Registry**: `ResourceRegistry` and `LogicalPartitionBinding` bind dynamic runtime resources (`ResourceHandle(namespace, resource_id)`) across partitions.
+- **Framework & Serialization Support**: Zero-copy DLPack tensor protocol bridging JAX, PyTorch, and NumPy, and binary MessagePack serialization via `msgpack_codec.py`.
+
 ## Build and inspect a graph
 
 This complete example compiles two CPU operators without starting Ray. The edge

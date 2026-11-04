@@ -13,7 +13,6 @@ from fluxway.profiler.errors import GraphTraceSymbolConflict, MissingGraphTraceS
 from fluxway.profiler.graph_symbols import (
     GraphTraceSymbols,
     OperatorTraceSymbol,
-    format_parameter_paths,
 )
 from fluxway.profiler.hierarchy import TraceTrackHierarchy
 from fluxway.profiler.record import (
@@ -35,7 +34,6 @@ INTERNED_PAYLOAD_FIELDS = frozenset(
         "event_id",
         "fence_id",
         "from_state_id",
-        "function_id",
         "hook_id",
         "execution_mode",
         "graph_id",
@@ -47,8 +45,6 @@ INTERNED_PAYLOAD_FIELDS = frozenset(
         "status_id",
         "target_spmd_id",
         "tensor_names_id",
-        "input_signature_id",
-        "output_signature_id",
         "to_state_id",
     }
 )
@@ -215,13 +211,13 @@ class PerfettoTraceWriter:
                 builder,
                 ts_ns=int(row[1]) + int(row[2]),
                 track_uuid=event_track_uuid,
-                name=metadata.name_for(name_id),
+                name=None,
                 event_type=proto.TrackEvent.TYPE_SLICE_END,
                 flow_id=0,
-                payload_fields=payload_fields,
-                payload_values=payload_values,
+                payload_fields=(),
+                payload_values=payload_values[:0],
                 metadata=metadata,
-                graph_annotations=graph_annotations,
+                graph_annotations=(),
             )
             return
         if kind == int(TraceEventKind.FLOW_END):
@@ -311,7 +307,7 @@ class PerfettoTraceWriter:
         *,
         ts_ns: int,
         track_uuid: int,
-        name: str,
+        name: str | None,
         event_type: int,
         flow_id: int = 0,
         terminating_flow_id: int = 0,
@@ -330,7 +326,8 @@ class PerfettoTraceWriter:
         packet.timestamp = ts_ns
         event = packet.track_event
         event.track_uuid = track_uuid
-        event.name = name
+        if name is not None:
+            event.name = name
         event.type = event_type
         if counter_value is not None:
             event.counter_value = counter_value
@@ -634,58 +631,4 @@ def _payload_value(payload_values: np.ndarray, index: int | None) -> int | None:
 def _operator_annotations(
     operator: OperatorTraceSymbol,
 ) -> GraphAnnotations:
-    annotations = [("operator.function", operator.function_id)]
-    _append_sequence(
-        annotations,
-        "operator.input.data_ports",
-        operator.input_data_ports,
-    )
-    _append_sequence(
-        annotations,
-        "operator.input.control_ports",
-        operator.input_control_ports,
-    )
-    _append_sequence(
-        annotations,
-        "operator.input.static_arguments",
-        operator.input_static_arguments,
-    )
-    _append_sequence(
-        annotations,
-        "operator.output.data_ports",
-        operator.output_data_ports,
-    )
-    _append_sequence(
-        annotations,
-        "operator.output.control_ports",
-        operator.output_control_ports,
-    )
-    _append_sequence(
-        annotations,
-        "operator.output.static_arguments",
-        operator.output_static_arguments,
-    )
-    if operator.input_parameter_paths:
-        annotations.append(
-            (
-                "operator.input.parameters",
-                format_parameter_paths(operator.input_parameter_paths),
-            )
-        )
-    if operator.output_parameter_paths:
-        annotations.append(
-            (
-                "operator.output.parameters",
-                format_parameter_paths(operator.output_parameter_paths),
-            )
-        )
-    return tuple(annotations)
-
-
-def _append_sequence(
-    annotations: list[tuple[str, str]],
-    name: str,
-    values: tuple[str, ...],
-) -> None:
-    if values:
-        annotations.append((name, ", ".join(values)))
+    return (("operator.function", operator.function_id),)

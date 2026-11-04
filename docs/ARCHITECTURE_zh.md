@@ -41,6 +41,182 @@ sequenceDiagram
 
 图示普通张量路径并聚合多级确认；驱动器和工作进程调用保持并发，获准工作可能在 `start()` 返回前开始。协议空帧等分支与统一交付屏障见[数据面运行时](dataplane_runtime_zh.md)。详细屏障与异常边界见[执行生命周期](execution_lifecycle_zh.md)。
 
+## 分层架构
+
+Fluxway 划分为五个高度专业化的平面：
+
+1. **控制平面 (Control Plane)**：负责全局计算图编译、放置优化、生命周期协调、数据摄取布局以及分布式检查点事务。
+2. **驱动/协调平面 (Driver / Coordination Plane)**：监督各个 SPMD 网格，协调步进同步、流控信用（Credit）与工作进程就绪状态。
+3. **工作进程/执行平面 (Worker / Execution Plane)**：执行分片后的用户算子，驱动本地微步流水线、输入汇聚组装与本地状态持久化。
+4. **数据与传输平面 (Data / Transport Plane)**：负责点对点（P2P）张量交付、MESI 缓存一致性、数据帧批处理以及高性能传输载体（`AxonDataPlane`、`RayActorDataPlane`）。
+5. **观测、分析与横切基础设施 (Diagnostics, Profiling & Cross-Cutting Plane)**：提供非阻塞操作系统信号捕获与退出归因、HLC 混合逻辑时钟同步的 Perfetto 跟踪，以及动态资源绑定。
+
+```mermaid
+flowchart TB
+    subgraph ControlPlane["控制平面 (Control Plane)"]
+        direction TB
+        CP_Ctrl["ControllerActor / Controller<br/>(全局主控协调器与生命周期中心)"]
+        CP_FSM["ControllerStateMachine (状态机)<br/>与 BoundedEffectScheduler (纯状态归约/有界效应调度)"]
+        CP_SPMD["SPMDManager 与 SPMDHandle<br/>(SPMD 网格拓扑与驱动器角色管理)"]
+        CP_Sched["PlacementPlanner 与 Scheduler (PGManager)<br/>(基于 PlacementRecipe 求解与 STRICT_SPREAD 绑定)"]
+        CP_HBFc["HeartbeatManager、Monitor<br/>与 FlowControlManager (健康检测与全局流控)"]
+        CP_Ing["IngestionLayoutPlanningComponent<br/>与 SourceProgressSupervisor (专用 IOLane 规划)"]
+        CP_Ledger["LogicalWorkLedger 与 AlgebraicLayoutCompiler<br/>(逻辑任务账本、租约、确认前沿与编译布局)"]
+        CP_Ckpt["FluxwayCheckpointer 与 CheckpointRepository<br/>(两阶段事务: STAGED -> COMMIT_DECIDED -> COMMITTED)"]
+        CP_CkptReg["CheckpointComponentRegistry 与保留协调器<br/>(SafeTensors, Orbax, WorkerLocal/Pickle, Inline)"]
+        
+        CP_Ctrl --- CP_FSM
+        CP_Ctrl --> CP_SPMD
+        CP_Ctrl --> CP_Sched
+        CP_Ctrl --> CP_HBFc
+        CP_Ctrl --> CP_Ing
+        CP_Ing --> CP_Ledger
+        CP_Ctrl --> CP_Ckpt
+        CP_Ckpt --> CP_CkptReg
+    end
+
+    subgraph DriverPlane["驱动/协调平面 (Driver / Coordination Plane - 按 SPMD 划分)"]
+        direction TB
+        DR_Driver["SPMDDriver (Ray 角色)<br/>(SPMD 网格监督者与准入协调中心)"]
+        DR_FSM["DriverStateMachine (状态机)<br/>与 BoundedEffectScheduler"]
+        DR_Exec["RayWorkerExecutor<br/>与 DriverComponentRegistry (工作进程执行代理)"]
+        DR_Credit["CreditManager (信用窗口/边)<br/>与 SPMDSynchronizer (MaxSkewSyncPolicy 最大偏斜同步)"]
+        DR_Mon["SnapshotOrchestrator、SPMDMonitor<br/>与 HeartbeatManager (快照编排与就绪/状态聚合)"]
+        
+        DR_Driver --- DR_FSM
+        DR_Driver --> DR_Exec
+        DR_Driver --> DR_Credit
+        DR_Driver --> DR_Mon
+    end
+
+    subgraph WorkerPlane["工作进程/执行平面 (Worker / Execution Plane - 按分片/Rank划分)"]
+        direction TB
+        WK_Worker["SPMDWorker (Ray 角色)<br/>(算子分片执行实体)"]
+        WK_Lifecycle["WorkerExecutionLifecycle<br/>与 StepAdmissionState (步骤准入状态与执行门)"]
+        WK_SourcePipe["SourcePipelineMaintenance<br/>与 SourceExecutionScope (来源流水维护与租约确认)"]
+        WK_PlanExec["LocalStepPlanExecutor 与 LocalStepPlan<br/>(微步流水: 等待输入 -> 用户调用 -> 提交 -> 发送 -> 等待完成)"]
+        WK_Mailbox["WorkerMailbox (张量邮箱)<br/>(步骤栅障 StepBarrier 与依赖条件裁决)"]
+        WK_Assemble["LocalInputPrepareRuntime 与 AssemblyRouteResolver<br/>(CompiledAssemblePlan: 聚集/反去重Gather/合并)"]
+        WK_OpMgr["OperatorManager 与 ExecutionDispatcher<br/>(算子分发、实例管理与参数准备)"]
+        WK_UserCall["UserCallableExecutor (进程内算子通道)<br/>与 WorkerProcessCallRuntime (BaseReader/独立进程算子)"]
+        WK_Ckpt["WorkerCheckpointCoordinator<br/>与 CheckpointActivity (本地状态持久化保存/恢复)"]
+        
+        WK_Worker --> WK_Lifecycle
+        WK_Lifecycle --> WK_SourcePipe
+        WK_SourcePipe --> WK_PlanExec
+        WK_Mailbox --> WK_Assemble
+        WK_Assemble --> WK_PlanExec
+        WK_PlanExec --> WK_OpMgr
+        WK_OpMgr --> WK_UserCall
+        WK_Worker --> WK_Ckpt
+    end
+
+    subgraph DataPlane["数据与传输平面 (Data / Transport Plane - 点对点高性能传输)"]
+        direction TB
+        DP_Out["LocalWorkerDataPlane<br/>与 BatchingDataPlaneExecutor (出站数据面与批处理调度)"]
+        DP_Coherence["CoherenceDirectory (端点本地 MESI 目录)<br/>与 CoherenceSequencer (主体排序与消费租约)"]
+        DP_Retire["CoherenceAdmissionRuntime 与 BatchRetireRuntime<br/>(多目标原子发布、并发入队与子回执跟踪)"]
+        DP_Routing["CompiledSendPlan 与 CompiledTensorRoute<br/>(Dense 规则、Sparse/MoE 稀疏、Replicated 广播、Unit 单元)"]
+        DP_Wire["TransportTensor ABI 与 TransportFrame 封包协议<br/>(位打包状态标志、数据帧头、DLPack 内存段)"]
+        DP_Distrib["AsyncDataDistributor 与 TransportReceiver<br/>(聚合传输组 AggregatedTransportGroup)"]
+        DP_Backends["DataPlaneCallable 传输后端实现:<br/>AxonDataPlane (P2P 高性能零拷贝/本地落盘) 与 RayActorDataPlane"]
+        DP_Kernels["数据汇聚与帧表内核<br/>(FrameTableKernel、Numba JIT 内核、RaggedTensor)"]
+        
+        DP_Out --> DP_Coherence
+        DP_Coherence --> DP_Retire
+        DP_Retire --> DP_Routing
+        DP_Routing --> DP_Wire
+        DP_Wire --> DP_Distrib
+        DP_Distrib --> DP_Backends
+        DP_Backends --> DP_Kernels
+    end
+
+    subgraph CrossCutting["观测、性能分析与横切基础设施 (Cross-Cutting Plane)"]
+        direction LR
+        CC_Diag["fluxway.diagnostics 诊断系统<br/>(prepare_worker_runtime_env 启动注入、Ray SIGTERM 拦截、<br/>pipe2 非阻塞守护输出、进程退出归因)"]
+        CC_Prof["fluxway.profiler 性能分析系统<br/>(ProfilerRuntimeFactory、PerfettoTraceWriter、<br/>HLC 混合逻辑时钟同步、分层跟踪作用域)"]
+        CC_Res["fluxway.common 基础构件<br/>(ResourceRegistry 动态资源、LogicalPartitionBinding 分片绑定、msgpack_codec)"]
+    end
+
+    %% Inter-plane control and supervision flows
+    CP_SPMD ==>|"Supervise Drivers & Distribute Projections"| DR_Driver
+    CP_Sched -.->|"Allocate Placement Groups"| DR_Driver
+    DR_Exec ==>|"Supervise Workers & Forward Control Admissions"| WK_Lifecycle
+    DR_Credit -.->|"Manage Stage Credit & Skew Bounds"| WK_SourcePipe
+    WK_SourcePipe -.->|"Async Source ACKs & Step Reports"| CP_Ledger
+    WK_Ckpt -.->|"Component Manifests & 2PC Permits"| CP_Ckpt
+    DR_Mon -.->|"Driver / Worker Readiness & Telemetry"| CP_HBFc
+
+    %% Worker to Data Plane flows
+    WK_PlanExec ==>|"1. Publish Tensor Outputs (SEND_OUTPUT)"| DP_Out
+    DP_Backends ==>|"2. P2P Transport (Axon / Ray Carrier) to Remote Workers"| WK_Mailbox
+    WK_PlanExec -.->|"3. Return Leases & Retires (InputGrant / MESI)"| DP_Coherence
+
+    %% Cross-cutting observability
+    CC_Diag -.-|"Signal Intercept & Exit Attribution"| WorkerPlane
+    CC_Prof -.-|"Perfetto Tracing & Unified HLC Clock"| WorkerPlane
+    CC_Prof -.-|"Trace Carrier Context"| DataPlane
+    CC_Res -.-|"Runtime Handles & DLPack Device Context"| WorkerPlane
+
+```
+
+### 各平面核心组件与职责划分
+
+#### 1. 控制平面 (`fluxway.control_plane`)
+- **主控制器与生命周期中心**：`ControllerActor` / `Controller` 担任全局编排中心。`ExecutionLifecycle` 严格把控启动、恢复、排空（Drain）、检查点事务、准入下发以及故障传播的执行顺序。
+- **纯状态机与效应调度器**：`ControllerStateMachine` (`ControllerFSM`) 以纯状态转移归约集群状态。外部副作用由 `BoundedLifecycleEffectScheduler` 在有界容量通道中调度（`ASYNC` 处理可等待 I/O，`THREAD` 处理阻塞调用，`PROCESS` 处理 CPU 密集型编译）。
+- **SPMD 与驱动拓扑管理**：`SPMDManager` 与 `SPMDHandle` 维护 SPMD 网格拓扑关系，负责驱动器（Driver）角色的创建、拓扑注册与生命周期管理。
+- **放置求解与资源调度**：`PlacementPlanner` 求解多维约束与按优先级排序的目标（`PlacementRecipe`），通过 `PGManager` 与 `Scheduler` 将其映射为带有 `STRICT_SPREAD` 绑定的 Ray 异构放置组（Placement Group）。
+- **健康监测与全局流控**：`HeartbeatManager` 汇总驱动器就绪心跳并监控节点存活；`FlowControlManager` 管理全局步进准入边界与缓冲区配额。
+- **数据源规划与账本管理**：`IngestionLayoutPlanningComponent` 将数据扫描与布局规划隔离在专用 `IOLane` 中，`SourceProgressSupervisor` 事件驱动补窗，`LogicalWorkLedger` 维护任务纪元、租约、确认前沿与提交切点，`AlgebraicLayoutCompiler` 编译输出 `CompiledIngestionLayout` 与 `WorkerCompiledLayout`。
+- **检查点事务编排**：`FluxwayCheckpointer` 与 `CheckpointRepository` 协调两阶段提交事务（`STAGED` -> `COMMIT_DECIDED` -> `COMMITTED` / `ABANDONED`）。`CheckpointRetentionCoordinator` 负责版本保留与清理，`CheckpointComponentRegistry` 集成可插拔状态组件（`SafeTensors`、`Orbax`、`WorkerLocalCheckpointComponent`、`StateCheckpointComponent`）。
+
+#### 2. 驱动/协调平面 (`fluxway.spmd.driver`)
+- **SPMD 驱动监督者**：`SPMDDriver` 作为单个 SPMD 网格节点的协调根节点。
+- **驱动器状态机**：`DriverStateMachine` (`DriverFSM`) 负责本地网格状态转移，通过 `BoundedLifecycleEffectScheduler` 调度执行副作用。
+- **工作进程代理执行**：`RayWorkerExecutor` 与 `DriverComponentRegistry` 向工作进程下发计算图投影并转发控制准入。
+- **流控信用管理**：`CreditManager` 跟踪跨阶段依赖缓冲区（`CreditWindow`、`CreditEdge`、`UpstreamCreditState`），防止缓冲区无限膨胀。
+- **步进同步与防倾斜**：`SPMDSynchronizer` 执行步进推进策略（如 `MaxSkewSyncPolicy`），防止并行阶段间产生严重长尾和步进倾斜。
+- **局部快照与监控聚合**：`SnapshotOrchestrator` 在检查点期间编排本地工作进程状态快照，`SPMDMonitor` 与 `HeartbeatManager` 聚合工作进程健康与遥测指标。
+
+#### 3. 工作进程/执行平面 (`fluxway.spmd.worker`)
+- **SPMD 工作进程实体**：`SPMDWorker` 对应 SPMD 网格物理坐标上的分片工作节点，执行具体算子计算。
+- **执行生命周期与门控**：`WorkerExecutionLifecycle` 管理工作进程运行阶段，通过 `StepAdmissionState`（`AdmissionAction`、`AdmissionDecision`）严格控制执行门开关。
+- **数据源流水维护**：`SourcePipelineMaintenance` 与 `SourceExecutionScope` 维护工作进程的待执行步进队列，在额度与流水深度允许时入队；`SourceWorkRuntime` 与 `SourceAcknowledgementRuntime` 异步确认租约并上报 ACK。
+- **本地步骤流水线执行器**：`LocalStepPlanExecutor` 驱动算子五阶段微步流水线：
+  1. `WAIT_INPUTS`：等待所需张量帧抵达 `WorkerMailbox` 并满足 `StepBarrier` 栅障条件。
+  2. `CALL_USER`：准备算子入参并调用用户函数。
+  3. `COMMIT`：提交算子输出与状态变更。
+  4. `SEND_OUTPUT`：将生成张量提交至出站数据面传输队列。
+  5. `AWAIT_SEND`：确认传输载体接收端已完成准入。
+- **张量邮箱与输入组装**：`WorkerMailbox` 按步骤缓存入站张量帧。`LocalInputPrepareRuntime` 与 `AssemblyRouteResolver` 依据 `CompiledAssemblePlan` 执行解包、反去重/Gather 还原、切片、排序和拼接操作。
+- **算子管理与分发**：`OperatorManager` 与 `ExecutionDispatcher` 负责算子实例管理、生命周期挂钩以及依赖路由解析。
+- **执行通道划分**：`UserCallableExecutor` 在进程内通道（`UserCallableLane`）运行用户算子；对于需要进程隔离的算子（如 `BaseReader`、`GrainReader`），由 `WorkerProcessCallRuntime` 调度独立子进程算子（Worker Process Operators）。
+- **本地状态持久化**：`WorkerCheckpointCoordinator` 与 `CheckpointActivity` 负责在检查点切点处保持执行门关闭并持久化本地组件状态。
+
+#### 4. 数据与传输平面 (`fluxway.transport` 与 `fluxway.rpc`)
+- **出站数据面与批处理**：`LocalWorkerDataPlane` 与 `BatchingDataPlaneExecutor` 将出站张量帧聚合成批次进行高效传输。
+- **MESI 缓存一致性子系统**：
+  - `CoherenceDirectory`：端点本地 MESI 目录，跟踪条目状态（`Modified`、`Exclusive`、`Shared`、`Invalid`）。
+  - `CoherenceSequencer`：负责主体纪元准入与意图排序，仲裁并发消费租约（`ConsumerLease`）。
+  - `CoherenceAdmissionRuntime` 与 `CoherenceBatchRetireRuntime`：负责多目标发布的原子准入、并发入队以及子回执（Receipt）跟踪管理。
+  - `ParentGrantReturnRuntime`：在发布退役时向上游生产者归还输入授权。
+- **编译路由与分片方案**：`CompiledSendPlan`、`CompiledAssemblePlan` 与 `CompiledTensorRoute` 编译并降低逻辑分片规约：Dense（规则切分）、Sparse（哈希/MoE 路由）、Replicated（广播复制）与 Unit（单元路由）。
+- **线协议与物理传输载体**：
+  - 规范 ABI：集成 DLPack 的 `TransportTensor`。
+  - 封包格式：带有位打包状态标志（`entry_state_flags`）的 `TransportFrame`、`TransportFrameEnvelope` 与 `TransportFrameHeader`。
+  - 传输分发器：`AsyncDataDistributor`、`TransportReceiver` 与 `AggregatedTransportGroup`。
+  - 传输后端实现 (`DataPlaneCallable`)：
+    - `RayActorDataPlane`：基于 Ray Actor RPC 和 Object Store 的默认传输载体。
+    - `AxonDataPlane`：高性能点对点直传后端，原生支持 CPU 与 CUDA 内存，提供严格的本地落盘边界语义（`invoke_transport_frames`）。
+  - 高性能汇聚内核：`FrameTableKernel`、`ragged.py` 以及用于加速帧表拼接的 Numba JIT 内核。
+
+#### 5. 观测、性能分析与横切基础设施 (`fluxway.diagnostics`、`fluxway.profiler`、`fluxway.common`)
+- **非阻塞诊断与信号捕获**：`prepare_worker_runtime_env` 向 Ray 工作进程注入 `worker_process_setup_hook`，拦截 Ray SIGTERM 处理，通过无锁非阻塞管道（`os.pipe2(O_NONBLOCK | O_CLOEXEC)`）向后台守护输出线程（`_SignalEventEmitter`）投递事件，杜绝信号处理上下文死锁；`report_actor_exit` 精准归因外部驱逐与抢占。
+- **高精分布式 Profiler**：`ProfilerRuntimeFactory` 与 `PerfettoTraceWriter` 输出 Perfetto `.pftrace` 跟踪文件与 Google Model Explorer 计算图，基于混合逻辑时钟（`TraceClockSource` HLC）对齐多节点时间戳，提供分层跟踪作用域（`async_scope`、`function_scope`）和由 `scope().launched()` 显式标记的用户发射边界。
+- **动态资源注册中心**：`ResourceRegistry` 与 `LogicalPartitionBinding` 在运行时跨分片绑定动态资源句柄（`ResourceHandle(namespace, resource_id)`）。
+- **多框架与序列化适配**：通过 DLPack 协议统一适配 JAX、PyTorch 与 NumPy 张量后端；通过 `msgpack_codec.py` 二进制序列化事务清单与持久化元数据。
+
 ## 构建并检查计算图
 
 下面是完整的本地例子，无需启动 Ray。依赖边将生产端的 `value` 输出连接到消费端的 `item` 输入。

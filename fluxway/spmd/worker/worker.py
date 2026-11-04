@@ -1281,6 +1281,7 @@ class SPMDWorker:
                 local_world_size=local_world_size,
                 node_rank=node_rank,
                 num_nodes=num_nodes,
+                worker_process_runtime=self._worker_process_call_runtime,
             )
             if self._control_plane_handle is not None:
                 manager_kwargs["control_plane_handle"] = self._control_plane_handle
@@ -4994,6 +4995,31 @@ class SPMDWorker:
         *,
         background_prepare: bool,
     ) -> "TransportTensor":
+        r"""Assemble tensor shards according to the operator prepare policy.
+
+        Execution Flow:
+        +-------------------------------------------------------------+
+        |                _assemble_tensor_for_prepare_policy          |
+        +-------------------------------------------------------------+
+                                       |
+                       [background_prepare == True?]
+                                      / \
+                                     /   \
+                             (Yes)  /     \  (No: sync operator)
+                                   v       v
+            +------------------------------+ +-----------------------+
+            |  _input_prepare_runtime      | |  _assemble_tensor     |
+            |  (PriorityThreadExecutor)    | |  (Event loop inline)  |
+            +------------------------------+ +-----------------------+
+                           |                             |
+                           +-------------> <-------------+
+                                          |
+                                          v
+                           +------------------------------+
+                           |  _assemble_tensor_sync       |
+                           |  (Numba concatenate/assemble)|
+                           +------------------------------+
+        """
         if not background_prepare:
             return await self._assemble_tensor(
                 op_name, transfer_code, step, shards, arrivals

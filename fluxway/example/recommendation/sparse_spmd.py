@@ -59,6 +59,7 @@ class SparseEmbeddingSPMD:
         vocab_size: int = 1000,
         embed_dim: int = 3,
         num_threads: int | None = None,
+        value_dtype: str = "bfloat16",
         name: str = "",
         mesh: "Any" = None,
         runtime_env: "Any" = None,
@@ -67,6 +68,7 @@ class SparseEmbeddingSPMD:
     ):
         self.embed_dim = embed_dim
         self.vocab_size = vocab_size
+        self.value_dtype = value_dtype
         self.num_threads = num_threads or os.cpu_count() or 4
 
         # -- Invariants on configuration --
@@ -84,7 +86,8 @@ class SparseEmbeddingSPMD:
             embedding_config=se.EmbeddingConfig(
                 dims=[embed_dim],
                 thread_budget=self.num_threads,
-                value_dtype="float32",
+                value_dtype=self.value_dtype,
+                gradient_dtype=self.value_dtype,
             ),
             initializer_config=se.Uniform(min_val=-0.01, max_val=0.01),
             optimizer_config=se.Adam(lr=0.01),

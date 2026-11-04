@@ -4,6 +4,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 import contextvars
 import json
+import time
 from typing import Any
 
 from fluxway.profiler.recorder import TraceRecorder
@@ -18,8 +19,8 @@ _RESERVED_ATTR_KEYS = frozenset({"op_id", "step", "rank", "execution_mode", "att
 class _NoopScope:
     __slots__ = ()
 
-    def __enter__(self) -> None:
-        return None
+    def __enter__(self) -> _NoopScope:
+        return self
 
     def __exit__(
         self,
@@ -29,8 +30,110 @@ class _NoopScope:
     ) -> bool:
         return False
 
+    async def __aenter__(self) -> _NoopScope:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: Any,
+    ) -> bool:
+        return False
+
+    def launched(self) -> None:
+        pass
+
+    def complete(self) -> None:
+        pass
+
 
 _NOOP_SCOPE = _NoopScope()
+
+
+class UserScopeContext:
+    __slots__ = (
+        "_recorder",
+        "_op_name",
+        "_step",
+        "_rank",
+        "_execution_mode",
+        "_name",
+        "_attrs_json",
+        "_start_ns",
+        "_launched",
+        "_completed",
+    )
+
+    def __init__(
+        self,
+        *,
+        recorder: TraceRecorder,
+        op_name: str,
+        step: int,
+        rank: int,
+        execution_mode: str,
+        name: str,
+        attrs_json: str,
+    ) -> None:
+        self._recorder = recorder
+        self._op_name = op_name
+        self._step = step
+        self._rank = rank
+        self._execution_mode = execution_mode
+        self._name = name
+        self._attrs_json = attrs_json
+        self._start_ns = 0
+        self._launched = False
+        self._completed = False
+
+    def __enter__(self) -> UserScopeContext:
+        self._start_ns = time.perf_counter_ns()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: Any,
+    ) -> bool:
+        self.complete()
+        return False
+
+    async def __aenter__(self) -> UserScopeContext:
+        return self.__enter__()
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: Any,
+    ) -> bool:
+        return self.__exit__(exc_type, exc, traceback)
+
+    def launched(self) -> None:
+        if not self._launched and self._start_ns > 0:
+            dur_ns = time.perf_counter_ns() - self._start_ns
+            self._record_slice(f"{self._name}.launch", self._start_ns, dur_ns)
+            self._launched = True
+
+    def complete(self) -> None:
+        if not self._completed and self._start_ns > 0:
+            dur_ns = time.perf_counter_ns() - self._start_ns
+            self._record_slice(self._name, self._start_ns, dur_ns)
+            self._completed = True
+
+    def _record_slice(self, event_name: str, start_ns: int, dur_ns: int) -> None:
+        self._recorder.user_custom_slice(
+            name=event_name,
+            op_name=self._op_name,
+            step=self._step,
+            rank=self._rank,
+            execution_mode=self._execution_mode,
+            attrs_json=self._attrs_json,
+            start_ns=start_ns,
+            dur_ns=dur_ns,
+        )
 
 
 class UserProfilerHandle:
@@ -51,19 +154,22 @@ class UserProfilerHandle:
         self._rank = rank
         self._execution_mode = execution_mode
 
-    @contextmanager
-    def scope(self, name: str, attrs: dict[str, Any]) -> Generator[None, None, None]:
+    @property
+    def enabled(self) -> bool:
+        return self._recorder.is_step_profiled(self._step)
+
+    def scope(self, name: str, attrs: dict[str, Any]) -> UserScopeContext:
         event_name = _event_name(name)
         attrs_json = _attrs_json(attrs)
-        with self._recorder.user_custom_scope(
-            name=event_name,
+        return UserScopeContext(
+            recorder=self._recorder,
             op_name=self._op_name,
             step=self._step,
             rank=self._rank,
             execution_mode=self._execution_mode,
+            name=event_name,
             attrs_json=attrs_json,
-        ):
-            yield
+        )
 
     def event(self, name: str, attrs: dict[str, Any]) -> None:
         self._recorder.user_custom_event(
@@ -83,28 +189,49 @@ class UserProfilerHandle:
             execution_mode=self._execution_mode,
         )
 
+    def start_async_operation(
+        self, name: str, attrs: dict[str, Any]
+    ) -> UserScopeContext:
+        ctx = self.scope(name, attrs)
+        ctx.__enter__()
+        return ctx
+
 
 def enabled() -> bool:
-    return _ACTIVE_USER_PROFILER.get() is not None
+    handle = _ACTIVE_USER_PROFILER.get()
+    if handle is None:
+        return False
+    return handle.enabled
 
 
 def scope(name: str, **attrs: Any) -> Any:
     handle = _ACTIVE_USER_PROFILER.get()
-    if handle is None:
+    if handle is None or not handle.enabled:
         return _NOOP_SCOPE
     return handle.scope(name, attrs)
 
 
+def async_scope(name: str, **attrs: Any) -> Any:
+    return scope(name, **attrs)
+
+
+def start_async_operation(name: str, **attrs: Any) -> Any:
+    handle = _ACTIVE_USER_PROFILER.get()
+    if handle is None or not handle.enabled:
+        return _NOOP_SCOPE
+    return handle.start_async_operation(name, attrs)
+
+
 def event(name: str, **attrs: Any) -> None:
     handle = _ACTIVE_USER_PROFILER.get()
-    if handle is None:
+    if handle is None or not handle.enabled:
         return
     handle.event(name, attrs)
 
 
 def function_scope() -> Any:
     handle = _ACTIVE_USER_PROFILER.get()
-    if handle is None:
+    if handle is None or not handle.enabled:
         return _NOOP_SCOPE
     return handle.function_scope()
 

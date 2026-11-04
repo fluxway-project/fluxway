@@ -12,21 +12,12 @@ from fluxway.profiler.errors import (
 )
 
 
-type ParameterPaths = tuple[tuple[str, tuple[str, ...]], ...]
-
-
 @dataclass(frozen=True, slots=True)
 class OperatorTraceSymbol:
     key: OperatorKey
     function_id: str
     input_data_ports: tuple[str, ...]
-    input_control_ports: tuple[str, ...]
-    input_static_arguments: tuple[str, ...]
     output_data_ports: tuple[str, ...]
-    output_control_ports: tuple[str, ...]
-    output_static_arguments: tuple[str, ...]
-    input_parameter_paths: ParameterPaths
-    output_parameter_paths: ParameterPaths
 
     @property
     def qualified_id(self) -> str:
@@ -250,30 +241,10 @@ def _operator_symbol(compiled_operator: CompiledOperator) -> OperatorTraceSymbol
         input_data_ports=tuple(
             compiled_operator.get_arguments(False, ArgumentType.DATA)
         ),
-        input_control_ports=tuple(
-            compiled_operator.get_arguments(False, ArgumentType.CONTROL)
-        ),
-        input_static_arguments=tuple(
-            compiled_operator.get_arguments(False, ArgumentType.STATIC)
-        ),
         output_data_ports=tuple(
             compiled_operator.get_arguments(True, ArgumentType.DATA)
         ),
-        output_control_ports=tuple(
-            compiled_operator.get_arguments(True, ArgumentType.CONTROL)
-        ),
-        output_static_arguments=tuple(
-            compiled_operator.get_arguments(True, ArgumentType.STATIC)
-        ),
-        input_parameter_paths=_parameter_paths(compiled_operator.spec.input_param_map),
-        output_parameter_paths=_parameter_paths(
-            compiled_operator.spec.output_param_map
-        ),
     )
-
-
-def _parameter_paths(mapping: Mapping[str, tuple[str, ...]]) -> ParameterPaths:
-    return tuple((name, tuple(paths)) for name, paths in mapping.items())
 
 
 def _validate_symbol_references(
@@ -356,9 +327,3 @@ def _insert_unique[K, V](
             detail="identity maps to multiple symbols",
         )
     mapping[identity] = symbol
-
-
-def format_parameter_paths(paths: ParameterPaths) -> str:
-    return "; ".join(
-        f"{parameter} -> [{', '.join(field_paths)}]" for parameter, field_paths in paths
-    )

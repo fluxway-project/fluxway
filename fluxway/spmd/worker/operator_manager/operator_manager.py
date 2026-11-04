@@ -12,7 +12,7 @@ Responsibilities:
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING, cast
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Generator
 from fluxway.common.utils.logging import get_logger
 import threading
 import inspect as _inspect
@@ -228,6 +228,7 @@ class OperatorManager:
         node_rank: int = 0,
         num_nodes: int = 1,
         control_plane_handle: Any | None = None,
+        worker_process_runtime: Any | None = None,
     ):
         """
         Initialize OperatorManager.
@@ -254,6 +255,7 @@ class OperatorManager:
         self._node_rank = node_rank
         self._num_nodes = num_nodes
         self._control_plane_handle = control_plane_handle
+        self._worker_process_runtime = worker_process_runtime
         if not isinstance(instance_container, OperatorInstanceContainer):
             raise TypeError("OperatorManager requires an OperatorInstanceContainer")
         self._instance_container = instance_container
@@ -1117,8 +1119,9 @@ class OperatorManager:
         operator = self._operator_for_execution(op_name, coroutine_function=True)
         call_args, call_kwargs = self._operator_arguments(op_name, args, kwargs)
         with self._operator_execution_context(op_name, step, source_work_items):
+            coro = operator(*call_args, **call_kwargs)
             with function_scope():
-                return await operator(*call_args, **call_kwargs)
+                return await coro
 
     def _operator_for_execution(
         self, op_name: str, *, coroutine_function: bool
@@ -1139,7 +1142,7 @@ class OperatorManager:
         op_name: str,
         step: int,
         source_work_items: Any | None = None,
-    ) -> Iterator[None]:
+    ) -> Generator[None]:
         from fluxway.common.decorators import operator_context
 
         meta = self.get_operator_spec(op_name)
@@ -1168,6 +1171,26 @@ class OperatorManager:
             source_work_items=source_work_items,
         )
 
+        lane_runner = None
+        worker_process_runtime = getattr(self, "_worker_process_runtime", None)
+        if worker_process_runtime is not None:
+
+            async def _run_in_lane(
+                fn: Any,
+                *args: Any,
+                lane: str = "default",
+                **kwargs: Any,
+            ) -> Any:
+                target = (lambda: fn(*args, **kwargs)) if (args or kwargs) else fn
+                return await worker_process_runtime.submit(
+                    target,
+                    callable_id=f"{self._spmd_id}.{op_name}.lane.{lane}",
+                    resource_id=0,
+                    execution_lane=lane,
+                )
+
+            lane_runner = _run_in_lane
+
         with operator_context(
             static_args=self._static_args,
             rank=self._rank,
@@ -1182,6 +1205,7 @@ class OperatorManager:
             control_plane=self._control_plane_handle,
             ray_component_limits=self._ray_component_limits,
             instance_container=self._instance_container,
+            lane_runner=lane_runner,
         ):
             yield
 

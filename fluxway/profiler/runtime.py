@@ -44,7 +44,7 @@ class ProfilerRuntimeFactory:
                 rounds=config.clock_sync_rounds,
                 max_uncertainty_ns=config.max_clock_uncertainty_ns,
             ),
-            skip_initial_steps=config.skip_initial_steps,
+            step_filter=config.create_step_filter(),
         )
         return cls(
             recorder,

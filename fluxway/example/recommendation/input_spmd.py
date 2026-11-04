@@ -50,11 +50,92 @@ def _unique_global_flat_positions(
     return out
 
 
+def _materialize_sparse_unique_tensors(
+    unique_raw: Any,
+    inv_raw: Any,
+    first_raw: Any,
+    original_ids: np.ndarray,
+    global_shape: tuple[int, ...],
+    nested_splits: tuple[np.ndarray, ...],
+    source_origins: np.ndarray,
+    group_name: str,
+) -> tuple[TransportTensor, TransportTensor]:
+    if hasattr(unique_raw, "__dlpack__") or hasattr(unique_raw, "__dlpack_device__"):
+        backend = get_backend()
+        unique_np = backend.from_dlpack(unique_raw).astype(np.int64)
+        inv_1d = backend.from_dlpack(inv_raw).astype(np.int32).reshape(-1)
+        first_local = backend.from_dlpack(first_raw).astype(np.int64).reshape(-1)
+    else:
+        unique_np = np.asarray(unique_raw, dtype=np.int64)
+        inv_1d = np.asarray(inv_raw, dtype=np.int32).reshape(-1)
+        first_local = np.asarray(first_raw, dtype=np.int64).reshape(-1)
+
+    assert unique_np.ndim == 1, (
+        f"[InputSPMD._sparse_unique:{group_name}] unique must be 1D, got shape={unique_np.shape}"
+    )
+    assert np.unique(unique_np).size == unique_np.size, (
+        f"[InputSPMD._sparse_unique:{group_name}] async_unique output contains duplicates"
+    )
+    assert first_local.shape == unique_np.shape, (
+        f"[InputSPMD._sparse_unique:{group_name}] first_indices shape {first_local.shape} "
+        f"!= unique shape {unique_np.shape}"
+    )
+    if first_local.size > 1:
+        assert bool(np.all(np.diff(first_local) > 0)), (
+            f"[InputSPMD._sparse_unique:{group_name}] first_indices not strictly monotonic; "
+            "async_unique's first-occurrence ordering contract was violated"
+        )
+
+    assert inv_1d.shape[0] == original_ids.shape[0], (
+        f"[InputSPMD._sparse_unique:{group_name}] inv length {inv_1d.shape[0]} "
+        f"!= original length {original_ids.shape[0]}"
+    )
+    if inv_1d.size > 0:
+        assert int(inv_1d.min()) >= 0 and int(inv_1d.max()) < unique_np.size, (
+            f"[InputSPMD._sparse_unique:{group_name}] inv out of range: "
+            f"min={int(inv_1d.min())}, max={int(inv_1d.max())}, "
+            f"unique_size={unique_np.size}"
+        )
+    np.testing.assert_array_equal(
+        unique_np[inv_1d],
+        original_ids,
+        err_msg=f"[InputSPMD:{group_name}] unique+inv reconstruction failed",
+    )
+    np.testing.assert_array_equal(
+        original_ids[first_local],
+        unique_np,
+        err_msg=(f"[InputSPMD:{group_name}] first_indices contract violated"),
+    )
+
+    widths = tuple(w for w in global_shape[1:])
+    origins = _unique_global_flat_positions(
+        nested_splits,
+        first_local,
+        widths,
+        source_origins,
+        group_name,
+    )
+    unique_global_shape = (int(np.prod(global_shape, dtype=np.int64)),)
+
+    unique_tt = TransportTensor(
+        flat_values=unique_np,
+        origin_indices=ExplicitIndex(origins),
+        global_shape=unique_global_shape,
+    )
+    inv_tt = TransportTensor(
+        flat_values=inv_1d.astype(np.int64, copy=False),
+        nested_splits=list(nested_splits),
+        global_shape=global_shape,
+    )
+    return unique_tt, inv_tt
+
+
 async def _sparse_unique(
     tt: TransportTensor,
     rank: int,
     world_size: int,
-    group_name: str = "",
+    group_name: str,
+    ctx: Any,
 ) -> tuple[TransportTensor, TransportTensor]:
     """Deduplicate ids via sparse_embedding.async_unique (C++ high-perf).
 
@@ -109,89 +190,29 @@ async def _sparse_unique(
     nested_splits = tuple(np.asarray(s, dtype=np.int64) for s in tt.nested_splits)
 
     if ids_np.size == 0:
-        unique_np = np.empty((0,), dtype=np.int64)
-        inv_1d = np.empty((0,), dtype=np.int32)
-        first_local = np.empty((0,), dtype=np.int64)
+        unique_raw = np.empty((0,), dtype=np.int64)
+        inv_raw = np.empty((0,), dtype=np.int32)
+        first_raw = np.empty((0,), dtype=np.int64)
     else:
-        unique_dlm, inv_dlm, first_dlm = await se.async_unique(
+        unique_raw, inv_raw, first_raw = await se.async_unique(
             prepare_dlpack_input(ids_np.ravel()),
             return_inverse=True,
             return_first_indices=True,
         )
 
-        backend = get_backend()
-        unique_np = backend.from_dlpack(unique_dlm).astype(np.int64)
-        inv_1d = backend.from_dlpack(inv_dlm).astype(np.int32).reshape(-1)
-        first_local = backend.from_dlpack(first_dlm).astype(np.int64).reshape(-1)
-
-    # -- Invariants on async_unique outputs --
-    assert unique_np.ndim == 1, (
-        f"[InputSPMD._sparse_unique:{group_name}] unique must be 1D, got shape={unique_np.shape}"
-    )
-    assert np.unique(unique_np).size == unique_np.size, (
-        f"[InputSPMD._sparse_unique:{group_name}] async_unique output contains duplicates"
-    )
-    assert first_local.shape == unique_np.shape, (
-        f"[InputSPMD._sparse_unique:{group_name}] first_indices shape {first_local.shape} "
-        f"!= unique shape {unique_np.shape}"
-    )
-    # async_unique emits unique in first-occurrence order, so first_indices
-    # must be strictly monotonic — this is the contract that lets dense
-    # rank d use argsort(origin_indices) to recover the producer's order.
-    if first_local.size > 1:
-        assert bool(np.all(np.diff(first_local) > 0)), (
-            f"[InputSPMD._sparse_unique:{group_name}] first_indices not strictly monotonic; "
-            "async_unique's first-occurrence ordering contract was violated"
-        )
-
-    # -- Numerical correctness check: unique + inv reconstruction --
-    # invariant: original_ids[i] == unique_ids[inv[i]] for all i
     original_ids = ids_np.ravel()
-    assert inv_1d.shape[0] == original_ids.shape[0], (
-        f"[InputSPMD._sparse_unique:{group_name}] inv length {inv_1d.shape[0]} "
-        f"!= original length {original_ids.shape[0]}"
-    )
-    if inv_1d.size > 0:
-        assert int(inv_1d.min()) >= 0 and int(inv_1d.max()) < unique_np.size, (
-            f"[InputSPMD._sparse_unique:{group_name}] inv out of range: "
-            f"min={int(inv_1d.min())}, max={int(inv_1d.max())}, "
-            f"unique_size={unique_np.size}"
-        )
-    np.testing.assert_array_equal(
-        unique_np[inv_1d],
+    return await ctx.run_in_lane(
+        _materialize_sparse_unique_tensors,
+        unique_raw,
+        inv_raw,
+        first_raw,
         original_ids,
-        err_msg=f"[InputSPMD:{group_name}] unique+inv reconstruction failed",
-    )
-
-    # Numerical correctness check: first_indices points to first occurrence.
-    # invariant: ids[first_indices[i]] == unique[i]
-    np.testing.assert_array_equal(
-        original_ids[first_local],
-        unique_np,
-        err_msg=(f"[InputSPMD:{group_name}] first_indices contract violated"),
-    )
-
-    widths = tuple(w for w in tt.global_shape[1:])
-    origins = _unique_global_flat_positions(
+        tt.global_shape,
         nested_splits,
-        first_local,
-        widths,
         np.asarray(source_origins, dtype=np.int64),
         group_name,
+        lane="compute",
     )
-    unique_global_shape = (int(np.prod(tt.global_shape, dtype=np.int64)),)
-
-    unique_tt = TransportTensor(
-        flat_values=unique_np,
-        origin_indices=ExplicitIndex(origins),
-        global_shape=unique_global_shape,
-    )
-    inv_tt = TransportTensor(
-        flat_values=inv_1d.astype(np.int64, copy=False),
-        nested_splits=list(nested_splits),
-        global_shape=tt.global_shape,
-    )
-    return unique_tt, inv_tt
 
 
 @spmd(
@@ -255,12 +276,14 @@ class InputSPMD:
             rank=self.rank,
             world_size=self.world_size,
             group_name="user",
+            ctx=self.ctx,
         )
         item_task = _sparse_unique(
             data.passive.target_target_id,
             rank=self.rank,
             world_size=self.world_size,
             group_name="item",
+            ctx=self.ctx,
         )
 
         with fw.profiler.scope(

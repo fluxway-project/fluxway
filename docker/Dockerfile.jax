@@ -47,11 +47,13 @@ RUN pip install --default-timeout=1000 --no-cache-dir \
     libclang \
     msgpack \
     minio \
+    ml_dtypes \
     numba \
     psutil \
     flask \
+    orjson \
     pandas \
-    "pyarrow>=14.0" \
+    pyarrow \
     pydantic \
     pylance \
     "pyiceberg[sql-postgres,s3,glue,hive,pyarrow]" \
@@ -68,6 +70,8 @@ RUN pip uninstall -y cupy-cuda12x
 
 # Install RAPIDS GPU-accelerated libraries
 RUN pip install --default-timeout=1000 --no-cache-dir --extra-index-url https://pypi.nvidia.com cudf-cu13 rmm-cu13
+
+RUN pip install --default-timeout=1000 --no-cache-dir --upgrade numba pyarrow
 
 # Copy project files into the container
 # NOTE: Ensure you run `docker build` from the repository root, e.g.:

@@ -49,6 +49,40 @@ assert not fw.profiler.enabled()
 分析未启用时，作用域和事件不执行记录，也不校验、驻留或序列化属性。
 大型张量和结构化数据应写入应用日志。
 
+### 异步操作与发射耗时采集
+
+当用户自定义算子或函数包含异步操作时，`fw.profiler.scope` 和 `fw.profiler.async_scope` 同时支持同步与异步上下文管理器（`with` 与 `async with`）。
+
+针对具有同步阻塞发射（例如向队列派发任务或发射 GPU Kernel）并在异步回调后完成的操作，可以调用 `op.launched()` 显式区分发射耗时与实际完成耗时：
+
+```python
+async def async_lookup(ids: list[int]):
+    async with fw.profiler.async_scope("async_embedding_lookup") as op:
+        # 1. 同步阻塞发射阶段
+        future = launch_request(ids)
+        op.launched()  # 记录 user.async_embedding_lookup.launch 的短耗时
+
+        # 2. 异步回调等待阶段
+        values = await future
+    # 代码块退出时自动记录完整的 user.async_embedding_lookup 真耗时
+    return values
+```
+
+基于回调形式的异步操作：
+
+```python
+op = fw.profiler.start_async_operation("callback_lookup")
+future = launch_request(ids)
+op.launched()
+future.add_done_callback(lambda _: op.complete())
+```
+
+在算子层面，`user_callable.execute` 记录整个调用，`user_callable.function_run`
+记录函数体耗时；`async def` 算子的等待也计入函数体。仅创建 coroutine 对象并未发射操作；
+需要区分真实发射阶段时，在自定义作用域内显式调用 `op.launched()`。
+已有代码若调用 `profiler.launch_scope()`，应改为在真实提交操作的位置建立具名
+`profiler.scope()`，并在提交完成时调用 `op.launched()`。不再自动生成 `user_callable.launch` 切片。
+
 ## 为作业启用采集
 
 安装导出依赖：
@@ -75,12 +109,18 @@ async def profile_job(
     run_id: str,
     *,
     skip_initial_steps: int = 0,
+    step_interval: int = 1,
+    target_steps: tuple[int, ...] | None = None,
+    max_steps: int | None = None,
     steady_state_only: bool = False,
 ) -> Path:
     config = ProfilerConfig(
         trace_dir=str(trace_directory),
         run_id=run_id,
         skip_initial_steps=skip_initial_steps,
+        step_interval=step_interval,
+        target_steps=target_steps,
+        max_steps=max_steps,
         steady_state_only=steady_state_only,
     )
     execution = await start(graph, placement_recipe=recipe, profiler_config=config)
@@ -97,7 +137,13 @@ async def profile_job(
 用 [Perfetto](https://ui.perfetto.dev/) 打开该文件。
 没有共享存储时，应从控制器所在机器取回文件，不能检查调用方本地的同名路径。
 
-`skip_initial_steps` 排除最初若干执行步，`steady_state_only` 只保留稳定执行区间内的记录。
+步数采集控制参数包括：
+- `skip_initial_steps`：跳过最初若干执行步（如 warmup 预热阶段）。
+- `step_interval`：控制采集步数间隔（例如 `step_interval=2` 每隔 2 步采集一次）。
+- `target_steps`：显式指定仅采集列表或集合中的具体步数。
+- `max_steps`：控制最大采集步数上限，累计达到该步数后自动停止采样。
+
+`steady_state_only` 只保留稳定执行区间内的记录。
 若过滤移除了全部记录，导出将抛出异常。
 采集使用固定大小的进程缓冲区，由 `buffer_bytes_per_process` 配置。
 默认启用严格的耗尽检查，容量不足时抛出 `ProfilerBufferExhausted`。
@@ -159,17 +205,23 @@ Controller/<subsystem>/<leaf>
 
 ## 将事件对应到编译后的计算图
 
-外围的 `user_callable.execute` 切片携带 `graph_id`、`spmd_id`、`op_id`、
-`function_id`、`input_signature_id` 和 `output_signature_id`。
-可以在 [Model Explorer](graph_visualization_zh.md) 中搜索相同值。
+外围的 `user_callable.execute` 切片携带 `graph_id`、`spmd_id` 和 `op_id`，
+可据此在 [Model Explorer](graph_visualization_zh.md) 中定位算子。
+导出的 `operator.function` 注解显示函数名。
 执行步和调用模式属于运行时事实，不属于编译后的计算图字段。
 
-导出时，`CompiledGraph` 提供算子函数、已声明的数据端口、控制端口、静态端口名称，
-以及显式的参数到字段路径。参数映射为空时保持为空，不猜测名称。
+`CompiledGraph` 保存算子函数、已声明的数据端口、控制端口、静态端口名称、签名，
+以及显式的参数到字段路径。trace 只重复函数名以方便阅读；静态端口和参数细节在 Model Explorer 中查看。
 `transfer_code` 标识从源端口到目标端口的一次传输，`logical_tuuid` 标识生产者输出。
 同一个输出可以供给多个目标端口：它们共享逻辑张量标识，但具有各自的传输编码。
 
 记录器在热路径上保存定宽整数记录，图名称在导出时通过冻结的符号投影统一解析。
+切片结束包只负责闭合切片，属性保存在开始包。
 显式的算子、传输或张量标识必须能解析，否则抛出 `MissingGraphTraceSymbol`。
 `execution.phase` 等生命周期事件可以不携带算子标识，按非算子元数据处理。
 控制器使用独立的记录入口，但共用同一记录格式和导出流程。
+
+旧版 trace 消费端应使用 `graph_id`、`spmd_id` 和 `op_id` 关联编译图，
+从编译图读取函数签名、端口和参数路径。切片中不再逐次写出 `function_id`、
+签名 ID 以及 `operator.input.*` / `operator.output.*` 注解。
+读取 `TYPE_SLICE_BEGIN` 的属性，再按轨道 UUID 匹配 `TYPE_SLICE_END`；结束包不带事件名或属性。

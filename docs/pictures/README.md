@@ -13,6 +13,8 @@ example exported by `scripts/docs_visualization_examples.py`.
 The graph is compiled and exported by Fluxway. The trace contains deterministic
 illustrative timings, written by Fluxway's `PerfettoTraceWriter` using symbols
 from that same compiled graph. It is not a recorded training job or a benchmark.
+This synthetic timeline contains worker events only; a real job trace exported
+by the controller also includes control-plane events.
 The longer lookup on embedding rank 1 at step 1 illustrates how to follow an
 upstream delay into a downstream wait. Durations do not establish GPU execution
 time or a performance improvement.
@@ -34,6 +36,8 @@ The Perfetto screenshots use custom workspaces to collect the original leaf
 tracks under compact SPMD/rank groups. The leaf labels retain their subsystem
 and purpose. This changes the viewer layout without changing event names,
 timings, or attributes.
+The scope screenshot stops after `operator.function`; static port and parameter
+details are available in the compiled graph rather than the compact trace.
 
 Titles and short reading cues sit outside the viewer screenshots. Empty canvas
 space is cropped for legibility; the graph edges and trace events are not

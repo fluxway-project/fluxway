@@ -12,7 +12,14 @@ from fluxway.profiler.errors import (
 )
 from fluxway.profiler.record import TraceCarrier, TraceEventKind, TraceMetadata
 from fluxway.profiler.runtime import ProfilerRuntimeFactory
-from fluxway.profiler.user_api import enabled, event, scope
+from fluxway.profiler.user_api import (
+    async_scope,
+    enabled,
+    event,
+    function_scope,
+    scope,
+    start_async_operation,
+)
 
 __all__ = [
     "CausalClockViolation",
@@ -28,7 +35,10 @@ __all__ = [
     "TraceCarrier",
     "TraceEventKind",
     "TraceMetadata",
+    "async_scope",
     "enabled",
     "event",
+    "function_scope",
     "scope",
+    "start_async_operation",
 ]

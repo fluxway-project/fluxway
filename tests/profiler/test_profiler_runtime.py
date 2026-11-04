@@ -4,7 +4,8 @@ from dataclasses import dataclass
 import importlib.util
 import inspect
 from pathlib import Path
-from typing import cast
+from types import SimpleNamespace
+from typing import Any, cast
 
 
 import numpy as np
@@ -55,6 +56,8 @@ from fluxway.profiler.wrappers import (
 )
 from fluxway.profiler.snapshots import merge_profiler_snapshots
 from fluxway.profiler.filtering import filter_steady_state_records
+from fluxway.profiler.filtering import StepFilter
+from fluxway.control_plane.controller import ControllerActor
 from fluxway.rpc.protocol import DataPlaneCallable, ReceiverIngressCompletion
 from fluxway.rpc.protocol import TransportFrameEnvelope
 from tests.compiled_graph_fixtures import compiled_spmd_spec
@@ -275,20 +278,11 @@ async def test_user_callable_execute_records_compiled_operator_identity(tmp_path
     payload = row[PAYLOAD_START_COLUMN : PAYLOAD_START_COLUMN + len(fields)]
     values = dict(zip(fields, payload, strict=True))
 
-    assert len(fields) == 8
+    assert len(fields) == 5
     assert metadata.name_for(int(values["graph_id"])) == _TRACE_PLAN.graph_id
     assert metadata.name_for(int(values["spmd_id"])) == "embedding"
-    assert metadata.name_for(int(values["function_id"])) == "tests.Embedding.lookup"
     assert metadata.name_for(int(values["op_id"])) == "lookup"
     assert int(values["step"]) == 9
-    assert (
-        metadata.name_for(int(values["input_signature_id"]))
-        == _TRACE_COMPILED_OPERATOR.input_signature_id
-    )
-    assert (
-        metadata.name_for(int(values["output_signature_id"]))
-        == _TRACE_COMPILED_OPERATOR.output_signature_id
-    )
     assert metadata.name_for(int(values["execution_mode"])) == "coroutine_async"
     assert "operator_facts" not in UserCallableSpec.__dataclass_fields__
 
@@ -350,7 +344,7 @@ async def test_trace_recorder_skips_step_level_records_below_threshold():
         TraceArena(buffer_bytes=8 * 16 * np.dtype(np.int64).itemsize),
         run_id="run",
         process_name="worker/spmd/rank:0",
-        skip_initial_steps=2,
+        step_filter=StepFilter(skip_initial_steps=2),
     )
 
     recorder.worker_scheduler_instant(spec=WORKER_RUN_LOOP)
@@ -425,7 +419,7 @@ async def test_skipped_trace_span_preserves_wrapped_exception():
         TraceArena(buffer_bytes=8 * 16 * np.dtype(np.int64).itemsize),
         run_id="run",
         process_name="worker/spmd/rank:0",
-        skip_initial_steps=1,
+        step_filter=StepFilter(skip_initial_steps=1),
     )
 
     with pytest.raises(RuntimeError, match="prepare failed"):
@@ -509,7 +503,7 @@ def test_user_profiler_skip_initial_steps_applies_to_custom_records():
         TraceArena(buffer_bytes=8 * 16 * np.dtype(np.int64).itemsize),
         run_id="run",
         process_name="worker/spmd/rank:0",
-        skip_initial_steps=2,
+        step_filter=StepFilter(skip_initial_steps=2),
     )
     for step in (1, 2):
         with activate_user_profiler(
@@ -543,6 +537,61 @@ async def test_steady_state_filter_removes_lifecycle_records():
     names = [recorder.metadata.name_for(int(row[4])) for row in filtered]
 
     assert names == ["driver.drain"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("steady_state_only", [False, True])
+async def test_controller_export_includes_control_plane_snapshot(
+    tmp_path, steady_state_only
+):
+    if importlib.util.find_spec("perfetto") is None:
+        pytest.skip("perfetto is not installed")
+    from perfetto.protos.perfetto.trace import perfetto_trace_pb2 as proto
+
+    config = ProfilerConfig(
+        trace_dir=str(tmp_path),
+        run_id="run",
+        steady_state_only=steady_state_only,
+    )
+    controller_recorder = TraceRecorder(
+        TraceArena(buffer_bytes=64 * 1024),
+        run_id=config.run_id,
+        process_name="controller",
+    )
+    worker_recorder = TraceRecorder(
+        TraceArena(buffer_bytes=64 * 1024),
+        run_id=config.run_id,
+        process_name="worker/embedding/rank:0",
+    )
+    controller_class = cast(Any, ControllerActor).__ray_actor_class__
+    controller = controller_class.__new__(controller_class)
+    controller._profiler_config = config
+    controller._profiler_runtime = ProfilerRuntimeFactory(controller_recorder)
+    controller._graph = SimpleNamespace(require_compiled_graph=lambda: _TRACE_PLAN)
+
+    async with controller_recorder.controller_initialize(spmd_count=1):
+        pass
+    async with worker_recorder.user_callable_execute(
+        graph_id=_TRACE_PLAN.graph_id,
+        compiled_operator=_TRACE_COMPILED_OPERATOR,
+        step=0,
+        execution_mode="coroutine_async",
+    ):
+        pass
+
+    output = tmp_path / "trace.pftrace"
+    await controller.write_profiler_trace(
+        str(output), {"embedding": {0: worker_recorder.snapshot()}}
+    )
+    trace = proto.Trace.FromString(output.read_bytes())
+    names = {
+        packet.track_event.name
+        for packet in trace.packet
+        if packet.track_event.type == proto.TrackEvent.TYPE_SLICE_BEGIN
+    }
+    assert "controller.profiler_export" in names
+    assert "user_callable.execute" in names
+    assert ("controller.initialize" in names) is not steady_state_only
 
 
 def test_trace_arena_fixed_capacity_exhaustion():
@@ -820,17 +869,13 @@ async def test_perfetto_writer_decodes_interned_debug_annotations(tmp_path):
     assert annotations["graph_id"] == _TRACE_PLAN.graph_id
     assert annotations["graph_generation"] == str(_TRACE_GRAPH_SYMBOLS.generation)
     assert annotations["spmd_id"] == "embedding"
-    assert annotations["function_id"] == "tests.Embedding.lookup"
+    assert annotations["operator.function"] == "tests.Embedding.lookup"
     assert annotations["op_id"] == "lookup"
     assert annotations["step"] == 4
-    assert (
-        annotations["input_signature_id"] == _TRACE_COMPILED_OPERATOR.input_signature_id
-    )
-    assert (
-        annotations["output_signature_id"]
-        == _TRACE_COMPILED_OPERATOR.output_signature_id
-    )
     assert annotations["execution_mode"] == "coroutine_async"
+    assert "function_id" not in annotations
+    assert "input_signature_id" not in annotations
+    assert "output_signature_id" not in annotations
 
     local_step_annotations = {}
     for packet in trace.packet:
@@ -848,9 +893,8 @@ async def test_perfetto_writer_decodes_interned_debug_annotations(tmp_path):
     assert local_step_annotations["step"] == 4
     assert local_step_annotations["node_count"] == 1
     assert local_step_annotations["operator.function"] == "tests.Embedding.lookup"
-    assert local_step_annotations["operator.input.data_ports"] == "ids, weights"
-    assert local_step_annotations["operator.input.control_ports"] == "lr"
-    assert local_step_annotations["operator.output.data_ports"] == "embeddings"
+    assert not any(key.startswith("operator.input.") for key in local_step_annotations)
+    assert not any(key.startswith("operator.output.") for key in local_step_annotations)
 
 
 @pytest.mark.asyncio
@@ -895,18 +939,28 @@ async def test_perfetto_writer_assigns_overlapping_slices_to_lanes(
         if packet.HasField("track_descriptor")
     }
     events_by_step = {7: [], 8: []}
+    active_by_track = {}
     for packet in trace.packet:
         event = packet.track_event
-        if event.name != "local_step_plan.execute":
+        if event.type == proto.TrackEvent.TYPE_SLICE_BEGIN:
+            if event.name != "local_step_plan.execute":
+                continue
+            step = next(
+                int(annotation.int_value)
+                for annotation in event.debug_annotations
+                if annotation.name == "step"
+            )
+            active_by_track[int(event.track_uuid)] = step
+        elif event.type == proto.TrackEvent.TYPE_SLICE_END:
+            assert event.name == ""
+            assert not event.debug_annotations
+            step = active_by_track.pop(int(event.track_uuid))
+        else:
             continue
-        step = next(
-            int(annotation.int_value)
-            for annotation in event.debug_annotations
-            if annotation.name == "step"
-        )
         events_by_step[step].append(
             (int(event.type), int(packet.timestamp), int(event.track_uuid))
         )
+    assert not active_by_track
 
     lane_uuids = set()
     for events in events_by_step.values():

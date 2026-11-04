@@ -22,6 +22,7 @@ from fluxway.profiler.record import (
     stable_u64,
 )
 from fluxway.profiler.clock import ClockCalibration
+from fluxway.profiler.filtering import StepFilter
 
 if TYPE_CHECKING:
     from fluxway.common.compiled_graph import CompiledOperator
@@ -355,10 +356,7 @@ USER_CALLABLE_EXECUTE = TraceEventSpec(
         "graph_id",
         "spmd_id",
         "op_id",
-        "function_id",
         "step",
-        "input_signature_id",
-        "output_signature_id",
         "execution_mode",
     ),
     "step",
@@ -689,14 +687,14 @@ class TraceRecorder:
         run_id: str,
         process_name: str,
         clock_calibration: ClockCalibration | None = None,
-        skip_initial_steps: int = 0,
+        step_filter: StepFilter | None = None,
     ) -> None:
-        if skip_initial_steps < 0:
-            raise ValueError("skip_initial_steps must be non-negative.")
+        if step_filter is not None and not isinstance(step_filter, StepFilter):
+            raise TypeError("step_filter must be a StepFilter or None.")
         self._arena = arena
         self._run_id = run_id
         self._process_name = process_name
-        self._skip_initial_steps = skip_initial_steps
+        self._step_filter = StepFilter() if step_filter is None else step_filter
         self._clock_calibration = clock_calibration or ClockCalibration(
             monotonic_to_epoch_offset_ns=0,
             uncertainty_ns=0,
@@ -706,6 +704,9 @@ class TraceRecorder:
         self._payload_fields_by_name_id: dict[int, tuple[str, ...]] = {}
         self._intern_lock = threading.RLock()
         self._root_carrier = TraceCarrier.root(run_id)
+
+    def is_step_profiled(self, step: int) -> bool:
+        return self._step_filter.is_step_profiled(step)
 
     @property
     def arena(self) -> TraceArena:
@@ -1254,10 +1255,7 @@ class TraceRecorder:
                 self.intern(graph_id),
                 self.intern(compiled_operator.key.spmd_id),
                 self.intern(compiled_operator.key.op_id),
-                self.intern(compiled_operator.function_id),
                 step,
-                self.intern(compiled_operator.input_signature_id),
-                self.intern(compiled_operator.output_signature_id),
                 self.intern(execution_mode),
             ),
         )
@@ -1280,7 +1278,7 @@ class TraceRecorder:
             ),
         )
 
-    def user_custom_scope(
+    def user_custom_slice(
         self,
         *,
         name: str,
@@ -1289,9 +1287,13 @@ class TraceRecorder:
         rank: int,
         execution_mode: str,
         attrs_json: str,
-    ) -> AbstractContextManager[None]:
-        return self._span(
+        start_ns: int,
+        dur_ns: int,
+    ) -> None:
+        self._slice(
             self._user_custom_spec(name=name, execution_mode=execution_mode),
+            start_ns=start_ns,
+            dur_ns=dur_ns,
             payload=(
                 self.intern(op_name),
                 step,
@@ -1764,8 +1766,33 @@ class TraceRecorder:
                     payload=payload,
                 )
 
+    def _slice(
+        self,
+        spec: TraceEventSpec,
+        *,
+        start_ns: int,
+        dur_ns: int,
+        carrier: TraceCarrier | None = None,
+        payload: tuple[int, ...] = EMPTY_TRACE_PAYLOAD,
+    ) -> None:
+        if self._skip_record(spec, payload):
+            return
+        active = self._root_carrier if carrier is None else carrier
+        track_id, name_id = self._register_spec(spec)
+        self._arena.append(
+            kind=TraceEventKind.SLICE_BEGIN,
+            ts_ns=start_ns,
+            dur_ns=dur_ns,
+            track_id=track_id,
+            name_id=name_id,
+            flow_id=active.flow_id,
+            task_id=active.task_id,
+            parent_task_id=active.parent_task_id,
+            payload=payload,
+        )
+
     def _skip_record(self, spec: TraceEventSpec, payload: tuple[int, ...]) -> bool:
-        if self._skip_initial_steps <= 0:
+        if not self._step_filter.has_filter:
             return False
         if spec.step_payload_field is None:
             return False
@@ -1781,7 +1808,8 @@ class TraceRecorder:
                 f"event={spec.name!r} payload length {len(payload)} does not contain "
                 f"step field {spec.step_payload_field!r} at index {step_index}."
             )
-        return payload[step_index] < self._skip_initial_steps
+        step = payload[step_index]
+        return not self._step_filter.is_step_profiled(step)
 
     @asynccontextmanager
     async def _async_span(

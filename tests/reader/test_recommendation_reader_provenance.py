@@ -1,5 +1,3 @@
-import asyncio
-
 import pytest
 
 from fluxway.common.decorators import _inject_context_properties, operator_context
@@ -61,7 +59,7 @@ def _read(reader: RecommendationReader, context: OperatorContext):
         world_size=context.physical_world_size,
         operator_ctx=context,
     ):
-        return asyncio.run(RecommendationReader.__dict__["read"].func(reader))
+        return RecommendationReader.__dict__["read"].func(reader)
 
 
 def test_recommendation_reader_requires_operator_context():
@@ -70,7 +68,7 @@ def test_recommendation_reader_requires_operator_context():
         RuntimeError,
         match="RecommendationReader.read requires an active OperatorContext",
     ):
-        asyncio.run(RecommendationReader.__dict__["read"].func(reader))
+        RecommendationReader.__dict__["read"].func(reader)
 
 
 def test_recommendation_reader_provenance_comes_from_canonical_work():

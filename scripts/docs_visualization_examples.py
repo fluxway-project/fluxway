@@ -191,7 +191,6 @@ def write_trace(graph: fw.Graph, output: Path) -> None:
     def call(
         spmd: str, rank: int, op: str, step: int, start: float, duration: float
     ) -> None:
-        operator = plan.spmd(spmd).operator(op)
         trace.add(
             f"worker/{spmd}/rank:{rank}",
             USER_CALLABLE_EXECUTE,
@@ -200,10 +199,7 @@ def write_trace(graph: fw.Graph, output: Path) -> None:
             graph_id=plan.graph_id,
             spmd_id=spmd,
             op_id=op,
-            function_id=operator.function_id,
             step=step,
-            input_signature_id=operator.input_signature_id,
-            output_signature_id=operator.output_signature_id,
             execution_mode="worker_process",
         )
 
