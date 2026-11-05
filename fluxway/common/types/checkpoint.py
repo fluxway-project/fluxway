@@ -205,7 +205,7 @@ class CheckpointCut:
             raise ValueError("control_epoch must be non-negative")
 
     @classmethod
-    def for_position(cls, cut_id: str, position: int) -> CheckpointCut:
+    def for_position(cls, cut_id: str, position: int | None) -> CheckpointCut:
         return cls(cut_id=cut_id, position=position)
 
     @classmethod
@@ -373,15 +373,24 @@ class CheckpointComponentSpec:
             raise ValueError("retention_domain must be non-empty when provided")
         if self.output_path is not None:
             if not isinstance(self.output_path, str):
-                raise TypeError("component output_path must be a string or None")
-            path = self.output_path.replace("\\", "/")
+                raise TypeError(
+                    f"Checkpoint component {self.component_id!r} output_path "
+                    f"must be a string or None; got {self.output_path!r}. "
+                    "Use a step-relative path such as 'sparse/UserTable'."
+                )
+            path = self.output_path
             if (
                 not path
                 or path.startswith("/")
+                or "\\" in path
+                or "\x00" in path
                 or any(part in {"", ".", ".."} for part in path.split("/"))
             ):
                 raise ValueError(
-                    "component output_path must be a non-empty relative path"
+                    f"Checkpoint component {self.component_id!r} has invalid "
+                    f"output_path={path!r}. Use a non-empty relative POSIX path "
+                    "under steps/<step>/, for example 'sparse/UserTable', "
+                    "without backslashes, NUL, empty segments, '.' or '..'."
                 )
         checkpoint_object_ids = [
             checkpoint_object.checkpoint_object_id

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, UTC
 from pathlib import Path
 from typing import Protocol
@@ -56,7 +56,7 @@ from fluxway.common.types.checkpoint import (
 )
 from fluxway.control_plane.checkpointer.component import (
     CheckpointComponentRegistration,
-    CheckpointComponent,
+    CheckpointComponentBinding,
     CheckpointComponentLifecycle,
     CheckpointObjectCleanup,
     CheckpointObjectLifecycle,
@@ -122,7 +122,7 @@ class GravitinoLanceStorageFactory:
 
 
 class SparseEmbeddingCheckpointComponent(
-    CheckpointComponent,
+    CheckpointComponentBinding,
     CheckpointComponentLifecycle,
     CheckpointComponentSave,
     CheckpointComponentRestore,
@@ -134,7 +134,7 @@ class SparseEmbeddingCheckpointComponent(
         storage_factory: SparseCheckpointStorageFactory,
         *,
         component_id: str = "embedding",
-        weight_group: str | None = None,
+        output_path: str | None = None,
         load_optimizer_state: bool = True,
         retention_domain: str | None = None,
         mode: CheckpointSaveMode = CheckpointSaveMode.INCREMENTAL,
@@ -161,19 +161,6 @@ class SparseEmbeddingCheckpointComponent(
             partition_spec = PartitionSpec.modulo()
         if not isinstance(partition_spec, PartitionSpec):
             raise TypeError("partition_spec must be a PartitionSpec")
-        if weight_group is None:
-            weight_group = (
-                component_id.removesuffix("_embedding")
-                if component_id.endswith("_embedding")
-                else component_id
-            )
-        if (
-            not weight_group
-            or "/" in weight_group
-            or "\\" in weight_group
-            or weight_group in {".", ".."}
-        ):
-            raise ValueError("weight_group must be a single safe path segment")
         self._descriptor = CheckpointComponentSpec(
             component_id=component_id,
             retention_domain=retention_domain,
@@ -185,8 +172,9 @@ class SparseEmbeddingCheckpointComponent(
             restore=CheckpointRestoreSpec(
                 topology=RestoreTopologyMode.LOGICAL_PARTITION_REMAP
             ),
-            output_path=f"sparse/{weight_group}",
+            output_path=output_path,
         )
+        self._bound_spmd_id: str | None = None
         self._storage_factory = storage_factory
         self._load_optimizer_state = load_optimizer_state
         self._mode = mode
@@ -203,6 +191,37 @@ class SparseEmbeddingCheckpointComponent(
     def descriptor(self) -> CheckpointComponentSpec:
         return self._descriptor
 
+    @property
+    def bound_spmd_id(self) -> str | None:
+        return self._bound_spmd_id
+
+    def bind_to_spmd(self, spmd_id: str) -> None:
+        if self._bound_spmd_id is not None:
+            raise ValueError(
+                f"Sparse checkpoint component {self.descriptor.component_id!r} "
+                f"is already bound to SPMD {self._bound_spmd_id!r}; "
+                f"cannot bind it again to {spmd_id!r}. Create a fresh component "
+                "for each node. FunctionalGraph does this automatically."
+            )
+        if (
+            not isinstance(spmd_id, str)
+            or not spmd_id
+            or spmd_id in {".", ".."}
+            or any(char in spmd_id for char in ("/", "\\", "\x00"))
+        ):
+            raise ValueError(
+                f"Cannot bind sparse checkpoint component "
+                f"{self.descriptor.component_id!r} to SPMD {spmd_id!r}: "
+                "the node name must be a non-empty single path segment without "
+                "slashes, backslashes, NUL, or '.'/'..'. Use a name such as "
+                "'UserTable'; it also identifies the checkpoint storage namespace."
+            )
+        if self._descriptor.output_path is None:
+            self._descriptor = replace(
+                self._descriptor, output_path=f"sparse/{spmd_id}"
+            )
+        self._bound_spmd_id = spmd_id
+
     def registration(self) -> CheckpointComponentRegistration:
         return CheckpointComponentRegistration(
             component=self,
@@ -214,6 +233,7 @@ class SparseEmbeddingCheckpointComponent(
         )
 
     async def open(self, runtime: CheckpointRuntime) -> None:
+        self.require_spmd_binding(runtime.spmd_id)
         if self._runtime is not None:
             raise RuntimeError(
                 f"sparse checkpoint component {self.descriptor.component_id!r} is open"
@@ -728,6 +748,7 @@ async def compact_sparse_checkpoints(
         initial_mode=CheckpointSaveMode.FULL,
         lineage_name=lineage_name,
     )
+    component.bind_to_spmd(spmd_id)
     await component.open(runtime)
     try:
         await component.compact_checkpoints()

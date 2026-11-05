@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -271,7 +272,7 @@ async def test_controller_waits_for_all_spmds_before_publishing_step(tmp_path):
     staging = tmp_path / "steps" / ".checkpoint.attempt"
     (staging / "model").mkdir(parents=True)
     (staging / "sparse" / "boss").mkdir(parents=True)
-    controller = object.__new__(Controller.__ray_metadata__.modified_class)
+    controller = object.__new__(cast(Any, Controller).__ray_actor_class__)
     controller._spmd_manager = _Manager()
     controller._snapshot_publication_context = {
         "checkpoint": (str(tmp_path), "attempt", 73)
@@ -399,3 +400,38 @@ async def test_component_output_requires_a_durable_step_position(tmp_path):
         )
 
     assert worker.state is None
+
+
+@pytest.mark.asyncio
+async def test_worker_requires_save_specification_when_save_capability_is_present(
+    tmp_path,
+):
+    storage = _LeaderStorage([])
+    component_without_save_spec = _Finalizer([])
+    broken_registration = object.__new__(CheckpointComponentRegistration)
+    object.__setattr__(broken_registration, "component", component_without_save_spec)
+    object.__setattr__(broken_registration, "save", storage)
+    object.__setattr__(broken_registration, "finalize", None)
+    object.__setattr__(broken_registration, "restore", None)
+    object.__setattr__(broken_registration, "component_lifecycle", None)
+    object.__setattr__(broken_registration, "object_lifecycle", None)
+    object.__setattr__(broken_registration, "object_cleanup", None)
+
+    worker = WorkerCheckpointCoordinator(
+        components=(broken_registration,),
+        operator_instance=object(),
+        repository_root=str(tmp_path),
+        spmd_id="test",
+        rank=0,
+        source_topology=TopologySnapshot(1, (), ()),
+    )
+
+    with pytest.raises(
+        RuntimeError, match="defines save capability without save specification"
+    ):
+        await worker.prepare_save(
+            "opaque-checkpoint-id",
+            "attempt",
+            CheckpointCommitPermit("attempt", 0, b"permit"),
+            CheckpointCut.for_step("cut", 1),
+        )

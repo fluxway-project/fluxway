@@ -39,6 +39,7 @@ dependencies = [
     "ray>=2.59.0",
     "ortools>=9.12",
     "numba>=0.66.0",
+    "tbb",
     "msgpack>=1.0.0",
 ]
 

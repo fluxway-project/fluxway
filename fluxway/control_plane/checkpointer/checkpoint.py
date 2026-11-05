@@ -114,6 +114,7 @@ class FluxwayCheckpointer:
         self._repository_dir = str(self._repository.root)
         self._interval_steps = interval_steps
         self._registries = dict(component_registries or {})
+        self._validate_output_paths()
         self._validate_retention_capabilities()
         self._restore_scope = restore_scope
         self._restore_spmd_bindings = dict(restore_spmd_bindings or {})
@@ -138,6 +139,39 @@ class FluxwayCheckpointer:
     @property
     def interval_steps(self) -> int:
         return self._interval_steps
+
+    def _validate_output_paths(self) -> None:
+        outputs: list[tuple[tuple[str, ...], str, str]] = []
+        for spmd_id, registry in self._registries.items():
+            registry.validate_spmd_binding(spmd_id)
+            for registration in registry:
+                descriptor = registration.descriptor
+                if descriptor.output_path is not None:
+                    outputs.append(
+                        (
+                            tuple(descriptor.output_path.split("/")),
+                            spmd_id,
+                            descriptor.component_id,
+                        )
+                    )
+        outputs.sort()
+        for previous, current in zip(outputs, outputs[1:], strict=False):
+            previous_parts, previous_spmd, previous_component = previous
+            current_parts, current_spmd, current_component = current
+            if current_parts[: len(previous_parts)] == previous_parts:
+                raise ValueError(
+                    "Conflicting checkpoint output paths: "
+                    f"SPMD {previous_spmd!r}, component {previous_component!r}, "
+                    f"output_path={'/'.join(previous_parts)!r} overlaps "
+                    f"SPMD {current_spmd!r}, component {current_component!r}, "
+                    f"output_path={'/'.join(current_parts)!r}. "
+                    "Each component exclusively owns its output directory and "
+                    "all descendants under steps/<step>/. Remove explicit sparse "
+                    "output_path overrides to use node-derived defaults, or "
+                    "set distinct output_path values that do not overlap. "
+                    "For multiple publishers in one SPMD, configure separate "
+                    "output_path values for each component."
+                )
 
     @property
     def snapshot_timeout_s(self) -> float:

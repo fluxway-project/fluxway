@@ -171,6 +171,7 @@ def _coordinator(root, rank, topology, owner):
         mode=CheckpointSaveMode.INCREMENTAL,
         initial_mode=CheckpointSaveMode.FULL,
     )
+    component.bind_to_spmd("embedding")
     return WorkerCheckpointCoordinator(
         (component.registration(),),
         owner,
@@ -188,6 +189,7 @@ async def _acknowledge_owner_save(root, permit):
         mode=CheckpointSaveMode.INCREMENTAL,
         initial_mode=CheckpointSaveMode.FULL,
     )
+    component.bind_to_spmd("embedding")
     await component.open(
         CheckpointRuntime(CheckpointRuntimeRole.CONTROL, str(root), "embedding")
     )
@@ -208,6 +210,7 @@ async def test_fluxway_restores_selected_step_from_exact_lance_version(tmp_path)
         mode=CheckpointSaveMode.INCREMENTAL,
         initial_mode=CheckpointSaveMode.FULL,
     )
+    control_component.bind_to_spmd("embedding")
     checkpointer = await FluxwayCheckpointer.create(
         controller,
         str(tmp_path / "repository"),
@@ -235,6 +238,7 @@ async def test_fluxway_restores_selected_step_from_exact_lance_version(tmp_path)
         mode=CheckpointSaveMode.INCREMENTAL,
         initial_mode=CheckpointSaveMode.FULL,
     )
+    restarted_component.bind_to_spmd("embedding")
     checkpointer = await FluxwayCheckpointer.create(
         controller,
         str(tmp_path / "repository"),
@@ -293,6 +297,7 @@ async def test_fluxway_automatically_cleanups_sparse_versions(tmp_path):
         mode=CheckpointSaveMode.INCREMENTAL,
         initial_mode=CheckpointSaveMode.FULL,
     )
+    control_component.bind_to_spmd("embedding")
     repository = tmp_path / "repository"
     checkpointer = await FluxwayCheckpointer.create(
         controller,
@@ -365,6 +370,7 @@ async def test_sparse_lease_blocks_automatic_cleanup_until_release(tmp_path):
         mode=CheckpointSaveMode.INCREMENTAL,
         initial_mode=CheckpointSaveMode.FULL,
     )
+    control_component.bind_to_spmd("embedding")
     checkpointer = await FluxwayCheckpointer.create(
         controller,
         str(tmp_path / "repository"),
@@ -688,13 +694,7 @@ class _ProbePayload:
     value: Any | None = None
 
 
-@pytest.mark.asyncio
-async def test_sparse_checkpoint_graph_node_isolation(tmp_path):
-    template_owner = SparseEmbeddingCheckpointComponent(
-        LocalLanceStorageFactory(),
-        partition_spec=PartitionSpec.hash(seed=42),
-    )
-
+def _sparse_graph(template_owner, names=("left", "right")):
     @spmd(
         resource_profile=ResourceProfile(base={"CPU": 1}),
         mesh_axis_names=("shard",),
@@ -710,13 +710,37 @@ async def test_sparse_checkpoint_graph_node_isolation(tmp_path):
             return payload
 
     with FunctionalGraph("partition-copy-isolation") as graph:
-        left = Probe(name="left")
-        right = Probe(name="right")
+        left = graph.node(names[0], Probe)
+        right = graph.node(names[1], Probe)
         right.execute(left.execute())
-        compiled = graph.build()
+        return graph.build()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("output_path", "left_output", "right_output"),
+    [
+        (None, "sparse/left", "sparse/right"),
+        ("sparse/embedding", "sparse/embedding", "sparse/embedding"),
+        ("exports/items_v1", "exports/items_v1", "exports/items_v1"),
+    ],
+)
+async def test_sparse_checkpoint_graph_node_isolation(
+    tmp_path, output_path, left_output, right_output
+):
+    template_owner = SparseEmbeddingCheckpointComponent(
+        LocalLanceStorageFactory(),
+        output_path=output_path,
+        partition_spec=PartitionSpec.hash(seed=42),
+    )
+    compiled = _sparse_graph(template_owner)
 
     left_registration = compiled.nodes["left"].spmd_config.checkpoint_components[0]
     right_registration = compiled.nodes["right"].spmd_config.checkpoint_components[0]
+    assert left_registration.descriptor.output_path == left_output
+    assert right_registration.descriptor.output_path == right_output
+    assert template_owner.descriptor.output_path == output_path
+    assert template_owner.bound_spmd_id is None
 
     for registration in (left_registration, right_registration):
         for capability in (
@@ -767,3 +791,140 @@ async def test_sparse_checkpoint_graph_node_isolation(tmp_path):
         assert template_owner._storage is None
     finally:
         await asyncio.gather(left_registry.close_all(), right_registry.close_all())
+
+
+@pytest.mark.asyncio
+async def test_two_default_sparse_graph_nodes_publish_distinct_weights(tmp_path):
+    from fluxway.control_plane.controller import _publish_checkpoint_output_step
+
+    template = SparseEmbeddingCheckpointComponent(LocalLanceStorageFactory())
+    graph = _sparse_graph(template, names=("UserTable", "ItemTable"))
+    topology = TopologySnapshot(1, (), ())
+    owners = (
+        _Owner(_store(np.asarray([1, 2], dtype=np.uint64))),
+        _Owner(_store(np.asarray([7, 8], dtype=np.uint64))),
+    )
+    coordinators = tuple(
+        WorkerCheckpointCoordinator(
+            node.spmd_config.checkpoint_components,
+            owner,
+            str(tmp_path),
+            name,
+            0,
+            topology,
+        )
+        for (name, node), owner in zip(graph.nodes.items(), owners, strict=True)
+    )
+    permit = CheckpointCommitPermit("attempt", 1, b"permit")
+    cut = CheckpointCut.for_step("cut", 17)
+    try:
+        await asyncio.gather(
+            *(
+                c.prepare_save("checkpoint", "attempt", permit, cut)
+                for c in coordinators
+            )
+        )
+        results = await asyncio.gather(*(c.save() for c in coordinators))
+        await asyncio.gather(*(c.finish_save() for c in coordinators))
+        publications = await asyncio.gather(
+            *(
+                c.commit_save({"embedding": {0: records["embedding"]}})
+                for c, records in zip(coordinators, results, strict=True)
+            )
+        )
+        await asyncio.gather(*(c.publish_save() for c in coordinators))
+        await _publish_checkpoint_output_step(
+            str(tmp_path), "checkpoint", "attempt", 17
+        )
+        handles = []
+        for name, publication, keys in zip(
+            graph.nodes,
+            publications,
+            ([1, 2], [7, 8]),
+            strict=True,
+        ):
+            storage = LocalLanceStorageFactory()(
+                CheckpointRuntime(CheckpointRuntimeRole.CONTROL, str(tmp_path), name),
+                "embedding",
+            )
+            try:
+                handle = storage.read_published_weight_handle(
+                    tmp_path / "steps" / "17" / "sparse" / name
+                )
+                checkpoint_object = (
+                    publication["embedding"].shared_records[0].checkpoint_objects[0]
+                )
+                assert handle == checkpoint_object.storage_locator
+                restored = se.EmbeddingStore(_config())
+                storage.load_component_checkpoint(
+                    restored,
+                    handle,
+                    _modulo_restore_options(1, 0),
+                    load_optimizer_state=True,
+                )
+                assert restored.total_size() == 2
+                np.testing.assert_allclose(
+                    _lookup(restored, np.asarray(keys, dtype=np.uint64)),
+                    np.repeat(np.asarray(keys, dtype=np.float32)[:, None], 4, axis=1),
+                )
+                handles.append(handle)
+            finally:
+                storage.close()
+        assert handles[0] != handles[1]
+        assert not (tmp_path / "steps" / ".checkpoint.attempt").exists()
+        assert template.descriptor.output_path is None
+    finally:
+        await asyncio.gather(*(c.close() for c in coordinators))
+
+
+@pytest.mark.asyncio
+async def test_unbound_sparse_component_fails_before_runtime_open(tmp_path):
+    component = SparseEmbeddingCheckpointComponent(LocalLanceStorageFactory())
+    with pytest.raises(ValueError) as error:
+        await FluxwayCheckpointer.create(
+            object(),
+            str(tmp_path),
+            interval_steps=1,
+            component_registries={
+                "UserTable": CheckpointComponentRegistry((component.registration(),))
+            },
+        )
+    message = str(error.value)
+    assert "UserTable" in message
+    assert "embedding" in message
+    assert "FunctionalGraph" in message
+    assert "component.bind_to_spmd('UserTable')" in message
+    assert "before creating a checkpointer" in message
+    assert not (tmp_path / "application-checkpoint_objects").exists()
+
+
+def test_sparse_component_cannot_be_used_on_another_host(tmp_path):
+    component = SparseEmbeddingCheckpointComponent(LocalLanceStorageFactory())
+    component.bind_to_spmd("UserTable")
+    with pytest.raises(ValueError) as error:
+        WorkerCheckpointCoordinator(
+            (component.registration(),),
+            object(),
+            str(tmp_path),
+            "ItemTable",
+            0,
+            TopologySnapshot(1, (), ()),
+        )
+    message = str(error.value)
+    assert "UserTable" in message
+    assert "ItemTable" in message
+    assert "fresh component" in message
+
+
+@pytest.mark.parametrize(
+    "name", ["", ".", "..", "group/table", "group\\table", "a\x00b"]
+)
+def test_sparse_graph_rejects_unsafe_node_names_with_guidance(name):
+    component = SparseEmbeddingCheckpointComponent(LocalLanceStorageFactory())
+    with pytest.raises(ValueError) as error:
+        _sparse_graph(component, names=(name, "right"))
+    message = str(error.value)
+    assert repr(name) in message
+    assert "node name" in message
+    assert "UserTable" in message
+    assert component.bound_spmd_id is None

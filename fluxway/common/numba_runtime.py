@@ -22,6 +22,40 @@ from typing import Any
 _numba_literal_lock = threading.RLock()
 
 
+class _ThreadingLayerVerifier:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._layer: str | None = None
+
+    def verify(self) -> str:
+        if self._layer is not None:
+            return self._layer
+        with self._lock:
+            if self._layer is not None:
+                return self._layer
+            # pyrefly: ignore[missing-import]
+            import numba.np.ufunc.parallel as parallel
+
+            parallel._launch_threads()
+            layer = str(parallel.threading_layer())
+            if layer == "workqueue":
+                raise RuntimeError(
+                    f"Numba threading layer is '{layer}'. "
+                    "The workqueue threading layer does not support concurrent multithreaded execution "
+                    "and crashes with SIGABRT upon concurrent access. "
+                    "Please install 'tbb' ('pip install tbb') or configure a thread-safe threading layer."
+                )
+            self._layer = layer
+            return layer
+
+
+_threading_layer_verifier = _ThreadingLayerVerifier()
+
+
+def verify_numba_threading_layer() -> str:
+    return _threading_layer_verifier.verify()
+
+
 def _lock_path() -> Path:
     configured = os.environ.get("FLUXWAY_NUMBA_CACHE_LOCK")
     if configured:
@@ -51,11 +85,16 @@ def numba_compile_lock() -> Generator[None, None, None]:
 
 
 def call_numba_cached(dispatcher: Any, *args: Any) -> Any:
+    if getattr(dispatcher, "targetoptions", {}).get("parallel", False):
+        verify_numba_threading_layer()
     argument_types = tuple(dispatcher.typeof_pyval(argument) for argument in args)
     if argument_types not in dispatcher.overloads:
         with _numba_literal_lock, numba_compile_lock():
             if argument_types not in dispatcher.overloads:
+                # pyrefly: ignore[missing-import]
                 from numba.core.types import Literal
+
+                # pyrefly: ignore[missing-import]
                 from numba.core.types.scalars import BooleanLiteral, IntegerLiteral
 
                 constructors = Literal.ctor_map

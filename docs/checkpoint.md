@@ -839,6 +839,27 @@ application. Compaction can run outside training through
 The native storage owner defines sparse partition plans, lineage, and restore.
 Keep credentials in runtime configuration.
 
+### Sparse publication paths
+
+Instantiating the same decorated sparse SPMD class as `UserTable` and
+`ItemTable` automatically publishes to `steps/<step>/sparse/UserTable` and
+`steps/<step>/sparse/ItemTable`. No per-node checkpoint registration is needed.
+Renaming a node changes the public output location for future checkpoints;
+update inference consumers accordingly. For a stable external name, configure
+the sparse component with `output_path="sparse/items_v1"`. The value is the full
+step-relative output path. The old `weight_group` keyword is removed: replace
+`weight_group="items_v1"` with `output_path="sparse/items_v1"`. Equal or nested
+output directories fail at startup with both owners and corrective guidance.
+Low-level callers must bind the component with
+`component.bind_to_spmd("UserTable")` before creating a checkpointer or worker
+coordinator. A registration object may be created before binding.
+
+The old default was derived from the component ID, dropping a trailing
+`_embedding` suffix if present. Upgrading changes the output
+path to `sparse/<spmd_id>` even when the node name stays the same. Update
+inference consumers, or explicitly set `output_path="sparse/<old-directory>"`
+on the component to preserve the existing public asset path.
+
 ## Source recovery boundary
 
 `SourceWorkKey(epoch, step, assignment_id)` identifies logical work. Physical

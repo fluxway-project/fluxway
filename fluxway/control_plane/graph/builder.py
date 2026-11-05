@@ -38,6 +38,7 @@ from fluxway.common.types.sharding import (
     AlgebraicRouting,
 )
 from fluxway.common.operator_policy import ArgumentType
+from fluxway.control_plane.checkpointer.component import CheckpointComponentBinding
 
 
 class Builder:
@@ -185,6 +186,10 @@ class Builder:
             )
 
         spmd_config.static_args.update(kwargs)
+        spmd_config.spmd_id = name
+        for registration in spmd_config.checkpoint_components:
+            if isinstance(registration.component, CheckpointComponentBinding):
+                registration.component.bind_to_spmd(name)
 
         node = Node(
             name=name,
@@ -193,8 +198,6 @@ class Builder:
             spmd_config=spmd_config,
             spmd_class=spmd_class,
         )
-
-        spmd_config.spmd_id = name
 
         self._nodes[name] = node
         self._spmd_classes[name] = spmd_class

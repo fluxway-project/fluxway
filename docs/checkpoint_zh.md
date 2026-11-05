@@ -691,6 +691,12 @@ embedding_checkpoint = SparseEmbeddingCheckpointComponent(
 
 `LocalLanceStorageFactory` 支持本地或共享 POSIX 存储，`GravitinoLanceStorageFactory` 接收应用提供的运行时目录设置。训练之外可通过 `compact_sparse_checkpoints(repository_root, spmd_id, lineage_name=...)` 合并片段。原生存储拥有者定义稀疏分区计划、谱系和恢复。凭据通过运行时配置传入。
 
+### 稀疏权重发布路径
+
+同一个装饰类实例化为 `UserTable` 和 `ItemTable` 时，图构建会自动将两个独立组件的发布路径绑定为 `steps/<step>/sparse/UserTable` 和 `steps/<step>/sparse/ItemTable`，无需为每个节点重新注册 Checkpoint 组件。节点改名会改变后续检查点的公共输出位置，推理侧读取路径需要同步调整。需要稳定的外部名称时，在稀疏组件上配置 `output_path="sparse/items_v1"`；这是相对于 `steps/<step>/` 的完整路径。旧参数 `weight_group` 已移除：将 `weight_group="items_v1"` 改为 `output_path="sparse/items_v1"`。相同或父子嵌套的发布目录会在启动时被拒绝，错误列出双方所有者及修改建议。直接使用底层接口时，在创建 Checkpointer 或 Worker 协调器前调用 `component.bind_to_spmd("UserTable")`；注册对象可以在绑定前创建。
+
+升级前的默认目录由组件 ID 派生；若组件 ID 以 `_embedding` 结尾，还会去掉该后缀。升级后，即使节点名不变，后续检查点的输出目录也会变为 `sparse/<spmd_id>`。请同步调整推理侧读取路径；若需保留旧的公共资产路径，在稀疏组件上显式配置 `output_path="sparse/<原目录>"`。
+
 ## 来源恢复边界
 
 `SourceWorkKey(epoch, step, assignment_id)` 标识逻辑任务，物理分段使用独立区间租约。确认只推进连续、完整确认的步骤，只有协调检查点推进已提交位置。新的租约会隔离旧执行的延迟确认。
