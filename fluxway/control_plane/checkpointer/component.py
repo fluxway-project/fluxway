@@ -31,10 +31,12 @@ class CheckpointComponent(ABC):
 class CheckpointComponentBinding(CheckpointComponent):
     @property
     @abstractmethod
-    def bound_spmd_id(self) -> str | None: ...
+    def bound_spmd_id(self) -> str | None:
+        raise NotImplementedError
 
     @abstractmethod
-    def bind_to_spmd(self, spmd_id: str) -> None: ...
+    def bind_to_spmd(self, spmd_id: str) -> None:
+        raise NotImplementedError
 
     def require_spmd_binding(self, spmd_id: str) -> None:
         if self.bound_spmd_id != spmd_id:

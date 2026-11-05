@@ -20,32 +20,40 @@ from typing import Any
 # this process, while the file lock coordinates Numba's on-disk cache across
 # processes.
 _numba_literal_lock = threading.RLock()
-_threading_layer_verified = False
-_threading_layer_lock = threading.Lock()
+
+
+class _ThreadingLayerVerifier:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._layer: str | None = None
+
+    def verify(self) -> str:
+        if self._layer is not None:
+            return self._layer
+        with self._lock:
+            if self._layer is not None:
+                return self._layer
+            # pyrefly: ignore[missing-import]
+            import numba.np.ufunc.parallel as parallel
+
+            parallel._launch_threads()
+            layer = str(parallel.threading_layer())
+            if layer == "workqueue":
+                raise RuntimeError(
+                    f"Numba threading layer is '{layer}'. "
+                    "The workqueue threading layer does not support concurrent multithreaded execution "
+                    "and crashes with SIGABRT upon concurrent access. "
+                    "Please install 'tbb' ('pip install tbb') or configure a thread-safe threading layer."
+                )
+            self._layer = layer
+            return layer
+
+
+_threading_layer_verifier = _ThreadingLayerVerifier()
 
 
 def verify_numba_threading_layer() -> str:
-    global _threading_layer_verified
-    if not _threading_layer_verified:
-        with _threading_layer_lock:
-            if not _threading_layer_verified:
-                # pyrefly: ignore[missing-import]
-                import numba.np.ufunc.parallel as parallel
-
-                parallel._launch_threads()
-                layer = str(parallel.threading_layer())
-                if layer == "workqueue":
-                    raise RuntimeError(
-                        f"Numba threading layer is '{layer}'. "
-                        "The workqueue threading layer does not support concurrent multithreaded execution "
-                        "and crashes with SIGABRT upon concurrent access. "
-                        "Please install 'tbb' ('pip install tbb') or configure a thread-safe threading layer."
-                    )
-                _threading_layer_verified = True
-    # pyrefly: ignore[missing-import]
-    import numba.np.ufunc.parallel as parallel
-
-    return str(parallel.threading_layer())
+    return _threading_layer_verifier.verify()
 
 
 def _lock_path() -> Path:
