@@ -134,7 +134,6 @@ class SparseEmbeddingCheckpointComponent(
         storage_factory: SparseCheckpointStorageFactory,
         *,
         component_id: str = "embedding",
-        weight_group: str | None = None,
         output_path: str | None = None,
         load_optimizer_state: bool = True,
         retention_domain: str | None = None,
@@ -162,21 +161,6 @@ class SparseEmbeddingCheckpointComponent(
             partition_spec = PartitionSpec.modulo()
         if not isinstance(partition_spec, PartitionSpec):
             raise TypeError("partition_spec must be a PartitionSpec")
-        if weight_group is not None:
-            if (
-                not isinstance(weight_group, str)
-                or not weight_group
-                or "/" in weight_group
-                or "\\" in weight_group
-                or weight_group in {".", ".."}
-            ):
-                raise ValueError("weight_group must be a single safe path segment")
-            derived_output_path = f"sparse/{weight_group}"
-            if output_path is not None and output_path != derived_output_path:
-                raise ValueError(
-                    f"Conflicting weight_group {weight_group!r} and output_path {output_path!r}"
-                )
-            output_path = derived_output_path
         self._descriptor = CheckpointComponentSpec(
             component_id=component_id,
             retention_domain=retention_domain,
