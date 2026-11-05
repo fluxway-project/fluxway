@@ -20,6 +20,32 @@ from typing import Any
 # this process, while the file lock coordinates Numba's on-disk cache across
 # processes.
 _numba_literal_lock = threading.RLock()
+_threading_layer_verified = False
+_threading_layer_lock = threading.Lock()
+
+
+def verify_numba_threading_layer() -> str:
+    global _threading_layer_verified
+    if not _threading_layer_verified:
+        with _threading_layer_lock:
+            if not _threading_layer_verified:
+                # pyrefly: ignore[missing-import]
+                import numba.np.ufunc.parallel as parallel
+
+                parallel._launch_threads()
+                layer = str(parallel.threading_layer())
+                if layer == "workqueue":
+                    raise RuntimeError(
+                        f"Numba threading layer is '{layer}'. "
+                        "The workqueue threading layer does not support concurrent multithreaded execution "
+                        "and crashes with SIGABRT upon concurrent access. "
+                        "Please install 'tbb' ('pip install tbb') or configure a thread-safe threading layer."
+                    )
+                _threading_layer_verified = True
+    # pyrefly: ignore[missing-import]
+    import numba.np.ufunc.parallel as parallel
+
+    return str(parallel.threading_layer())
 
 
 def _lock_path() -> Path:
@@ -51,11 +77,16 @@ def numba_compile_lock() -> Generator[None, None, None]:
 
 
 def call_numba_cached(dispatcher: Any, *args: Any) -> Any:
+    if getattr(dispatcher, "targetoptions", {}).get("parallel", False):
+        verify_numba_threading_layer()
     argument_types = tuple(dispatcher.typeof_pyval(argument) for argument in args)
     if argument_types not in dispatcher.overloads:
         with _numba_literal_lock, numba_compile_lock():
             if argument_types not in dispatcher.overloads:
+                # pyrefly: ignore[missing-import]
                 from numba.core.types import Literal
+
+                # pyrefly: ignore[missing-import]
                 from numba.core.types.scalars import BooleanLiteral, IntegerLiteral
 
                 constructors = Literal.ctor_map

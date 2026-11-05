@@ -717,6 +717,9 @@ async def test_sparse_checkpoint_graph_node_isolation(tmp_path):
 
     left_registration = compiled.nodes["left"].spmd_config.checkpoint_components[0]
     right_registration = compiled.nodes["right"].spmd_config.checkpoint_components[0]
+    assert left_registration.descriptor.output_path == "sparse/left"
+    assert right_registration.descriptor.output_path == "sparse/right"
+    assert template_owner.descriptor.output_path is None
 
     for registration in (left_registration, right_registration):
         for capability in (
