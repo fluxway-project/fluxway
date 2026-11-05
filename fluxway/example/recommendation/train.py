@@ -150,12 +150,6 @@ async def run_training(args):
     from fluxway.example.recommendation.sparse_checkpoint import (
         compact_sparse_checkpoints,
     )
-    from fluxway.common.bind import bind_spmd
-    from fluxway.integrations.sparse_embedding.checkpoint import (
-        LocalLanceStorageFactory,
-        SparseEmbeddingCheckpointComponent,
-        CheckpointSaveMode,
-    )
 
     if getattr(args, "compact_only", False):
         for spmd_id in ("EmbeddingTable1", "EmbeddingTable2"):
@@ -222,35 +216,7 @@ async def run_training(args):
         input_node = InputSPMD(
             name="InputProcessor", mesh=input_mesh, runtime_env=cpu_runtime_env
         )
-        table1_type = bind_spmd(
-            SparseEmbeddingSPMD,
-            resource_profile=SparseEmbeddingSPMD.get_resource_profile(),
-            mesh_axis_names=("shard",),
-            checkpoint_components=(
-                SparseEmbeddingCheckpointComponent(
-                    LocalLanceStorageFactory(),
-                    weight_group="table1",
-                    lineage_name="embedding",
-                    mode=CheckpointSaveMode.INCREMENTAL,
-                    initial_mode=CheckpointSaveMode.FULL,
-                ).registration(),
-            ),
-        )
-        table2_type = bind_spmd(
-            SparseEmbeddingSPMD,
-            resource_profile=SparseEmbeddingSPMD.get_resource_profile(),
-            mesh_axis_names=("shard",),
-            checkpoint_components=(
-                SparseEmbeddingCheckpointComponent(
-                    LocalLanceStorageFactory(),
-                    weight_group="table2",
-                    lineage_name="embedding",
-                    mode=CheckpointSaveMode.INCREMENTAL,
-                    initial_mode=CheckpointSaveMode.FULL,
-                ).registration(),
-            ),
-        )
-        table1 = table1_type(
+        table1 = SparseEmbeddingSPMD(
             name="EmbeddingTable1",
             mesh=table1_mesh,
             vocab_size=2000,
@@ -259,7 +225,7 @@ async def run_training(args):
             value_dtype=args.dtype,
             runtime_env=cpu_runtime_env,
         )
-        table2 = table2_type(
+        table2 = SparseEmbeddingSPMD(
             name="EmbeddingTable2",
             mesh=table2_mesh,
             vocab_size=2000,

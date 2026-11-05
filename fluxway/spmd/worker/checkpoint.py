@@ -52,6 +52,7 @@ class WorkerCheckpointCoordinator:
         if rank < 0 or rank >= source_topology.world_size:
             raise ValueError("worker checkpoint coordinator rank is outside topology")
         self._registry = CheckpointComponentRegistry(components)
+        self._registry.validate_spmd_binding(spmd_id)
         self._owner = operator_instance
         self._repository_root = repository_root
         self._spmd_id = spmd_id
@@ -113,9 +114,14 @@ class WorkerCheckpointCoordinator:
                 save = component.save
                 if save is None:
                     continue
+                save_spec = component.descriptor.save
+                if save_spec is None:
+                    raise RuntimeError(
+                        f"checkpoint component {component.descriptor.component_id!r} "
+                        "defines save capability without save specification"
+                    )
                 if (
-                    component.descriptor.save.prepare_scope
-                    is CheckpointSaveScope.LEADER
+                    save_spec.prepare_scope is CheckpointSaveScope.LEADER
                     and self._rank != 0
                 ):
                     continue
@@ -170,8 +176,14 @@ class WorkerCheckpointCoordinator:
                 save = component.save
                 if save is None:
                     continue
+                save_spec = component.descriptor.save
+                if save_spec is None:
+                    raise RuntimeError(
+                        f"checkpoint component {component.descriptor.component_id!r} "
+                        "defines save capability without save specification"
+                    )
                 if (
-                    component.descriptor.save.commit_scope is CheckpointSaveScope.LEADER
+                    save_spec.commit_scope is CheckpointSaveScope.LEADER
                     and self._rank != 0
                 ):
                     continue

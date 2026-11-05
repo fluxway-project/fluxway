@@ -24,6 +24,7 @@ from fluxway.common.types.checkpoint import (
 )
 from fluxway.control_plane.checkpointer.component import (
     CheckpointComponent,
+    CheckpointComponentBinding,
     CheckpointComponentLifecycle,
     CheckpointComponentRegistration,
     CheckpointComponentRegistry,
@@ -67,6 +68,7 @@ def register_checkpoint_component(
 
 __all__ = [
     "CheckpointComponent",
+    "CheckpointComponentBinding",
     "CheckpointComponentLifecycle",
     "CheckpointComponentRegistration",
     "CheckpointComponentRegistry",

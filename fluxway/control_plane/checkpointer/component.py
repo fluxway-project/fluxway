@@ -28,6 +28,27 @@ class CheckpointComponent(ABC):
     def descriptor(self) -> CheckpointComponentSpec: ...
 
 
+class CheckpointComponentBinding(CheckpointComponent):
+    @property
+    @abstractmethod
+    def bound_spmd_id(self) -> str | None: ...
+
+    @abstractmethod
+    def bind_to_spmd(self, spmd_id: str) -> None: ...
+
+    def require_spmd_binding(self, spmd_id: str) -> None:
+        if self.bound_spmd_id != spmd_id:
+            raise ValueError(
+                f"Checkpoint component {self.descriptor.component_id!r} requires "
+                f"binding to SPMD {spmd_id!r}; currently bound to "
+                f"{self.bound_spmd_id!r}. Instantiate the decorated SPMD in a "
+                "FunctionalGraph for automatic binding. Low-level callers must "
+                f"call component.bind_to_spmd({spmd_id!r}) on a fresh component "
+                "before creating a checkpointer, worker coordinator, or "
+                "opening its registry."
+            )
+
+
 class CheckpointComponentLifecycle(ABC):
     @abstractmethod
     async def open(self, runtime: CheckpointRuntime) -> None: ...
@@ -225,7 +246,13 @@ class CheckpointComponentRegistry:
     def __contains__(self, component_id: str) -> bool:
         return component_id in self._by_id
 
+    def validate_spmd_binding(self, spmd_id: str) -> None:
+        for registration in self:
+            if isinstance(registration.component, CheckpointComponentBinding):
+                registration.component.require_spmd_binding(spmd_id)
+
     async def open_all(self, runtime: CheckpointRuntime) -> None:
+        self.validate_spmd_binding(runtime.spmd_id)
         opened: list[CheckpointComponentLifecycle] = []
         try:
             for registration in self._registrations:
