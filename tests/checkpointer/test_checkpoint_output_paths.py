@@ -111,3 +111,37 @@ def test_output_path_errors_explain_the_required_syntax(output_path):
     assert repr(output_path) in message
     assert "relative POSIX" in message
     assert "sparse/UserTable" in message
+
+
+def test_sparse_checkpoint_component_weight_group_and_binding():
+    from fluxway.integrations.sparse_embedding.checkpoint import (
+        LocalLanceStorageFactory,
+        SparseEmbeddingCheckpointComponent,
+    )
+
+    # 1. Providing weight_group resolves to sparse/<weight_group>
+    comp_wg = SparseEmbeddingCheckpointComponent(
+        LocalLanceStorageFactory(),
+        component_id="user_embedding",
+        weight_group="user",
+    )
+    assert comp_wg.descriptor.output_path == "sparse/user"
+    comp_wg.bind_to_spmd("Embedding_user")
+    assert comp_wg.descriptor.output_path == "sparse/user"
+
+    # 2. Providing neither weight_group nor output_path defaults to sparse/<spmd_id> on bind
+    comp_default = SparseEmbeddingCheckpointComponent(
+        LocalLanceStorageFactory(),
+        component_id="embedding",
+    )
+    assert comp_default.descriptor.output_path is None
+    comp_default.bind_to_spmd("UserTable")
+    assert comp_default.descriptor.output_path == "sparse/UserTable"
+
+    # 3. Conflicting weight_group and output_path raises ValueError
+    with pytest.raises(ValueError, match="Conflicting weight_group"):
+        SparseEmbeddingCheckpointComponent(
+            LocalLanceStorageFactory(),
+            weight_group="user",
+            output_path="sparse/other",
+        )
