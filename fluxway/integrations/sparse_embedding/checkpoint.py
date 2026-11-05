@@ -233,7 +233,10 @@ class SparseEmbeddingCheckpointComponent(
         )
 
     async def open(self, runtime: CheckpointRuntime) -> None:
-        self.require_spmd_binding(runtime.spmd_id)
+        if self._bound_spmd_id is None:
+            self.bind_to_spmd(runtime.spmd_id)
+        else:
+            self.require_spmd_binding(runtime.spmd_id)
         if self._runtime is not None:
             raise RuntimeError(
                 f"sparse checkpoint component {self.descriptor.component_id!r} is open"

@@ -111,3 +111,30 @@ def test_output_path_errors_explain_the_required_syntax(output_path):
     assert repr(output_path) in message
     assert "relative POSIX" in message
     assert "sparse/UserTable" in message
+
+
+def test_sparse_checkpoint_component_output_path_and_binding():
+    pytest.importorskip("sparse_embedding")
+    from fluxway.integrations.sparse_embedding.checkpoint import (
+        LocalLanceStorageFactory,
+        SparseEmbeddingCheckpointComponent,
+    )
+
+    # 1. Providing explicit output_path is preserved upon binding
+    comp_custom = SparseEmbeddingCheckpointComponent(
+        LocalLanceStorageFactory(),
+        component_id="user_embedding",
+        output_path="sparse/user",
+    )
+    assert comp_custom.descriptor.output_path == "sparse/user"
+    comp_custom.bind_to_spmd("Embedding_user")
+    assert comp_custom.descriptor.output_path == "sparse/user"
+
+    # 2. Providing no output_path defaults to sparse/<spmd_id> on bind
+    comp_default = SparseEmbeddingCheckpointComponent(
+        LocalLanceStorageFactory(),
+        component_id="embedding",
+    )
+    assert comp_default.descriptor.output_path is None
+    comp_default.bind_to_spmd("UserTable")
+    assert comp_default.descriptor.output_path == "sparse/UserTable"
