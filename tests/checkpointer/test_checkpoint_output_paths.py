@@ -114,6 +114,7 @@ def test_output_path_errors_explain_the_required_syntax(output_path):
 
 
 def test_sparse_checkpoint_component_output_path_and_binding():
+    pytest.importorskip("sparse_embedding")
     from fluxway.integrations.sparse_embedding.checkpoint import (
         LocalLanceStorageFactory,
         SparseEmbeddingCheckpointComponent,
