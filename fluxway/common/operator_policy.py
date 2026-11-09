@@ -99,8 +99,21 @@ class SchedulePolicy(FluxwayBaseSchema):
     micro_step_key: str = "step"
 
     @classmethod
-    def fifo(cls, base_priority: int = 0) -> SchedulePolicy:
-        return cls(kind="fifo", base_priority=base_priority)
+    def fifo(
+        cls,
+        base_priority: int = 0,
+        *,
+        lane: str | None = None,
+        lane_order: tuple[str, ...] = (),
+        lane_priorities: dict[str, int] | None = None,
+    ) -> SchedulePolicy:
+        return cls(
+            kind="fifo",
+            base_priority=base_priority,
+            lane=lane,
+            lane_order=lane_order,
+            lane_priorities={} if lane_priorities is None else lane_priorities,
+        )
 
     @classmethod
     def deadline_boost(
@@ -108,12 +121,19 @@ class SchedulePolicy(FluxwayBaseSchema):
         base_priority: int = 0,
         boost_priority: int = 100,
         trigger: str = "staleness_limit",
+        *,
+        lane: str | None = None,
+        lane_order: tuple[str, ...] = (),
+        lane_priorities: dict[str, int] | None = None,
     ) -> SchedulePolicy:
         return cls(
             kind="deadline_boost",
             base_priority=base_priority,
             boost_priority=boost_priority,
             trigger=trigger,
+            lane=lane,
+            lane_order=lane_order,
+            lane_priorities={} if lane_priorities is None else lane_priorities,
         )
 
     @classmethod
@@ -124,6 +144,9 @@ class SchedulePolicy(FluxwayBaseSchema):
         phase_order: tuple[str, ...],
         micro_step_key: str = "step",
         base_priority: int = 0,
+        lane: str | None = None,
+        lane_order: tuple[str, ...] = (),
+        lane_priorities: dict[str, int] | None = None,
     ) -> SchedulePolicy:
         return cls(
             kind="phase_order",
@@ -131,6 +154,9 @@ class SchedulePolicy(FluxwayBaseSchema):
             phase_order=phase_order,
             micro_step_key=micro_step_key,
             base_priority=base_priority,
+            lane=lane,
+            lane_order=lane_order,
+            lane_priorities={} if lane_priorities is None else lane_priorities,
         )
 
     @classmethod

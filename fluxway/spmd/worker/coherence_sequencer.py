@@ -627,6 +627,17 @@ class CoherenceSequencer[PayloadT]:
         intent.sealed = True
         self._schedule_drain()
 
+    def inspect_lane_status(self, instance: CoherenceInstance) -> tuple[str, int]:
+        lane = self._lanes.get(instance.subject)
+        if lane is None:
+            return "ready", 0
+        head = lane.next_intent_to_admit()
+        if head is None or head.instance == instance:
+            return "ready", 0
+        if head.active_consumer_leases > 0:
+            return "consumer_lease_wait", head.active_consumer_leases
+        return "lane_order_wait", 0
+
     def abort_intent(self, instance: CoherenceInstance, error: BaseException) -> None:
         if self._fenced_error is not None:
             return

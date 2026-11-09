@@ -2618,6 +2618,8 @@ class SPMDWorker:
             effective_priority = base_priority
             if self._deadline_boost_active(op_name, step):
                 effective_priority += policy.boost_priority
+            if self._uses_lane_aware_phase_priority(policy):
+                effective_priority += self._lane_priority(policy, policy.lane)
             return (-effective_priority, prepare_state, step, op_name)
         if kind in ("phase_order", "phase_graph"):
             phase_order = policy.phase_ordering
@@ -2646,6 +2648,9 @@ class SPMDWorker:
             )
         if kind != "fifo":
             raise ValueError(f"Unsupported schedule policy {kind!r} for op={op_name}.")
+        if self._uses_lane_aware_phase_priority(policy):
+            lane_priority = self._lane_priority(policy, policy.lane)
+            return (-base_priority - lane_priority, prepare_state, step, op_name)
         return (-base_priority, prepare_state, step, op_name)
 
     @staticmethod
@@ -6604,6 +6609,9 @@ class SPMDWorker:
         deliveries: list[asyncio.Task[Any]],
     ) -> tuple[asyncio.Task[Any], ...]:
         wrapped_results: dict[int, TransportTensor] = {}
+        profiler_recorder = (
+            self._profiler_runtime.recorder if self._profiler_runtime.enabled else None
+        )
         await self._deposit_local_only_orderings(
             send_context.compiled_plan,
             exec_step,
@@ -6730,8 +6738,28 @@ class SPMDWorker:
 
                 retirement_task.add_done_callback(complete_deposit)
 
-                async def await_deposit(deposit_complete=deposit_complete) -> None:
-                    await asyncio.shield(deposit_complete)
+                lane_status, active_leases = (
+                    self._coherence_sequencer.inspect_lane_status(output_instance)
+                )
+
+                async def await_deposit(
+                    deposit_complete=deposit_complete,
+                    tensor_route=tensor_route,
+                    lane_status=lane_status,
+                    active_leases=active_leases,
+                ) -> None:
+                    if profiler_recorder is None:
+                        await asyncio.shield(deposit_complete)
+                    else:
+                        async with profiler_recorder.worker_local_delivery(
+                            op_name=send_context.compiled_plan.op_name,
+                            transfer_code=tensor_route.transfer_code,
+                            logical_tuuid=tensor_route.logical_tuuid,
+                            step=exec_step,
+                            active_consumer_leases=active_leases,
+                            status=lane_status,
+                        ):
+                            await asyncio.shield(deposit_complete)
 
                 deliveries.append(asyncio.create_task(await_deposit()))
         return tuple(deliveries)

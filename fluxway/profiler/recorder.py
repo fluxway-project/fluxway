@@ -659,6 +659,19 @@ MAILBOX_DEPOSIT_LOCAL_TENSOR = TraceEventSpec(
     ("op_id", "transfer_code", "step", "data_count"),
     "step",
 )
+WORKER_LOCAL_DELIVERY = TraceEventSpec(
+    "worker.local_delivery",
+    "coherence/delivery",
+    (
+        "op_id",
+        "transfer_code",
+        "logical_tuuid",
+        "step",
+        "active_consumer_leases",
+        "status_id",
+    ),
+    "step",
+)
 MAILBOX_READY_FIRE = TraceEventSpec(
     "mailbox.ready_fire",
     "mailbox/barrier",
@@ -1140,6 +1153,28 @@ class TraceRecorder:
         return self._async_span(
             WORKER_SEND_OUTPUT,
             payload=(self.intern(op_name), step, output_count, successor_count),
+        )
+
+    def worker_local_delivery(
+        self,
+        *,
+        op_name: str,
+        transfer_code: int,
+        logical_tuuid: int,
+        step: int,
+        active_consumer_leases: int,
+        status: str,
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            WORKER_LOCAL_DELIVERY,
+            payload=(
+                self.intern(op_name),
+                transfer_code,
+                logical_tuuid,
+                step,
+                active_consumer_leases,
+                self.intern(status),
+            ),
         )
 
     def local_step_plan_execute(

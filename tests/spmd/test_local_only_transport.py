@@ -367,6 +367,131 @@ async def test_local_only_direct_deposit_preserves_transport_tensor_receipt():
 
 
 @pytest.mark.asyncio
+async def test_local_only_deposit_records_worker_local_delivery_span(tmp_path):
+    raw_cls = SPMDWorker.__ray_actor_class__
+    config = _local_only_config()
+    op_manager = OperatorManager(
+        config,
+        rank=0,
+        spmd_id="A",
+        static_args={},
+        instance_container=OperatorInstanceContainer(),
+    )
+    mailbox = WorkerMailbox()
+    profiler_config = ProfilerConfig(
+        trace_dir=str(tmp_path),
+        run_id="test_run",
+        buffer_bytes_per_process=1024 * 1024,
+    )
+    profiler_runtime = ProfilerRuntimeFactory.from_config(
+        profiler_config,
+        process_name="worker/A/rank:0/worker",
+    )
+    stub = types.SimpleNamespace(
+        spmd_id="A",
+        rank=0,
+        config=config,
+        _graph_view=config.require_graph_view(),
+        _world_size=config.num_workers,
+        _mesh=config.mesh,
+        _local_spmd_code=3,
+        _successor_handlers={},
+        _operator_send_context_cache={},
+        _profiler_runtime=profiler_runtime,
+        _mailbox=mailbox,
+        _barriers_declared={},
+        _op_manager=op_manager,
+        op_manager=op_manager,
+        receive_transport_frames=_receive_transport_frames,
+        receive_control=_receive_control,
+        _coherence_directory=CoherenceDirectory(),
+    )
+    stub._require_local_spmd_code = types.MethodType(
+        raw_cls._require_local_spmd_code,
+        stub,
+    )
+    stub._local_only_successor_handlers = types.MethodType(
+        raw_cls._local_only_successor_handlers,
+        stub,
+    )
+    stub._operator_send_context = types.MethodType(
+        raw_cls._operator_send_context,
+        stub,
+    )
+    stub._ensure_step_declared = types.MethodType(
+        raw_cls._ensure_step_declared,
+        stub,
+    )
+    stub._coherence_subject = types.MethodType(raw_cls._coherence_subject, stub)
+    stub._deposit_local_only_outputs = types.MethodType(
+        raw_cls._deposit_local_only_outputs,
+        stub,
+    )
+    _bind_direct_local_fast_path(stub, raw_cls)
+
+    send_context = stub._operator_send_context("produce")
+    tensor0 = TransportTensor(np.asarray([1, 2, 3], dtype=np.int32))
+
+    await stub._deposit_local_only_outputs(
+        [tensor0],
+        send_context,
+        {},
+        0,
+        dependency_decisions=None,
+    )
+
+    transfer_code = _only_expected_transfer_code(op_manager, "consume")
+    stored0 = stub._direct_local_input_slots["consume"][0][transfer_code].tensor
+    lease0 = stored0.acquire_consumer_lease()
+
+    inst1 = CoherenceInstance(CoherenceSubject(stub._local_spmd_code, stub.rank, 1), 1)
+    stub._coherence_sequencer.issue_intent(inst1)
+    stub._coherence_output_intents[("produce", 1)] = (inst1,)
+    tensor1 = TransportTensor(np.asarray([4, 5, 6], dtype=np.int32))
+
+    task1 = asyncio.create_task(
+        stub._deposit_local_only_outputs(
+            [tensor1],
+            send_context,
+            {},
+            1,
+            dependency_decisions=None,
+        )
+    )
+    await asyncio.sleep(0.01)
+    assert not task1.done()
+
+    lease0.release()
+    await task1
+    assert task1.done()
+
+    stored1 = stub._direct_local_input_slots["consume"][1][transfer_code].tensor
+    stored1.acquire_consumer_lease().release()
+
+    snap = profiler_runtime.recorder.snapshot()
+    records = snap["records"]
+    meta = snap["metadata"]
+    delivery_records = [
+        r for r in records if meta.name_for(int(r[4])) == "worker.local_delivery"
+    ]
+    assert len(delivery_records) == 2
+
+    p0 = delivery_records[0][8:14]
+    status0 = meta.name_for(int(p0[5]))
+    assert p0[1] == transfer_code
+    assert p0[3] == 0
+    assert p0[4] == 0
+    assert status0 == "ready"
+
+    p1 = delivery_records[1][8:14]
+    status1 = meta.name_for(int(p1[5]))
+    assert p1[1] == transfer_code
+    assert p1[3] == 1
+    assert p1[4] == 1
+    assert status1 == "consumer_lease_wait"
+
+
+@pytest.mark.asyncio
 async def test_local_only_fanout_uses_distinct_zero_copy_aliases():
     raw_cls = SPMDWorker.__ray_actor_class__  # pyrefly: ignore [missing-attribute]
     config = _local_fanout_config()

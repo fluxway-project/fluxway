@@ -191,26 +191,67 @@ concurrently; hooks are not guaranteed to start after every thread call ends. Ow
 must coordinate outstanding resource access. Cancelling a coroutine wait cannot stop a
 running Python thread. Forced process termination does not guarantee hooks.
 
-## State and scheduling
+## State and scheduling policy
 
-`AsyncPolicy.depth` bounds local pipelining. State access is a separate decision:
+Concurrent operator execution in Fluxway is governed by **state mutex policies (`StatePolicy`)** and **queue scheduling policies (`SchedulePolicy`)**.
 
-- `StatePolicy.exclusive()` serializes operators sharing the same state resource.
-  Keep this for model updates and mutable stores; it is the default.
-- `StatePolicy.thread_safe()` removes that instance lock. Use it only when the
-  operator and its underlying resources support concurrent calls.
+### 1. State access policy (`StatePolicy`)
+* `StatePolicy.exclusive()`: **Default policy**. Serializes execution for operators sharing the same SPMD instance lock. Model parameter updates and mutable stateful stores must preserve this policy.
+* `StatePolicy.thread_safe()`: Removes the instance lock. Used when the operator is completely stateless or its internal resources are thread-safe, permitting concurrent cross-step execution on the same actor.
 
-In the example, `prepare` only transforms its input and can overlap with `write`.
-Calls to `write` remain exclusive because they share a file. A process-local
-constructor does not prohibit this overlap.
+### 2. 1-Minute SchedulePolicy selection guide
 
-For multi-phase model updates, `SchedulePolicy.phase_graph` can allow helper
-work and updates from one step to overlap while preventing the next training
-step from reading unfinished state. The
-[recommendation example](../fluxway/example/recommendation/dense_spmd.py) uses
-thread-safe `prepare_dense_inputs` and `scatter_sparse_grads`, with exclusive
-`train_core` and `update`. The graph and [visualization](graph_visualization.md)
-use the same compiled phase rules.
+To help developers choose the appropriate policy within seconds, follow this decision tree and cheatsheet:
+
+```mermaid
+flowchart TD
+    Q1{"Does the SPMD contain multiple sequential phases that mutate shared state?\n(e.g., Forward -> Backward -> Update)"}
+    Q1 -- "No (90% of pipelines: Reader, ETL, stateless transforms, single-operator training)" --> R1["Use default FIFO (No explicit schedule needed!)\nOut-of-the-box + Canonical Lanes + Backpressure priority"]
+    Q1 -- "Yes (Multi-phase model update in same actor)" --> Q2{"Are there complex cross-step asymmetric overlap requirements?"}
+    Q2 -- "No (Standard sequential stages within step)" --> R2["SchedulePolicy.phase_order\nStrict step barrier gates prevent dirty reads"]
+    Q2 -- "Yes (Fine-grained overlap optimization)" --> R3["SchedulePolicy.phase_graph\nExplicitly defines cross-step causal DAG"]
+    
+    Q3{"Does the pipeline require straggler prevention / staleness escalation?"} -->|Yes| R4["SchedulePolicy.deadline_boost\nDynamically escalates priority when lag exceeds threshold"]
+```
+
+#### Policy Cheatsheet & Code Patterns
+
+| Policy | When to use | Framework default behavior | Core Code Pattern |
+| :--- | :--- | :--- | :--- |
+| **`fifo` (Default)** | **90% of use cases**: Data ingestion, feature transforms, stateless forward passes, single-operator training. | **Out-of-the-box default**. Automatically assigned to `io`/`compute` canonical lanes and paired with `("compute", "io")` cooperative priority to consume data first. | `@operator("read", async_policy=AsyncPolicy.pipelined(depth=4))` *(no schedule parameter required)* |
+| **`phase_order`** | **Multi-phase model training**: When an actor contains `train_core` and `update` phases and Step $S+1$ must never read half-updated parameters from Step $S$. | Compiles a `PhaseGate` barrier. Step $S+1$ is **physically held outside the ready queue** until Step $S$ optimizer update commits. | `SchedulePolicy.phase_order(phase="fwd", phase_order=("fwd", "bwd", "opt"))` |
+| **`phase_graph`** | **Complex cross-step overlap**: When helper work for Step $S+1$ (e.g. gradient pre-dispatch) can overlap with Step $S$ update, but core computation must wait. | Declares fine-grained causal DAG via `(before, after, step_delta)` triples. | `SchedulePolicy.phase_graph(phase="fwd", phase_order=..., dependencies=(("opt", "fwd", 1),))` |
+| **`deadline_boost`** | **Straggler mitigation / Periodic flush**: Keeps low priority by default to yield CPU, but jumps to `boost_priority` when lag exceeds `staleness_limit`. | Automatically monitors scheduling lag and escalates queue priority when threshold is violated. | `SchedulePolicy.deadline_boost(base_priority=0, boost_priority=100)` |
+
+#### Code Comparison
+
+```python
+# 1. Default FIFO: Minimal boilerplate, ideal for streaming pipelines
+@operator("process", async_policy=AsyncPolicy.pipelined(depth=4))
+def process(self, batch: Batch) -> Tensor:
+    return self.transform(batch)
+
+# 2. Phase Order: Multi-phase training with strict barrier protection
+@operator(
+    "train_core",
+    async_policy=AsyncPolicy.pipelined(
+        depth=1,
+        schedule=SchedulePolicy.phase_order(phase="train", phase_order=("train", "update")),
+    ),
+)
+def train_core(self, batch: Batch) -> Gradients:
+    return self.backward(batch)
+
+@operator(
+    "update",
+    async_policy=AsyncPolicy.pipelined(
+        depth=1,
+        schedule=SchedulePolicy.phase_order(phase="update", phase_order=("train", "update")),
+    ),
+)
+def update(self, grads: Gradients) -> None:
+    self.optimizer_step(grads)
+```
 
 With profiling enabled, `user_callable.execute` includes queue wait;
 `user_callable.function_run` measures the function invocation without lane
@@ -225,62 +266,72 @@ with a `Fluxway Worker Process Error`. Use the decorator instead of setting the
 internal `__fluxway_process_affine__` field. The marker does not supply JAX,
 create a distributed coordinator, or make mismatched worker topology valid.
 
-## Managed execution lanes and CPU compute offloading
+## Canonical execution lanes and cooperative scheduling
 
-In distributed SPMD computation, `async def` coroutine operators are often used to orchestrate network communication and asynchronous IPC (e.g. `async_unique` cross-device exchanges). However, when a coroutine operator needs to execute heavy CPU tasks (such as Numba JIT kernels, DLPack conversions, tensor materialization, or metric writes), running them directly on the event loop blocks the single event loop thread, stalling heartbeats and message routing.
+In distributed high-performance computing, operators exhibit distinct computation and I/O characteristics. Mixing all operators into an undifferentiated execution queue or dynamically spawning an unbounded number of thread pools per function leads to thread thrashing, scheduler overhead, and pipeline backpressure breakdown.
 
-Fluxway provides **Managed Worker Process Lanes** to safely offload CPU-bound tasks:
+During graph compilation, Fluxway automatically classifies operators into coarse-grained **Canonical Lanes** and establishes cooperative scheduling policies based on operator metadata:
 
 ```mermaid
 flowchart TD
     subgraph SPMDWorker["SPMD Worker Actor"]
         direction TB
-        subgraph EventLoop["AsyncIO Event Loop"]
-            CoroutineOp["async def Operator\n(Coordination, network, await IPC)"]
+        subgraph EventLoop["AsyncIO Event Loop (COROUTINE_ASYNC)"]
+            CoroutineOp["async def Operators\n(Scheduling, network transfers, IPC orchestration)"]
             Heartbeat["Node Heartbeat & Cluster Coordination"]
         end
 
-        subgraph WorkerProcessRuntime["WorkerProcessCallRuntime (Managed Thread Pools)"]
-            ComputeLane["'compute' Lane Thread Pool\n(Numba JIT, DLPack, Sparse/Dense Materialization)"]
-            IOLane["'io' Lane Thread Pool\n(Disk flush, Arrow decoding, metric persistence)"]
+        subgraph WorkerProcessRuntime["WorkerProcessCallRuntime (Managed Bounded Lanes)"]
+            ComputeLane["'compute' Lane\n(Sync compute operators, matrix math, transformations)"]
+            IOLane["'io' Lane\n(BaseReader operators, is_source=True, ingestion I/O)"]
+        end
+
+        subgraph PriorityQueue["Min-Heap Cooperative Priority Queue"]
+            ComputeHigher["compute op (Higher weight: 1)"]
+            IOLower["io op (Lower weight: 0)"]
+            ComputeHigher -->|Consumes ready batches first| IOLower
         end
     end
 
-    CoroutineOp -- "await ctx.run_in_lane(fn, lane='compute')" --> ComputeLane
-    CoroutineOp -. "Event loop stays fully responsive" .-> Heartbeat
-    ComputeLane -- "Returns materialized result" --> CoroutineOp
+    EventLoop -. "Stays fully responsive to heartbeats" .-> Heartbeat
+    PriorityQueue --> ComputeLane
+    PriorityQueue --> IOLane
 ```
 
-### 1. Core capabilities of `ctx.run_in_lane`
-* **Bounded lane thread pools**: Obtains/creates dedicated, bounded thread pools per named lane (`"compute"`, `"io"`, `"default"`), eliminating thread explosion and thread thrashing without requiring ad-hoc `asyncio.Semaphore` guards in user code.
-* **ContextVars transparent propagation**: Context variables (including operator runtime context and tracing baggage) are copied and preserved across thread boundaries.
-* **Integrated profiler recording**: Queue wait times and thread run times are automatically recorded into Chrome Trace profiling logs.
+### 1. Canonical lane classification rules
 
+During graph compilation (`Builder.build`), the framework infers canonical lanes based on operator metadata (`fluxway.common.canonical_lanes`):
+
+* **`io` lane**: Operators marked with `is_source=True`, declaring a `source` descriptor, or belonging to a class inheriting from `BaseReader` default to the `"io"` lane.
+* **`compute` lane**: Regular synchronous compute operators (`def` methods) default to the `"compute"` lane and run on bounded worker thread pools where C extensions release the GIL without blocking the event loop.
+* **Async coroutine operators**: `async def` operators remain unassigned to thread lanes (`lane=None`) and execute directly on the asyncio event loop for lightweight asynchronous I/O and network coordination.
+
+### 2. Auto-paired cooperative priority and natural backpressure
+
+When the graph compiler identifies the presence of both `compute` and `io` lanes, it automatically pairs and injects standard cooperative priority:
 ```python
-# Example: Offloading CPU kernels from an async operator
-@operator("process")
-async def process(self, batch: UserBatch) -> NodeOutput:
-    # Phase 1: Asynchronous distributed unique on the event loop
-    unique_ids, inv_index = await self.async_dedup(batch)
-
-    # Phase 2: Safely offload Numba JIT and tensor materialization to compute lane
-    tensors = await self.ctx.run_in_lane(
-        self._numba_materialize_kernel,
-        unique_ids,
-        inv_index,
-        lane="compute",
-    )
-    return NodeOutput(tensors=tensors)
+lane_order = ("compute", "io")
 ```
+Inside the worker scheduling engine, compute operators receive a higher scheduling priority than I/O operators (`priority(compute) > priority(io)`). This guarantees that ready batches are prioritized for downstream consumption before the reader over-allocates memory by reading ahead excessively, providing natural pipeline backpressure.
 
-### 2. Unified invoker `invoke_callable_async`
-For dataloader executors or generic pipeline adapters that accept arbitrary user callables: if the function is a coroutine, it is directly awaited; if it is synchronous, it is automatically routed to the active operator context's managed worker thread lane, completely eliminating boilerplate `inspect.iscoroutinefunction` checks:
+### 3. Open-Closed Principle and explicit overrides
+
+The default canonical lane preset is an out-of-the-box best practice. Operators with bespoke scheduling requirements can explicitly declare custom lanes or orderings via `SchedulePolicy`, which the framework respects without overriding:
 
 ```python
-from fluxway.common.asyncio_runtime import invoke_callable_async
-
-# Automatically adapts to both coroutine and synchronous functions
-result = await invoke_callable_async(custom_transform_fn, data, lane="compute")
+# Example: Custom lane declaration and ordering
+@operator(
+    "custom_transform",
+    async_policy=AsyncPolicy.pipelined(
+        depth=2,
+        schedule=SchedulePolicy.fifo(
+            lane="custom_lane",
+            lane_order=("custom_lane", "io"),
+        ),
+    ),
+)
+def custom_transform(self, batch: UserBatch) -> NodeOutput:
+    ...
 ```
 
 ## Checkpoint extension boundary

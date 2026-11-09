@@ -177,23 +177,67 @@ sequenceDiagram
 
 同步 `on_shutdown()` 直接在工作进程事件循环调用；耗时清理应使用异步钩子并自行分派阻塞工作。实例钩子与用户调用排空并发执行，不保证钩子开始前所有线程调用已经结束。拥有者须协调仍在进行的资源访问；取消协程等待也不能终止已运行的 Python 线程。强制结束进程不保证执行钩子。
 
-## 状态与调度
+## 状态与调度策略 (State & Schedule Policy)
 
-`AsyncPolicy.depth` 限制本地流水线深度。状态访问需要单独选择：
+在 Fluxway 中，算子的并发执行由**状态互斥策略 (`StatePolicy`)**与**队列调度策略 (`SchedulePolicy`)**共同决定。
 
-- `StatePolicy.exclusive()` 将共用同一状态资源的算子串行化。
-  模型更新和可变存储应保留此默认策略。
-- `StatePolicy.thread_safe()` 移除实例锁。只有算子及其底层资源支持并发调用时才使用。
+### 1. 状态访问策略 (`StatePolicy`)
+* `StatePolicy.exclusive()`：**默认策略**。对同一个 SPMD 实例加锁串行化，模型权重修改、有状态存储必须保留此策略。
+* `StatePolicy.thread_safe()`：移除实例锁。仅当算子为纯无状态转换或其内部资源完全线程安全时使用，允许同实例多步并行执行。
 
-示例中，`prepare` 只转换输入，可以与 `write` 重叠。
-`write` 的多次调用共用文件，因此仍然互斥。进程本地构造并不禁止这样的重叠。
+### 2. 调度策略一分钟极速选型指南 (`SchedulePolicy`)
 
-模型更新包含多个阶段时，`SchedulePolicy.phase_graph` 可以允许同一步的辅助工作与更新重叠，
-同时阻止下一训练步读取尚未完成的状态。
-[推荐模型示例](../fluxway/example/recommendation/dense_spmd.py) 中，
-`prepare_dense_inputs` 和 `scatter_sparse_grads` 声明为线程安全，
-`train_core` 和 `update` 保持独占。计算图和[可视化](graph_visualization_zh.md)
-使用同一份编译后的阶段规则。
+为了让业务方在 10 秒内明确选择最适合的调度策略，请参考以下决策树与速查表：
+
+```mermaid
+flowchart TD
+    Q1{"同一 SPMD 内是否包含多个修改共享状态的连续阶段？\n(如 Forward -> Backward -> Update)"}
+    Q1 -- "否 (90% 场景: Reader、ETL、无状态变换、单算子训练)" --> R1["使用默认 FIFO (无需显式指定！)\n开箱即用 + 自动规范泳道 + 天然背压"]
+    Q1 -- "是 (同一模型包含多阶段更新)" --> Q2{"阶段间是否有复杂的跨步非对称重叠需求？"}
+    Q2 -- "否 (标准的步内串行阶段)" --> R2["SchedulePolicy.phase_order\n严格步进门禁，物理阻止跨步脏读"]
+    Q2 -- "是 (精细重叠优化)" --> R3["SchedulePolicy.phase_graph\n显式定义跨步因果依赖图"]
+    
+    Q3{"业务是否要求防长尾/落后批次紧急提权？"} -->|是| R4["SchedulePolicy.deadline_boost\n滞后步数超限时动态爆发插队"]
+```
+
+#### 策略速查与代码模板对照表
+
+| 策略类型 | 什么时候用 | 框架默认行为 / 保证 | 核心代码范式 |
+| :--- | :--- | :--- | :--- |
+| **`fifo` (默认)** | **90% 业务场景**：数据读取、特征物化、无状态前向、单算子训练。 | **默认开箱即用**。自动归入 `io`/`compute` 规范泳道并自动配齐协同优先级 `("compute", "io")`，下游计算优先出队消费。 | `@operator("read", async_policy=AsyncPolicy.pipelined(depth=4))` *(无需写 schedule)* |
+| **`phase_order`** | **多阶段模型训练**：同一个 Actor 内有 `train_core` 与 `update` 等多个阶段，必须确保下一步的计算不会读取到正在更新的脏权重。 | 框架编译底层 `PhaseGate` 门禁。在 Step $S$ 优化器更新完成前，Step $S+1$ 计算**物理被拦截在执行队列之外**，绝对无竞态。 | `SchedulePolicy.phase_order(phase="fwd", phase_order=("fwd", "bwd", "opt"))` |
+| **`phase_graph`** | **复杂跨步重叠**：模型更新时，允许 Step $S+1$ 的部分辅助工作（如梯度预通信）与 Step $S$ 更新重叠，但核心前向必须等待。 | 用户通过 `(before, after, step_delta)` 显式表达细粒度因果依赖 DAG。 | `SchedulePolicy.phase_graph(phase="fwd", phase_order=..., dependencies=(("opt", "fwd", 1),))` |
+| **`deadline_boost`** | **防掉队者 / 周期性刷盘**：平时保持低优先级让出资源，当滞后步数超过 `staleness_limit` 时，临时提权到 `boost_priority` 优先出队。 | 自动监控调度步数滞后差，超限立即在 Min-Heap 队列中提权插队。 | `SchedulePolicy.deadline_boost(base_priority=0, boost_priority=100)` |
+
+#### 代码范例对比
+
+```python
+# 1. 默认 FIFO：最简形式，适合绝大多数数据流与单算子
+@operator("process", async_policy=AsyncPolicy.pipelined(depth=4))
+def process(self, batch: Batch) -> Tensor:
+    return self.transform(batch)
+
+# 2. Phase Order：多阶段训练，防止下一步读到未更新的脏参数
+@operator(
+    "train_core",
+    async_policy=AsyncPolicy.pipelined(
+        depth=1,
+        schedule=SchedulePolicy.phase_order(phase="train", phase_order=("train", "update")),
+    ),
+)
+def train_core(self, batch: Batch) -> Gradients:
+    return self.backward(batch)
+
+@operator(
+    "update",
+    async_policy=AsyncPolicy.pipelined(
+        depth=1,
+        schedule=SchedulePolicy.phase_order(phase="update", phase_order=("train", "update")),
+    ),
+)
+def update(self, grads: Gradients) -> None:
+    self.optimizer_step(grads)
+```
 
 启用性能分析后，`user_callable.execute` 包含排队时间；
 `user_callable.function_run` 只测量函数调用，不包含通道排队和工作进程上下文设置。
@@ -206,62 +250,72 @@ sequenceDiagram
 `Fluxway Worker Process Error`。应使用装饰器，不要直接设置内部字段
 `__fluxway_process_affine__`。该标记不会安装 JAX、创建分布式协调器或修正不一致的工作进程拓扑。
 
-## 受控执行泳道与异步计算卸载
+## 标准执行泳道与自动协同调度 (Canonical Lanes & Cooperative Scheduling)
 
-在分布式与高性能计算中，`async def` 协程算子通常用于编排网络传输与异步 IPC（如 `async_unique` 跨设备通信）。然而，当协程算子需要执行繁重的 CPU 计算（如 Numba JIT 内核、DLPack 索引转换、复杂的张量物化或指标导出）时，直接在事件循环线程上执行会导致主事件循环严重卡顿，破坏集群心跳与数据包投递。
+在分布式与高性能计算中，算子通常具有不同的计算与 IO 语义特征。若将所有算子混入单一无序队列，或者为每个函数动态分裂出无限个线程池，都会导致系统调度失控、线程上下文切换过载或内存反压失效。
 
-Fluxway 提供了**内建的受控工作线程泳道（Managed Worker Process Lanes）**机制：
+Fluxway 在编译计算图时，基于算子元数据（Metadata）自动进行粗粒度的**标准规范泳道（Canonical Lanes）归类与协同调度规划**：
 
 ```mermaid
 flowchart TD
     subgraph SPMDWorker["SPMD 工作进程 (Worker Actor)"]
         direction TB
-        subgraph EventLoop["AsyncIO 主事件循环"]
-            CoroutineOp["async def 算子\n(调度、网络、等待 IPC)"]
-            Heartbeat["节点心跳 & 控制面协作"]
+        subgraph EventLoop["AsyncIO 主事件循环 (COROUTINE_ASYNC)"]
+            CoroutineOp["async def 算子\n(调度、网络、等待 IPC、数据面流转)"]
+            Heartbeat["节点心跳 & 集群协调"]
         end
 
-        subgraph WorkerProcessRuntime["WorkerProcessCallRuntime (受控线程池)"]
-            ComputeLane["'compute' 泳道线程池\n(Numba JIT, DLPack, 稠密/稀疏物化)"]
-            IOLane["'io' 泳道线程池\n(磁盘刷写, Arrow 解码, 检查点导出)"]
+        subgraph WorkerProcessRuntime["WorkerProcessCallRuntime (工作进程有界泳道)"]
+            ComputeLane["'compute' 泳道\n(同步普通计算算子、矩阵运算、特征提取)"]
+            IOLane["'io' 泳道\n(BaseReader 来源读取、is_source=True 算子、磁盘拉取)"]
+        end
+
+        subgraph PriorityQueue["Min-Heap 协同调度优先队列"]
+            ComputeHigher["compute 算子 (优先级更高: 1)"]
+            IOLower["io 算子 (优先级更低: 0)"]
+            ComputeHigher -->|优先消费就绪数据| IOLower
         end
     end
 
-    CoroutineOp -- "await ctx.run_in_lane(fn, lane='compute')" --> ComputeLane
-    CoroutineOp -. "主循环始终保持空闲响应" .-> Heartbeat
-    ComputeLane -- "返回物化结果" --> CoroutineOp
+    EventLoop -. "始终保持响应与网络无阻塞" .-> Heartbeat
+    PriorityQueue --> ComputeLane
+    PriorityQueue --> IOLane
 ```
 
-### 1. `ctx.run_in_lane` 核心能力
-* **线程池配额隔离**：根据指定的 `lane`（如 `"compute"`、`"io"`、`"default"`）自动获取并复用工作进程专属的有界线程池，无需用户在业务层通过 `asyncio.Semaphore` 手动限制并发，杜绝线程过度创建与上下文切换抖动。
-* **ContextVars 自动穿透**：运行时在提交到工作线程时自动复制当前的 `ContextVar` 环境，使得算子内部的元数据与链路追踪在线程中无缝透明流转。
-* **内建 Profiler 集成**：自动将任务排队等待时间、线程实际运行耗时记录到统一的 Chrome Trace 分析数据中。
+### 1. 标准泳道粗粒度自动规划规则
 
+在 `Builder.build` 编译图阶段，框架根据算子的元数据语义特征自动执行推导（实现位于 `fluxway.common.canonical_lanes`）：
+
+* **`io` 泳道**：凡是算子标记为 `is_source=True`、声明了 `source` 描述符或所属类继承自 `BaseReader` 的算子，默认归入 `"io"` 泳道。
+* **`compute` 泳道**：普通的同步计算算子（非 IO 的 `def` 算子）默认归入 `"compute"` 泳道，并在专属有界工作线程池中执行，C 扩展完全释放 GIL，不阻塞主事件循环。
+* **异步协程通信算子**：`async def` 协程算子不分配线程池泳道（保持 `lane=None`），直接由 asyncio 主事件循环调度，专职负责跨节点高效通信与异步编排。
+
+### 2. 自动配齐协同优先级与天然背压
+
+当框架在图中同时识别到 `compute` 泳道与 `io` 泳道时，会自动为未显式指定排序的算子注入标准协同优先级：
 ```python
-# 示例：在异步算子中卸载密集 CPU 运算
-@operator("process")
-async def process(self, batch: UserBatch) -> NodeOutput:
-    # 阶段 1：在主事件循环上并发执行异步分布式去重
-    unique_ids, inv_index = await self.async_dedup(batch)
-
-    # 阶段 2：安全卸载 Numba JIT 与张量物化到 compute 泳道，释放主循环
-    tensors = await self.ctx.run_in_lane(
-        self._numba_materialize_kernel,
-        unique_ids,
-        inv_index,
-        lane="compute",
-    )
-    return NodeOutput(tensors=tensors)
+lane_order = ("compute", "io")
 ```
+在 Worker 调度引擎与优先队列中，`compute` 泳道算子获得更高的调度权重（`priority(compute) > priority(io)`）。这确保了已生成的批次数据被下游计算算子**优先消费**，而不是任由读取算子无限制预取撑爆内存，从而在框架层实现了优雅且高性能的生产-消费协同背压。
 
-### 2. 统一异步调用器 `invoke_callable_async`
-在数据管道执行器或高阶包装器中，用户传入的方法可能是普通的同步函数，也可能是异步协程函数。使用 `invoke_callable_async` 可自动识别：若为协程则直接 `await`；若为普通函数则自动调度到当前算子上下文绑定的工作线程泳道，无需手写繁琐的 `inspect.iscoroutinefunction` 分支代码：
+### 3. 开闭原则与显式定制
+
+默认规则为开箱即用的高性能标准实践。如果算子有特殊调度需求，可直接在 `SchedulePolicy` 中显式指定，框架严格遵从用户显式配置，绝不覆盖：
 
 ```python
-from fluxway.common.asyncio_runtime import invoke_callable_async
-
-# 自动自适应协程与同步函数，彻底消除下游反模式样板代码
-result = await invoke_callable_async(custom_transform_fn, data, lane="compute")
+# 示例：显式定制算子泳道与优先级
+@operator(
+    "custom_transform",
+    async_policy=AsyncPolicy.pipelined(
+        depth=2,
+        schedule=SchedulePolicy.fifo(
+            lane="custom_lane",
+            lane_order=("custom_lane", "io"),
+        ),
+    ),
+)
+def custom_transform(self, batch: UserBatch) -> NodeOutput:
+    ...
 ```
 
 ## 检查点扩展边界
