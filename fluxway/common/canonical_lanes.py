@@ -51,23 +51,12 @@ def resolve_operator_execution_trait(
     """Resolve the execution trait of an operator cleanly from static metadata."""
     if spec.execution_trait is not None:
         return spec.execution_trait
-    if spec.is_source is True or spec.source is not None:
-        return OperatorExecutionTrait.IO_SOURCE
-    owner = spec.owner or spmd_class
-    if (
-        owner is not None
-        and isinstance(owner, type)
-        and issubclass(owner, _get_base_reader())
-    ):
-        return OperatorExecutionTrait.IO_SOURCE
-    return OperatorExecutionTrait.SYNC_COMPUTE
+    return OperatorExecutionTrait.from_owner(spec.owner or spmd_class, spec.method_name)
 
 
 def is_io_operator(spec: OperatorSpec, spmd_class: type | None = None) -> bool:
     """Return True if the operator is an I/O source or reader operator."""
-    if spec.execution_trait == OperatorExecutionTrait.IO_SOURCE:
-        return True
-    if spec.is_source or spec.source is not None:
+    if spec.is_source is True or spec.source is not None:
         return True
     owner = spec.owner or spmd_class
     if (
@@ -81,9 +70,10 @@ def is_io_operator(spec: OperatorSpec, spmd_class: type | None = None) -> bool:
 
 def is_coroutine_operator(spec: OperatorSpec, spmd_class: type | None = None) -> bool:
     """Return True if the operator implementation is an async coroutine function."""
-    if spec.execution_trait is not None:
-        return spec.execution_trait == OperatorExecutionTrait.ASYNC_COROUTINE
-    return False
+    return (
+        resolve_operator_execution_trait(spec, spmd_class)
+        == OperatorExecutionTrait.ASYNC_COROUTINE
+    )
 
 
 def infer_canonical_lane(
@@ -93,20 +83,17 @@ def infer_canonical_lane(
 
     If the operator already declares an explicit lane, the declared lane is returned.
     Otherwise:
-    - I/O / source operators default to 'io'.
-    - Synchronous compute operators default to 'compute'.
     - Coroutine operators return None (unassigned lane, executed in event loop).
+    - Synchronous I/O / source operators default to 'io'.
+    - Synchronous compute operators default to 'compute'.
     """
     if spec.async_policy.schedule.lane is not None:
         return spec.async_policy.schedule.lane
-    trait = resolve_operator_execution_trait(spec, spmd_class)
-    if trait == OperatorExecutionTrait.IO_SOURCE:
-        return CANONICAL_LANE_IO
-    if trait == OperatorExecutionTrait.SYNC_COMPUTE:
-        return CANONICAL_LANE_COMPUTE
-    if trait == OperatorExecutionTrait.ASYNC_COROUTINE:
+    if is_coroutine_operator(spec, spmd_class):
         return None
-    raise ValueError(f"Unknown operator execution trait: {trait!r}")
+    if is_io_operator(spec, spmd_class):
+        return CANONICAL_LANE_IO
+    return CANONICAL_LANE_COMPUTE
 
 
 def apply_canonical_lane_presets(
@@ -162,6 +149,8 @@ def apply_canonical_lane_presets(
             spec_updates: dict[str, Any] = {}
             if spec.execution_trait is None:
                 spec_updates["execution_trait"] = trait
+            if is_io_operator(spec, spmd.spmd_class) and not spec.is_source:
+                spec_updates["is_source"] = True
             if updates:
                 new_schedule = schedule.model_copy(update=updates)
                 new_async = spec.async_policy.model_copy(

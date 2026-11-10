@@ -754,25 +754,14 @@ def _create_operator_wrapper(
     else:
         output_args = None
 
-    if is_source or source is not None:
-        execution_trait = OperatorExecutionTrait.IO_SOURCE
-    else:
-        func_unwrap = func
-        while hasattr(func_unwrap, "__wrapped__"):
-            func_unwrap = func_unwrap.__wrapped__
-        if hasattr(func_unwrap, "func"):
-            func_unwrap = func_unwrap.func
-        if inspect.iscoroutinefunction(func_unwrap):
-            execution_trait = OperatorExecutionTrait.ASYNC_COROUTINE
-        else:
-            execution_trait = OperatorExecutionTrait.SYNC_COMPUTE
+    execution_trait = OperatorExecutionTrait.from_callable(func)
 
     spec = OperatorSpec(
         name=name,
         owner=None,
         method_name=func.__name__,
         execution_trait=execution_trait,
-        is_source=is_source,
+        is_source=is_source or (source is not None),
         source=source,
         async_policy=normalized_async_policy,
         tensor_access={} if tensor_access is None else tensor_access,
@@ -985,26 +974,15 @@ def spmd(
             is_reader = issubclass(c, BaseReader)
             operator_specs = {}
             for attr_name, (op_name, spec, owner_cls) in wrapper_specs.items():
+                actual_fn = getattr(c, attr_name)
                 updates: dict[str, Any] = {
                     "owner": c,
                     "method_name": attr_name,
+                    "execution_trait": OperatorExecutionTrait.from_callable(actual_fn),
                     "requires_worker_process": _is_worker_process_required(owner_cls),
                 }
                 if is_reader or spec.is_source or spec.source is not None:
-                    updates["execution_trait"] = OperatorExecutionTrait.IO_SOURCE
-                else:
-                    actual_fn = getattr(c, attr_name)
-                    func_unwrap = actual_fn
-                    while hasattr(func_unwrap, "__wrapped__"):
-                        func_unwrap = func_unwrap.__wrapped__
-                    if hasattr(func_unwrap, "func"):
-                        func_unwrap = func_unwrap.func
-                    if inspect.iscoroutinefunction(func_unwrap):
-                        updates["execution_trait"] = (
-                            OperatorExecutionTrait.ASYNC_COROUTINE
-                        )
-                    else:
-                        updates["execution_trait"] = OperatorExecutionTrait.SYNC_COMPUTE
+                    updates["is_source"] = True
                 operator_specs[op_name] = spec.model_copy(update=updates)
 
             return SPMDConfig(
@@ -1060,14 +1038,11 @@ def spmd_source(
         orig_get_config = cls.get_spmd_config
 
         def new_get_config(c):
-            from fluxway.common.operator_spec import OperatorExecutionTrait
-
             config = orig_get_config()
             config.operator_specs = {
                 name: spec.model_copy(
                     update={
                         "is_source": True,
-                        "execution_trait": OperatorExecutionTrait.IO_SOURCE,
                         "is_interleaved": interleaved,
                         "interleave_unit_size": interleave_unit_size,
                         "execution_groups": execution_groups,

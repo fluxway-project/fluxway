@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from enum import StrEnum
+import inspect
 from typing import Annotated, Any
 
 from pydantic import (
@@ -53,7 +54,29 @@ type TensorAccessMap = Annotated[
 class OperatorExecutionTrait(StrEnum):
     SYNC_COMPUTE = "sync_compute"
     ASYNC_COROUTINE = "async_coroutine"
-    IO_SOURCE = "io_source"
+
+    @classmethod
+    def from_callable(cls, fn: Any) -> OperatorExecutionTrait:
+        """Resolve the execution trait from any callable, safely unwrapping wrappers."""
+        if fn is None:
+            return cls.SYNC_COMPUTE
+        unwrapped = inspect.unwrap(fn)
+        if hasattr(unwrapped, "func"):
+            unwrapped = inspect.unwrap(unwrapped.func)
+        if inspect.iscoroutinefunction(unwrapped):
+            return cls.ASYNC_COROUTINE
+        return cls.SYNC_COMPUTE
+
+    @classmethod
+    def from_owner(
+        cls, owner: type | None, method_name: str | None
+    ) -> OperatorExecutionTrait:
+        """Resolve the execution trait from an owner class and method name."""
+        if owner is not None and isinstance(owner, type) and method_name:
+            fn = getattr(owner, method_name, None)
+            if fn is not None:
+                return cls.from_callable(fn)
+        return cls.SYNC_COMPUTE
 
 
 class OperatorSpec(BaseModel):
@@ -98,21 +121,9 @@ class OperatorSpec(BaseModel):
             if not val_dict.get("method_name") and val_dict.get("name"):
                 val_dict["method_name"] = val_dict["name"]
             if val_dict.get("execution_trait") is None:
-                if val_dict.get("is_source") or val_dict.get("source") is not None:
-                    val_dict["execution_trait"] = OperatorExecutionTrait.IO_SOURCE
-                else:
-                    owner = val_dict.get("owner")
-                    if owner is not None and isinstance(owner, type):
-                        from fluxway.reader.base_reader import BaseReader
-
-                        if issubclass(owner, BaseReader):
-                            val_dict["execution_trait"] = (
-                                OperatorExecutionTrait.IO_SOURCE
-                            )
-                    if val_dict.get("execution_trait") is None:
-                        val_dict["execution_trait"] = (
-                            OperatorExecutionTrait.SYNC_COMPUTE
-                        )
+                val_dict["execution_trait"] = OperatorExecutionTrait.from_owner(
+                    val_dict.get("owner"), val_dict.get("method_name")
+                )
             return val_dict
         return value
 

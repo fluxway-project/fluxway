@@ -33,6 +33,17 @@ class DummyReader(BaseReader):
     mesh_axis_names=("data",),
     mesh_axis_shapes=(1,),
 )
+class AsyncDummyReader(BaseReader):
+    @operator("read", output_sharding={"data": {"type": "static", "axis": []}})
+    async def read(self) -> dict[str, list[int]]:
+        return {"data": [1, 2, 3]}
+
+
+@spmd(
+    resource_profile=fw.ResourceProfile(base={"CPU": 1}),
+    mesh_axis_names=("data",),
+    mesh_axis_shapes=(1,),
+)
 class DummyTrainer:
     @operator("train", input_sharding={"data": {"type": "static", "axis": []}})
     def train(self, data: list[int]) -> int:
@@ -61,15 +72,30 @@ def test_operator_classification():
     assert not is_coroutine_operator(read_spec)
     assert infer_canonical_lane(read_spec) == CANONICAL_LANE_IO
     assert (
-        resolve_operator_execution_trait(read_spec) == OperatorExecutionTrait.IO_SOURCE
+        resolve_operator_execution_trait(read_spec)
+        == OperatorExecutionTrait.SYNC_COMPUTE
     )
+    assert not read_spec.is_coroutine_function
+
+    async_read_spec = OperatorSpec(
+        name="read", method_name="read", owner=AsyncDummyReader
+    )
+    assert is_io_operator(async_read_spec)
+    assert is_coroutine_operator(async_read_spec)
+    assert infer_canonical_lane(async_read_spec) is None
+    assert (
+        resolve_operator_execution_trait(async_read_spec)
+        == OperatorExecutionTrait.ASYNC_COROUTINE
+    )
+    assert async_read_spec.is_coroutine_function
 
     source_spec = OperatorSpec(name="src", is_source=True)
     assert is_io_operator(source_spec)
+    assert not is_coroutine_operator(source_spec)
     assert infer_canonical_lane(source_spec) == CANONICAL_LANE_IO
     assert (
         resolve_operator_execution_trait(source_spec)
-        == OperatorExecutionTrait.IO_SOURCE
+        == OperatorExecutionTrait.SYNC_COMPUTE
     )
 
     train_spec = OperatorSpec(name="train", method_name="train", owner=DummyTrainer)
@@ -152,12 +178,44 @@ def test_builder_canonical_lane_integration():
     )
 
     # Verify execution traits are populated
-    assert reader_specs["read"].execution_trait == OperatorExecutionTrait.IO_SOURCE
+    assert reader_specs["read"].execution_trait == OperatorExecutionTrait.SYNC_COMPUTE
+    assert reader_specs["read"].is_source is True
+    assert not reader_specs["read"].is_coroutine_function
+
     assert trainer_specs["train"].execution_trait == OperatorExecutionTrait.SYNC_COMPUTE
+    assert not trainer_specs["train"].is_source
+    assert not trainer_specs["train"].is_coroutine_function
+
     assert (
         trainer_specs["async_fetch"].execution_trait
         == OperatorExecutionTrait.ASYNC_COROUTINE
     )
+    assert not trainer_specs["async_fetch"].is_source
+    assert trainer_specs["async_fetch"].is_coroutine_function
+
+
+def test_builder_async_reader_integration():
+    builder = fw.Builder()
+    builder.add_node("async_reader", AsyncDummyReader)
+    builder.add_node("trainer", DummyTrainer)
+    builder.add_func_edge(
+        "async_reader",
+        "read",
+        "trainer",
+        "train",
+        tensor_map={"data": "data"},
+    )
+    graph = builder.build("async_canonical_graph")
+
+    async_reader_specs = graph.nodes["async_reader"].spmd_config.operator_specs
+    assert async_reader_specs["read"].async_policy.schedule.lane is None
+    assert async_reader_specs["read"].async_policy.schedule.lane_ordering == ()
+    assert (
+        async_reader_specs["read"].execution_trait
+        == OperatorExecutionTrait.ASYNC_COROUTINE
+    )
+    assert async_reader_specs["read"].is_source is True
+    assert async_reader_specs["read"].is_coroutine_function
 
 
 def test_canonical_lane_single_lane_no_ordering():
