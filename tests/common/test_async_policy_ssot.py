@@ -65,6 +65,9 @@ def test_async_policy_is_the_only_operator_async_fact_source():
     assert runtime.state_resource is None
     assert runtime.schedule is _ASYNC_POLICY.schedule
     assert runtime.priority == 7
+    assert runtime.max_staleness == 2
+    assert runtime.is_pipelined is True
+    assert runtime.has_bounded_staleness is True
 
     with pytest.raises(FrozenInstanceError):
         runtime.pipeline_depth = 4

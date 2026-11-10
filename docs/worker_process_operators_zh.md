@@ -177,17 +177,152 @@ sequenceDiagram
 
 同步 `on_shutdown()` 直接在工作进程事件循环调用；耗时清理应使用异步钩子并自行分派阻塞工作。实例钩子与用户调用排空并发执行，不保证钩子开始前所有线程调用已经结束。拥有者须协调仍在进行的资源访问；取消协程等待也不能终止已运行的 Python 线程。强制结束进程不保证执行钩子。
 
-## 状态与调度策略 (State & Schedule Policy)
+## 异步执行与协同调度架构 (Async, State & Schedule Architecture)
 
-在 Fluxway 中，算子的并发执行由**状态互斥策略 (`StatePolicy`)**与**队列调度策略 (`SchedulePolicy`)**共同决定。
+在 Fluxway 中，算子的并发执行由三个正交的策略维度共同决定：**异步并发策略 (`AsyncPolicy`)**、**队列调度策略 (`SchedulePolicy`)** 与 **状态互斥策略 (`StatePolicy`)**。三者彼此解耦，由框架编译引擎统一组装为高性能、内存安全的运行时控制块。
 
-### 1. 状态访问策略 (`StatePolicy`)
-* `StatePolicy.exclusive()`：**默认策略**。对同一个 SPMD 实例加锁串行化，模型权重修改、有状态存储必须保留此策略。
-* `StatePolicy.thread_safe()`：移除实例锁。仅当算子为纯无状态转换或其内部资源完全线程安全时使用，允许同实例多步并行执行。
+```mermaid
+flowchart TD
+    subgraph Spec["算子策略声明 (Operator Policy Declaration)"]
+        AP["AsyncPolicy<br/>(滑动窗口与在飞步数)"]
+        SP["SchedulePolicy<br/>(阶段顺序与队列优先级)"]
+        ST["StatePolicy<br/>(实例锁与线程互斥)"]
+    end
 
-### 2. 调度策略一分钟极速选型指南 (`SchedulePolicy`)
+    AP -->|编译为| CAP["CompiledAsyncPolicy<br/>(is_pipelined, max_staleness)"]
+    SP -->|编译为| PG["PhaseGate 门禁 & 队列排序器"]
+    ST -->|绑定至| LK["Actor 实例互斥锁 / 线程安全调度"]
 
-为了让业务方在 10 秒内明确选择最适合的调度策略，请参考以下决策树与速查表：
+    CAP & PG & LK --> RUNTIME["SPMDWorker 协同执行引擎"]
+```
+
+---
+
+### 1. 异步执行策略 (`AsyncPolicy`)
+
+`AsyncPolicy` 定义算子在步数（Step / Microbatch）维度的向前推进能力与重叠窗口，提供三种平级且正交的原生并发执行模式：
+
+#### `AsyncPolicy.sync`（严格单步同步）
+
+* **核心语义**：严格单步执行，流水线深度固定为 1（`depth=1`）。当前 Step 的输入准备、执行与结果提交全部完成之前，绝不触发下一步。
+* **适用场景**：单步调试验证、有强因果同步屏障、或完全不可重叠的串行执行流。
+
+```mermaid
+gantt
+    title AsyncPolicy.sync (depth=1) 执行甘特图
+    dateFormat X
+    axisFormat %s
+    section Worker 计算
+    Step 0 执行 :active, 0, 10
+    Step 1 执行 :active, 10, 20
+    section Ingress 输入准备
+    Step 0 准备 :0, 3
+    Step 1 准备 :10, 13
+```
+
+```mermaid
+sequenceDiagram
+    participant Ingress as 输入通道 (Input Ingress)
+    participant Worker as 工作计算 (Compute Worker)
+    participant Sink as 输出提交通道 (Commit Sink)
+
+    Ingress->>Worker: Step 0 输入准备就绪
+    Worker->>Sink: Step 0 执行计算并提交
+    Ingress->>Worker: Step 1 输入准备就绪 (必须等待 Step 0 完成提交)
+    Worker->>Sink: Step 1 执行计算并提交
+```
+
+#### `AsyncPolicy.pipelined`（滑动窗口流水线）
+
+* **核心语义**：滑动窗口异步流水线。允许算子同时在飞（in-flight）最多 $K$ 个微批次或步数。框架自动重叠上游预取（Prefetching）、输入准备（Input Prepare）与工作线程执行，消除 IO 与网络等待气泡；在飞步数达到 $K$ 时天然触发背压限流。
+* **适用场景**：数据读取、特征物化变换、深度学习前向/反向计算、标准流水线并行。
+
+```mermaid
+gantt
+    title AsyncPolicy.pipelined (depth=2) 执行甘特图
+    dateFormat X
+    axisFormat %s
+    section Worker 计算
+    Step 0 执行 :active, 3, 10
+    Step 1 执行 :active, 10, 17
+    Step 2 执行 :active, 17, 24
+    section Ingress 输入预取
+    Step 0 准备 :0, 3
+    Step 1 预取 (并发重叠) :3, 6
+    Step 2 预取 (并发重叠) :10, 13
+    Step 3 预取 (并发重叠) :17, 20
+```
+
+```mermaid
+sequenceDiagram
+    participant Ingress as 输入通道 (Input Ingress)
+    participant Worker as 工作计算 (Compute Worker)
+    participant Sink as 输出提交通道 (Commit Sink)
+
+    Ingress->>Worker: Step 0 输入准备就绪
+    par 计算与预取重叠
+        Worker->>Sink: Step 0 执行计算
+    and
+        Ingress->>Worker: Step 1 输入提前就绪 (Prefetch)
+    end
+    Worker->>Sink: Step 1 执行计算 (零气泡接力)
+```
+
+#### `AsyncPolicy.bounded_stale`（有界陈旧度并行 / SSP）
+
+* **核心语义**：有界陈旧度参数并行（Stale Synchronous Parallelism, SSP）。允许算子在本地使用落后至多 $M$ 步的陈旧参数（Stale Parameters）高速迭代；当滞后步数达到 $M$ 时，框架触发强制屏障同步（Staleness Fence Barrier）挂起算子，等待全局参数同步对齐。
+* **适用场景**：大规模推荐系统 Embedding 异步查表更新、参数服务器（Parameter Server）架构、容忍轻微滞后的分布式 SGD。
+
+```mermaid
+gantt
+    title AsyncPolicy.bounded_stale (depth=2, max_staleness=2) 执行甘特图
+    dateFormat X
+    axisFormat %s
+    section Worker 计算
+    Step 0 (使用参数 W0) :active, 0, 6
+    Step 1 (使用参数 W0) :active, 6, 12
+    Step 2 (使用参数 W0) :active, 12, 18
+    Staleness 超限屏障挂起 :crit, 18, 24
+    Step 3 (使用参数 W1) :active, 24, 30
+    section 参数同步
+    W0 到 W1 异步网络传输 :0, 24
+```
+
+```mermaid
+sequenceDiagram
+    participant Worker as 工作计算 (Compute Worker)
+    participant Param as 全局参数同步 (Param Sync)
+
+    Worker->>Worker: Step 0 计算 (使用参数 W0)
+    Worker->>Worker: Step 1 计算 (允许使用滞后参数 W0)
+    Worker->>Worker: Step 2 计算 (达到滞后上限 M=2)
+    Note over Worker,Param: 触发 Staleness Fence 强同步屏障，挂起等待参数对齐
+    Param-->>Worker: W1 全局参数同步就绪
+    Worker->>Worker: Step 3 计算 (恢复最新参数 W1)
+```
+
+#### 极速选型决策树
+
+```mermaid
+flowchart TD
+    Start{"算子需要何种异步执行与重叠语义？"}
+    Start -->|单步串行调试 / 严苛步内结算| Sync["AsyncPolicy.sync()<br/>(depth=1, 零跨步重叠)"]
+    Start -->|常规数据流 / 滑动窗口流水 / 多微批次计算| Pipe["AsyncPolicy.pipelined(depth=K)<br/>(滑动窗口重叠，自动有界背压)"]
+    Start -->|参数服务器 / 异步 SGD / 容忍参数滞后| Stale["AsyncPolicy.bounded_stale(depth=K, max_staleness=M)<br/>(SSP 模式，陈旧度超限自动对齐)"]
+```
+
+---
+
+### 2. 状态访问策略 (`StatePolicy`)
+
+* **`StatePolicy.exclusive()`**：**默认策略**。对同一个 SPMD Actor 实例加锁串行化。模型权重更新、有状态缓存等存在数据竞争的算子必须保留此策略。
+* **`StatePolicy.thread_safe()`**：移除实例锁。仅当算子为纯无状态转换或其内部资源完全线程安全时使用，允许同一个 Actor 实例跨多步并发执行。
+
+---
+
+### 3. 队列调度策略 (`SchedulePolicy`)
+
+为了让业务方快速选择最适合的调度策略，请参考以下决策树与速查表：
 
 ```mermaid
 flowchart TD
@@ -202,22 +337,85 @@ flowchart TD
 
 #### 策略速查与代码模板对照表
 
-| 策略类型 | 什么时候用 | 框架默认行为 / 保证 | 核心代码范式 |
+| 策略类型 | 适用场景 | 框架保证 | 核心代码范式 |
 | :--- | :--- | :--- | :--- |
-| **`fifo` (默认)** | **90% 业务场景**：数据读取、特征物化、无状态前向、单算子训练。 | **默认开箱即用**。自动归入 `io`/`compute` 规范泳道并自动配齐协同优先级 `("compute", "io")`，下游计算优先出队消费。 | `@operator("read", async_policy=AsyncPolicy.pipelined(depth=4))` *(无需写 schedule)* |
-| **`phase_order`** | **多阶段模型训练**：同一个 Actor 内有 `train_core` 与 `update` 等多个阶段，必须确保下一步的计算不会读取到正在更新的脏权重。 | 框架编译底层 `PhaseGate` 门禁。在 Step $S$ 优化器更新完成前，Step $S+1$ 计算**物理被拦截在执行队列之外**，绝对无竞态。 | `SchedulePolicy.phase_order(phase="fwd", phase_order=("fwd", "bwd", "opt"))` |
+| **`fifo` (默认)** | **90% 业务场景**：数据读取、特征物化、无状态前向、单算子训练。 | **默认开箱即用**。自动归入 `io`/`compute` 规范泳道并自动配齐协同优先级 `("compute", "io")`，下游计算优先出队消费。 | `@operator("read", async_policy=AsyncPolicy.pipelined(depth=4))` *(无需显式指定 schedule)* |
+| **`phase_order`** | **多阶段模型训练**：同一个 Actor 内有 `train_core` 与 `update` 等阶段，确保下一步计算不会读取到正在更新的脏权重。 | 框架编译底层 `PhaseGate` 门禁。在 Step $S$ 优化器更新完成前，Step $S+1$ 计算**物理被拦截在执行队列之外**，绝对无竞态。 | `SchedulePolicy.phase_order(phase="fwd", phase_order=("fwd", "bwd", "opt"))` |
 | **`phase_graph`** | **复杂跨步重叠**：模型更新时，允许 Step $S+1$ 的部分辅助工作（如梯度预通信）与 Step $S$ 更新重叠，但核心前向必须等待。 | 用户通过 `(before, after, step_delta)` 显式表达细粒度因果依赖 DAG。 | `SchedulePolicy.phase_graph(phase="fwd", phase_order=..., dependencies=(("opt", "fwd", 1),))` |
-| **`deadline_boost`** | **防掉队者 / 周期性刷盘**：平时保持低优先级让出资源，当滞后步数超过 `staleness_limit` 时，临时提权到 `boost_priority` 优先出队。 | 自动监控调度步数滞后差，超限立即在 Min-Heap 队列中提权插队。 | `SchedulePolicy.deadline_boost(base_priority=0, boost_priority=100)` |
+| **`deadline_boost`** | **防掉队者 / 周期性刷盘**：平时保持低优先级让出资源，当滞后步数超过阈值时，临时提权到 `boost_priority` 优先出队。 | 自动监控调度步数滞后差，超限立即在 Min-Heap 队列中提权插队。 | `SchedulePolicy.deadline_boost(base_priority=0, boost_priority=100)` |
 
-#### 代码范例对比
+---
+
+### 4. 正交组合应用范式 (Orthogonal Composition Patterns)
+
+Fluxway 拒绝硬编码的死板模式。`AsyncPolicy`（滑动窗口与推进深度）与 `SchedulePolicy`（因果依赖与阶段门禁）通过正交解耦的组合，天然支撑各种高性能计算范式：
+
+#### 范式 A：流式数据预取与背压流水（Streaming Ingestion & Backpressure）
+
+适用于纯数据加载、特征变换与无状态前向。无需声明阶段门禁，直接由 `pipelined` 与默认 `FIFO` 协同工作，提供天然的内存有界反压：
 
 ```python
-# 1. 默认 FIFO：最简形式，适合绝大多数数据流与单算子
+# 最简流式数据处理：上游预取与当前步计算自动重叠，在飞步数达到 4 时自动反压限流
 @operator("process", async_policy=AsyncPolicy.pipelined(depth=4))
 def process(self, batch: Batch) -> Tensor:
     return self.transform(batch)
+```
 
-# 2. Phase Order：多阶段训练，防止下一步读到未更新的脏参数
+#### 范式 B：多阶段流水线并行（Cross-Phase Pipeline Parallelism / 1F1B）
+
+适用于现代大模型与分布式深度学习流水线并行。由 `AsyncPolicy.pipelined(depth=K)` 驱动 $K$ 个微批次（Microbatch）同时在流水线中流动，并由 `SchedulePolicy.phase_order` 提供前向（Forward）与反向（Backward）阶段的因果门禁：
+
+```mermaid
+sequenceDiagram
+    participant Driver as 驱动层 / 数据输入
+    participant Gate as PhaseGate (阶段门禁)
+    participant FWD as Forward 阶段算子 (fwd)
+    participant BWD as Backward 阶段算子 (bwd)
+
+    Driver->>Gate: Microbatch 0 输入
+    Gate->>FWD: 准入执行 Step 0 Forward
+    FWD-->>Gate: Step 0 Forward 完成
+    Gate->>BWD: 准入执行 Step 0 Backward
+    par 流水线重叠推进 (1F1B)
+        Driver->>Gate: Microbatch 1 输入
+        Gate->>FWD: 准入执行 Step 1 Forward
+    and
+        BWD-->>Gate: Step 0 Backward 完成
+    end
+```
+
+```python
+class PipelineParallelStage:
+    """标准 1F1B 流水线并行阶段算子组"""
+
+    @operator(
+        "fwd_stage",
+        async_policy=AsyncPolicy.pipelined(
+            depth=4,  # 在飞微批次深度
+            schedule=SchedulePolicy.phase_order(phase="fwd", phase_order=("fwd", "bwd")),
+            state=StatePolicy.exclusive(),
+        ),
+    )
+    def fwd_stage(self, microbatch: Tensor) -> Tensor:
+        return self.forward_compute(microbatch)
+
+    @operator(
+        "bwd_stage",
+        async_policy=AsyncPolicy.pipelined(
+            depth=4,
+            schedule=SchedulePolicy.phase_order(phase="bwd", phase_order=("fwd", "bwd")),
+            state=StatePolicy.exclusive(),
+        ),
+    )
+    def bwd_stage(self, grad_output: Tensor) -> Tensor:
+        return self.backward_compute(grad_output)
+```
+
+#### 范式 C：多阶段步内屏障隔离（Barrier-Isolated Multi-Phase Training）
+
+适用于单 Actor 内包含核心计算与参数更新的多阶段任务，通过 `depth=1` 结合 `phase_order` 门禁，物理阻止下一步读到未更新完成的脏权重：
+
+```python
 @operator(
     "train_core",
     async_policy=AsyncPolicy.pipelined(
@@ -284,11 +482,75 @@ flowchart TD
 
 ### 1. 标准泳道粗粒度自动规划规则
 
-在 `Builder.build` 编译图阶段，框架根据算子的元数据语义特征自动执行推导（实现位于 `fluxway.common.canonical_lanes`）：
+在 `Builder.build` 编译图阶段，框架根据算子的静态元数据语义特征解析执行特征（Execution Trait）并自动执行泳道推导（实现位于 `fluxway.common.canonical_lanes`）：
 
-* **`io` 泳道**：凡是算子标记为 `is_source=True`、声明了 `source` 描述符或所属类继承自 `BaseReader` 的算子，默认归入 `"io"` 泳道。
-* **`compute` 泳道**：普通的同步计算算子（非 IO 的 `def` 算子）默认归入 `"compute"` 泳道，并在专属有界工作线程池中执行，C 扩展完全释放 GIL，不阻塞主事件循环。
-* **异步协程通信算子**：`async def` 协程算子不分配线程池泳道（保持 `lane=None`），直接由 asyncio 主事件循环调度，专职负责跨节点高效通信与异步编排。
+* **`OperatorExecutionTrait.IO_SOURCE`**：凡是算子标记为 `is_source=True`、声明了 `source` 描述符或所属类继承自 `BaseReader` 的算子，默认归入 `"io"` 泳道。
+* **`OperatorExecutionTrait.SYNC_COMPUTE`**：普通的同步计算算子（非 IO 的 `def` 算子）默认归入 `"compute"` 泳道，并在专属有界工作线程池中执行，C 扩展完全释放 GIL，不阻塞主事件循环。
+* **`OperatorExecutionTrait.ASYNC_COROUTINE`**：`async def` 协程算子不分配线程池泳道（保持 `lane=None`），直接由 asyncio 主事件循环调度，专职负责跨节点高效通信与异步编排。
+
+```mermaid
+flowchart TD
+    Op["@operator 算子定义"] --> Resolve["resolve_operator_execution_trait()"]
+    Resolve --> Trait{"OperatorExecutionTrait"}
+    Trait -->|IO_SOURCE| IOLane["标准 'io' 泳道"]
+    Trait -->|SYNC_COMPUTE| CompLane["标准 'compute' 泳道"]
+    Trait -->|ASYNC_COROUTINE| Loop["Asyncio 主事件循环 (lane=None)"]
+
+    IOLane --> Sched["compute_lane_priority(policy, lane)"]
+    CompLane --> Sched
+    Sched --> PriQueue["协同优先级调度队列"]
+```
+
+辅助函数 `compute_lane_priority(policy, lane)` 作为泳道优先级的单一真实来源（Single Source of Truth），统一依据 `SchedulePolicy.lane_priorities` 或 `SchedulePolicy.lane_ordering` 结算调度分值。
+
+以下独立示例展示了静态特征解析、标准泳道推导与优先级计算：
+
+```python
+from fluxway.common.canonical_lanes import (
+    compute_lane_priority,
+    infer_canonical_lane,
+    resolve_operator_execution_trait,
+)
+from fluxway.common.decorators import get_spmd_config, operator, spmd
+from fluxway.common.operator_policy import SchedulePolicy
+from fluxway.common.operator_spec import OperatorExecutionTrait
+from fluxway.resources import ResourceProfile
+
+
+@spmd(resource_profile=ResourceProfile(base={"CPU": 1}))
+class PipelineModel:
+    @operator(name="read_batch", is_source=True)
+    def read_batch(self) -> dict:
+        return {"x": 1}
+
+    @operator(name="sync_compute")
+    def sync_compute(self, x: int) -> int:
+        return x * 2
+
+    @operator(name="async_coord")
+    async def async_coord(self, x: int) -> int:
+        return x + 1
+
+
+config = get_spmd_config(PipelineModel)
+read_spec = config.operator_specs["read_batch"]
+compute_spec = config.operator_specs["sync_compute"]
+async_spec = config.operator_specs["async_coord"]
+
+assert resolve_operator_execution_trait(read_spec, PipelineModel) == OperatorExecutionTrait.IO_SOURCE
+assert infer_canonical_lane(read_spec, PipelineModel) == "io"
+
+assert resolve_operator_execution_trait(compute_spec, PipelineModel) == OperatorExecutionTrait.SYNC_COMPUTE
+assert infer_canonical_lane(compute_spec, PipelineModel) == "compute"
+
+assert resolve_operator_execution_trait(async_spec, PipelineModel) == OperatorExecutionTrait.ASYNC_COROUTINE
+assert infer_canonical_lane(async_spec, PipelineModel) is None
+
+# 统一优先级分值结算
+policy = SchedulePolicy.fifo(lane="compute", lane_order=("compute", "io"))
+assert compute_lane_priority(policy, "compute") == 1
+assert compute_lane_priority(policy, "io") == 0
+```
 
 ### 2. 自动配齐协同优先级与天然背压
 

@@ -308,8 +308,8 @@ def _operator_attributes(
         values["dependency_cycle_group"] = cycle_group
     if policy.max_staleness is not None:
         values["async_max_staleness"] = str(policy.max_staleness)
-    if policy.phases:
-        values["async_phases"] = json.dumps(policy.phases)
+    if schedule.phase_ordering:
+        values["async_phases"] = json.dumps(schedule.phase_ordering)
     if policy.state.resource is not None:
         values["state_resource"] = policy.state.resource
     if schedule.phase is not None:

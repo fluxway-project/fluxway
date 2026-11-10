@@ -20,15 +20,44 @@ RetirePayload = Callable[[tuple[CoherenceInstance, ...], PayloadT], Awaitable[An
 AdmitInstance = Callable[[CoherenceInstance], Awaitable[None]]
 
 
+class IntentPhase(StrEnum):
+    OPEN = "open"
+    SEALED = "sealed"
+    DELIVERED = "delivered"
+    RECLAIMED = "reclaimed"
+
+
 @dataclass(slots=True)
 class _Intent:
     instance: CoherenceInstance
+    phase: IntentPhase = IntentPhase.OPEN
     payloads: deque[_Ticket[Any]] = field(default_factory=deque)
     active_payloads: int = 0
     active_consumer_leases: int = 0
     admitted: bool = False
-    sealed: bool = False
     admission_task: asyncio.Task[None] | None = None
+
+    @property
+    def sealed(self) -> bool:
+        return self.phase in (
+            IntentPhase.SEALED,
+            IntentPhase.DELIVERED,
+            IntentPhase.RECLAIMED,
+        )
+
+    @sealed.setter
+    def sealed(self, value: bool) -> None:
+        if value and self.phase is IntentPhase.OPEN:
+            self.phase = IntentPhase.SEALED
+            self._refresh_phase()
+        elif not value and self.phase is not IntentPhase.OPEN:
+            raise CoherenceStateTransitionError(
+                f"cannot unseal coherence intent: {self.instance}."
+            )
+
+    @property
+    def is_delivery_completed(self) -> bool:
+        return self.sealed and all(t.delivery_complete for t in self.payloads)
 
     @property
     def is_completed(self) -> bool:
@@ -37,6 +66,55 @@ class _Intent:
             and self.active_payloads == 0
             and self.active_consumer_leases == 0
         )
+
+    def seal(self) -> None:
+        if self.phase is not IntentPhase.OPEN:
+            raise CoherenceStateTransitionError(
+                f"coherence intent is already sealed: {self.instance}."
+            )
+        self.phase = IntentPhase.SEALED
+        self._refresh_phase()
+
+    def mark_admitted(self) -> None:
+        self.admitted = True
+
+    def add_ticket(self, ticket: _Ticket[Any]) -> None:
+        if self.phase is not IntentPhase.OPEN:
+            raise CoherenceStateTransitionError(
+                f"cannot add ticket to sealed intent: {self.instance}."
+            )
+        self.payloads.append(ticket)
+        self.active_payloads += 1
+
+    def remove_ticket(self, ticket: _Ticket[Any]) -> None:
+        if ticket not in self.payloads:
+            raise CoherenceStateTransitionError(
+                f"ticket not found in intent payloads for {self.instance}."
+            )
+        self.payloads.remove(ticket)
+        self.active_payloads -= 1
+        if self.active_payloads < 0:
+            raise CoherenceStateTransitionError(
+                f"coherence payload count underflow for {self.instance}."
+            )
+        self._refresh_phase()
+
+    def acquire_lease(self) -> None:
+        self.active_consumer_leases += 1
+
+    def release_lease(self) -> None:
+        if self.active_consumer_leases <= 0:
+            raise CoherenceStateTransitionError(
+                f"coherence intent lease count underflow for {self.instance}."
+            )
+        self.active_consumer_leases -= 1
+        self._refresh_phase()
+
+    def _refresh_phase(self) -> None:
+        if self.is_completed:
+            self.phase = IntentPhase.RECLAIMED
+        elif self.is_delivery_completed:
+            self.phase = IntentPhase.DELIVERED
 
     def next_ticket(self) -> _Ticket[Any] | None:
         return next(iter(self.payloads), None)
@@ -49,15 +127,19 @@ class _Intent:
             raise CoherenceStateTransitionError(
                 "coherence intent next ticket changed during retirement."
             )
-        self.payloads.popleft()
+        self.remove_ticket(ticket)
 
 
-class _TicketState(StrEnum):
+class _TicketPhase(StrEnum):
     READY = "ready"
     ADMITTING = "admitting"
     DELIVERING = "delivering"
+    DELIVERED = "delivered"
     RETIRED = "retired"
     ABORTED = "aborted"
+
+
+_TicketState = _TicketPhase
 
 
 class ConsumerLease:
@@ -152,14 +234,48 @@ class _Ticket[PayloadT]:
     instances: tuple[CoherenceInstance, ...]
     payload: PayloadT
     future: asyncio.Future[Any] | None
+    ticket_id: int = 0
     intents: tuple[_Intent, ...] = field(default_factory=tuple)
-    state: _TicketState = _TicketState.READY
+    phase: _TicketPhase = _TicketPhase.READY
     inline_claimed: bool = False
     direct_executing: bool = False
     active_consumer_leases: int = 0
-    delivery_complete: bool = False
     result: Any = _MISSING
     error: BaseException | None = None
+
+    @property
+    def state(self) -> _TicketPhase:
+        return self.phase
+
+    @state.setter
+    def state(self, value: _TicketPhase) -> None:
+        self.transition_to(value)
+
+    @property
+    def delivery_complete(self) -> bool:
+        return self.phase in (_TicketPhase.DELIVERED, _TicketPhase.RETIRED)
+
+    def transition_to(self, new_phase: _TicketPhase) -> None:
+        if self.phase is new_phase:
+            return
+        valid_transitions = {
+            _TicketPhase.READY: (_TicketPhase.ADMITTING, _TicketPhase.ABORTED),
+            _TicketPhase.ADMITTING: (_TicketPhase.DELIVERING, _TicketPhase.ABORTED),
+            _TicketPhase.DELIVERING: (
+                _TicketPhase.DELIVERED,
+                _TicketPhase.RETIRED,
+                _TicketPhase.ABORTED,
+            ),
+            _TicketPhase.DELIVERED: (_TicketPhase.RETIRED, _TicketPhase.ABORTED),
+            _TicketPhase.RETIRED: (),
+            _TicketPhase.ABORTED: (),
+        }
+        allowed = valid_transitions.get(self.phase, ())
+        if new_phase not in allowed:
+            raise CoherenceStateTransitionError(
+                f"illegal ticket state transition from {self.phase} to {new_phase}."
+            )
+        self.phase = new_phase
 
 
 class _SubjectLane:
@@ -177,23 +293,29 @@ class _SubjectLane:
     def active_intents(self) -> tuple[_Intent, ...]:
         return tuple(self._intents)
 
+    def next_intent_to_publish(self) -> _Intent | None:
+        for intent in self._intents:
+            if not intent.is_delivery_completed:
+                return intent
+        return None
+
     def next_intent_to_admit(self) -> _Intent | None:
+        return self.next_intent_to_publish()
+
+    def head_intent(self) -> _Intent | None:
         return next(iter(self._intents), None)
 
     def owns_next_intent(self, intent: _Intent) -> bool:
-        return self.next_intent_to_admit() is intent
+        return self.head_intent() is intent
 
     def next_ticket_to_retire(self) -> _Ticket[Any] | None:
-        intent = self.next_intent_to_admit()
+        intent = self.head_intent()
         return intent.next_ticket() if intent is not None else None
 
     def discard_completed_prefix(self) -> tuple[_Intent, ...]:
         discarded: list[_Intent] = []
-        while (intent := self.next_intent_to_admit()) is not None:
-            if not intent.is_completed:
-                break
-            discarded.append(intent)
-            self._intents.popleft()
+        while self._intents and self._intents[0].is_completed:
+            discarded.append(self._intents.popleft())
         return tuple(discarded)
 
     def retire_next_intent(self, intent: _Intent) -> None:
@@ -222,6 +344,7 @@ class CoherenceSequencer[PayloadT]:
         self._intent_index: dict[CoherenceInstance, _Intent] = {}
         self._last_issued_instance: dict[object, CoherenceInstance] = {}
         self._last_retired_instance: dict[object, CoherenceInstance] = {}
+        self._next_ticket_id = 0
         self._tickets: dict[int, _Ticket[Any]] = {}
         self._drain_handle: asyncio.Handle | None = None
         self._retire_tasks: dict[int, asyncio.Task[None]] = {}
@@ -279,8 +402,44 @@ class CoherenceSequencer[PayloadT]:
         self._intent_index[instance] = intent
         self._last_issued_instance[instance.subject] = instance
 
+    def allocate_ticket_id(self) -> int:
+        self._ensure_open()
+        ticket_id = self._next_ticket_id
+        self._next_ticket_id += 1
+        return ticket_id
+
+    def _resolve_target_ticket(
+        self,
+        intent: _Intent,
+        ticket_id: int | None = None,
+    ) -> _Ticket[Any]:
+        if ticket_id is not None:
+            for cand in intent.payloads:
+                if cand.ticket_id == ticket_id:
+                    return cand
+            raise CoherenceStateTransitionError(
+                f"ticket_id {ticket_id} not found in intent {intent.instance}."
+            )
+        if len(intent.payloads) == 1:
+            return intent.payloads[0]
+        if not intent.payloads:
+            raise CoherenceStateTransitionError(
+                f"cannot bind consumer lease for an inactive coherence instance: {intent.instance}."
+            )
+        delivering = [c for c in intent.payloads if c.phase is _TicketPhase.DELIVERING]
+        delivered = [c for c in intent.payloads if c.phase is _TicketPhase.DELIVERED]
+        active_candidates = delivering + delivered
+        if len(active_candidates) == 1:
+            return active_candidates[0]
+        raise CoherenceStateTransitionError(
+            f"ambiguous tickets ({len(intent.payloads)} tickets present) for intent {intent.instance}; "
+            "ticket_id must be specified."
+        )
+
     def acquire_consumer_lease(
-        self, instances: Iterable[CoherenceInstance]
+        self,
+        instances: Iterable[CoherenceInstance],
+        ticket_id: int | None = None,
     ) -> ConsumerLease:
         self._ensure_open()
         self._capture_owner_loop()
@@ -297,27 +456,17 @@ class CoherenceSequencer[PayloadT]:
                     "cannot acquire consumer lease for an inactive coherence "
                     f"instance: {instance}."
                 )
-            ticket = next(
-                (
-                    candidate
-                    for candidate in intent.payloads
-                    if candidate.state is _TicketState.DELIVERING
-                ),
-                intent.next_ticket(),
-            )
-            if ticket is None:
-                raise CoherenceStateTransitionError(
-                    "cannot acquire consumer lease for an inactive coherence "
-                    f"instance: {instance}."
-                )
+            ticket = self._resolve_target_ticket(intent, ticket_id)
             bindings.append((ticket, intent))
         for ticket, intent in bindings:
             ticket.active_consumer_leases += 1
-            intent.active_consumer_leases += 1
+            intent.acquire_lease()
         return ConsumerLease(self, tuple(bindings))
 
     def reserve_consumer_lease(
-        self, instances: Iterable[CoherenceInstance]
+        self,
+        instances: Iterable[CoherenceInstance],
+        ticket_id: int | None = None,
     ) -> ConsumerLeaseReservationRef:
         self._ensure_open()
         self._capture_owner_loop()
@@ -334,15 +483,8 @@ class CoherenceSequencer[PayloadT]:
                     "cannot reserve consumer lease for an inactive coherence "
                     f"instance: {instance}."
                 )
-            ticket = next(
-                (
-                    candidate
-                    for candidate in intent.payloads
-                    if candidate.state is _TicketState.DELIVERING
-                ),
-                None,
-            )
-            if ticket is None:
+            ticket = self._resolve_target_ticket(intent, ticket_id)
+            if ticket.phase not in (_TicketPhase.DELIVERING, _TicketPhase.DELIVERED):
                 raise CoherenceStateTransitionError(
                     "consumer lease reservation requires an active payload: "
                     f"{instance}."
@@ -350,7 +492,7 @@ class CoherenceSequencer[PayloadT]:
             bindings.append((ticket, intent))
         for ticket, _intent in bindings:
             ticket.active_consumer_leases += 1
-            _intent.active_consumer_leases += 1
+            _intent.acquire_lease()
         control = _ConsumerLeaseReservationRecord(tuple(bindings))
         reservation_id = self._register_consumer_lease_reservation(control)
         return ConsumerLeaseReservationRef(self, reservation_id)
@@ -439,6 +581,15 @@ class CoherenceSequencer[PayloadT]:
         bindings: tuple[tuple[_Ticket[Any], _Intent], ...],
         reservation_id: int | None = None,
     ) -> None:
+        if self._fenced_error is not None:
+            for ticket, intent in bindings:
+                if ticket.active_consumer_leases > 0:
+                    ticket.active_consumer_leases -= 1
+                if intent.active_consumer_leases > 0:
+                    intent.release_lease()
+            if reservation_id is not None:
+                self._retire_consumer_lease_reservation(reservation_id)
+            return
         for ticket, _intent in bindings:
             if ticket.active_consumer_leases <= 0:
                 raise CoherenceStateTransitionError(
@@ -446,7 +597,12 @@ class CoherenceSequencer[PayloadT]:
                 )
         for ticket, intent in bindings:
             ticket.active_consumer_leases -= 1
-            intent.active_consumer_leases -= 1
+            intent.release_lease()
+            if (
+                ticket.phase is _TicketPhase.DELIVERED
+                and ticket.active_consumer_leases == 0
+            ):
+                self._finish_retired_ticket(ticket, ticket.result)
         if reservation_id is not None:
             self._retire_consumer_lease_reservation(reservation_id)
         self._schedule_drain()
@@ -467,6 +623,7 @@ class CoherenceSequencer[PayloadT]:
         self,
         instances: Iterable[CoherenceInstance],
         payload: PayloadT,
+        ticket_id: int | None = None,
     ) -> Coroutine[Any, Any, Any]:
         self._ensure_open()
         self._capture_owner_loop()
@@ -489,7 +646,17 @@ class CoherenceSequencer[PayloadT]:
                     "one coherence payload cannot span multiple epochs of one subject: "
                     f"subject={instance.subject} epochs={previous.epoch},{instance.epoch}."
                 )
-        ticket = _Ticket(ordered, payload, None)
+        if ticket_id is None:
+            ticket_id = self._next_ticket_id
+            self._next_ticket_id += 1
+        else:
+            if ticket_id in self._tickets:
+                raise CoherenceStateTransitionError(
+                    f"ticket_id {ticket_id} is already in use."
+                )
+            if ticket_id >= self._next_ticket_id:
+                self._next_ticket_id = ticket_id + 1
+        ticket = _Ticket(ordered, payload, None, ticket_id=ticket_id)
         intents: list[_Intent] = []
         try:
             for instance in ordered:
@@ -514,9 +681,8 @@ class CoherenceSequencer[PayloadT]:
                 intents.append(intent)
             ticket.intents = tuple(intents)
             for intent in intents:
-                intent.payloads.append(ticket)
-                intent.active_payloads += 1
-            self._tickets[id(ticket)] = ticket
+                intent.add_ticket(ticket)
+            self._tickets[ticket.ticket_id] = ticket
             if self._claim_inline_retirement(ticket):
                 ticket.inline_claimed = True
         except BaseException:
@@ -528,12 +694,12 @@ class CoherenceSequencer[PayloadT]:
         if (
             self._fenced_error is not None
             and ticket.future is None
-            and ticket.state is not _TicketState.RETIRED
+            and ticket.phase is not _TicketPhase.RETIRED
         ):
             raise self._fenced_error
-        if ticket.state is _TicketState.RETIRED:
+        if ticket.phase in (_TicketPhase.DELIVERED, _TicketPhase.RETIRED):
             return ticket.result if ticket.result is not _MISSING else None
-        if ticket.state is _TicketState.ABORTED:
+        if ticket.phase is _TicketPhase.ABORTED:
             if ticket.error is not None:
                 raise ticket.error
             if self._fenced_error is not None:
@@ -552,14 +718,14 @@ class CoherenceSequencer[PayloadT]:
             current_task = asyncio.current_task()
             if current_task is None:
                 raise RuntimeError("coherence retirement requires an active task.")
-            self._retire_tasks[id(ticket)] = current_task
+            self._retire_tasks[ticket.ticket_id] = current_task
             try:
                 result = await self._admit_and_retire(ticket, direct=True)
                 self._schedule_drain()
                 return result
             except asyncio.CancelledError:
                 self._abort_ticket(ticket, asyncio.CancelledError())
-                if ticket.state is not _TicketState.DELIVERING:
+                if ticket.phase is not _TicketPhase.DELIVERING:
                     self._schedule_drain()
                 raise
             except BaseException as error:
@@ -567,7 +733,7 @@ class CoherenceSequencer[PayloadT]:
                 raise
             finally:
                 ticket.direct_executing = False
-                self._retire_tasks.pop(id(ticket), None)
+                self._retire_tasks.pop(ticket.ticket_id, None)
 
         try:
             future = ticket.future
@@ -576,41 +742,38 @@ class CoherenceSequencer[PayloadT]:
             return await asyncio.shield(future)
         except asyncio.CancelledError:
             self._abort_ticket(ticket, asyncio.CancelledError())
-            if ticket.state is not _TicketState.DELIVERING:
+            if ticket.phase is not _TicketPhase.DELIVERING:
                 self._schedule_drain()
             raise
 
     def _is_ticket_ready(self, ticket: _Ticket[Any]) -> bool:
-        if ticket.state not in (_TicketState.READY, _TicketState.DELIVERING):
+        if ticket.phase not in (
+            _TicketPhase.READY,
+            _TicketPhase.DELIVERING,
+            _TicketPhase.DELIVERED,
+        ):
             return False
         for intent in ticket.intents:
             lane = self._lanes.get(intent.instance.subject)
-            if lane is None or not lane.owns_next_intent(intent) or not intent.sealed:
+            if lane is None:
                 return False
-            if ticket.state is _TicketState.DELIVERING:
-                if (
-                    intent.next_ticket() is not ticket
-                    or not ticket.delivery_complete
-                    or ticket.active_consumer_leases != 0
-                ):
+            if ticket.phase is _TicketPhase.DELIVERED:
+                if ticket.active_consumer_leases != 0:
                     return False
                 continue
-            if ticket.active_consumer_leases != 0:
+            if lane.next_intent_to_publish() is not intent or not intent.sealed:
                 return False
             for prior in intent.payloads:
                 if prior is ticket:
                     break
-                if (
-                    prior.state is not _TicketState.DELIVERING
-                    or not prior.delivery_complete
-                ):
+                if not prior.delivery_complete:
                     return False
         return True
 
     def _claim_inline_retirement(self, ticket: _Ticket[Any]) -> bool:
         if not self._is_ticket_ready(ticket):
             return False
-        ticket.state = _TicketState.ADMITTING
+        ticket.transition_to(_TicketPhase.ADMITTING)
         return True
 
     def close_intent(self, instance: CoherenceInstance) -> None:
@@ -631,7 +794,7 @@ class CoherenceSequencer[PayloadT]:
         lane = self._lanes.get(instance.subject)
         if lane is None:
             return "ready", 0
-        head = lane.next_intent_to_admit()
+        head = lane.head_intent()
         if head is None or head.instance == instance:
             return "ready", 0
         if head.active_consumer_leases > 0:
@@ -725,27 +888,29 @@ class CoherenceSequencer[PayloadT]:
 
     def _start_retirement(self, ticket: _Ticket[Any]) -> None:
         if (
-            ticket.state not in (_TicketState.READY, _TicketState.DELIVERING)
-            or id(ticket) not in self._tickets
-            or id(ticket) in self._retire_tasks
+            ticket.phase
+            not in (
+                _TicketPhase.READY,
+                _TicketPhase.DELIVERING,
+                _TicketPhase.DELIVERED,
+            )
+            or ticket.ticket_id not in self._tickets
+            or ticket.ticket_id in self._retire_tasks
         ):
             return
-        if ticket.state is _TicketState.DELIVERING:
-            self._retire_tasks[id(ticket)] = asyncio.create_task(
-                self._finalize_delivered_ticket(ticket)
-            )
-            self._retire_tasks[id(ticket)].add_done_callback(
-                lambda done_task: self._retirement_done(ticket, done_task)
-            )
+        if ticket.phase is _TicketPhase.DELIVERED:
+            self._finish_retired_ticket(ticket, ticket.result)
             return
-        ticket.state = _TicketState.ADMITTING
+        if ticket.phase is _TicketPhase.DELIVERING:
+            return
+        ticket.transition_to(_TicketPhase.ADMITTING)
         task = asyncio.create_task(self._admit_and_retire(ticket))
-        self._retire_tasks[id(ticket)] = task
+        self._retire_tasks[ticket.ticket_id] = task
 
         def done(done_task: asyncio.Task[None]) -> None:
-            self._retire_tasks.pop(id(ticket), None)
+            self._retire_tasks.pop(ticket.ticket_id, None)
             if done_task.cancelled():
-                if ticket.state is not _TicketState.ABORTED:
+                if ticket.phase is not _TicketPhase.ABORTED:
                     self._abort_all(asyncio.CancelledError())
                 return
             error = done_task.exception()
@@ -755,21 +920,6 @@ class CoherenceSequencer[PayloadT]:
             self._schedule_drain()
 
         task.add_done_callback(done)
-
-    async def _finalize_delivered_ticket(self, ticket: _Ticket[Any]) -> None:
-        self._finish_retired_ticket(ticket, ticket.result)
-
-    def _retirement_done(
-        self, ticket: _Ticket[Any], done_task: asyncio.Task[None]
-    ) -> None:
-        self._retire_tasks.pop(id(ticket), None)
-        if done_task.cancelled():
-            return
-        error = done_task.exception()
-        if error is not None:
-            self._fence_after_failure(error)
-        else:
-            self._schedule_drain()
 
     async def _admit_and_retire(
         self, ticket: _Ticket[Any], *, direct: bool = False
@@ -790,10 +940,10 @@ class CoherenceSequencer[PayloadT]:
 
     async def _admit_intent(self, intent: _Intent) -> None:
         await self._admit_instance(intent.instance)
-        intent.admitted = True
+        intent.mark_admitted()
 
     async def _retire_ticket(self, ticket: _Ticket[Any]) -> Any:
-        ticket.state = _TicketState.DELIVERING
+        ticket.transition_to(_TicketPhase.DELIVERING)
         try:
             result = await self._retire_payload(ticket.instances, ticket.payload)
         except BaseException as error:
@@ -807,7 +957,9 @@ class CoherenceSequencer[PayloadT]:
                 future.set_exception(error)
             raise
         try:
-            ticket.delivery_complete = True
+            ticket.transition_to(_TicketPhase.DELIVERED)
+            for intent in ticket.intents:
+                intent._refresh_phase()
             self._publish_ticket_result(ticket, result)
             self._finish_retired_ticket(ticket, result)
         except BaseException as cleanup_error:
@@ -818,49 +970,30 @@ class CoherenceSequencer[PayloadT]:
     def _finish_retired_ticket(
         self, ticket: _Ticket[Any], result: Any = _MISSING
     ) -> None:
-        if ticket.state is _TicketState.RETIRED:
+        if ticket.phase is _TicketPhase.RETIRED:
             return
-        if ticket.active_consumer_leases:
-            if result is not _MISSING:
-                ticket.result = result
-            return
-        if ticket.state is _TicketState.DELIVERING and not ticket.delivery_complete:
-            return
-        for intent in ticket.intents:
-            lane = self._lanes.get(intent.instance.subject)
-            if lane is None or not lane.owns_next_intent(intent):
-                if self._fenced_error is not None:
-                    return
-                raise CoherenceStateTransitionError(
-                    "coherence ROB current intent changed during retirement."
-                )
-            if not intent.owns_next_ticket(ticket):
-                if result is not _MISSING:
-                    ticket.result = result
-                return
-        if ticket.state is not _TicketState.ABORTED:
-            ticket.state = _TicketState.RETIRED
         if result is not _MISSING:
             ticket.result = result
+        if ticket.active_consumer_leases > 0:
+            return
+        if ticket.phase is not _TicketPhase.DELIVERED:
+            return
+        if ticket.phase is not _TicketPhase.ABORTED:
+            ticket.transition_to(_TicketPhase.RETIRED)
         for intent in ticket.intents:
             lane = self._lanes.get(intent.instance.subject)
             if lane is None:
                 raise CoherenceStateTransitionError(
                     "coherence ROB lane disappeared during retirement."
                 )
-            intent.remove_next_ticket(ticket)
-            intent.active_payloads -= 1
-            if intent.active_payloads < 0:
-                raise CoherenceStateTransitionError(
-                    f"coherence payload count underflow for {intent.instance}."
-                )
+            intent.remove_ticket(ticket)
             if intent.is_completed:
                 self._intent_index.pop(intent.instance, None)
                 self._last_retired_instance[intent.instance.subject] = intent.instance
-                lane.retire_next_intent(intent)
+                lane.discard_completed_prefix()
                 if not lane:
                     del self._lanes[intent.instance.subject]
-        self._tickets.pop(id(ticket), None)
+        self._tickets.pop(ticket.ticket_id, None)
         self._publish_ticket_result(ticket, result)
 
     @staticmethod
@@ -876,39 +1009,34 @@ class CoherenceSequencer[PayloadT]:
         for subject, lane in tuple(self._lanes.items()):
             for intent in lane.discard_completed_prefix():
                 self._intent_index.pop(intent.instance, None)
+                self._last_retired_instance[intent.instance.subject] = intent.instance
             if not lane:
                 del self._lanes[subject]
 
     def _next_ready_tickets(self) -> tuple[_Ticket[PayloadT], ...]:
         candidates: dict[int, _Ticket[PayloadT]] = {}
         for lane in self._lanes.values():
-            intent = lane.next_intent_to_admit()
+            intent = lane.next_intent_to_publish()
             if intent is None:
                 continue
-            head = intent.next_ticket()
-            if (
-                head is not None
-                and id(head) not in self._retire_tasks
-                and self._is_ticket_ready(head)
-            ):
-                candidates[id(head)] = head
-                continue
             for ticket in intent.payloads:
-                if ticket.state is not _TicketState.DELIVERING:
-                    if self._is_ticket_ready(ticket):
-                        candidates[id(ticket)] = ticket
-                    break
+                if ticket.ticket_id in self._retire_tasks:
+                    if not ticket.delivery_complete:
+                        break
+                    continue
+                if self._is_ticket_ready(ticket):
+                    candidates[ticket.ticket_id] = ticket
                 if not ticket.delivery_complete:
                     break
         return tuple(candidates.values())
 
     def _dependency_cycle(self) -> tuple[int, ...]:
         active_tickets = {
-            id(ticket): ticket
+            ticket.ticket_id: ticket
             for lane in self._lanes.values()
             for intent in lane.active_intents()
             for ticket in intent.payloads
-            if ticket.state not in (_TicketState.ABORTED, _TicketState.RETIRED)
+            if ticket.phase not in (_TicketPhase.ABORTED, _TicketPhase.RETIRED)
         }
         if not active_tickets:
             return ()
@@ -919,18 +1047,18 @@ class CoherenceSequencer[PayloadT]:
                 lane = self._lanes.get(instance.subject)
                 if lane is None:
                     continue
-                current_intent = lane.next_intent_to_admit()
+                current_intent = lane.next_intent_to_publish()
                 if current_intent is None:
                     continue
                 intent = self._intent_index[instance]
                 if current_intent is intent:
                     continue
                 for blocker in current_intent.payloads:
-                    blocker_id = id(blocker)
+                    blocker_id = blocker.ticket_id
                     if (
                         blocker_id != ticket_id
-                        and blocker.state
-                        not in (_TicketState.ABORTED, _TicketState.RETIRED)
+                        and blocker.phase
+                        not in (_TicketPhase.ABORTED, _TicketPhase.RETIRED)
                         and blocker_id in self._tickets
                     ):
                         edges[ticket_id].add(blocker_id)
@@ -973,7 +1101,7 @@ class CoherenceSequencer[PayloadT]:
         pending: list[dict[str, Any]] = []
         for subject, lane in self._lanes.items():
             for intent in lane.active_intents():
-                ticket = intent.next_ticket()
+                ticket = next(iter(intent.payloads), None)
                 pending.append(
                     {
                         "subject": repr(subject),
@@ -981,10 +1109,12 @@ class CoherenceSequencer[PayloadT]:
                         "sealed": intent.sealed,
                         "active_payloads": intent.active_payloads,
                         "active_consumer_leases": intent.active_consumer_leases,
-                        "head_ticket_id": id(ticket) if ticket is not None else None,
-                        "head_ticket_state": ticket.state
-                        if ticket is not None
-                        else None,
+                        "head_ticket_id": (
+                            ticket.ticket_id if ticket is not None else None
+                        ),
+                        "head_ticket_state": (
+                            ticket.phase if ticket is not None else None
+                        ),
                     }
                 )
         return tuple(pending)
@@ -994,14 +1124,16 @@ class CoherenceSequencer[PayloadT]:
         ticket: _Ticket[Any],
         error: BaseException | None = None,
     ) -> None:
-        if ticket.state is _TicketState.RETIRED:
+        if ticket.phase is _TicketPhase.RETIRED:
             if ticket.future is not None and not ticket.future.done():
                 ticket.future.set_exception(
                     error or RuntimeError("retired coherence payload has no result")
                 )
             return
-        retire_task = self._retire_tasks.get(id(ticket))
-        ticket.state = _TicketState.ABORTED
+        if ticket.phase is _TicketPhase.ABORTED:
+            return
+        retire_task = self._retire_tasks.get(ticket.ticket_id)
+        ticket.transition_to(_TicketPhase.ABORTED)
         abort_error = error or RuntimeError("coherence payload aborted")
         ticket.error = abort_error
         if (
@@ -1012,8 +1144,7 @@ class CoherenceSequencer[PayloadT]:
             retire_task.cancel()
         for intent in ticket.intents:
             if ticket in intent.payloads:
-                intent.payloads.remove(ticket)
-                intent.active_payloads -= 1
+                intent.remove_ticket(ticket)
             if (
                 intent.active_payloads == 0
                 and intent.admission_task is not None
@@ -1028,7 +1159,7 @@ class CoherenceSequencer[PayloadT]:
                 future.cancel()
             else:
                 future.set_exception(abort_error)
-        self._tickets.pop(id(ticket), None)
+        self._tickets.pop(ticket.ticket_id, None)
 
     def _abort_all(self, error: BaseException) -> None:
         for ticket in tuple(self._tickets.values()):

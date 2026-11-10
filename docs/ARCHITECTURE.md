@@ -192,12 +192,12 @@ flowchart TB
 - **Worker Execution Lifecycle**: `WorkerExecutionLifecycle` manages worker states and enforces execution gates via `StepAdmissionState` (`AdmissionAction`, `AdmissionDecision`).
 - **Source Ingestion Pipeline**: `SourcePipelineMaintenance` and `SourceExecutionScope` maintain the worker's active step queue, checking credit and pipeline depth before step acquisition. `SourceWorkRuntime` and `SourceAcknowledgementRuntime` report work leases and submit ACKs asynchronously.
 - **Local Step Plan Executor**: `LocalStepPlanExecutor` runs the 5-phase operator micro-step lifecycle:
-  1. `WAIT_INPUTS`: Waits for required tensor frames to arrive in `WorkerMailbox` and fulfills `StepBarrier` requirements.
+  1. `WAIT_INPUTS`: Waits for required tensor frames to arrive in `OperatorMailbox` and fulfills `StepBarrier` or direct local completeness requirements.
   2. `CALL_USER`: Prepares operator arguments and invokes user callables.
   3. `COMMIT`: Commits operator outputs and state.
   4. `SEND_OUTPUT`: Submits outputs to outbound transport queues.
   5. `AWAIT_SEND`: Confirms that carrier ingress completed.
-- **Worker Mailbox & Input Assembly**: `WorkerMailbox` buffers inbound tensor frames by step. `LocalInputPrepareRuntime` and `AssemblyRouteResolver` use `CompiledAssemblePlan` to unpack, de-duplicate/gather, slice, sort, and concatenate shards into contiguous tensors.
+- **Operator Mailbox & Input Assembly**: Built on the unified `OperatorMailbox` abstraction, separating `DirectLocalMailbox` (zero-lock fast-path for `local_only` edges) from `DelegatedWorkerMailbox` (delegates distributed ingress and `StepBarrier` synchronization to `WorkerMailbox`). `LocalInputPrepareRuntime` and `AssemblyRouteResolver` use `CompiledAssemblePlan` to unpack, de-duplicate/gather, slice, sort, and concatenate shards into contiguous tensors.
 - **Operator Management & Dispatch**: `OperatorManager` and `ExecutionDispatcher` manage operator instances, lifecycle hooks, and dependency route resolution.
 - **Execution Lanes**: `UserCallableExecutor` runs in-process operators on `UserCallableLane`. For operators requiring process isolation (such as `BaseReader` and `GrainReader`), `WorkerProcessCallRuntime` coordinates subprocess worker execution.
 - **Local Checkpoint Persistence**: `WorkerCheckpointCoordinator` and `CheckpointActivity` persist local component state to storage while holding execution gates closed at the checkpoint cut.
@@ -206,7 +206,7 @@ flowchart TB
 - **Outbound Data Plane**: `LocalWorkerDataPlane` and `BatchingDataPlaneExecutor` coalesce outbound frames into batches for efficient transport.
 - **MESI Cache Coherence Subsystem**:
   - `CoherenceDirectory`: Endpoint-local MESI directory maintaining entry states (`Modified`, `Exclusive`, `Shared`, `Invalid`).
-  - `CoherenceSequencer`: Enforces epoch admission and intent ordering, granting `ConsumerLease` reservations.
+  - `CoherenceSequencer`: Controls per-subject epoch admission and intent ordering, strictly decoupling the delivery pipeline from underlying buffer retirement, and orchestrating concurrent consumer leases (`ConsumerLease`) with fine-grained ticket IDs.
   - `CoherenceAdmissionRuntime` & `CoherenceBatchRetireRuntime`: Provides atomic admission for multi-target publications, concurrent destination enqueue, and child delivery receipt aggregation.
   - `ParentGrantReturnRuntime`: Returns input grants to upstream producers upon retirement.
 - **Routing & Sharding Plans**: `CompiledSendPlan`, `CompiledAssemblePlan`, and `CompiledTensorRoute` lower logical sharding specs: Dense (regular slicing), Sparse (hash/MoE routing), Replicated (broadcast), and Unit routing.

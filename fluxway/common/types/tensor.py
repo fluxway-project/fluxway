@@ -43,11 +43,15 @@ class TensorRuntimeState(Enum):
 
 class _ConsumerLeaseOwner(Protocol):
     def acquire_consumer_lease(
-        self, instances: tuple[CoherenceInstance, ...]
+        self,
+        instances: tuple[CoherenceInstance, ...],
+        ticket_id: int | None = None,
     ) -> Any: ...
 
     def reserve_consumer_lease(
-        self, instances: tuple[CoherenceInstance, ...]
+        self,
+        instances: tuple[CoherenceInstance, ...],
+        ticket_id: int | None = None,
     ) -> Any: ...
 
 
@@ -309,6 +313,7 @@ class TransportTensor:
         self._active_consumer_leases = 0
         self._release_requested = False
         self._coherence_instances: tuple[CoherenceInstance, ...] = ()
+        self._coherence_ticket_id: int | None = None
         self._allocation_descriptor: AllocationDescriptor | None = None
         self.source_step = source_step
         validate_metadata_lengths(
@@ -599,7 +604,25 @@ class TransportTensor:
             )
         return force_writable(self._payload.values)
 
-    def acquire_consumer_lease(self) -> TensorConsumerLease:
+    @property
+    def coherence_ticket_id(self) -> int | None:
+        return self._coherence_ticket_id
+
+    def _bind_coherence_ticket_id(self, ticket_id: int | None) -> None:
+        if ticket_id is None:
+            return
+        if (
+            self._coherence_ticket_id is not None
+            and self._coherence_ticket_id != ticket_id
+        ):
+            raise CoherenceStateTransitionError(
+                f"conflicting coherence ticket id: expected={self._coherence_ticket_id} actual={ticket_id}"
+            )
+        self._coherence_ticket_id = ticket_id
+
+    def acquire_consumer_lease(
+        self, ticket_id: int | None = None
+    ) -> TensorConsumerLease:
         if self._runtime_state is not TensorRuntimeState.VALID:
             raise CoherenceStateTransitionError(
                 f"cannot acquire a consumer lease while tensor access is "
@@ -615,15 +638,20 @@ class TransportTensor:
             lease = reservation_ref.claim()
             self._consumer_lease_reservation_ref = None
         else:
+            target_ticket_id = (
+                ticket_id if ticket_id is not None else self._coherence_ticket_id
+            )
             lease = (
-                owner.acquire_consumer_lease(self._coherence_instances)
+                owner.acquire_consumer_lease(
+                    self._coherence_instances, ticket_id=target_ticket_id
+                )
                 if owner is not None
                 else _LocalConsumerLease()
             )
         self._active_consumer_leases += 1
         return TensorConsumerLease(self, lease)
 
-    def _reserve_consumer_lease(self) -> None:
+    def _reserve_consumer_lease(self, ticket_id: int | None = None) -> None:
         if self._runtime_state is not TensorRuntimeState.VALID:
             raise CoherenceStateTransitionError(
                 "cannot reserve a consumer lease for invalid data."
@@ -637,8 +665,12 @@ class TransportTensor:
             raise CoherenceStateTransitionError(
                 "tensor already has a consumer lease reservation."
             )
+        target_ticket_id = (
+            ticket_id if ticket_id is not None else self._coherence_ticket_id
+        )
         self._consumer_lease_reservation_ref = owner.reserve_consumer_lease(
-            self._coherence_instances
+            self._coherence_instances,
+            ticket_id=target_ticket_id,
         )
 
     def _cleanup_consumer_lease_reservation_ref(self) -> None:
@@ -918,6 +950,7 @@ class TransportTensor:
                 "zero-copy alias construction changed the backing allocation."
             )
         alias._set_runtime_access_intent(intent)
+        alias._coherence_ticket_id = self._coherence_ticket_id
         return alias
 
     @property

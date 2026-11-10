@@ -184,12 +184,12 @@ flowchart TB
 - **执行生命周期与门控**：`WorkerExecutionLifecycle` 管理工作进程运行阶段，通过 `StepAdmissionState`（`AdmissionAction`、`AdmissionDecision`）严格控制执行门开关。
 - **数据源流水维护**：`SourcePipelineMaintenance` 与 `SourceExecutionScope` 维护工作进程的待执行步进队列，在额度与流水深度允许时入队；`SourceWorkRuntime` 与 `SourceAcknowledgementRuntime` 异步确认租约并上报 ACK。
 - **本地步骤流水线执行器**：`LocalStepPlanExecutor` 驱动算子五阶段微步流水线：
-  1. `WAIT_INPUTS`：等待所需张量帧抵达 `WorkerMailbox` 并满足 `StepBarrier` 栅障条件。
+  1. `WAIT_INPUTS`：等待所需张量帧抵达 `OperatorMailbox` 并满足 `StepBarrier` 栅障或直接本地就绪条件。
   2. `CALL_USER`：准备算子入参并调用用户函数。
   3. `COMMIT`：提交算子输出与状态变更。
   4. `SEND_OUTPUT`：将生成张量提交至出站数据面传输队列。
   5. `AWAIT_SEND`：确认传输载体接收端已完成准入。
-- **张量邮箱与输入组装**：`WorkerMailbox` 按步骤缓存入站张量帧。`LocalInputPrepareRuntime` 与 `AssemblyRouteResolver` 依据 `CompiledAssemblePlan` 执行解包、反去重/Gather 还原、切片、排序和拼接操作。
+- **算子邮箱与输入组装**：基于统一 `OperatorMailbox` 抽象，严格区分 `DirectLocalMailbox`（面向 `local_only` 边的零锁直通入站）与 `DelegatedWorkerMailbox`（委托 `WorkerMailbox` 处理分布式步进栅障与依赖裁决）。`LocalInputPrepareRuntime` 与 `AssemblyRouteResolver` 依据 `CompiledAssemblePlan` 执行解包、反去重/Gather 还原、切片、排序和拼接操作。
 - **算子管理与分发**：`OperatorManager` 与 `ExecutionDispatcher` 负责算子实例管理、生命周期挂钩以及依赖路由解析。
 - **执行通道划分**：`UserCallableExecutor` 在进程内通道（`UserCallableLane`）运行用户算子；对于需要进程隔离的算子（如 `BaseReader`、`GrainReader`），由 `WorkerProcessCallRuntime` 调度独立子进程算子（Worker Process Operators）。
 - **本地状态持久化**：`WorkerCheckpointCoordinator` 与 `CheckpointActivity` 负责在检查点切点处保持执行门关闭并持久化本地组件状态。
@@ -198,7 +198,7 @@ flowchart TB
 - **出站数据面与批处理**：`LocalWorkerDataPlane` 与 `BatchingDataPlaneExecutor` 将出站张量帧聚合成批次进行高效传输。
 - **MESI 缓存一致性子系统**：
   - `CoherenceDirectory`：端点本地 MESI 目录，跟踪条目状态（`Modified`、`Exclusive`、`Shared`、`Invalid`）。
-  - `CoherenceSequencer`：负责主体纪元准入与意图排序，仲裁并发消费租约（`ConsumerLease`）。
+  - `CoherenceSequencer`：负责主体纪元准入与意图排序，严格解耦交付流水线（Delivery Pipeline）推进与底层资源退役回收（Resource Retirement），以 Ticket 级精确仲裁并发消费租约（`ConsumerLease`）。
   - `CoherenceAdmissionRuntime` 与 `CoherenceBatchRetireRuntime`：负责多目标发布的原子准入、并发入队以及子回执（Receipt）跟踪管理。
   - `ParentGrantReturnRuntime`：在发布退役时向上游生产者归还输入授权。
 - **编译路由与分片方案**：`CompiledSendPlan`、`CompiledAssemblePlan` 与 `CompiledTensorRoute` 编译并降低逻辑分片规约：Dense（规则切分）、Sparse（哈希/MoE 路由）、Replicated（广播复制）与 Unit（单元路由）。

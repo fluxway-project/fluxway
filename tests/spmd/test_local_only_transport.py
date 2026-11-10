@@ -128,6 +128,7 @@ def _bind_direct_local_fast_path(stub, raw_cls):
         "_compiled_assemble_plan",
         "_direct_local_input_transfer_codes",
         "_uses_direct_local_input_fast_path",
+        "_get_operator_mailbox",
         "_deposit_direct_local_input",
         "_deposit_local_only_orderings",
         "_deposit_local_only_dependency_decisions",
@@ -368,7 +369,7 @@ async def test_local_only_direct_deposit_preserves_transport_tensor_receipt():
 
 @pytest.mark.asyncio
 async def test_local_only_deposit_records_worker_local_delivery_span(tmp_path):
-    raw_cls = SPMDWorker.__ray_actor_class__
+    raw_cls = SPMDWorker.__ray_actor_class__  # pyrefly: ignore[missing-attribute]
     config = _local_only_config()
     op_manager = OperatorManager(
         config,
@@ -458,12 +459,10 @@ async def test_local_only_deposit_records_worker_local_delivery_span(tmp_path):
             dependency_decisions=None,
         )
     )
-    await asyncio.sleep(0.01)
-    assert not task1.done()
-
-    lease0.release()
     await task1
     assert task1.done()
+
+    lease0.release()
 
     stored1 = stub._direct_local_input_slots["consume"][1][transfer_code].tensor
     stored1.acquire_consumer_lease().release()

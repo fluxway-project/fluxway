@@ -548,17 +548,15 @@ def test_phase_order_schedule_places_forward_before_backward_same_micro_step():
     order = ("forward", "backward", "optimizer")
     forward = OperatorSpec(
         name="forward",
-        async_policy=AsyncPolicy.pipeline_parallel(
+        async_policy=AsyncPolicy.pipelined(
             depth=2,
-            phases=order,
             schedule=SchedulePolicy.phase_order(phase="forward", phase_order=order),
         ),
     )
     backward = OperatorSpec(
         name="backward",
-        async_policy=AsyncPolicy.pipeline_parallel(
+        async_policy=AsyncPolicy.pipelined(
             depth=2,
-            phases=order,
             schedule=SchedulePolicy.phase_order(phase="backward", phase_order=order),
         ),
     )

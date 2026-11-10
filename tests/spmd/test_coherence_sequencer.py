@@ -309,3 +309,179 @@ async def test_consumer_lease_release_from_worker_thread_is_non_blocking() -> No
     thread.join()
     release_callback.set()
     await delivery
+
+
+@pytest.mark.asyncio
+async def test_publication_frontier_decoupled_from_reclamation_frontier() -> None:
+    subject = CoherenceSubject(1, 0, 100)
+    inst0 = _instance(subject, 0)
+    inst1 = _instance(subject, 1)
+
+    retired: list[str] = []
+
+    async def retire(_instances, payload):
+        retired.append(payload)
+        return f"result_{payload}"
+
+    async def admit(_instance):
+        return None
+
+    sequencer = CoherenceSequencer(retire, admit)
+    sequencer.issue_intent(inst0)
+    task0 = asyncio.create_task(sequencer.commit_payload((inst0,), "p0"))
+    await asyncio.sleep(0.01)
+
+    lease0 = sequencer.acquire_consumer_lease((inst0,))
+    sequencer.close_intent(inst0)
+    assert await task0 == "result_p0"
+
+    # Epoch 1 must deliver payload even though Epoch 0 consumer lease is active
+    sequencer.issue_intent(inst1)
+    task1 = asyncio.create_task(sequencer.commit_payload((inst1,), "p1"))
+    sequencer.close_intent(inst1)
+    await asyncio.sleep(0.01)
+    assert task1.done()
+    assert await task1 == "result_p1"
+    assert retired == ["p0", "p1"]
+
+    # Epoch 0 is retained in intent index while lease0 is active
+    assert inst0 in sequencer._intent_index
+    assert sequencer._intent_index[inst0].active_consumer_leases == 1
+
+    # Releasing lease0 reclaims Epoch 0
+    lease0.release()
+    assert inst0 not in sequencer._intent_index
+
+
+@pytest.mark.asyncio
+async def test_precise_ticket_level_lease_binding() -> None:
+    subject = CoherenceSubject(1, 0, 200)
+    inst = _instance(subject, 0)
+
+    async def retire(_instances, payload):
+        return f"result_{payload}"
+
+    async def admit(_instance):
+        return None
+
+    sequencer = CoherenceSequencer(retire, admit)
+    sequencer.issue_intent(inst)
+
+    task_a = asyncio.create_task(
+        sequencer.commit_payload((inst,), "payload_A", ticket_id=11)
+    )
+    task_b = asyncio.create_task(
+        sequencer.commit_payload((inst,), "payload_B", ticket_id=22)
+    )
+    await asyncio.sleep(0.01)
+
+    # Bind specifically to ticket 22
+    lease_b = sequencer.acquire_consumer_lease((inst,), ticket_id=22)
+    assert lease_b._bindings[0][0].ticket_id == 22
+    assert lease_b._bindings[0][0].active_consumer_leases == 1
+
+    sequencer.close_intent(inst)
+    assert await task_a == "result_payload_A"
+    assert await task_b == "result_payload_B"
+
+    # Ticket 11 was retired and removed from sequencer
+    assert 11 not in sequencer._tickets
+    # Ticket 22 is retained because of active consumer lease
+    assert 22 in sequencer._tickets
+    assert inst in sequencer._intent_index
+
+    lease_b.release()
+    assert 22 not in sequencer._tickets
+    assert inst not in sequencer._intent_index
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_tickets_without_ticket_id_raises_error():
+    async def deliver(instances, value):
+        return f"result_{value}"
+
+    async def _admit(_instance):
+        pass
+
+    sequencer = CoherenceSequencer(deliver, _admit)
+    subject = CoherenceSubject(1, 0, 88)
+    inst = CoherenceInstance(subject, 0)
+    sequencer.issue_intent(inst)
+
+    t1 = asyncio.create_task(
+        sequencer.commit_payload((inst,), "payload_1", ticket_id=101)
+    )
+    t2 = asyncio.create_task(
+        sequencer.commit_payload((inst,), "payload_2", ticket_id=102)
+    )
+
+    with pytest.raises(CoherenceStateTransitionError, match="ambiguous tickets"):
+        sequencer.acquire_consumer_lease((inst,))
+
+    lease1 = sequencer.acquire_consumer_lease((inst,), ticket_id=101)
+    assert lease1._bindings[0][0].ticket_id == 101
+    lease1.release()
+
+    sequencer.close_intent(inst)
+    await t1
+    await t2
+
+
+def test_fsm_state_setter_enforces_transition_rules():
+    from fluxway.spmd.worker.coherence_sequencer import _Ticket, _TicketPhase
+
+    subject = CoherenceSubject(1, 0, 99)
+    inst = CoherenceInstance(subject, 0)
+    ticket = _Ticket(instances=(inst,), payload="test", future=None)
+
+    ticket.transition_to(_TicketPhase.ADMITTING)
+    ticket.transition_to(_TicketPhase.DELIVERING)
+    ticket.transition_to(_TicketPhase.DELIVERED)
+
+    with pytest.raises(
+        CoherenceStateTransitionError, match="illegal ticket state transition"
+    ):
+        ticket.state = _TicketPhase.READY
+
+
+@pytest.mark.asyncio
+async def test_transport_tensor_ticket_id_lease_propagation():
+    from fluxway.common.types.tensor import TransportTensor
+    import numpy as np
+
+    deliver_gate = asyncio.Event()
+
+    async def deliver(instances, value):
+        tensor._reserve_consumer_lease()
+        await deliver_gate.wait()
+        return value
+
+    async def _admit(_instance):
+        pass
+
+    sequencer = CoherenceSequencer(deliver, _admit)
+    subject = CoherenceSubject(1, 0, 77)
+    inst = CoherenceInstance(subject, 0)
+    sequencer.issue_intent(inst)
+
+    ticket_id = sequencer.allocate_ticket_id()
+    tensor = TransportTensor(np.array([1, 2, 3]))
+    tensor._bind_coherence_instances((inst,))
+    tensor._bind_coherence_ticket_id(ticket_id)
+    tensor._bind_consumer_lease_owner(sequencer)
+
+    task = asyncio.create_task(
+        sequencer.commit_payload((inst,), "data", ticket_id=ticket_id)
+    )
+    sequencer.close_intent(inst)
+    await asyncio.sleep(0.01)
+
+    lease = tensor.acquire_consumer_lease()
+    assert tensor.coherence_ticket_id == ticket_id
+
+    deliver_gate.set()
+    assert await task == "data"
+    assert ticket_id in sequencer._tickets
+
+    lease.release()
+    assert ticket_id not in sequencer._tickets

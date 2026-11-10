@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-import inspect
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from fluxway.common.frozen_mapping import freeze_mapping
-from fluxway.common.operator_spec import OperatorSpec
+from fluxway.common.operator_spec import OperatorExecutionTrait, OperatorSpec
 
 if TYPE_CHECKING:
     from fluxway.common.compiled_graph import SPMDGraphSpec
+    from fluxway.common.operator_policy import SchedulePolicy
 
 CANONICAL_LANE_COMPUTE: str = "compute"
 CANONICAL_LANE_IO: str = "io"
@@ -27,34 +27,62 @@ def _get_base_reader() -> type:
     return _BASE_READER_CLS
 
 
+def compute_lane_priority(policy: SchedulePolicy, lane: str | None) -> int:
+    """Compute the effective priority score for a lane under a SchedulePolicy.
+
+    Single source of truth for lane ordering and priority calculation.
+    """
+    if lane is None:
+        return 0
+    priorities = policy.lane_priorities
+    if lane in priorities:
+        return priorities[lane]
+    lane_order = policy.lane_ordering
+    if not lane_order:
+        return 0
+    if lane not in lane_order:
+        raise ValueError(f"lane {lane!r} is not in lane_order={lane_order!r}.")
+    return len(lane_order) - lane_order.index(lane) - 1
+
+
+def resolve_operator_execution_trait(
+    spec: OperatorSpec, spmd_class: type | None = None
+) -> OperatorExecutionTrait:
+    """Resolve the execution trait of an operator cleanly from static metadata."""
+    if spec.execution_trait is not None:
+        return spec.execution_trait
+    if spec.is_source is True or spec.source is not None:
+        return OperatorExecutionTrait.IO_SOURCE
+    owner = spec.owner or spmd_class
+    if (
+        owner is not None
+        and isinstance(owner, type)
+        and issubclass(owner, _get_base_reader())
+    ):
+        return OperatorExecutionTrait.IO_SOURCE
+    return OperatorExecutionTrait.SYNC_COMPUTE
+
+
 def is_io_operator(spec: OperatorSpec, spmd_class: type | None = None) -> bool:
     """Return True if the operator is an I/O source or reader operator."""
-    if spec.is_source:
+    if spec.execution_trait == OperatorExecutionTrait.IO_SOURCE:
         return True
-    if spec.source is not None:
+    if spec.is_source or spec.source is not None:
         return True
     owner = spec.owner or spmd_class
-    if owner is not None and isinstance(owner, type):
-        if issubclass(owner, _get_base_reader()):
-            return True
+    if (
+        owner is not None
+        and isinstance(owner, type)
+        and issubclass(owner, _get_base_reader())
+    ):
+        return True
     return False
 
 
 def is_coroutine_operator(spec: OperatorSpec, spmd_class: type | None = None) -> bool:
     """Return True if the operator implementation is an async coroutine function."""
-    owner = spec.owner or spmd_class
-    method_name = spec.method_name or spec.name
-    if owner is not None and method_name:
-        method = getattr(owner, method_name, None)
-        if method is not None:
-            if inspect.iscoroutinefunction(method):
-                return True
-            if hasattr(method, "func") and inspect.iscoroutinefunction(method.func):
-                return True
-            if hasattr(method, "__wrapped__") and inspect.iscoroutinefunction(
-                method.__wrapped__
-            ):
-                return True
+    if spec.execution_trait is not None:
+        return spec.execution_trait == OperatorExecutionTrait.ASYNC_COROUTINE
     return False
 
 
@@ -71,11 +99,14 @@ def infer_canonical_lane(
     """
     if spec.async_policy.schedule.lane is not None:
         return spec.async_policy.schedule.lane
-    if is_io_operator(spec, spmd_class):
+    trait = resolve_operator_execution_trait(spec, spmd_class)
+    if trait == OperatorExecutionTrait.IO_SOURCE:
         return CANONICAL_LANE_IO
-    if not is_coroutine_operator(spec, spmd_class):
+    if trait == OperatorExecutionTrait.SYNC_COMPUTE:
         return CANONICAL_LANE_COMPUTE
-    return None
+    if trait == OperatorExecutionTrait.ASYNC_COROUTINE:
+        return None
+    raise ValueError(f"Unknown operator execution trait: {trait!r}")
 
 
 def apply_canonical_lane_presets(
@@ -84,15 +115,19 @@ def apply_canonical_lane_presets(
     """Inspect SPMD operator metadata and apply canonical lane and ordering presets.
 
     1. Operators without an explicit lane are classified into 'io' or 'compute'.
-    2. When both canonical lanes ('compute' and 'io') are identified across the graph,
+    2. Execution traits are resolved and populated onto OperatorSpec.
+    3. When both canonical lanes ('compute' and 'io') are identified across the graph,
        operators in canonical lanes without custom lane_ordering/lane_priorities
        are injected with lane_order=('compute', 'io') to prioritize compute over I/O.
     """
     inferred_lanes: dict[tuple[int, str], str | None] = {}
+    resolved_traits: dict[tuple[int, str], OperatorExecutionTrait] = {}
     has_compute = False
     has_io = False
     for spmd_idx, spmd in enumerate(spmds):
         for op_id, spec in spmd.operators.items():
+            trait = resolve_operator_execution_trait(spec, spmd.spmd_class)
+            resolved_traits[(spmd_idx, op_id)] = trait
             target_lane = infer_canonical_lane(spec, spmd.spmd_class)
             inferred_lanes[(spmd_idx, op_id)] = target_lane
             effective_lane = spec.async_policy.schedule.lane or target_lane
@@ -110,6 +145,7 @@ def apply_canonical_lane_presets(
         for op_id, spec in spmd.operators.items():
             schedule = spec.async_policy.schedule
             target_lane = inferred_lanes[(spmd_idx, op_id)]
+            trait = resolved_traits[(spmd_idx, op_id)]
             effective_lane = schedule.lane if schedule.lane is not None else target_lane
 
             updates: dict[str, Any] = {}
@@ -123,12 +159,18 @@ def apply_canonical_lane_presets(
             ):
                 updates["lane_ordering"] = CANONICAL_LANE_ORDER
 
+            spec_updates: dict[str, Any] = {}
+            if spec.execution_trait is None:
+                spec_updates["execution_trait"] = trait
             if updates:
                 new_schedule = schedule.model_copy(update=updates)
                 new_async = spec.async_policy.model_copy(
                     update={"schedule": new_schedule}
                 )
-                new_operators[op_id] = spec.updated(async_policy=new_async)
+                spec_updates["async_policy"] = new_async
+
+            if spec_updates:
+                new_operators[op_id] = spec.updated(**spec_updates)
                 spmd_changed = True
             else:
                 new_operators[op_id] = spec

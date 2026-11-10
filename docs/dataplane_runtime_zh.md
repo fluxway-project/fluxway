@@ -183,6 +183,83 @@ assert lifetime.released
 `AllocationRegistry` 只管理身份和精确交接，不能靠推进水位释放内存。
 同一工作进程内的别名必须保留 `ConsumerLease`，直到读取结束。
 
+## 算子邮箱与本地直通路径
+
+工作进程为每个算子维护专属的 `OperatorMailbox` 抽象，严格区分分布式入站传输与同工作进程内的本地直通路径：
+
+1. **本地直通邮箱（`DirectLocalMailbox`）**：
+   - 针对 `local_only=True` 边编译确定的算子，完全绕过全局工作进程锁与异步事件队列。
+   - 生产端通过 `deposit()` 直接存入目标步进槽位 `DirectLocalInputSlot`。
+   - 当特定步进的所有预期传输码（`expected_transfer_codes`）集齐后，立即触发就绪回调 `on_step_ready` 唤醒算子执行。
+   - 计算完成后，通过 `clear_step_sync()` 或 `clear_step()` 立即释放步进槽位。
+2. **委托工作进程邮箱（`DelegatedWorkerMailbox`）**：
+   - 面向跨 Rank、跨节点或异构传输的入站数据，委托由共享的 `WorkerMailbox` 统一处理。
+   - 维护完整的步进栅障（`StepBarrier`）与依赖条件裁决（`CompiledDependencyCondition`）。
+
+```mermaid
+flowchart TD
+    Inbound["入站张量传输 (Inbound Tensor)"] --> Branch{"传输拓扑类型"}
+    Branch -->|同进程内部 (local_only=True)| FastPath["DirectLocalMailbox (零锁直通)"]
+    Branch -->|跨节点/跨进程传输| DistPath["DelegatedWorkerMailbox -> WorkerMailbox"]
+
+    subgraph DirectLocal["DirectLocalMailbox 极速路径"]
+        FastPath --> Deposit["deposit() 直接写入 DirectLocalInputSlot"]
+        Deposit --> CheckReady{"检查 expected_transfer_codes 是否全部集齐?"}
+        CheckReady -->|是| TriggerReady["立即调用 on_step_ready 触发算子就绪"]
+        CheckReady -->|否| WaitSlots["保留槽位等待后续传输码"]
+        TriggerReady --> Assemble["get_step_slots() 组装输入"]
+        Assemble --> Compute["算子执行计算"]
+        Compute --> ClearStep["clear_step_sync() 释放步进槽位"]
+    end
+
+    subgraph Distributed["分布式委托路径"]
+        DistPath --> IngressQueue["异步入站队列与帧准入"]
+        IngressQueue --> StepBarrier["StepBarrier 栅障与依赖条件裁决"]
+        StepBarrier --> DistAssemble["组装入参并派发调度"]
+    end
+```
+
+以下独立示例展示了本地直通邮箱的存放、就绪判定以及步进清理过程：
+
+```python
+import numpy as np
+from fluxway.common.types.tensor import TransportTensor
+from fluxway.spmd.worker.mailbox import (
+    DirectLocalMailbox,
+    create_operator_mailbox,
+)
+
+ready_records = []
+
+mailbox = create_operator_mailbox(
+    "dense_mlp",
+    expected_direct_transfer_codes={101, 102},
+    on_step_ready=lambda op, step: ready_records.append((op, step)),
+    worker_mailbox=None,
+)
+assert mailbox.is_direct_fast_path
+
+# 零锁直通存放本地张量
+t1 = TransportTensor(np.array([1, 2, 3]))
+mailbox.deposit(transfer_code=101, step=0, sender_id="worker_0", rank=0, tensor=t1)
+assert not mailbox.is_ready(0)
+
+# 全部预期传输码就绪后，步进状态变为 ready
+t2 = TransportTensor(np.array([4, 5, 6]))
+mailbox.deposit(transfer_code=102, step=0, sender_id="worker_0", rank=0, tensor=t2)
+assert mailbox.is_ready(0)
+assert ready_records == [("dense_mlp", 0)]
+
+# 输入组装读取槽位，计算完成后工作进程立即释放步进
+assert isinstance(mailbox, DirectLocalMailbox)
+slots = mailbox.get_step_slots(0)
+assert slots[101].tensor is t1
+assert slots[102].tensor is t2
+
+mailbox.clear_step_sync(0)
+assert not mailbox.is_ready(0)
+```
+
 ## 来源获取与背压
 
 对于受控来源，工作进程按步骤索引计划片段，并批量向控制器获取完整步骤前缀。

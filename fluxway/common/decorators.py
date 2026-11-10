@@ -11,7 +11,10 @@ import logging
 from contextlib import contextmanager
 from decimal import Decimal
 from dataclasses import dataclass, field
-from typing import Annotated, Any, TypeVar, Union, get_type_hints
+from typing import Annotated, Any, TYPE_CHECKING, TypeVar, Union, get_type_hints
+
+if TYPE_CHECKING:
+    from fluxway.common.types import SPMDConfig
 from collections.abc import Callable, Mapping
 from fluxway.common.operator_initialization import operator_initialization_arguments
 from fluxway.common.utils.tree import tree_flatten_type, _is_fluxway_data_type
@@ -664,7 +667,7 @@ def _create_operator_wrapper(
         StandardBarrierConfig,
         PeriodicBarrierConfig,
     )
-    from fluxway.common.operator_spec import OperatorSpec
+    from fluxway.common.operator_spec import OperatorExecutionTrait, OperatorSpec
 
     sig = inspect.signature(func)
     data_params, has_var_keyword = _classify_sig_params(
@@ -747,22 +750,36 @@ def _create_operator_wrapper(
             ArgumentType.CONTROL.value: out_control_fields,
         }
     elif resolved_output:
-        output_args = {ArgumentType.DATA.value: list(resolved_output.keys())}
+        output_args = {ArgumentType.DATA.value: tuple(resolved_output.keys())}
     else:
         output_args = None
+
+    if is_source or source is not None:
+        execution_trait = OperatorExecutionTrait.IO_SOURCE
+    else:
+        func_unwrap = func
+        while hasattr(func_unwrap, "__wrapped__"):
+            func_unwrap = func_unwrap.__wrapped__
+        if hasattr(func_unwrap, "func"):
+            func_unwrap = func_unwrap.func
+        if inspect.iscoroutinefunction(func_unwrap):
+            execution_trait = OperatorExecutionTrait.ASYNC_COROUTINE
+        else:
+            execution_trait = OperatorExecutionTrait.SYNC_COMPUTE
 
     spec = OperatorSpec(
         name=name,
         owner=None,
         method_name=func.__name__,
+        execution_trait=execution_trait,
         is_source=is_source,
         source=source,
         async_policy=normalized_async_policy,
         tensor_access={} if tensor_access is None else tensor_access,
         input_arguments={
-            ArgumentType.CONTROL.value: final_states,
-            ArgumentType.DATA.value: final_tensors,
-            ArgumentType.STATIC.value: list(final_statics),
+            ArgumentType.CONTROL.value: tuple(final_states),
+            ArgumentType.DATA.value: tuple(final_tensors),
+            ArgumentType.STATIC.value: tuple(final_statics),
         },
         output_arguments={} if output_args is None else output_args,
         input_sharding=resolved_input,
@@ -869,7 +886,6 @@ def spmd(
         mesh_axis_names: Axis names for the execution mesh.
         mesh_axis_shapes: Shape of the execution mesh.
     """
-    from fluxway.common.types import SPMDConfig
     from fluxway.resources import ResourceProfile
     from fluxway.common.mesh import DeviceMesh
 
@@ -938,7 +954,10 @@ def spmd(
 
         def get_spmd_config(c) -> "SPMDConfig":
             from fluxway.common.types import SPMDConfig
-            from fluxway.common.operator_spec import OperatorSpec
+            from fluxway.common.operator_spec import (
+                OperatorExecutionTrait,
+                OperatorSpec,
+            )
 
             # Pass 1: walk the full MRO to collect operator metadata from _OperatorWrapper.
             # A subclass may override a method with a plain function, losing the wrapper.
@@ -961,17 +980,32 @@ def spmd(
             # Pass 2: for each discovered operator, resolve the attr_name that the final
             # class actually exposes (may be a plain override — that is fine, the framework
             # only needs to know the correct attr_name for dispatch and the metadata).
+            from fluxway.reader.base_reader import BaseReader
+
+            is_reader = issubclass(c, BaseReader)
             operator_specs = {}
             for attr_name, (op_name, spec, owner_cls) in wrapper_specs.items():
-                operator_specs[op_name] = spec.model_copy(
-                    update={
-                        "owner": c,
-                        "method_name": attr_name,
-                        "requires_worker_process": _is_worker_process_required(
-                            owner_cls
-                        ),
-                    }
-                )
+                updates: dict[str, Any] = {
+                    "owner": c,
+                    "method_name": attr_name,
+                    "requires_worker_process": _is_worker_process_required(owner_cls),
+                }
+                if is_reader or spec.is_source or spec.source is not None:
+                    updates["execution_trait"] = OperatorExecutionTrait.IO_SOURCE
+                else:
+                    actual_fn = getattr(c, attr_name)
+                    func_unwrap = actual_fn
+                    while hasattr(func_unwrap, "__wrapped__"):
+                        func_unwrap = func_unwrap.__wrapped__
+                    if hasattr(func_unwrap, "func"):
+                        func_unwrap = func_unwrap.func
+                    if inspect.iscoroutinefunction(func_unwrap):
+                        updates["execution_trait"] = (
+                            OperatorExecutionTrait.ASYNC_COROUTINE
+                        )
+                    else:
+                        updates["execution_trait"] = OperatorExecutionTrait.SYNC_COMPUTE
+                operator_specs[op_name] = spec.model_copy(update=updates)
 
             return SPMDConfig(
                 mesh=c._mesh,
@@ -1026,11 +1060,14 @@ def spmd_source(
         orig_get_config = cls.get_spmd_config
 
         def new_get_config(c):
+            from fluxway.common.operator_spec import OperatorExecutionTrait
+
             config = orig_get_config()
             config.operator_specs = {
                 name: spec.model_copy(
                     update={
                         "is_source": True,
+                        "execution_trait": OperatorExecutionTrait.IO_SOURCE,
                         "is_interleaved": interleaved,
                         "interleave_unit_size": interleave_unit_size,
                         "execution_groups": execution_groups,
@@ -1045,3 +1082,11 @@ def spmd_source(
         return cls
 
     return decorator
+
+
+def get_spmd_config(target: type) -> "SPMDConfig":
+    """Retrieve the compiled SPMDConfig for an SPMD-decorated class."""
+    config_getter = getattr(target, "get_spmd_config", None)
+    if config_getter is None:
+        raise TypeError(f"Class '{target.__name__}' is not decorated with @spmd")
+    return config_getter()
