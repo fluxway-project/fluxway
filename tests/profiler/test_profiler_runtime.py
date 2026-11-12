@@ -24,6 +24,7 @@ from fluxway.profiler import (
     ProfilerBufferExhausted,
     ProfilerConfig,
     ProfilerDiagnostic,
+    ProfilerLevel,
     ProfilerRuntimeFactory,
 )
 from fluxway.profiler.clock import AxonNativeHlcBridge, RayFluxwayHlcBridge
@@ -46,6 +47,7 @@ from fluxway.profiler.recorder import (
     LOCAL_STEP_WAIT_INPUTS,
     MAILBOX_DECLARE_STEP,
     MAILBOX_DEPOSIT_LOCAL_TENSOR,
+    WORKER_QUEUE_ENQUEUE,
     WORKER_RUN_LOOP,
     TraceRecorder,
 )
@@ -336,6 +338,41 @@ def test_profiler_config_rejects_negative_skip_initial_steps(tmp_path):
             run_id="bad",
             skip_initial_steps=-1,
         )
+
+
+def test_profiler_config_defaults_to_standard_level(tmp_path):
+    config = ProfilerConfig(trace_dir=str(tmp_path), run_id="run")
+
+    assert config.level is ProfilerLevel.STANDARD
+
+
+@pytest.mark.asyncio
+async def test_profiler_level_filters_internal_scheduler_events():
+    recorder = TraceRecorder(
+        TraceArena(buffer_bytes=16 * 16 * np.dtype(np.int64).itemsize),
+        run_id="run",
+        process_name="worker/spmd/rank:0",
+        level=ProfilerLevel.STANDARD,
+    )
+
+    recorder.worker_scheduler_instant(spec=WORKER_RUN_LOOP)
+    recorder.worker_scheduler_instant(
+        spec=WORKER_QUEUE_ENQUEUE,
+        payload=(recorder.intern("op"), 0, 0),
+    )
+    async with recorder.local_step_node(
+        spec=LOCAL_STEP_WAIT_INPUTS,
+        op_name="op",
+        step=0,
+    ):
+        pass
+
+    names = [
+        recorder.metadata.name_for(int(row[4])) for row in recorder.arena.snapshot()
+    ]
+    assert "local_step.wait_inputs" in names
+    assert "worker.run_loop" not in names
+    assert "worker.queue_enqueue" not in names
 
 
 @pytest.mark.asyncio

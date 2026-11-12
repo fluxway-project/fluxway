@@ -232,6 +232,7 @@ from fluxway.profiler.recorder import (
     WORKER_ASSEMBLE_SCATTER,
     WORKER_ASSEMBLE_SORT,
     WORKER_ADVANCE_STEP,
+    WORKER_ADMISSION,
     WORKER_BACKGROUND_TASK,
     WORKER_DRAIN_WAIT,
     WORKER_QUEUE_DEQUEUE,
@@ -2482,11 +2483,30 @@ class SPMDWorker:
             return
         if (op_name, step) not in self._in_op_step_queue:
             return
-        self._spawn_background_task(self._enqueue_prepare_ready_refresh(op_name, step))
+        try:
+            self._enqueue_prepare_ready_refresh(op_name, step)
+        except BaseException as error:
+            self._record_failure(
+                error,
+                phase="BACKGROUND",
+                op_name=op_name,
+                step=step,
+            )
 
-    async def _enqueue_prepare_ready_refresh(self, op_name: str, step: int) -> None:
+    def _enqueue_prepare_ready_refresh(self, op_name: str, step: int) -> None:
         schedule_key = self._effective_schedule_key(op_name, step)
-        await self._put_execution_item(op_name, schedule_key)
+        self._publish_execution_item(op_name, schedule_key)
+        if self._profiler_runtime.enabled:
+            recorder = self._profiler_runtime.recorder
+            if recorder.event_enabled(WORKER_QUEUE_ENQUEUE, step=step):
+                recorder.worker_scheduler_instant(
+                    spec=WORKER_QUEUE_ENQUEUE,
+                    payload=recorder.worker_op_payload(
+                        op_name,
+                        step,
+                        schedule_key[0],
+                    ),
+                )
 
     def _should_prepare_inputs_on_ready(self, op_name: str) -> bool:
         meta = self.op_manager.get_operator_spec(op_name)
@@ -2556,10 +2576,13 @@ class SPMDWorker:
         priority_key = schedule_key[0]
         if self._profiler_runtime.enabled:
             recorder = self._profiler_runtime.recorder
-            async with recorder.worker_scheduler_span(
-                spec=WORKER_QUEUE_ENQUEUE,
-                payload=recorder.worker_op_payload(op_name, step, priority_key),
-            ):
+            if recorder.event_enabled(WORKER_QUEUE_ENQUEUE, step=step):
+                async with recorder.worker_scheduler_span(
+                    spec=WORKER_QUEUE_ENQUEUE,
+                    payload=recorder.worker_op_payload(op_name, step, priority_key),
+                ):
+                    await self._put_execution_item(op_name, schedule_key)
+            else:
                 await self._put_execution_item(op_name, schedule_key)
         else:
             await self._put_execution_item(op_name, schedule_key)
@@ -2595,12 +2618,19 @@ class SPMDWorker:
     ) -> asyncio.PriorityQueue[tuple[int, int, int, str]]:
         return self._execution_queue_for_lane(self._execution_lane_for_op(op_name))
 
+    def _publish_execution_item(
+        self,
+        op_name: str,
+        item: tuple[int, int, int, str],
+    ) -> None:
+        self._execution_queue_for_op(op_name).put_nowait(item)
+
     async def _put_execution_item(
         self,
         op_name: str,
         item: tuple[int, int, int, str],
     ) -> None:
-        await self._execution_queue_for_op(op_name).put(item)
+        self._publish_execution_item(op_name, item)
 
     def _effective_schedule_key(
         self, op_name: str, step: int
@@ -2903,7 +2933,12 @@ class SPMDWorker:
                         op_name,
                     ) == _EXECUTION_STOP_ITEM:
                         break
-                    if profiler_recorder is not None:
+                    if (
+                        profiler_recorder is not None
+                        and profiler_recorder.event_enabled(
+                            WORKER_QUEUE_DEQUEUE, step=step
+                        )
+                    ):
                         profiler_recorder.worker_scheduler_instant(
                             spec=WORKER_QUEUE_DEQUEUE,
                             payload=profiler_recorder.worker_op_payload(
@@ -2922,6 +2957,16 @@ class SPMDWorker:
                         break
 
                     decision = self._admission_state.evaluate(op_name, step)
+                    if (
+                        profiler_recorder is not None
+                        and profiler_recorder.event_enabled(WORKER_ADMISSION, step=step)
+                    ):
+                        profiler_recorder.worker_admission(
+                            op_name=op_name,
+                            step=step,
+                            action=decision.action.value,
+                            reason=decision.reason,
+                        )
                     if decision.action is not AdmissionAction.DISPATCH:
                         continue
                     self._start_local_step_plan(op_name, step)

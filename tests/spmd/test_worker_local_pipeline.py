@@ -53,6 +53,10 @@ def _attach_execution_queue_methods(stub, raw_cls):
         raw_cls._execution_queue_for_op,
         stub,
     )
+    stub._publish_execution_item = types.MethodType(
+        raw_cls._publish_execution_item,
+        stub,
+    )
     stub._put_execution_item = types.MethodType(raw_cls._put_execution_item, stub)
     _attach_schedule_key_methods(stub, raw_cls)
 
@@ -1041,6 +1045,18 @@ async def test_prepare_ready_refresh_adds_ready_queue_key():
 
     refreshed = await stub._execution_queue.get()
     assert refreshed == (0, 0, 0, "op")
+
+
+def test_prepare_ready_refresh_publishes_without_background_task():
+    stub = _make_pipeline_stub(
+        OperatorSpec(name="op", async_policy=AsyncPolicy.pipelined(depth=2))
+    )
+    stub._in_op_step_queue.add(("op", 0))
+
+    stub._on_prepare_ready("op", 0)
+
+    assert stub._execution_queue.get_nowait() == (0, 0, 0, "op")
+    assert not stub._background_tasks
 
 
 @pytest.mark.asyncio
