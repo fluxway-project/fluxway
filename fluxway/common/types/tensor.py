@@ -950,7 +950,6 @@ class TransportTensor:
                 "zero-copy alias construction changed the backing allocation."
             )
         alias._set_runtime_access_intent(intent)
-        alias._coherence_ticket_id = self._coherence_ticket_id
         return alias
 
     @property

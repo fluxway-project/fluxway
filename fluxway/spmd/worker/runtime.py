@@ -645,6 +645,7 @@ class OutboundDeliveryRuntime:
         self._on_task_done = on_task_done
         self._tasks: set[asyncio.Task] = set()
         self._task_keys: dict[asyncio.Task, ScheduleKey] = {}
+        self._capacity_release_tasks: set[asyncio.Task] = set()
 
     async def submit(
         self,
@@ -653,41 +654,101 @@ class OutboundDeliveryRuntime:
         schedule_key: ScheduleKey,
     ) -> asyncio.Task:
         original_coro = awaitable
-        if self._profiler_runtime.enabled:
-            recorder = self._profiler_runtime.recorder
-            task_name = getattr(
-                getattr(original_coro, "cr_code", None),
-                "co_name",
-                type(original_coro).__name__,
-            )
-
-            async def traced_coro() -> Any:
-                async with recorder.worker_scheduler_span(
-                    spec=WORKER_OUTBOUND_TASK,
-                    payload=(recorder.intern(task_name),),
+        coro: Coroutine[Any, Any, Any] | None = None
+        registered = False
+        # The submitter owns release until registration transfers it to the task.
+        capacity_owned = False
+        started = [False]
+        try:
+            if self._profiler_runtime.enabled:
+                async with self._profiler_runtime.recorder.delivery_semaphore_wait(
+                    pending_delivery_count=self.pending_count(),
                 ):
-                    return await self._run_delivery(original_coro, schedule_key)
+                    await self._capacity.acquire(schedule_key)
+                    capacity_owned = True
+            else:
+                await self._capacity.acquire(schedule_key)
+                capacity_owned = True
 
-            coro = traced_coro()
-        else:
-            coro = self._run_delivery(original_coro, schedule_key)
-        if self._profiler_runtime.enabled:
-            async with self._profiler_runtime.recorder.delivery_register_token(
-                pending_delivery_count=len(self._tasks) + 1,
-            ):
-                task = asyncio.create_task(coro)
-                self._background_tasks.add(task)
-                self._tasks.add(task)
-                self._task_keys[task] = schedule_key
-        else:
+            if self._profiler_runtime.enabled:
+                recorder = self._profiler_runtime.recorder
+                task_name = getattr(
+                    getattr(original_coro, "cr_code", None),
+                    "co_name",
+                    type(original_coro).__name__,
+                )
+
+                async def traced_coro() -> Any:
+                    async with recorder.worker_scheduler_span(
+                        spec=WORKER_OUTBOUND_TASK,
+                        payload=(recorder.intern(task_name),),
+                    ):
+                        return await self._run_delivery(original_coro, started)
+
+                coro = traced_coro()
+            else:
+                coro = self._run_delivery(original_coro, started)
+            if self._profiler_runtime.enabled:
+                async with self._profiler_runtime.recorder.delivery_register_token(
+                    pending_delivery_count=len(self._tasks) + 1,
+                ):
+                    task = self._register_delivery_task(
+                        coro, schedule_key, started, original_coro
+                    )
+                    registered = True
+                    capacity_owned = False
+            else:
+                task = self._register_delivery_task(
+                    coro, schedule_key, started, original_coro
+                )
+                registered = True
+                capacity_owned = False
+            return task
+        except BaseException:
+            if not registered:
+                if coro is not None:
+                    coro.close()
+                original_coro.close()
+            if capacity_owned:
+                await asyncio.shield(self._capacity.release())
+            raise
+
+    def _schedule_capacity_release(self) -> asyncio.Task[None]:
+        release_task: asyncio.Task[None] | None = None
+
+        async def _release() -> None:
+            try:
+                await asyncio.shield(self._capacity.release())
+            finally:
+                if release_task is not None:
+                    self._capacity_release_tasks.discard(release_task)
+
+        release_task = asyncio.create_task(_release())
+        self._capacity_release_tasks.add(release_task)
+        return release_task
+
+    def _register_delivery_task(
+        self,
+        coro: Coroutine[Any, Any, Any],
+        schedule_key: ScheduleKey,
+        started: list[bool],
+        original_coro: Coroutine[Any, Any, Any],
+    ) -> asyncio.Task:
+        try:
             task = asyncio.create_task(coro)
-            self._background_tasks.add(task)
-            self._tasks.add(task)
-            self._task_keys[task] = schedule_key
+        except BaseException:
+            coro.close()
+            raise
+        self._background_tasks.add(task)
+        self._tasks.add(task)
+        self._task_keys[task] = schedule_key
 
         def _done(done_task: asyncio.Task) -> None:
             self._tasks.discard(done_task)
             self._task_keys.pop(done_task, None)
+            if not started[0]:
+                original_coro.close()
+                self._schedule_capacity_release()
             if self._profiler_runtime.enabled and not done_task.cancelled():
                 exc = done_task.exception()
                 if exc is not None:
@@ -703,20 +764,10 @@ class OutboundDeliveryRuntime:
     async def _run_delivery(
         self,
         awaitable: Coroutine[Any, Any, Any],
-        schedule_key: ScheduleKey,
+        started: list[bool],
     ) -> Any:
-        acquired = False
-        started = False
+        started[0] = True
         try:
-            if self._profiler_runtime.enabled:
-                async with self._profiler_runtime.recorder.delivery_semaphore_wait(
-                    pending_delivery_count=self.pending_count(),
-                ):
-                    await self._capacity.acquire(schedule_key)
-            else:
-                await self._capacity.acquire(schedule_key)
-            acquired = True
-            started = True
             if self._profiler_runtime.enabled:
                 async with self._profiler_runtime.recorder.delivery_run(
                     pending_delivery_count=self.pending_count(),
@@ -724,12 +775,7 @@ class OutboundDeliveryRuntime:
                     return await awaitable
             return await awaitable
         finally:
-            if acquired:
-                await self._capacity.release()
-            if not started:
-                close = getattr(awaitable, "close", None)
-                if callable(close):
-                    close()
+            await self._capacity.release()
 
     def pending_count(self) -> int:
         return sum(1 for task in self._tasks if not task.done())
@@ -740,8 +786,11 @@ class OutboundDeliveryRuntime:
         )
         while True:
             tasks = [task for task in self._tasks if not task.done()]
-            if not tasks:
+            if not tasks and not self._capacity_release_tasks:
                 return
+            if not tasks:
+                await asyncio.gather(*tuple(self._capacity_release_tasks))
+                continue
             if recorder is None:
                 await asyncio.gather(*tasks)
             else:
@@ -757,6 +806,8 @@ class OutboundDeliveryRuntime:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        while self._capacity_release_tasks:
+            await asyncio.gather(*tuple(self._capacity_release_tasks))
         self._tasks.clear()
         self._task_keys.clear()
 
@@ -770,6 +821,8 @@ class OutboundDeliveryRuntime:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        while self._capacity_release_tasks:
+            await asyncio.gather(*tuple(self._capacity_release_tasks))
         for task in tasks:
             self._tasks.discard(task)
             self._task_keys.pop(task, None)

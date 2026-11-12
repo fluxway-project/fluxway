@@ -469,6 +469,11 @@ async def test_transport_tensor_ticket_id_lease_propagation():
     tensor._bind_coherence_instances((inst,))
     tensor._bind_coherence_ticket_id(ticket_id)
     tensor._bind_consumer_lease_owner(sequencer)
+    alias = tensor.zero_copy_alias()
+
+    assert alias.coherence_ticket_id is None
+    assert not alias._coherence_instances
+    assert alias._consumer_lease_owner is None
 
     task = asyncio.create_task(
         sequencer.commit_payload((inst,), "data", ticket_id=ticket_id)

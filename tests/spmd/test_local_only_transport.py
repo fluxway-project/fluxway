@@ -72,6 +72,29 @@ class _LocalFanoutTransportSPMD:
         return x
 
 
+@spmd(
+    resource_profile=ResourceProfile(base={"CPU": 1}),
+    mesh_axis_names=("dp",),
+    mesh_axis_shapes=(1,),
+)
+class _LocalPipelineTransportSPMD:
+    @operator(name="produce", output_sharding={"x": _LOCAL_SPEC})
+    def produce(self) -> dict:
+        return {"x": 1}
+
+    @operator(
+        name="forward",
+        input_sharding={"x": _LOCAL_SPEC},
+        output_sharding={"x": _LOCAL_SPEC},
+    )
+    def forward(self, x: TransportTensor) -> dict:
+        return {"x": x.zero_copy_alias()}
+
+    @operator(name="consume", input_sharding={"x": _LOCAL_SPEC})
+    def consume(self, x: Any):
+        return x
+
+
 async def _receive_transport_frames(_frames):
     return ()
 
@@ -110,6 +133,30 @@ def _local_fanout_config():
             local_only=True,
         )
     return builder.build("local_fanout_transport").nodes["A"].spmd_config
+
+
+def _local_pipeline_config():
+    builder = Builder()
+    builder.add_node("A", _LocalPipelineTransportSPMD)
+    builder.add_func_edge(
+        "A",
+        "produce",
+        "A",
+        "forward",
+        source_output="x",
+        target_input="x",
+        local_only=True,
+    )
+    builder.add_func_edge(
+        "A",
+        "forward",
+        "A",
+        "consume",
+        source_output="x",
+        target_input="x",
+        local_only=True,
+    )
+    return builder.build("local_pipeline_transport").nodes["A"].spmd_config
 
 
 def _only_expected_transfer_code(op_manager, op_name):
@@ -564,6 +611,79 @@ async def test_local_only_fanout_uses_distinct_zero_copy_aliases():
     second_lease = second.acquire_consumer_lease()
     first_lease.release()
     second_lease.release()
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_local_only_pipeline_rebinds_alias_to_new_coherence_ticket():
+    raw_cls = SPMDWorker.__ray_actor_class__  # pyrefly: ignore [missing-attribute]
+    config = _local_pipeline_config()
+    op_manager = OperatorManager(
+        config,
+        rank=0,
+        spmd_id="A",
+        static_args={},
+        instance_container=OperatorInstanceContainer(),
+    )
+    stub = types.SimpleNamespace(
+        spmd_id="A",
+        rank=0,
+        config=config,
+        _graph_view=config.require_graph_view(),
+        _world_size=config.num_workers,
+        _mesh=config.mesh,
+        _local_spmd_code=3,
+        _successor_handlers={},
+        _operator_send_context_cache={},
+        _profiler_runtime=ProfilerRuntimeFactory.from_config(
+            None,
+            process_name="worker/test/pipeline/rank:0",
+        ),
+        _mailbox=WorkerMailbox(),
+        _barriers_declared={},
+        _op_manager=op_manager,
+        op_manager=op_manager,
+        receive_transport_frames=_receive_transport_frames,
+        receive_control=_receive_control,
+        _coherence_directory=CoherenceDirectory(),
+    )
+    for name in (
+        "_require_local_spmd_code",
+        "_local_only_successor_handlers",
+        "_operator_send_context",
+        "_ensure_step_declared",
+        "_deposit_local_only_outputs",
+        "_prepare_local_only_outputs",
+        "_prepare_local_only_outputs_impl",
+        "_deposit_direct_local_input",
+        "_declare_step_coherence_intents",
+    ):
+        setattr(stub, name, types.MethodType(getattr(raw_cls, name), stub))
+    stub._coherence_subject = types.MethodType(raw_cls._coherence_subject, stub)
+    _bind_direct_local_fast_path(stub, raw_cls)
+
+    original = TransportTensor(np.arange(4, dtype=np.float32), source_step=0)
+    await stub._deposit_local_only_outputs(
+        [original], stub._operator_send_context("produce"), {}, 0, None
+    )
+
+    transfer_code = _only_expected_transfer_code(op_manager, "forward")
+    received = stub._direct_local_input_slots["forward"][0][transfer_code].tensor
+    assert received.coherence_ticket_id == 0
+
+    output = received.zero_copy_alias()
+    assert output.coherence_ticket_id is None
+    stub._declare_step_coherence_intents("forward", 0)
+    await stub._deposit_local_only_outputs(
+        [output], stub._operator_send_context("forward"), {}, 0, None
+    )
+
+    next_transfer_code = _only_expected_transfer_code(op_manager, "consume")
+    next_tensor = stub._direct_local_input_slots["consume"][0][
+        next_transfer_code
+    ].tensor
+    assert next_tensor.coherence_ticket_id == 1
+    assert received.coherence_ticket_id == 0
     await asyncio.sleep(0)
 
 
