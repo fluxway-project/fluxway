@@ -542,6 +542,7 @@ def test_compile_send_plan_preserves_each_canonical_transfer_route():
 
 def test_coherence_child_slots_are_canonical_bijection():
     from types import SimpleNamespace
+    from typing import Any, cast
 
     from fluxway.spmd.worker.data_plane import _compile_coherence_child_slots
 
@@ -559,7 +560,7 @@ def test_coherence_child_slots_are_canonical_bijection():
         ),
     )
 
-    slots = _compile_coherence_child_slots(contexts)
+    slots = _compile_coherence_child_slots(cast(Any, contexts))
 
     assert slots == {
         (7, "target_a", 0): 0,
@@ -1019,11 +1020,13 @@ def test_mirror_route_uses_exact_input_transfer_code_cache_key():
         receipt=SymmetryReceipt(2, np.array([1, 0], dtype=np.int32)),
     )
     output = TransportTensor(np.ones((2, 8), dtype=np.float32), global_shape=(2, 8))
+    output._bind_coherence_ticket_id(41)
+    output_alias = output.zero_copy_readonly_alias()
 
     inherited = prepare_route_tensor(
         compiled_plan=compiled,
         route=route,
-        raw_leaf=output,
+        raw_leaf=output_alias,
         step_transfer_cache={input_transfer_code: source_ref},
         exec_step=3,
         wrapped_results={},
@@ -1032,6 +1035,18 @@ def test_mirror_route_uses_exact_input_transfer_code_cache_key():
     assert inherited is not None
     assert inherited.receipt is source_ref.receipt
     assert inherited.origin_indices is source_ref.origin_indices
+    assert inherited.coherence_ticket_id is None
+    assert output.coherence_ticket_id == 41
+
+    frame_groups = build_step_frame_groups(
+        compiled_plan=compiled,
+        flat_results=[output_alias],
+        step_transfer_cache={input_transfer_code: source_ref},
+        exec_step=3,
+    )
+    assert frame_groups
+    assert output_alias.coherence_ticket_id is None
+    assert output.coherence_ticket_id == 41
 
 
 def test_mirror_route_rejects_unknown_path_without_logical_tuuid_fallback():

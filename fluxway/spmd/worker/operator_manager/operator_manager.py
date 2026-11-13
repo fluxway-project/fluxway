@@ -283,9 +283,7 @@ class OperatorManager:
                 op_func = _OperatorWrapper(op_func, spec).__get__(None, owner_cls)
             self._operators[op_name] = op_func
             self._compiled_operators[op_name] = compiled_operator
-            self._operator_is_coroutine_function[op_name] = (
-                _inspect.iscoroutinefunction(op_func)
-            )
+            self._operator_is_coroutine_function[op_name] = spec.is_coroutine_function
 
         # Initialize per-operator dictionaries
         self._input_sharding: dict[str, dict[int, ShardingSpec]] = {}

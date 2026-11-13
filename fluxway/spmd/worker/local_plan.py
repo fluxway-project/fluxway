@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from enum import IntEnum
 import inspect
 from typing import Any, Protocol
-from collections.abc import Callable
 
 from fluxway.spmd.worker.user_callable_executor import (
     USER_CALLABLE_DEFAULT_OPERATOR_LANE,
@@ -37,6 +36,25 @@ class LocalStepPlan:
     dependency_offsets: tuple[int, ...]
     dependencies: tuple[int, ...]
     result_node: int
+    _serial_chain: bool = field(init=False, repr=False, compare=False)
+
+    def __init__(
+        self,
+        node_kinds: Sequence[int],
+        callable_ids: Sequence[str],
+        resource_ids: Sequence[int],
+        dependency_offsets: Sequence[int],
+        dependencies: Sequence[int],
+        result_node: int,
+    ) -> None:
+        object.__setattr__(self, "node_kinds", tuple(node_kinds))
+        object.__setattr__(self, "callable_ids", tuple(callable_ids))
+        object.__setattr__(self, "resource_ids", tuple(resource_ids))
+        object.__setattr__(self, "dependency_offsets", tuple(dependency_offsets))
+        object.__setattr__(self, "dependencies", tuple(dependencies))
+        object.__setattr__(self, "result_node", result_node)
+        self.validate()
+        object.__setattr__(self, "_serial_chain", self._derive_serial_chain())
 
     @classmethod
     def single_call(cls, callable_id: str, *, resource_id: int = 0) -> LocalStepPlan:
@@ -91,6 +109,24 @@ class LocalStepPlan:
         begin = self.dependency_offsets[node_index]
         end = self.dependency_offsets[node_index + 1]
         return self.dependencies[begin:end]
+
+    def _derive_serial_chain(self) -> bool:
+        """Determines whether the execution DAG is a strictly serial pipeline chain.
+
+        A plan is a serial chain if node 0 has no dependencies, and every subsequent
+        node i depends on its immediate predecessor i - 1 with all dependencies ordered
+        strictly before i. When True, LocalStepPlanExecutor can bypass asyncio Task/Event
+        scheduling and execute nodes sequentially in a direct loop with zero overhead.
+        """
+        return all(
+            (
+                self.dependencies_for(index) == ()
+                if index == 0
+                else all(dep < index for dep in self.dependencies_for(index))
+                and index - 1 in self.dependencies_for(index)
+            )
+            for index in range(len(self.node_kinds))
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,7 +231,6 @@ class LocalStepPlanExecutor:
         registry: LocalCallableRegistry,
         step_context: LocalStepContext = LocalStepContext(),
     ) -> Any:
-        plan.validate()
         node_count = len(plan.node_kinds)
         node_results: list[Any] = [None] * node_count
         execution_task = asyncio.current_task()
@@ -203,7 +238,7 @@ class LocalStepPlanExecutor:
             raise RuntimeError("LocalStepPlanExecutor requires an asyncio task.")
         self._active_executions.add(execution_task)
         try:
-            if self._is_linear_chain(plan):
+            if plan._serial_chain:
                 for node_index in range(node_count):
                     await self._execute_ready_node(
                         plan,
@@ -221,13 +256,6 @@ class LocalStepPlanExecutor:
             )
         finally:
             self._active_executions.discard(execution_task)
-
-    @staticmethod
-    def _is_linear_chain(plan: LocalStepPlan) -> bool:
-        return all(
-            plan.dependencies_for(index) == (() if index == 0 else (index - 1,))
-            for index in range(len(plan.node_kinds))
-        )
 
     async def _execute_dag(
         self,

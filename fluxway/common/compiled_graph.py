@@ -13,6 +13,7 @@ from fluxway.common.transfer import UnitRouting, TransferRelation
 from fluxway.common.operator_policy import ArgumentType
 from fluxway.common.coherence import TensorAccessIntent
 from fluxway.common.operator_spec import OperatorSpec
+from fluxway.common.canonical_lanes import apply_canonical_lane_presets
 from fluxway.common.types.sharding import ReferentialRouting, ShardingSpec
 from fluxway.resources import ResourceProfile
 
@@ -1194,7 +1195,10 @@ class GraphCompiler:
         name: str,
         spmds: tuple[SPMDGraphSpec, ...],
         dependencies: tuple[DependencySpec, ...],
+        canonical_lane_presets: bool = False,
     ) -> CompiledGraph:
+        if canonical_lane_presets:
+            spmds = apply_canonical_lane_presets(spmds)
         spmd_by_id = _index_spmds(spmds)
         declarations = _compile_spmd_declarations(spmd_by_id)
         specs_by_key = _index_operator_specs(spmds)
@@ -1350,11 +1354,13 @@ def compile_graph(
     name: str,
     spmds: tuple[SPMDGraphSpec, ...],
     dependencies: tuple[DependencySpec, ...],
+    canonical_lane_presets: bool = False,
 ) -> CompiledGraph:
     return GraphCompiler().compile(
         name=name,
         spmds=spmds,
         dependencies=dependencies,
+        canonical_lane_presets=canonical_lane_presets,
     )
 
 

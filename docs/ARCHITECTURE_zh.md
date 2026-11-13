@@ -80,7 +80,7 @@ flowchart TB
         DR_Driver["SPMDDriver (Ray 角色)<br/>(SPMD 网格监督者与准入协调中心)"]
         DR_FSM["DriverStateMachine (状态机)<br/>与 BoundedEffectScheduler"]
         DR_Exec["RayWorkerExecutor<br/>与 DriverComponentRegistry (工作进程执行代理)"]
-        DR_Credit["CreditManager (信用窗口/边)<br/>与 SPMDSynchronizer (MaxSkewSyncPolicy 最大偏斜同步)"]
+        DR_Credit["CreditManager (信用窗口/边)<br/>与 SPMDSynchronizer (MaxRankStepSkewSyncPolicy 步进防倾斜同步)"]
         DR_Mon["SnapshotOrchestrator、SPMDMonitor<br/>与 HeartbeatManager (快照编排与就绪/状态聚合)"]
         
         DR_Driver --- DR_FSM
@@ -176,7 +176,17 @@ flowchart TB
 - **驱动器状态机**：`DriverStateMachine` (`DriverFSM`) 负责本地网格状态转移，通过 `BoundedLifecycleEffectScheduler` 调度执行副作用。
 - **工作进程代理执行**：`RayWorkerExecutor` 与 `DriverComponentRegistry` 向工作进程下发计算图投影并转发控制准入。
 - **流控信用管理**：`CreditManager` 跟踪跨阶段依赖缓冲区（`CreditWindow`、`CreditEdge`、`UpstreamCreditState`），防止缓冲区无限膨胀。
-- **步进同步与防倾斜**：`SPMDSynchronizer` 执行步进推进策略（如 `MaxSkewSyncPolicy`），防止并行阶段间产生严重长尾和步进倾斜。
+- **步进同步与防倾斜**：`SPMDSynchronizer` 基于 `MaxRankStepSkewSyncPolicy` 协调网格内部各 rank 的步进推进。通过 `SPMDConfig.max_rank_step_skew` 约束最快与最慢 rank 之间已完成步数的最大差值：`0` 表示严格步进锁定（Lockstep），`N > 0` 则允许领先 rank 最多超前完成 `N` 步，超出后暂停准入调度。该 rank 级防倾斜同步约束完全独立于算子流水线深度与跨 SPMD 信用窗口。支持通过 `@spmd(max_rank_step_skew=...)` 静态声明，或通过 `bind_spmd(..., max_rank_step_skew=...)` 动态配置：
+
+  ```python
+  @spmd(max_rank_step_skew=0)  # RecsysBackboneTrain：集合通信严格同步
+  class RecsysBackboneTrain:
+      ...
+
+  @spmd(max_rank_step_skew=2)  # Input：允许有限步数超前
+  class Input:
+      ...
+  ```
 - **局部快照与监控聚合**：`SnapshotOrchestrator` 在检查点期间编排本地工作进程状态快照，`SPMDMonitor` 与 `HeartbeatManager` 聚合工作进程健康与遥测指标。
 
 #### 3. 工作进程/执行平面 (`fluxway.spmd.worker`)
@@ -184,12 +194,12 @@ flowchart TB
 - **执行生命周期与门控**：`WorkerExecutionLifecycle` 管理工作进程运行阶段，通过 `StepAdmissionState`（`AdmissionAction`、`AdmissionDecision`）严格控制执行门开关。
 - **数据源流水维护**：`SourcePipelineMaintenance` 与 `SourceExecutionScope` 维护工作进程的待执行步进队列，在额度与流水深度允许时入队；`SourceWorkRuntime` 与 `SourceAcknowledgementRuntime` 异步确认租约并上报 ACK。
 - **本地步骤流水线执行器**：`LocalStepPlanExecutor` 驱动算子五阶段微步流水线：
-  1. `WAIT_INPUTS`：等待所需张量帧抵达 `WorkerMailbox` 并满足 `StepBarrier` 栅障条件。
+  1. `WAIT_INPUTS`：等待所需张量帧抵达 `OperatorMailbox` 并满足 `StepBarrier` 栅障或直接本地就绪条件。
   2. `CALL_USER`：准备算子入参并调用用户函数。
   3. `COMMIT`：提交算子输出与状态变更。
   4. `SEND_OUTPUT`：将生成张量提交至出站数据面传输队列。
   5. `AWAIT_SEND`：确认传输载体接收端已完成准入。
-- **张量邮箱与输入组装**：`WorkerMailbox` 按步骤缓存入站张量帧。`LocalInputPrepareRuntime` 与 `AssemblyRouteResolver` 依据 `CompiledAssemblePlan` 执行解包、反去重/Gather 还原、切片、排序和拼接操作。
+- **算子邮箱与输入组装**：基于统一 `OperatorMailbox` 抽象，严格区分 `DirectLocalMailbox`（面向 `local_only` 边的零锁直通入站）与 `DelegatedWorkerMailbox`（委托 `WorkerMailbox` 处理分布式步进栅障与依赖裁决）。`LocalInputPrepareRuntime` 与 `AssemblyRouteResolver` 依据 `CompiledAssemblePlan` 执行解包、反去重/Gather 还原、切片、排序和拼接操作。
 - **算子管理与分发**：`OperatorManager` 与 `ExecutionDispatcher` 负责算子实例管理、生命周期挂钩以及依赖路由解析。
 - **执行通道划分**：`UserCallableExecutor` 在进程内通道（`UserCallableLane`）运行用户算子；对于需要进程隔离的算子（如 `BaseReader`、`GrainReader`），由 `WorkerProcessCallRuntime` 调度独立子进程算子（Worker Process Operators）。
 - **本地状态持久化**：`WorkerCheckpointCoordinator` 与 `CheckpointActivity` 负责在检查点切点处保持执行门关闭并持久化本地组件状态。
@@ -198,7 +208,7 @@ flowchart TB
 - **出站数据面与批处理**：`LocalWorkerDataPlane` 与 `BatchingDataPlaneExecutor` 将出站张量帧聚合成批次进行高效传输。
 - **MESI 缓存一致性子系统**：
   - `CoherenceDirectory`：端点本地 MESI 目录，跟踪条目状态（`Modified`、`Exclusive`、`Shared`、`Invalid`）。
-  - `CoherenceSequencer`：负责主体纪元准入与意图排序，仲裁并发消费租约（`ConsumerLease`）。
+  - `CoherenceSequencer`：负责主体纪元准入与意图排序，严格解耦交付流水线（Delivery Pipeline）推进与底层资源退役回收（Resource Retirement），以 Ticket 级精确仲裁并发消费租约（`ConsumerLease`）。
   - `CoherenceAdmissionRuntime` 与 `CoherenceBatchRetireRuntime`：负责多目标发布的原子准入、并发入队以及子回执（Receipt）跟踪管理。
   - `ParentGrantReturnRuntime`：在发布退役时向上游生产者归还输入授权。
 - **编译路由与分片方案**：`CompiledSendPlan`、`CompiledAssemblePlan` 与 `CompiledTensorRoute` 编译并降低逻辑分片规约：Dense（规则切分）、Sparse（哈希/MoE 路由）、Replicated（广播复制）与 Unit（单元路由）。

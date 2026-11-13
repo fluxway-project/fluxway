@@ -285,7 +285,7 @@ flowchart LR
     subgraph DownstreamLanes["下游算子计算泳道 (InputSPMD)"]
         direction TB
         AsyncUnique["GPU/网络通信 async_unique"]
-        CpuFinalize["ctx.run_in_lane('compute')\nNumba/物化计算"]
+        CpuFinalize["同步计算算子 (compute 泳道)\n密集特征与张量物化"]
         AsyncUnique --> CpuFinalize
     end
 
@@ -297,7 +297,7 @@ flowchart LR
 ### 1. 同步执行契约与非阻塞泳道隔离
 * **普通同步函数（`def read(self)`）**：用户编写纯粹的同步业务逻辑。运行时调度器（`UserCallableExecutor`）自动将普通函数分发到 `WORKER_PROCESS` 线程泳道。
 * **硬件级多核并行**：PyArrow、NumPy、Numba 等底层计算在进入 C/C++ 核心时会自动释放 GIL，实现真正的多核物理加速，同时彻底解放主事件循环，消除对集群心跳与网络路由的延迟阻塞。
-* **避免在协程中执行 CPU 密集物化**：严禁在 `async def` 算子中直接执行重度 Arrow/NumPy 转换或张量构造。若必须在异步算子中进行 CPU 物化，必须使用 `await self.ctx.run_in_lane(...)` 委托到专用工作线程。
+* **同步与异步分层隔离**：普通的同步读取与计算算子在各自的规范泳道（`io` 与 `compute`）中有界并发，C 扩展完全释放 GIL；跨节点异步通信在 `async def` 协程中进行，主事件循环零阻塞。
 
 ### 2. 零成本流水预取
 * 无需额外实现专门的 `Prefetcher`、队列或后台线程环形缓冲区。
@@ -331,9 +331,8 @@ class ParquetRecommendationReader(BaseReader):
 
 | 算子/任务编写模式 | 声明形式 | 运行物理宿主 | 适用场景 | 架构优势 |
 | :--- | :--- | :--- | :--- | :--- |
-| **同步普通算子** | `def read(self)` / `def op(self)` | `WORKER_PROCESS` 线程池 | 来源读取、数据解包、密集矩阵计算、Arrow/NumPy 处理 | 零异步样板代码，C 扩展完全释放 GIL，不阻塞 Event Loop。 |
-| **纯异步通信算子** | `async def op(self)` | `COROUTINE_ASYNC` 事件循环 | 跨节点通信调度、异步分布式搜寻、事件流驱动 | 极致上下文切换性能，高并发 IO。 |
-| **异步算子内计算卸载** | `await self.ctx.run_in_lane(fn, *args, lane="compute")` | 指定的受控线程泳道 | 异步算子在拿到网络数据后需要进行复杂 Numba 计算或张量组装 | 线程池配额受控（避免线程爆炸），保留 ContextVar 链路追踪与 Profiler 事件记录。 |
-| **通用异步调用器** | `await invoke_callable_async(fn, *args, lane="default")` | 自动根据签名自适应调度 | 管道通用适配层、统一装饰器、回调执行 | 彻底消除业务代码中繁琐且脆弱的 `inspect.iscoroutinefunction` 分支。 |
+| **同步来源算子 (IO)** | `def read(self)` (继承自 `BaseReader` 或 `is_source=True`) | `WORKER_PROCESS` 线程池 (`io` 泳道) | 来源读取、数据解包、磁盘拉取、Arrow 解析 | 编译期自动归入 `io` 泳道，零异步样板代码，C 扩展完全释放 GIL。 |
+| **同步计算算子 (Compute)** | `def op(self)` | `WORKER_PROCESS` 线程池 (`compute` 泳道) | 密集矩阵计算、特征交叉、模型前向、张量处理 | 编译期自动归入 `compute` 泳道，与 `io` 自动配齐协同优先级（`compute` 优先执行）。 |
+| **纯异步通信算子** | `async def op(self)` | `COROUTINE_ASYNC` 事件循环 (无泳道) | 跨节点通信调度、异步分布式搜寻、事件流驱动 | 极致上下文切换性能，高并发 IO，不占用工作线程池。 |
 
 

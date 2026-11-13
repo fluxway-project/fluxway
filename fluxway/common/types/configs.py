@@ -97,8 +97,14 @@ class SPMDConfig(FluxwayBaseSchema):
     # Static arguments for operators: {arg_name: arg_value}
     static_args: dict[str, Any] = Field(default_factory=dict)
 
-    max_worker_step_skew: int = (
-        0  # Max allowed step diff between workers in a mesh (intra-SPMD sync)
+    max_rank_step_skew: int = Field(
+        default=0,
+        ge=0,
+        strict=True,
+        description=(
+            "Maximum completed-step difference between ranks in this SPMD. "
+            "Zero enforces lockstep."
+        ),
     )
     # Global step limit for the SPMD. If set, source operators will self-terminate
     max_steps: int | None = None

@@ -708,21 +708,25 @@ class Builder:
             name=name,
             spmds=tuple(spmd_specs),
             dependencies=tuple(self._edges),
+            canonical_lane_presets=True,
         )
-        graph_nodes = {
-            spmd_id: node.model_copy(
+        graph_nodes = {}
+        for spmd_id, node in self._nodes.items():
+            spmd_view = compiled_graph.spmd(spmd_id)
+            updated_operator_specs = dict(node.spmd_config.operator_specs)
+            for op in spmd_view.operators:
+                updated_operator_specs[op.key.op_id] = op.spec
+            graph_nodes[spmd_id] = node.model_copy(
                 update={
                     "spmd_config": node.spmd_config.model_copy(
                         update={
-                            "operator_specs": dict(node.spmd_config.operator_specs),
+                            "operator_specs": updated_operator_specs,
                             "static_args": dict(node.spmd_config.static_args),
-                            "graph_view": compiled_graph.spmd(spmd_id),
+                            "graph_view": spmd_view,
                         }
                     )
                 }
             )
-            for spmd_id, node in self._nodes.items()
-        }
         graph = Graph(
             name=name,
             nodes=graph_nodes,

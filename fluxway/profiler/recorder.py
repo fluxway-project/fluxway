@@ -22,6 +22,7 @@ from fluxway.profiler.record import (
     stable_u64,
 )
 from fluxway.profiler.clock import ClockCalibration
+from fluxway.profiler.config import ProfilerLevel
 from fluxway.profiler.filtering import StepFilter
 
 if TYPE_CHECKING:
@@ -37,6 +38,49 @@ class TraceEventSpec:
     track: str
     payload_fields: tuple[str, ...] = EMPTY_PAYLOAD_FIELDS
     step_payload_field: str | None = None
+    level: ProfilerLevel | None = None
+
+
+_PROFILER_LEVEL_RANK = {
+    ProfilerLevel.SUMMARY: 0,
+    ProfilerLevel.STANDARD: 1,
+    ProfilerLevel.DETAILED: 2,
+    ProfilerLevel.DEBUG: 3,
+}
+_DEBUG_TRACK_PREFIXES = ("scheduler/", "heartbeat/", "fsm/")
+_DETAILED_TRACK_PREFIXES = (
+    "compute/user_callable_runtime",
+    "data_plane/delivery",
+    "mailbox/deposit",
+)
+_SUMMARY_TRACK_PREFIXES = (
+    "checkpoint/",
+    "compute/prepare",
+    "compute/local_plan",
+    "compute/user_callable",
+    "controller/",
+    "data_plane/",
+    "driver/",
+    "lifecycle/",
+    "mailbox/barrier",
+    "spmd_manager/",
+    "tensor/",
+    "topology/",
+    "transport/",
+)
+
+
+def _required_profiler_level(spec: TraceEventSpec) -> ProfilerLevel:
+    if spec.level is not None:
+        return spec.level
+    track = spec.track
+    if track.startswith(_DEBUG_TRACK_PREFIXES):
+        return ProfilerLevel.DEBUG
+    if track.endswith("/detail") or track.startswith(_DETAILED_TRACK_PREFIXES):
+        return ProfilerLevel.DETAILED
+    if track.startswith(_SUMMARY_TRACK_PREFIXES):
+        return ProfilerLevel.SUMMARY
+    return ProfilerLevel.STANDARD
 
 
 DATA_PLANE_RECEIVE_TRANSPORT_FRAME = TraceEventSpec(
@@ -388,6 +432,7 @@ WORKER_PROCESS_CALL_THREAD_RUN = TraceEventSpec(
     "worker_process_call.thread_run",
     "compute/user_callable_runtime",
     ("callable_id", "resource_id"),
+    level=ProfilerLevel.STANDARD,
 )
 WORKER_PROCESS_CALL_FUTURE_WAIT = TraceEventSpec(
     "worker_process_call.future_wait",
@@ -583,6 +628,12 @@ WORKER_QUEUE_DEQUEUE = TraceEventSpec(
     ("op_id", "step", "priority"),
     "step",
 )
+WORKER_ADMISSION = TraceEventSpec(
+    "worker.admission",
+    "scheduler/queue",
+    ("op_id", "step", "action_id", "reason_id"),
+    "step",
+)
 WORKER_BLOCKED_TASK = TraceEventSpec(
     "worker.blocked_task",
     "scheduler/queue",
@@ -659,6 +710,19 @@ MAILBOX_DEPOSIT_LOCAL_TENSOR = TraceEventSpec(
     ("op_id", "transfer_code", "step", "data_count"),
     "step",
 )
+WORKER_LOCAL_DELIVERY = TraceEventSpec(
+    "worker.local_delivery",
+    "coherence/delivery",
+    (
+        "op_id",
+        "transfer_code",
+        "logical_tuuid",
+        "step",
+        "active_consumer_leases",
+        "status_id",
+    ),
+    "step",
+)
 MAILBOX_READY_FIRE = TraceEventSpec(
     "mailbox.ready_fire",
     "mailbox/barrier",
@@ -688,13 +752,17 @@ class TraceRecorder:
         process_name: str,
         clock_calibration: ClockCalibration | None = None,
         step_filter: StepFilter | None = None,
+        level: ProfilerLevel = ProfilerLevel.DEBUG,
     ) -> None:
         if step_filter is not None and not isinstance(step_filter, StepFilter):
             raise TypeError("step_filter must be a StepFilter or None.")
+        if not isinstance(level, ProfilerLevel):
+            raise TypeError("level must be a ProfilerLevel.")
         self._arena = arena
         self._run_id = run_id
         self._process_name = process_name
         self._step_filter = StepFilter() if step_filter is None else step_filter
+        self._level = level
         self._clock_calibration = clock_calibration or ClockCalibration(
             monotonic_to_epoch_offset_ns=0,
             uncertainty_ns=0,
@@ -707,6 +775,14 @@ class TraceRecorder:
 
     def is_step_profiled(self, step: int) -> bool:
         return self._step_filter.is_step_profiled(step)
+
+    def event_enabled(self, spec: TraceEventSpec, *, step: int | None = None) -> bool:
+        if (
+            _PROFILER_LEVEL_RANK[_required_profiler_level(spec)]
+            > _PROFILER_LEVEL_RANK[self._level]
+        ):
+            return False
+        return step is None or self._step_filter.is_step_profiled(step)
 
     @property
     def arena(self) -> TraceArena:
@@ -1140,6 +1216,28 @@ class TraceRecorder:
         return self._async_span(
             WORKER_SEND_OUTPUT,
             payload=(self.intern(op_name), step, output_count, successor_count),
+        )
+
+    def worker_local_delivery(
+        self,
+        *,
+        op_name: str,
+        transfer_code: int,
+        logical_tuuid: int,
+        step: int,
+        active_consumer_leases: int,
+        status: str,
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            WORKER_LOCAL_DELIVERY,
+            payload=(
+                self.intern(op_name),
+                transfer_code,
+                logical_tuuid,
+                step,
+                active_consumer_leases,
+                self.intern(status),
+            ),
         )
 
     def local_step_plan_execute(
@@ -1642,6 +1740,24 @@ class TraceRecorder:
     ) -> None:
         self._instant(spec, payload=payload)
 
+    def worker_admission(
+        self,
+        *,
+        op_name: str,
+        step: int,
+        action: str,
+        reason: str,
+    ) -> None:
+        self._instant(
+            WORKER_ADMISSION,
+            payload=(
+                self.intern(op_name),
+                step,
+                self.intern(action),
+                self.intern(reason),
+            ),
+        )
+
     def worker_op_payload(self, op_name: str, *values: int) -> tuple[int, ...]:
         return (self.intern(op_name), *values)
 
@@ -1746,6 +1862,9 @@ class TraceRecorder:
         carrier: TraceCarrier | None = None,
         payload: tuple[int, ...] = EMPTY_TRACE_PAYLOAD,
     ) -> Generator[None, None, None]:
+        if self._skip_record(spec, payload):
+            yield
+            return
         active = self._root_carrier if carrier is None else carrier
         track_id, name_id = self._register_spec(spec)
         start = time.perf_counter_ns()
@@ -1792,6 +1911,8 @@ class TraceRecorder:
         )
 
     def _skip_record(self, spec: TraceEventSpec, payload: tuple[int, ...]) -> bool:
+        if not self.event_enabled(spec):
+            return True
         if not self._step_filter.has_filter:
             return False
         if spec.step_payload_field is None:

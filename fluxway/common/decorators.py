@@ -11,7 +11,10 @@ import logging
 from contextlib import contextmanager
 from decimal import Decimal
 from dataclasses import dataclass, field
-from typing import Annotated, Any, TypeVar, Union, get_type_hints
+from typing import Annotated, Any, TYPE_CHECKING, TypeVar, Union, get_type_hints
+
+if TYPE_CHECKING:
+    from fluxway.common.types import SPMDConfig
 from collections.abc import Callable, Mapping
 from fluxway.common.operator_initialization import operator_initialization_arguments
 from fluxway.common.utils.tree import tree_flatten_type, _is_fluxway_data_type
@@ -664,7 +667,7 @@ def _create_operator_wrapper(
         StandardBarrierConfig,
         PeriodicBarrierConfig,
     )
-    from fluxway.common.operator_spec import OperatorSpec
+    from fluxway.common.operator_spec import OperatorExecutionTrait, OperatorSpec
 
     sig = inspect.signature(func)
     data_params, has_var_keyword = _classify_sig_params(
@@ -747,22 +750,25 @@ def _create_operator_wrapper(
             ArgumentType.CONTROL.value: out_control_fields,
         }
     elif resolved_output:
-        output_args = {ArgumentType.DATA.value: list(resolved_output.keys())}
+        output_args = {ArgumentType.DATA.value: tuple(resolved_output.keys())}
     else:
         output_args = None
+
+    execution_trait = OperatorExecutionTrait.from_callable(func)
 
     spec = OperatorSpec(
         name=name,
         owner=None,
         method_name=func.__name__,
-        is_source=is_source,
+        execution_trait=execution_trait,
+        is_source=is_source or (source is not None),
         source=source,
         async_policy=normalized_async_policy,
         tensor_access={} if tensor_access is None else tensor_access,
         input_arguments={
-            ArgumentType.CONTROL.value: final_states,
-            ArgumentType.DATA.value: final_tensors,
-            ArgumentType.STATIC.value: list(final_statics),
+            ArgumentType.CONTROL.value: tuple(final_states),
+            ArgumentType.DATA.value: tuple(final_tensors),
+            ArgumentType.STATIC.value: tuple(final_statics),
         },
         output_arguments={} if output_args is None else output_args,
         input_sharding=resolved_input,
@@ -852,6 +858,7 @@ def spmd(
     heartbeat_interval_s: float = 5.0,
     execution_progress_warning_s: float = 90.0,
     heartbeat_timeout_s: float = 90.0,
+    max_rank_step_skew: int = 0,
 ):
     """
     Configure a class for SPMD distributed execution.
@@ -868,8 +875,9 @@ def spmd(
                             specific resources (rare).
         mesh_axis_names: Axis names for the execution mesh.
         mesh_axis_shapes: Shape of the execution mesh.
+        max_rank_step_skew: Maximum completed-step difference between ranks in
+                            this SPMD. Zero enforces lockstep.
     """
-    from fluxway.common.types import SPMDConfig
     from fluxway.resources import ResourceProfile
     from fluxway.common.mesh import DeviceMesh
 
@@ -910,6 +918,7 @@ def spmd(
         cls._mesh = mesh  # type: ignore
         cls._runtime_env = runtime_env  # type: ignore
         cls._driver_runtime_env = driver_runtime_env  # type: ignore
+        cls._max_rank_step_skew = max_rank_step_skew  # type: ignore
         cls._checkpoint_components = checkpoint_components  # type: ignore
 
         cls.get_resource_profile = classmethod(lambda c: c._resource_profile)  # type: ignore
@@ -938,7 +947,10 @@ def spmd(
 
         def get_spmd_config(c) -> "SPMDConfig":
             from fluxway.common.types import SPMDConfig
-            from fluxway.common.operator_spec import OperatorSpec
+            from fluxway.common.operator_spec import (
+                OperatorExecutionTrait,
+                OperatorSpec,
+            )
 
             # Pass 1: walk the full MRO to collect operator metadata from _OperatorWrapper.
             # A subclass may override a method with a plain function, losing the wrapper.
@@ -961,21 +973,26 @@ def spmd(
             # Pass 2: for each discovered operator, resolve the attr_name that the final
             # class actually exposes (may be a plain override — that is fine, the framework
             # only needs to know the correct attr_name for dispatch and the metadata).
+            from fluxway.reader.base_reader import BaseReader
+
+            is_reader = issubclass(c, BaseReader)
             operator_specs = {}
             for attr_name, (op_name, spec, owner_cls) in wrapper_specs.items():
-                operator_specs[op_name] = spec.model_copy(
-                    update={
-                        "owner": c,
-                        "method_name": attr_name,
-                        "requires_worker_process": _is_worker_process_required(
-                            owner_cls
-                        ),
-                    }
-                )
+                actual_fn = getattr(c, attr_name)
+                updates: dict[str, Any] = {
+                    "owner": c,
+                    "method_name": attr_name,
+                    "execution_trait": OperatorExecutionTrait.from_callable(actual_fn),
+                    "requires_worker_process": _is_worker_process_required(owner_cls),
+                }
+                if is_reader or spec.is_source or spec.source is not None:
+                    updates["is_source"] = True
+                operator_specs[op_name] = spec.model_copy(update=updates)
 
             return SPMDConfig(
                 mesh=c._mesh,
                 operator_specs=operator_specs,
+                max_rank_step_skew=c._max_rank_step_skew,
                 runtime_env=c._runtime_env,
                 driver_runtime_env=c._driver_runtime_env,
                 checkpoint_components=c._checkpoint_components,
@@ -1004,6 +1021,7 @@ def spmd_source(
     heartbeat_interval_s: float = 5.0,
     execution_progress_warning_s: float = 90.0,
     heartbeat_timeout_s: float = 90.0,
+    max_rank_step_skew: int = 0,
 ):
     """
     Configure a class as an SPMD source.
@@ -1013,6 +1031,7 @@ def spmd_source(
         resource_profile=resource_profile,
         mesh_axis_names=mesh_axis_names,
         mesh_axis_shapes=mesh_axis_shapes,
+        max_rank_step_skew=max_rank_step_skew,
         runtime_env=runtime_env,
         driver_runtime_env=driver_runtime_env,
         checkpoint_components=checkpoint_components,
@@ -1045,3 +1064,11 @@ def spmd_source(
         return cls
 
     return decorator
+
+
+def get_spmd_config(target: type) -> "SPMDConfig":
+    """Retrieve the compiled SPMDConfig for an SPMD-decorated class."""
+    config_getter = getattr(target, "get_spmd_config", None)
+    if config_getter is None:
+        raise TypeError(f"Class '{target.__name__}' is not decorated with @spmd")
+    return config_getter()

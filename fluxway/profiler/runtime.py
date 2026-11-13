@@ -45,6 +45,7 @@ class ProfilerRuntimeFactory:
                 max_uncertainty_ns=config.max_clock_uncertainty_ns,
             ),
             step_filter=config.create_step_filter(),
+            level=config.level,
         )
         return cls(
             recorder,

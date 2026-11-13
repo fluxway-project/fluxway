@@ -870,6 +870,9 @@ def test_strict_donate_handoffs_exact_allocation_to_new_ssa_instance() -> None:
     new = CoherenceInstance(CoherenceSubject(4, 0, 23), step)
     tensor = TransportTensor(np.arange(4, dtype=np.int64))
     tensor._bind_coherence_instances((old,))
+    tensor._bind_coherence_ticket_id(31)
+    output = tensor.zero_copy_alias()
+    assert output.coherence_ticket_id is None
     directory = CoherenceDirectory()
     directory.publish_local_payload(old.subject, old.epoch)
     write = directory.request_write(old.subject, old.epoch, ExecutionToken(step))
@@ -923,14 +926,17 @@ def test_strict_donate_handoffs_exact_allocation_to_new_ssa_instance() -> None:
         ),
     )
 
-    handoffs = worker._register_coherence_alias_dependencies("op", step, tensor)
+    handoffs = worker._register_coherence_alias_dependencies("op", step, output)
 
     assert registry.is_bound(old)
     assert not registry.is_bound(new)
     worker._commit_allocation_handoffs(handoffs, step)
 
     assert registry.binding(new).descriptor.owner is tensor.flat_values
-    assert tensor._coherence_instances == (new,)
+    assert tensor._coherence_instances == (old,)
+    assert output._coherence_instances == (new,)
+    assert tensor.coherence_ticket_id == 31
+    assert output.coherence_ticket_id is None
 
 
 def test_alias_dependency_rejects_noncanonical_output_epoch() -> None:

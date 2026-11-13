@@ -1,5 +1,6 @@
+# syntax=docker/dockerfile:1
 # Use a specific, tagged JAX base image for reproducibility
-FROM ghcr.io/nvidia/jax:maxtext-2026-10-20
+FROM ghcr.io/nvidia/jax:maxtext-2026-11-11
 
 # Set environment variables for logging and system configuration
 ENV FLUXWAY_LOG_LEVEL=WARNING \
@@ -73,13 +74,10 @@ RUN pip install --default-timeout=1000 --no-cache-dir --extra-index-url https://
 
 RUN pip install --default-timeout=1000 --no-cache-dir --upgrade numba pyarrow
 
-# Copy project files into the container
-# NOTE: Ensure you run `docker build` from the repository root, e.g.:
-# docker build -t fluxway -f docker/Dockerfile .
-COPY . /workspace/fluxway
-
-# Install Fluxway core, JAX, profiling, and graph visualization dependencies
-RUN cd /workspace/fluxway && \
+# Build from the source context without adding the source tree to an image layer
+RUN --mount=type=bind,source=.,target=/tmp/fluxway-src \
+    cd /tmp/fluxway-src && \
+    python -m pip install --group lint && \
     CUDA_MAJOR=$(nvcc --version | grep "release" | awk '{print $5}' | cut -d'.' -f1) && \
     if [ "$CUDA_MAJOR" = "12" ]; then \
     CUDA_EXTRA=",cuda12x"; \
@@ -88,7 +86,11 @@ RUN cd /workspace/fluxway && \
     else \
     CUDA_EXTRA=""; \
     fi && \
-    pip install --default-timeout=1000 --no-cache-dir -e ".[jax,profiler,visualization${CUDA_EXTRA}]"
+    python -m pip wheel --default-timeout=1000 --no-cache-dir --no-deps --wheel-dir /tmp/fluxway-wheel . && \
+    WHEEL_PATH=$(find /tmp/fluxway-wheel -maxdepth 1 -type f -name 'fluxway-*.whl' -print -quit) && \
+    python -m pip install --default-timeout=1000 --no-cache-dir --upgrade \
+    "${WHEEL_PATH}[jax,profiler,visualization${CUDA_EXTRA}]" && \
+    rm -rf /tmp/fluxway-wheel
 
 # Default command
 CMD ["/bin/bash"]

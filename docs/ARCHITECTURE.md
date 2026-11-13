@@ -88,7 +88,7 @@ flowchart TB
         DR_Driver["SPMDDriver (Ray Actor)<br/>(Mesh Supervisor & Admission Coordinator)"]
         DR_FSM["DriverStateMachine (FSM)<br/>& BoundedEffectScheduler"]
         DR_Exec["RayWorkerExecutor<br/>& DriverComponentRegistry (Worker Supervision)"]
-        DR_Credit["CreditManager (CreditWindow/Edges)<br/>& SPMDSynchronizer (MaxSkewSyncPolicy)"]
+        DR_Credit["CreditManager (CreditWindow/Edges)<br/>& SPMDSynchronizer (MaxRankStepSkewSyncPolicy)"]
         DR_Mon["SnapshotOrchestrator, SPMDMonitor<br/>& HeartbeatManager (Readiness Aggregator)"]
         
         DR_Driver --- DR_FSM
@@ -184,7 +184,17 @@ flowchart TB
 - **Driver State Machine**: `DriverStateMachine` (`DriverFSM`) processes local mesh state transitions, scheduling effects via `BoundedLifecycleEffectScheduler`.
 - **Worker Supervision**: `RayWorkerExecutor` and `DriverComponentRegistry` install graph projections on worker actors and forward control admissions.
 - **Credit & Flow Control**: `CreditManager` tracks inter-stage dependency buffers (`CreditWindow`, `CreditEdge`, `UpstreamCreditState`) to prevent buffer bloat.
-- **Step Synchronization**: `SPMDSynchronizer` enforces step progression policies such as `MaxSkewSyncPolicy` to prevent stragglers across parallel stages.
+- **Step Synchronization**: `SPMDSynchronizer` coordinates intra-SPMD step progression via `MaxRankStepSkewSyncPolicy`. Configured via `SPMDConfig.max_rank_step_skew`, it bounds the maximum difference in completed steps between the fastest and slowest ranks in a mesh: `0` enforces strict lockstep synchronization, while `N > 0` allows leading ranks to complete at most `N` additional steps before admission is gated. This rank-level synchronization bound operates independently of operator pipeline depths and inter-SPMD credit flow control. It can be declared statically via `@spmd(max_rank_step_skew=...)` or configured dynamically via `bind_spmd(..., max_rank_step_skew=...)`. Each SPMD configures its synchronization policy independently:
+
+  ```python
+  @spmd(max_rank_step_skew=0)  # RecsysBackboneTrain: collective lockstep
+  class RecsysBackboneTrain:
+      ...
+
+  @spmd(max_rank_step_skew=2)  # Input: bounded rank look-ahead
+  class Input:
+      ...
+  ```
 - **Snapshot & Health Monitoring**: `SnapshotOrchestrator` coordinates local worker state snapshots during checkpoints, while `SPMDMonitor` and `HeartbeatManager` aggregate worker health and execution metrics.
 
 #### 3. Worker / execution plane (`fluxway.spmd.worker`)
@@ -192,12 +202,12 @@ flowchart TB
 - **Worker Execution Lifecycle**: `WorkerExecutionLifecycle` manages worker states and enforces execution gates via `StepAdmissionState` (`AdmissionAction`, `AdmissionDecision`).
 - **Source Ingestion Pipeline**: `SourcePipelineMaintenance` and `SourceExecutionScope` maintain the worker's active step queue, checking credit and pipeline depth before step acquisition. `SourceWorkRuntime` and `SourceAcknowledgementRuntime` report work leases and submit ACKs asynchronously.
 - **Local Step Plan Executor**: `LocalStepPlanExecutor` runs the 5-phase operator micro-step lifecycle:
-  1. `WAIT_INPUTS`: Waits for required tensor frames to arrive in `WorkerMailbox` and fulfills `StepBarrier` requirements.
+  1. `WAIT_INPUTS`: Waits for required tensor frames to arrive in `OperatorMailbox` and fulfills `StepBarrier` or direct local completeness requirements.
   2. `CALL_USER`: Prepares operator arguments and invokes user callables.
   3. `COMMIT`: Commits operator outputs and state.
   4. `SEND_OUTPUT`: Submits outputs to outbound transport queues.
   5. `AWAIT_SEND`: Confirms that carrier ingress completed.
-- **Worker Mailbox & Input Assembly**: `WorkerMailbox` buffers inbound tensor frames by step. `LocalInputPrepareRuntime` and `AssemblyRouteResolver` use `CompiledAssemblePlan` to unpack, de-duplicate/gather, slice, sort, and concatenate shards into contiguous tensors.
+- **Operator Mailbox & Input Assembly**: Built on the unified `OperatorMailbox` abstraction, separating `DirectLocalMailbox` (zero-lock fast-path for `local_only` edges) from `DelegatedWorkerMailbox` (delegates distributed ingress and `StepBarrier` synchronization to `WorkerMailbox`). `LocalInputPrepareRuntime` and `AssemblyRouteResolver` use `CompiledAssemblePlan` to unpack, de-duplicate/gather, slice, sort, and concatenate shards into contiguous tensors.
 - **Operator Management & Dispatch**: `OperatorManager` and `ExecutionDispatcher` manage operator instances, lifecycle hooks, and dependency route resolution.
 - **Execution Lanes**: `UserCallableExecutor` runs in-process operators on `UserCallableLane`. For operators requiring process isolation (such as `BaseReader` and `GrainReader`), `WorkerProcessCallRuntime` coordinates subprocess worker execution.
 - **Local Checkpoint Persistence**: `WorkerCheckpointCoordinator` and `CheckpointActivity` persist local component state to storage while holding execution gates closed at the checkpoint cut.
@@ -206,7 +216,7 @@ flowchart TB
 - **Outbound Data Plane**: `LocalWorkerDataPlane` and `BatchingDataPlaneExecutor` coalesce outbound frames into batches for efficient transport.
 - **MESI Cache Coherence Subsystem**:
   - `CoherenceDirectory`: Endpoint-local MESI directory maintaining entry states (`Modified`, `Exclusive`, `Shared`, `Invalid`).
-  - `CoherenceSequencer`: Enforces epoch admission and intent ordering, granting `ConsumerLease` reservations.
+  - `CoherenceSequencer`: Controls per-subject epoch admission and intent ordering, strictly decoupling the delivery pipeline from underlying buffer retirement, and orchestrating concurrent consumer leases (`ConsumerLease`) with fine-grained ticket IDs.
   - `CoherenceAdmissionRuntime` & `CoherenceBatchRetireRuntime`: Provides atomic admission for multi-target publications, concurrent destination enqueue, and child delivery receipt aggregation.
   - `ParentGrantReturnRuntime`: Returns input grants to upstream producers upon retirement.
 - **Routing & Sharding Plans**: `CompiledSendPlan`, `CompiledAssemblePlan`, and `CompiledTensorRoute` lower logical sharding specs: Dense (regular slicing), Sparse (hash/MoE routing), Replicated (broadcast), and Unit routing.

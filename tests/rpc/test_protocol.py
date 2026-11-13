@@ -1,5 +1,8 @@
 import numpy as np
+import asyncio
 import pytest
+import ray
+import threading
 
 from fluxway.common.tensor_backend import ensure_cpu_serializable
 from fluxway.rpc.protocol import (
@@ -7,6 +10,7 @@ from fluxway.rpc.protocol import (
     DataPlaneRegistry,
     PayloadDeviceClass,
     RayActorDataPlane,
+    _await_ray_object_ref,
     TransportFrameEnvelope,
     payload_device_class,
     validate_payload_iov_device_class,
@@ -135,20 +139,21 @@ def test_ensure_cpu_serializable():
 
 
 @pytest.mark.asyncio
-async def test_ray_actor_data_plane_sends_header_and_payload_buffers():
+async def test_ray_actor_data_plane_sends_header_and_payload_buffers(monkeypatch):
     class RemoteMethod:
         def __init__(self):
             self.args = None
 
-        async def remote(self, *args):
+        def remote(self, *args):
             self.args = args
-            return True
+            return ray.ObjectRef.from_random()
 
     class MockHandle:
         def __init__(self):
             self.receive_transport_frames = RemoteMethod()
 
     handle = MockHandle()
+    monkeypatch.setattr(ray, ray.get.__name__, lambda ref: True)
     adapter = RayActorDataPlane(handle, sender_spmd_code=7)
     ids = np.array([2**40], dtype=np.uint64)
     emb = np.arange(4, dtype=np.float32)
@@ -306,3 +311,100 @@ async def test_axon_data_plane_rejects_payload_before_invoking_handle():
             )
         )
     assert handle.called is False
+
+
+@pytest.mark.asyncio
+async def test_ray_object_ref_wait_runs_off_owner_loop(monkeypatch):
+    owner_thread = threading.get_ident()
+    get_threads: list[int] = []
+
+    def fake_get(ref):
+        assert isinstance(ref, ray.ObjectRef)
+        get_threads.append(threading.get_ident())
+        return True
+
+    monkeypatch.setattr(ray, ray.get.__name__, fake_get)
+    assert await _await_ray_object_ref(ray.ObjectRef.from_random()) is True
+    assert get_threads[0] != owner_thread
+
+
+@pytest.mark.asyncio
+async def test_ray_actor_data_plane_receive_control_awaits_object_ref(monkeypatch):
+    result = {"accepted": True}
+
+    class RemoteMethod:
+        def remote(self, *args):
+            assert args == ("update", 3, ["weight"], [result])
+            return ray.ObjectRef.from_random()
+
+    class MockHandle:
+        receive_control = RemoteMethod()
+
+    monkeypatch.setattr(ray, ray.get.__name__, lambda ref: result)
+    adapter = RayActorDataPlane(MockHandle(), sender_spmd_code=0)
+
+    assert await adapter.receive_control("update", 3, ["weight"], [result]) is result
+
+
+@pytest.mark.asyncio
+async def test_ray_actor_data_plane_receive_control_propagates_ray_failure(monkeypatch):
+    failure = RuntimeError("control RPC failed")
+
+    class RemoteMethod:
+        def remote(self, *_args):
+            return ray.ObjectRef.from_random()
+
+    class MockHandle:
+        receive_control = RemoteMethod()
+
+    def fail_get(_ref):
+        raise failure
+
+    monkeypatch.setattr(ray, ray.get.__name__, fail_get)
+    adapter = RayActorDataPlane(MockHandle(), sender_spmd_code=0)
+
+    with pytest.raises(RuntimeError) as error:
+        await adapter.receive_control("update", 3, [], [])
+
+    assert error.value is failure
+
+
+@pytest.mark.asyncio
+async def test_ray_actor_data_plane_receive_control_cancellation_cancels_object_ref(
+    monkeypatch,
+):
+    wait_started = threading.Event()
+    release_wait = threading.Event()
+    ref = ray.ObjectRef.from_random()
+    cancelled_refs = []
+
+    class RemoteMethod:
+        def remote(self, *_args):
+            return ref
+
+    class MockHandle:
+        receive_control = RemoteMethod()
+
+    def blocking_get(received_ref):
+        assert received_ref is ref
+        wait_started.set()
+        assert release_wait.wait(timeout=5)
+        return True
+
+    monkeypatch.setattr(ray, ray.get.__name__, blocking_get)
+    monkeypatch.setattr(
+        ray,
+        ray.cancel.__name__,
+        lambda received_ref, force: cancelled_refs.append((received_ref, force)),
+    )
+    adapter = RayActorDataPlane(MockHandle(), sender_spmd_code=0)
+    task = asyncio.create_task(adapter.receive_control("update", 3, [], []))
+
+    try:
+        assert await asyncio.to_thread(wait_started.wait, 2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
+        assert cancelled_refs == [(ref, False)]
+    finally:
+        release_wait.set()

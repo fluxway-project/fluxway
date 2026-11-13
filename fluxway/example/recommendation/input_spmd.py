@@ -135,7 +135,6 @@ async def _sparse_unique(
     rank: int,
     world_size: int,
     group_name: str,
-    ctx: Any,
 ) -> tuple[TransportTensor, TransportTensor]:
     """Deduplicate ids via sparse_embedding.async_unique (C++ high-perf).
 
@@ -201,8 +200,7 @@ async def _sparse_unique(
         )
 
     original_ids = ids_np.ravel()
-    return await ctx.run_in_lane(
-        _materialize_sparse_unique_tensors,
+    return _materialize_sparse_unique_tensors(
         unique_raw,
         inv_raw,
         first_raw,
@@ -211,7 +209,6 @@ async def _sparse_unique(
         nested_splits,
         np.asarray(source_origins, dtype=np.int64),
         group_name,
-        lane="compute",
     )
 
 
@@ -276,14 +273,12 @@ class InputSPMD:
             rank=self.rank,
             world_size=self.world_size,
             group_name="user",
-            ctx=self.ctx,
         )
         item_task = _sparse_unique(
             data.passive.target_target_id,
             rank=self.rank,
             world_size=self.world_size,
             group_name="item",
-            ctx=self.ctx,
         )
 
         with fw.profiler.scope(

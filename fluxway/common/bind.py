@@ -91,6 +91,7 @@ def bind_spmd(
     heartbeat_interval_s: float = 5.0,
     execution_progress_warning_s: float = 90.0,
     heartbeat_timeout_s: float = 90.0,
+    max_rank_step_skew: int = 0,
     **operator_configs: dict[str, Any],
 ) -> type:
     dynamic_cls = type(
@@ -137,6 +138,7 @@ def bind_spmd(
             resource_profile=resource_profile,
             mesh_axis_names=mesh_axis_names,
             mesh_axis_shapes=mesh_axis_shapes,
+            max_rank_step_skew=max_rank_step_skew,
             interleaved=interleaved,
             interleave_unit_size=interleave_unit_size,
             source=source_descriptor,
@@ -152,6 +154,7 @@ def bind_spmd(
             resource_profile=resource_profile,
             mesh_axis_names=mesh_axis_names,
             mesh_axis_shapes=mesh_axis_shapes,
+            max_rank_step_skew=max_rank_step_skew,
             runtime_env=runtime_env,
             driver_runtime_env=driver_runtime_env,
             checkpoint_components=checkpoint_components,
