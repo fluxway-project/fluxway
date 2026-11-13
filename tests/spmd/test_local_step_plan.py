@@ -73,13 +73,14 @@ async def test_execution_uses_construction_time_plan_validation(monkeypatch):
 
     monkeypatch.setattr(LocalStepPlan, "validate", count_validation)
     plan = LocalStepPlan.single_call("op")
-    assert validation_count == 1
+    initial_validations = validation_count
+    assert initial_validations == 1
 
     executor = _make_executor()
     result = await executor.execute(plan, MappingCallableRegistry({"op": lambda: 7}))
 
     assert result == 7
-    assert validation_count == 1
+    assert validation_count == initial_validations
 
 
 @pytest.mark.asyncio

@@ -139,9 +139,6 @@ class _TicketPhase(StrEnum):
     ABORTED = "aborted"
 
 
-_TicketState = _TicketPhase
-
-
 class ConsumerLease:
     __slots__ = (
         "_bindings",

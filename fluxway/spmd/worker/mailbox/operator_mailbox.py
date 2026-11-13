@@ -36,17 +36,17 @@ class OperatorMailbox(ABC):
     @abstractmethod
     def is_direct_fast_path(self) -> bool:
         """Whether this mailbox uses the zero-lock direct local input fast-path."""
-        ...
+        pass
 
     @abstractmethod
     def is_ready(self, step: int) -> bool:
         """Check if inputs for the specified step are fully assembled/ready."""
-        ...
+        pass
 
     @abstractmethod
     async def clear_step(self, step: int) -> None:
         """Release and clean up input slots and state for the completed step."""
-        ...
+        pass
 
     @abstractmethod
     async def deposit_local_tensor(
@@ -59,7 +59,7 @@ class OperatorMailbox(ABC):
         tensor: TransportTensor,
     ) -> None:
         """Deposit a local tensor into this operator mailbox."""
-        ...
+        pass
 
 
 class DirectLocalMailbox(OperatorMailbox):

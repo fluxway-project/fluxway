@@ -506,7 +506,7 @@ async def test_local_only_deposit_records_worker_local_delivery_span(tmp_path):
             dependency_decisions=None,
         )
     )
-    await task1
+    assert await task1 is None
     assert task1.done()
 
     lease0.release()

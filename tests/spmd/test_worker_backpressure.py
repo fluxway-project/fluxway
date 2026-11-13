@@ -420,9 +420,10 @@ async def test_delivery_cancel_matching_waits_for_capacity_release():
         started.append(name)
         return name
 
-    _task = await worker._delivery_runtime.submit(
+    target_task = await worker._delivery_runtime.submit(
         delivery("target"), schedule_key=(0, 0, 0, "target_op")
     )
+    assert not target_task.done()
     assert worker._delivery_runtime._capacity._active == 1
 
     await worker._delivery_runtime.cancel_matching(

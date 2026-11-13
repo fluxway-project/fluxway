@@ -423,8 +423,8 @@ async def test_ambiguous_tickets_without_ticket_id_raises_error():
     lease1.release()
 
     sequencer.close_intent(inst)
-    await t1
-    await t2
+    assert await t1 == "result_payload_1"
+    assert await t2 == "result_payload_2"
 
 
 def test_fsm_state_setter_enforces_transition_rules():

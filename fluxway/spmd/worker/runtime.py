@@ -655,7 +655,7 @@ class OutboundDeliveryRuntime:
     ) -> asyncio.Task:
         original_coro = awaitable
         coro: Coroutine[Any, Any, Any] | None = None
-        registered = False
+        task: asyncio.Task | None = None
         # The submitter owns release until registration transfers it to the task.
         capacity_owned = False
         started = [False]
@@ -695,22 +695,18 @@ class OutboundDeliveryRuntime:
                     task = self._register_delivery_task(
                         coro, schedule_key, started, original_coro
                     )
-                    registered = True
-                    capacity_owned = False
             else:
                 task = self._register_delivery_task(
                     coro, schedule_key, started, original_coro
                 )
-                registered = True
-                capacity_owned = False
             return task
         except BaseException:
-            if not registered:
+            if task is None:
                 if coro is not None:
                     coro.close()
                 original_coro.close()
-            if capacity_owned:
-                await asyncio.shield(self._capacity.release())
+                if capacity_owned:
+                    await asyncio.shield(self._capacity.release())
             raise
 
     def _schedule_capacity_release(self) -> asyncio.Task[None]:
