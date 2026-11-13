@@ -88,7 +88,7 @@ flowchart TB
         DR_Driver["SPMDDriver (Ray Actor)<br/>(Mesh Supervisor & Admission Coordinator)"]
         DR_FSM["DriverStateMachine (FSM)<br/>& BoundedEffectScheduler"]
         DR_Exec["RayWorkerExecutor<br/>& DriverComponentRegistry (Worker Supervision)"]
-        DR_Credit["CreditManager (CreditWindow/Edges)<br/>& SPMDSynchronizer (MaxSkewSyncPolicy)"]
+        DR_Credit["CreditManager (CreditWindow/Edges)<br/>& SPMDSynchronizer (MaxRankStepSkewSyncPolicy)"]
         DR_Mon["SnapshotOrchestrator, SPMDMonitor<br/>& HeartbeatManager (Readiness Aggregator)"]
         
         DR_Driver --- DR_FSM
@@ -184,7 +184,17 @@ flowchart TB
 - **Driver State Machine**: `DriverStateMachine` (`DriverFSM`) processes local mesh state transitions, scheduling effects via `BoundedLifecycleEffectScheduler`.
 - **Worker Supervision**: `RayWorkerExecutor` and `DriverComponentRegistry` install graph projections on worker actors and forward control admissions.
 - **Credit & Flow Control**: `CreditManager` tracks inter-stage dependency buffers (`CreditWindow`, `CreditEdge`, `UpstreamCreditState`) to prevent buffer bloat.
-- **Step Synchronization**: `SPMDSynchronizer` enforces step progression policies such as `MaxSkewSyncPolicy` to prevent stragglers across parallel stages.
+- **Step Synchronization**: `SPMDSynchronizer` coordinates intra-SPMD step progression via `MaxRankStepSkewSyncPolicy`. Configured via `SPMDConfig.max_rank_step_skew`, it bounds the maximum difference in completed steps between the fastest and slowest ranks in a mesh: `0` enforces strict lockstep synchronization, while `N > 0` allows leading ranks to complete at most `N` additional steps before admission is gated. This rank-level synchronization bound operates independently of operator pipeline depths and inter-SPMD credit flow control. It can be declared statically via `@spmd(max_rank_step_skew=...)` or configured dynamically via `bind_spmd(..., max_rank_step_skew=...)`. Each SPMD configures its synchronization policy independently:
+
+  ```python
+  @spmd(max_rank_step_skew=0)  # RecsysBackboneTrain: collective lockstep
+  class RecsysBackboneTrain:
+      ...
+
+  @spmd(max_rank_step_skew=2)  # Input: bounded rank look-ahead
+  class Input:
+      ...
+  ```
 - **Snapshot & Health Monitoring**: `SnapshotOrchestrator` coordinates local worker state snapshots during checkpoints, while `SPMDMonitor` and `HeartbeatManager` aggregate worker health and execution metrics.
 
 #### 3. Worker / execution plane (`fluxway.spmd.worker`)

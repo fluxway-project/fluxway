@@ -80,7 +80,7 @@ flowchart TB
         DR_Driver["SPMDDriver (Ray 角色)<br/>(SPMD 网格监督者与准入协调中心)"]
         DR_FSM["DriverStateMachine (状态机)<br/>与 BoundedEffectScheduler"]
         DR_Exec["RayWorkerExecutor<br/>与 DriverComponentRegistry (工作进程执行代理)"]
-        DR_Credit["CreditManager (信用窗口/边)<br/>与 SPMDSynchronizer (MaxSkewSyncPolicy 最大偏斜同步)"]
+        DR_Credit["CreditManager (信用窗口/边)<br/>与 SPMDSynchronizer (MaxRankStepSkewSyncPolicy 步进防倾斜同步)"]
         DR_Mon["SnapshotOrchestrator、SPMDMonitor<br/>与 HeartbeatManager (快照编排与就绪/状态聚合)"]
         
         DR_Driver --- DR_FSM
@@ -176,7 +176,17 @@ flowchart TB
 - **驱动器状态机**：`DriverStateMachine` (`DriverFSM`) 负责本地网格状态转移，通过 `BoundedLifecycleEffectScheduler` 调度执行副作用。
 - **工作进程代理执行**：`RayWorkerExecutor` 与 `DriverComponentRegistry` 向工作进程下发计算图投影并转发控制准入。
 - **流控信用管理**：`CreditManager` 跟踪跨阶段依赖缓冲区（`CreditWindow`、`CreditEdge`、`UpstreamCreditState`），防止缓冲区无限膨胀。
-- **步进同步与防倾斜**：`SPMDSynchronizer` 执行步进推进策略（如 `MaxSkewSyncPolicy`），防止并行阶段间产生严重长尾和步进倾斜。
+- **步进同步与防倾斜**：`SPMDSynchronizer` 基于 `MaxRankStepSkewSyncPolicy` 协调网格内部各 rank 的步进推进。通过 `SPMDConfig.max_rank_step_skew` 约束最快与最慢 rank 之间已完成步数的最大差值：`0` 表示严格步进锁定（Lockstep），`N > 0` 则允许领先 rank 最多超前完成 `N` 步，超出后暂停准入调度。该 rank 级防倾斜同步约束完全独立于算子流水线深度与跨 SPMD 信用窗口。支持通过 `@spmd(max_rank_step_skew=...)` 静态声明，或通过 `bind_spmd(..., max_rank_step_skew=...)` 动态配置：
+
+  ```python
+  @spmd(max_rank_step_skew=0)  # RecsysBackboneTrain：集合通信严格同步
+  class RecsysBackboneTrain:
+      ...
+
+  @spmd(max_rank_step_skew=2)  # Input：允许有限步数超前
+  class Input:
+      ...
+  ```
 - **局部快照与监控聚合**：`SnapshotOrchestrator` 在检查点期间编排本地工作进程状态快照，`SPMDMonitor` 与 `HeartbeatManager` 聚合工作进程健康与遥测指标。
 
 #### 3. 工作进程/执行平面 (`fluxway.spmd.worker`)

@@ -858,6 +858,7 @@ def spmd(
     heartbeat_interval_s: float = 5.0,
     execution_progress_warning_s: float = 90.0,
     heartbeat_timeout_s: float = 90.0,
+    max_rank_step_skew: int = 0,
 ):
     """
     Configure a class for SPMD distributed execution.
@@ -874,6 +875,8 @@ def spmd(
                             specific resources (rare).
         mesh_axis_names: Axis names for the execution mesh.
         mesh_axis_shapes: Shape of the execution mesh.
+        max_rank_step_skew: Maximum completed-step difference between ranks in
+                            this SPMD. Zero enforces lockstep.
     """
     from fluxway.resources import ResourceProfile
     from fluxway.common.mesh import DeviceMesh
@@ -915,6 +918,7 @@ def spmd(
         cls._mesh = mesh  # type: ignore
         cls._runtime_env = runtime_env  # type: ignore
         cls._driver_runtime_env = driver_runtime_env  # type: ignore
+        cls._max_rank_step_skew = max_rank_step_skew  # type: ignore
         cls._checkpoint_components = checkpoint_components  # type: ignore
 
         cls.get_resource_profile = classmethod(lambda c: c._resource_profile)  # type: ignore
@@ -988,6 +992,7 @@ def spmd(
             return SPMDConfig(
                 mesh=c._mesh,
                 operator_specs=operator_specs,
+                max_rank_step_skew=c._max_rank_step_skew,
                 runtime_env=c._runtime_env,
                 driver_runtime_env=c._driver_runtime_env,
                 checkpoint_components=c._checkpoint_components,
@@ -1016,6 +1021,7 @@ def spmd_source(
     heartbeat_interval_s: float = 5.0,
     execution_progress_warning_s: float = 90.0,
     heartbeat_timeout_s: float = 90.0,
+    max_rank_step_skew: int = 0,
 ):
     """
     Configure a class as an SPMD source.
@@ -1025,6 +1031,7 @@ def spmd_source(
         resource_profile=resource_profile,
         mesh_axis_names=mesh_axis_names,
         mesh_axis_shapes=mesh_axis_shapes,
+        max_rank_step_skew=max_rank_step_skew,
         runtime_env=runtime_env,
         driver_runtime_env=driver_runtime_env,
         checkpoint_components=checkpoint_components,
