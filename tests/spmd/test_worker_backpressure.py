@@ -166,7 +166,7 @@ async def test_delivery_waiter_cancellation_does_not_consume_capacity():
 
     waiting_submit.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await waiting_submit
+        await asyncio.wait_for(waiting_submit, timeout=5)
 
     release_first.set()
     assert await first == "first"
@@ -217,7 +217,7 @@ async def test_delivery_registration_cancellation_releases_acquired_capacity(
     await registration_entered.wait()
     submit.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await submit
+        await asyncio.wait_for(submit, timeout=5)
 
     assert inspect.getcoroutinestate(cancelled_delivery) == inspect.CORO_CLOSED
     monkeypatch.setattr(recorder, "delivery_register_token", original_register_token)
@@ -275,7 +275,7 @@ async def test_delivery_cancel_before_first_run_releases_capacity():
     )
     cancelled.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await cancelled
+        await asyncio.wait_for(cancelled, timeout=5)
 
     recovered = await worker._delivery_runtime.submit(
         delivery("recovered"), schedule_key=(0, 0, 1, "op")
@@ -310,11 +310,11 @@ async def test_delivery_waiters_preserve_schedule_priority():
     assert not low_submit.done()
     assert not high_submit.done()
     release_first.set()
-    await first
+    assert await first == "first"
     high = await high_submit
     low = await low_submit
-    await high
-    await low
+    assert await high == "high"
+    assert await low == "low"
     assert started == ["first", "high", "low"]
 
 
@@ -355,7 +355,7 @@ async def test_delivery_profiler_failure_before_first_run_releases_capacity(
             delivery("failed"), schedule_key=(0, 0, 0, "op")
         )
         with pytest.raises(RuntimeError, match="profiler intern failure"):
-            await task
+            await asyncio.wait_for(task, timeout=5)
 
     while worker._delivery_runtime._capacity_release_tasks:
         await asyncio.sleep(0)

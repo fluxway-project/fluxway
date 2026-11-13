@@ -2485,7 +2485,7 @@ class SPMDWorker:
             return
         try:
             self._enqueue_prepare_ready_refresh(op_name, step)
-        except BaseException as error:
+        except Exception as error:
             self._record_failure(
                 error,
                 phase="BACKGROUND",

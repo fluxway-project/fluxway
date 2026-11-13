@@ -404,7 +404,7 @@ async def test_ray_actor_data_plane_receive_control_cancellation_cancels_object_
         assert await asyncio.to_thread(wait_started.wait, 2)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await task
+            await asyncio.wait_for(task, timeout=5)
         assert cancelled_refs == [(ref, False)]
     finally:
         release_wait.set()
