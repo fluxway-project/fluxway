@@ -3,6 +3,7 @@ import unittest
 from fluxway import OperatorSpec
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.operator_instances import OperatorInstanceContainer
+from fluxway.common.operator_spec import OperatorExecutionTrait
 from fluxway.common.types.tensor import TransportTensor
 from fluxway.spmd.worker.operator_manager import OperatorManager
 from tests.compiled_graph_fixtures import single_spmd_config
@@ -21,6 +22,11 @@ def _operator_config(name: str):
         name=name,
         owner=DummyNode,
         output_sharding={"out1": {"type": "static", "axis": []}},
+        execution_trait=(
+            OperatorExecutionTrait.ASYNC_COROUTINE
+            if name == "async_step"
+            else OperatorExecutionTrait.SYNC_COMPUTE
+        ),
     )
     return single_spmd_config(
         name="operator-injection",

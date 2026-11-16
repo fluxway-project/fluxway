@@ -204,6 +204,83 @@ or failed recycler raises or fences the lifetime. `AllocationRegistry` tracks
 identity and exact handoff; it cannot release a buffer by advancing a watermark.
 Same-worker aliases retain their `ConsumerLease` until reading finishes.
 
+## Operator Mailbox and Direct Local Fast-Path
+
+The worker runtime maintains an explicit `OperatorMailbox` abstraction for each operator, cleanly separating distributed network ingress from intra-worker local fast paths:
+
+1. **Direct Local Mailbox (`DirectLocalMailbox`)**:
+   - For operators whose inbound edges are compiled with `local_only=True`, the mailbox completely bypasses global worker locks and asynchronous event queues.
+   - The upstream producer calls `deposit()` to place tensors directly into the step slot `DirectLocalInputSlot`.
+   - As soon as all required transfer codes (`expected_transfer_codes`) arrive for a given step, it immediately fires the `on_step_ready` callback to trigger operator dispatch.
+   - Upon completion of the operator step, slots are reclaimed immediately via `clear_step_sync()` or `clear_step()`.
+2. **Delegated Worker Mailbox (`DelegatedWorkerMailbox`)**:
+   - For inter-rank, inter-process, or remote transports, requests are delegated to the shared `WorkerMailbox`.
+   - Coordinates global `StepBarrier` barriers and dependency condition adjudication (`CompiledDependencyCondition`).
+
+```mermaid
+flowchart TD
+    Inbound["Inbound Tensor"] --> Branch{"Routing Topology"}
+    Branch -->|Intra-worker (local_only=True)| FastPath["DirectLocalMailbox (Zero-Lock Fast-Path)"]
+    Branch -->|Cross-Worker / Distributed| DistPath["DelegatedWorkerMailbox -> WorkerMailbox"]
+
+    subgraph DirectLocal["DirectLocalMailbox Fast-Path"]
+        FastPath --> Deposit["deposit() writes directly to DirectLocalInputSlot"]
+        Deposit --> CheckReady{"Are all expected_transfer_codes present?"}
+        CheckReady -->|Yes| TriggerReady["Invoke on_step_ready callback"]
+        CheckReady -->|No| WaitSlots["Hold slot, await remaining transfer codes"]
+        TriggerReady --> Assemble["Assemble inputs via get_step_slots()"]
+        Assemble --> Compute["Execute operator computation"]
+        Compute --> ClearStep["Reclaim slots via clear_step_sync()"]
+    end
+
+    subgraph Distributed["Distributed Delegated Path"]
+        DistPath --> IngressQueue["Async ingress queue & frame admission"]
+        IngressQueue --> StepBarrier["StepBarrier synchronization & dependency checks"]
+        StepBarrier --> DistAssemble["Assemble inputs & dispatch execution"]
+    end
+```
+
+The following example demonstrates direct local mailbox deposit, ready detection, and step clearance:
+
+```python
+import numpy as np
+from fluxway.common.types.tensor import TransportTensor
+from fluxway.spmd.worker.mailbox import (
+    DirectLocalMailbox,
+    create_operator_mailbox,
+)
+
+ready_records = []
+
+mailbox = create_operator_mailbox(
+    "dense_mlp",
+    expected_direct_transfer_codes={101, 102},
+    on_step_ready=lambda op, step: ready_records.append((op, step)),
+    worker_mailbox=None,
+)
+assert mailbox.is_direct_fast_path
+
+# Deposit local tensors directly without locks
+t1 = TransportTensor(np.array([1, 2, 3]))
+mailbox.deposit(transfer_code=101, step=0, sender_id="worker_0", rank=0, tensor=t1)
+assert not mailbox.is_ready(0)
+
+# Once all transfer codes arrive, the step becomes ready
+t2 = TransportTensor(np.array([4, 5, 6]))
+mailbox.deposit(transfer_code=102, step=0, sender_id="worker_0", rank=0, tensor=t2)
+assert mailbox.is_ready(0)
+assert ready_records == [("dense_mlp", 0)]
+
+# Input assembly reads slots, and worker reclaims slots after compute
+assert isinstance(mailbox, DirectLocalMailbox)
+slots = mailbox.get_step_slots(0)
+assert slots[101].tensor is t1
+assert slots[102].tensor is t2
+
+mailbox.clear_step_sync(0)
+assert not mailbox.is_ready(0)
+```
+
 ## Source acquisition and backpressure
 
 For controlled sources, the Worker indexes planned segments by step and

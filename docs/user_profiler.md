@@ -107,7 +107,7 @@ requirements. This function starts the job; it is not a local recording example.
 from pathlib import Path
 
 from fluxway import Graph, PlacementRecipe, start
-from fluxway.profiler import ProfilerConfig
+from fluxway.profiler import ProfilerConfig, ProfilerLevel
 
 
 async def profile_job(
@@ -116,6 +116,7 @@ async def profile_job(
     trace_directory: str | Path,
     run_id: str,
     *,
+    level: ProfilerLevel = ProfilerLevel.STANDARD,
     skip_initial_steps: int = 0,
     step_interval: int = 1,
     target_steps: tuple[int, ...] | None = None,
@@ -125,6 +126,7 @@ async def profile_job(
     config = ProfilerConfig(
         trace_dir=str(trace_directory),
         run_id=run_id,
+        level=level,
         skip_initial_steps=skip_initial_steps,
         step_interval=step_interval,
         target_steps=target_steps,
@@ -139,6 +141,15 @@ async def profile_job(
     assert config.output_path.is_file()
     return config.output_path
 ```
+
+Profiler collection has four levels. `standard` is the default and keeps
+algorithm-facing prepare, local-plan, operator, and high-level transport
+timings. `summary` keeps only the highest-level records. `detailed` adds
+runtime queue/future, delivery, and mailbox internals. Callable thread execution
+remains in `standard`; `debug` adds scheduler, heartbeat,
+FSM, and admission decisions. Disabled levels are filtered before event
+registration and trace-buffer writes. Heartbeat diagnostics remain separately
+opt-in through `ProfilerDiagnostic.HEARTBEAT`.
 
 The controller collects worker snapshots and writes the trace during completion.
 By default, the result is `trace_directory/run_id/trace.pftrace`; `output_file`

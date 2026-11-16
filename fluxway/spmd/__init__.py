@@ -8,7 +8,7 @@ from .driver import (
     SPMDDriver,
     SPMDSynchronizer,
     SyncPolicy,
-    MaxSkewSyncPolicy,
+    MaxRankStepSkewSyncPolicy,
     SPMDMonitor,
 )
 from .worker import SPMDWorker
@@ -18,7 +18,7 @@ __all__ = [
     "SPMDMonitor",
     "SPMDSynchronizer",
     "SyncPolicy",
-    "MaxSkewSyncPolicy",
+    "MaxRankStepSkewSyncPolicy",
     "SPMDWorker",
     "ensure_logging_configured",
 ]

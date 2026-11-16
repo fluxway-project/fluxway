@@ -2,7 +2,7 @@
 Tests for intra-SPMD and inter-SPMD asynchronous execution mechanisms.
 
 These tests verify:
-1. max_worker_step_skew: Limits step difference between workers in the same SPMD.
+1. max_rank_step_skew: Limits completed-step difference between ranks in one SPMD.
 2. max_inflight_steps: Limits step difference between connected SPMDs in the graph.
 """
 
@@ -12,7 +12,10 @@ from unittest.mock import MagicMock
 import pytest
 
 from fluxway.control_plane.flow_control.manager import FlowControlManager
-from fluxway.spmd.driver.synchronizer import SPMDSynchronizer, MaxSkewSyncPolicy
+from fluxway.spmd.driver.synchronizer import (
+    MaxRankStepSkewSyncPolicy,
+    SPMDSynchronizer,
+)
 from fluxway.spmd.driver.driver import SPMDDriver
 from fluxway.spmd.driver.credit import (
     CreditEdge,
@@ -103,14 +106,14 @@ def _planned_graph(
 
 def test_worker_sync_skew_limit():
     """
-    Verify that SPMDSynchronizer blocks workers that exceed max_worker_step_skew.
+    Verify that SPMDSynchronizer blocks ranks that exceed max_rank_step_skew.
     """
     num_workers = 3
     max_diff = 2
     sync = SPMDSynchronizer(
         spmd_id="test_spmd",
         num_workers=num_workers,
-        sync_policy=MaxSkewSyncPolicy(max_diff),
+        sync_policy=MaxRankStepSkewSyncPolicy(max_diff),
     )
 
     blocked_workers: set[int] = set()
@@ -175,7 +178,7 @@ def test_worker_sync_skew_limit():
 def test_worker_sync_controller_lock():
     """Verify that controller-requested locks work alongside drift locks."""
     sync = SPMDSynchronizer(
-        spmd_id="test_spmd", num_workers=2, sync_policy=MaxSkewSyncPolicy(10)
+        spmd_id="test_spmd", num_workers=2, sync_policy=MaxRankStepSkewSyncPolicy(10)
     )
 
     blocked = []
@@ -189,7 +192,7 @@ def test_worker_sync_controller_lock():
 
 def test_worker_sync_op_runnable_epochs_are_monotonic_per_worker_op():
     sync = SPMDSynchronizer(
-        spmd_id="test_spmd", num_workers=2, sync_policy=MaxSkewSyncPolicy(0)
+        spmd_id="test_spmd", num_workers=2, sync_policy=MaxRankStepSkewSyncPolicy(0)
     )
     events = []
     sync.set_callbacks(
@@ -208,6 +211,44 @@ def test_worker_sync_op_runnable_epochs_are_monotonic_per_worker_op():
     for epochs in epochs_by_worker.values():
         assert epochs == sorted(epochs)
         assert len(epochs) == len(set(epochs))
+
+
+def test_max_rank_step_skew_sync_policy_invariants():
+    policy = MaxRankStepSkewSyncPolicy()
+    assert policy.max_rank_step_skew == 0
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        MaxRankStepSkewSyncPolicy(-1)
+    with pytest.raises(ValueError, match="non-negative integer"):
+        MaxRankStepSkewSyncPolicy(True)
+    with pytest.raises(ValueError, match="non-negative integer"):
+        MaxRankStepSkewSyncPolicy(1.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="non-negative integer"):
+        MaxRankStepSkewSyncPolicy("0")  # type: ignore[arg-type]
+
+    steps = {0: {"train": 1}, 1: {"train": 0}}
+    assert (
+        policy.evaluate(
+            steps,
+            num_workers=2,
+            rank=0,
+            op_name="train",
+            max_step=1,
+            min_step=0,
+        )
+        is True
+    )
+    assert (
+        policy.evaluate(
+            steps,
+            num_workers=2,
+            rank=1,
+            op_name="train",
+            max_step=1,
+            min_step=0,
+        )
+        is False
+    )
 
 
 # =============================================================================
@@ -545,11 +586,13 @@ def test_async_manager_reports_all_completed_at_max_steps():
 class TestResumeSkewRecheck:
     """Prove root cause and fix: stale policy locks after snapshot resume."""
 
-    def _make_sync(self, max_skew: int = 1, num_workers: int = 2):
+    def _make_sync(self, max_rank_step_skew: int = 1, num_workers: int = 2):
         sync = SPMDSynchronizer(
             "EmbeddingTable2",
             num_workers=num_workers,
-            sync_policy=MaxSkewSyncPolicy(max_skew=max_skew),
+            sync_policy=MaxRankStepSkewSyncPolicy(
+                max_rank_step_skew=max_rank_step_skew
+            ),
         )
         blocks: list[tuple[int, str]] = []
         unblocks: list[tuple[int, str]] = []
@@ -616,5 +659,5 @@ class TestResumeSkewRecheck:
         sync.clear_drain()
 
         assert sync._worker_op_locked[0].get("lookup", False), (
-            "Genuine skew=2 > max_skew=1 must remain blocked after recheck"
+            "Genuine skew=2 > max_rank_step_skew=1 must remain blocked after recheck"
         )

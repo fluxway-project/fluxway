@@ -11,8 +11,10 @@ from fluxway.common.compiled_graph import (
     CompiledTensorTransfer,
     OperatorKey,
     OperatorPort,
+    SPMDGraphView,
     TensorTransfer,
 )
+from fluxway.common.operator_policy import AsyncPolicy
 from fluxway.common.types.sharding import PartitionSpec, ShardingSpec
 from fluxway.spmd.worker.assembly import compile_assemble_plan
 from fluxway.spmd.worker.mailbox.mailbox import WorkerMailbox
@@ -37,7 +39,7 @@ _TEST_SHARDING = ShardingSpec.chunk(PartitionSpec())
 class FakeOpManager:
     def __init__(self):
         self._operator_spec = SimpleNamespace(
-            runtime_policy=SimpleNamespace(mode="sync"),
+            runtime_policy=AsyncPolicy.sync().compile(),
             tensor_access={"value": "readonly"},
             input_param_map={"value": ("value",)},
             input_treedefs={},
@@ -162,10 +164,14 @@ def _worker(mailbox):
     worker._coherence_input_grants[("lookup", 2)] = {grant.identity: grant}
     worker._coherence_input_bindings = {}
     worker._local_input_origins = {}
-    worker._coherence_input_intents = {}
     worker._coherence_input_tensors = {}
     worker._predecessor_handlers = {}
-    worker._parent_grant_return_runtime = None
+    from fluxway.spmd.worker.coherence_runtime import ParentGrantReturnRuntime
+
+    worker._parent_grant_return_runtime = ParentGrantReturnRuntime(
+        worker._coherence_directory,
+        worker._send_parent_return_group,
+    )
     worker._coherence_directory = worker._coherence_directory
     worker._local_spmd_code = 1
     worker._allocation_registry = AllocationRegistry()
@@ -185,8 +191,9 @@ def _receive_worker(mailbox):
         worker._coherence_directory
     )
     worker._spmd_id_by_code = {0: "Input"}
-    worker._graph_view = SimpleNamespace(
-        transfer=lambda code: SimpleNamespace(logical_tuuid=code)
+    worker._graph_view = cast(
+        SPMDGraphView,
+        SimpleNamespace(transfer=lambda code: SimpleNamespace(logical_tuuid=code)),
     )
     worker._fence_state = ExecutionFenceState.OPEN
     worker._barriers_declared = {}

@@ -45,6 +45,7 @@ from fluxway.common.decorators import (
     _STATIC_CONTEXT_ATTR_NAMES,
     _validate_worker_process_marker,
 )
+from fluxway.common.canonical_lanes import compute_lane_priority
 from fluxway.common.operator_instances import OperatorInstanceContainer
 from fluxway.common.execution import compile
 from fluxway.common.compiled_graph import CompiledDependency
@@ -175,6 +176,13 @@ from fluxway.spmd.worker.assembly import (
     CompiledAssemblePlan,
     compile_assemble_plan,
 )
+from fluxway.spmd.worker.mailbox import (
+    DirectLocalInputSlot,
+    DirectLocalMailbox,
+    DelegatedWorkerMailbox,
+    OperatorMailbox,
+    create_operator_mailbox,
+)
 from fluxway.spmd.worker.local_plan import (
     LocalNodeSpec,
     LocalStepContext,
@@ -224,6 +232,7 @@ from fluxway.profiler.recorder import (
     WORKER_ASSEMBLE_SCATTER,
     WORKER_ASSEMBLE_SORT,
     WORKER_ADVANCE_STEP,
+    WORKER_ADMISSION,
     WORKER_BACKGROUND_TASK,
     WORKER_DRAIN_WAIT,
     WORKER_QUEUE_DEQUEUE,
@@ -569,12 +578,7 @@ class _PreparedTensorBinding:
     grants: tuple["_InputCoherenceGrant", ...]
 
 
-@dataclass(frozen=True)
-class _DirectLocalInputSlot:
-    tensor: TransportTensor
-    source_step: int
-    sender_id: str
-    rank: int
+_DirectLocalInputSlot = DirectLocalInputSlot
 
 
 @dataclass(frozen=True)
@@ -843,6 +847,7 @@ class SPMDWorker:
         self._operator_send_context_cache = {}
         self._local_step_plan_cache: dict[str, LocalStepPlan] = {}
         self._assemble_plan_cache: dict[tuple[str, int], CompiledAssemblePlan] = {}
+        self._operator_mailboxes: dict[str, OperatorMailbox] = {}
         self._direct_local_input_slots: dict[
             str, dict[int, dict[int, _DirectLocalInputSlot]]
         ] = {}
@@ -1168,7 +1173,7 @@ class SPMDWorker:
             raise last_err
         raise OSError(f"Failed to bind any resolved address for host {target_host!r}")
 
-    def _worker_process_call_max_workers(self) -> int:
+    def _max_operator_pipeline_depth(self) -> int:
         max_depth = 1
         for op_meta in self._operator_specs.values():
             depth = op_meta.runtime_policy.pipeline_depth
@@ -1180,24 +1185,11 @@ class SPMDWorker:
             max_depth = max(max_depth, depth)
         return max_depth
 
+    def _worker_process_call_max_workers(self) -> int:
+        return self._max_operator_pipeline_depth()
+
     def _input_prepare_max_workers(self) -> int:
-        max_depth = 1
-        for op_meta in self._operator_specs.values():
-            mode = op_meta.runtime_policy.mode
-            if mode == "sync":
-                continue
-            if mode not in ("pipelined", "bounded_stale", "pipeline_parallel"):
-                raise ValueError(
-                    f"Unsupported AsyncPolicy mode {mode!r} for op={op_meta.name}."
-                )
-            depth = op_meta.runtime_policy.pipeline_depth
-            if depth <= 0:
-                raise ValueError(
-                    f"local_pipeline_depth must be positive for op={op_meta.name}, "
-                    f"got {depth}."
-                )
-            max_depth = max(max_depth, depth)
-        return max_depth
+        return self._max_operator_pipeline_depth()
 
     async def acquire_source_operator_work(
         self, operator_name: str, step: int
@@ -2363,6 +2355,33 @@ class SPMDWorker:
         else:
             self._spawn_background_task(self._enqueue(op_name, step))
 
+    def _get_operator_mailbox(self, op_name: str) -> OperatorMailbox:
+        operator_mailboxes = getattr(self, "_operator_mailboxes", None)
+        if operator_mailboxes is None:
+            operator_mailboxes = {}
+            self._operator_mailboxes = operator_mailboxes
+        mailbox = operator_mailboxes.get(op_name)
+        if mailbox is not None:
+            return mailbox
+        slots = None
+        ready_steps = None
+        if hasattr(self, "_direct_local_input_slots"):
+            slots = self._direct_local_input_slots.setdefault(op_name, {})
+        if hasattr(self, "_direct_local_ready_steps"):
+            ready_steps = self._direct_local_ready_steps.setdefault(op_name, set())
+        mailbox = create_operator_mailbox(
+            op_name=op_name,
+            expected_direct_transfer_codes=self._direct_local_input_transfer_codes(
+                op_name
+            ),
+            on_step_ready=self._on_step_ready,
+            worker_mailbox=getattr(self, "_mailbox", None),
+            slots=slots,
+            ready_steps=ready_steps,
+        )
+        operator_mailboxes[op_name] = mailbox
+        return mailbox
+
     def _direct_local_input_transfer_codes(self, op_name: str) -> set[int]:
         expected = self.op_manager.get_expected_transfer_shards(op_name)
         if not expected or any(count != 1 for count in expected.values()):
@@ -2390,7 +2409,7 @@ class SPMDWorker:
         return direct_codes
 
     def _uses_direct_local_input_fast_path(self, op_name: str) -> bool:
-        return bool(self._direct_local_input_transfer_codes(op_name))
+        return self._get_operator_mailbox(op_name).is_direct_fast_path
 
     def _deposit_direct_local_input(
         self,
@@ -2402,12 +2421,10 @@ class SPMDWorker:
         rank: int,
         tensor: TransportTensor,
     ) -> None:
-        direct_codes = self._direct_local_input_transfer_codes(op_name)
-        if transfer_code not in direct_codes:
+        mailbox = self._get_operator_mailbox(op_name)
+        if not isinstance(mailbox, DirectLocalMailbox):
             raise ValueError(
-                "Direct local input fast path received a tensor outside the "
-                f"compiled local-only contract: op={op_name} "
-                f"transfer_code={transfer_code} expected={sorted(direct_codes)}."
+                f"Direct local deposit invoked for operator without DirectLocalMailbox: op={op_name}"
             )
         plan = self._compiled_assemble_plan(op_name, transfer_code)
         ensure_transport_source_step(
@@ -2420,39 +2437,24 @@ class SPMDWorker:
             tensor=tensor,
             exec_step=step,
         )
-        step_slots = self._direct_local_input_slots.setdefault(op_name, {}).setdefault(
-            step, {}
+        mailbox.deposit(
+            transfer_code,
+            step,
+            sender_id,
+            rank,
+            tensor,
         )
-        if transfer_code in step_slots:
-            existing = step_slots[transfer_code]
-            raise ValueError(
-                "Duplicate direct local tensor deposit: "
-                f"op={op_name} transfer_code={transfer_code} "
-                f"logical_tensor={plan.logical_tensor.name!r} "
-                f"logical_tuuid={plan.logical_tensor.logical_tuuid} step={step} "
-                f"existing={existing.sender_id}:{existing.rank} "
-                f"new={sender_id}:{rank}."
-            )
-        step_slots[transfer_code] = _DirectLocalInputSlot(
-            tensor=tensor,
-            source_step=step,
-            sender_id=sender_id,
-            rank=rank,
-        )
-        if direct_codes.issubset(step_slots.keys()):
-            self._direct_local_ready_steps.setdefault(op_name, set()).add(step)
-            self._on_step_ready(op_name, step)
 
     def _direct_local_slots_ready(self, op_name: str, step: int) -> bool:
-        direct_codes = self._direct_local_input_transfer_codes(op_name)
-        if not direct_codes:
-            return False
-        step_slots = self._direct_local_input_slots.get(op_name, {}).get(step, {})
-        return direct_codes.issubset(step_slots.keys())
+        return self._get_operator_mailbox(op_name).is_ready(step)
 
     def _clear_direct_local_step(self, op_name: str, step: int) -> None:
-        self._direct_local_input_slots.get(op_name, {}).pop(step, None)
-        self._direct_local_ready_steps.get(op_name, set()).discard(step)
+        mailbox = self._get_operator_mailbox(op_name)
+        if isinstance(mailbox, DirectLocalMailbox):
+            mailbox.clear_step_sync(step)
+        else:
+            self._direct_local_input_slots.get(op_name, {}).pop(step, None)
+            self._direct_local_ready_steps.get(op_name, set()).discard(step)
 
     def _should_start_prepare_on_ready(self, op_name: str, step: int) -> bool:
         if not self._should_prepare_inputs_on_ready(op_name):
@@ -2481,20 +2483,34 @@ class SPMDWorker:
             return
         if (op_name, step) not in self._in_op_step_queue:
             return
-        self._spawn_background_task(self._enqueue_prepare_ready_refresh(op_name, step))
+        try:
+            self._enqueue_prepare_ready_refresh(op_name, step)
+        except Exception as error:
+            self._record_failure(
+                error,
+                phase="BACKGROUND",
+                op_name=op_name,
+                step=step,
+            )
 
-    async def _enqueue_prepare_ready_refresh(self, op_name: str, step: int) -> None:
+    def _enqueue_prepare_ready_refresh(self, op_name: str, step: int) -> None:
         schedule_key = self._effective_schedule_key(op_name, step)
-        await self._put_execution_item(op_name, schedule_key)
+        self._publish_execution_item(op_name, schedule_key)
+        if self._profiler_runtime.enabled:
+            recorder = self._profiler_runtime.recorder
+            if recorder.event_enabled(WORKER_QUEUE_ENQUEUE, step=step):
+                recorder.worker_scheduler_instant(
+                    spec=WORKER_QUEUE_ENQUEUE,
+                    payload=recorder.worker_op_payload(
+                        op_name,
+                        step,
+                        schedule_key[0],
+                    ),
+                )
 
     def _should_prepare_inputs_on_ready(self, op_name: str) -> bool:
         meta = self.op_manager.get_operator_spec(op_name)
-        mode = meta.runtime_policy.mode
-        if mode == "sync":
-            return False
-        if mode in ("pipelined", "bounded_stale", "pipeline_parallel"):
-            return True
-        raise ValueError(f"Unsupported AsyncPolicy mode {mode!r} for op={op_name}.")
+        return meta.runtime_policy.is_pipelined
 
     async def _schedule_mailbox_ready_steps(self, op_name: str) -> None:
         if self.op_manager.is_periodic_trigger(op_name):
@@ -2560,10 +2576,13 @@ class SPMDWorker:
         priority_key = schedule_key[0]
         if self._profiler_runtime.enabled:
             recorder = self._profiler_runtime.recorder
-            async with recorder.worker_scheduler_span(
-                spec=WORKER_QUEUE_ENQUEUE,
-                payload=recorder.worker_op_payload(op_name, step, priority_key),
-            ):
+            if recorder.event_enabled(WORKER_QUEUE_ENQUEUE, step=step):
+                async with recorder.worker_scheduler_span(
+                    spec=WORKER_QUEUE_ENQUEUE,
+                    payload=recorder.worker_op_payload(op_name, step, priority_key),
+                ):
+                    await self._put_execution_item(op_name, schedule_key)
+            else:
                 await self._put_execution_item(op_name, schedule_key)
         else:
             await self._put_execution_item(op_name, schedule_key)
@@ -2599,12 +2618,19 @@ class SPMDWorker:
     ) -> asyncio.PriorityQueue[tuple[int, int, int, str]]:
         return self._execution_queue_for_lane(self._execution_lane_for_op(op_name))
 
+    def _publish_execution_item(
+        self,
+        op_name: str,
+        item: tuple[int, int, int, str],
+    ) -> None:
+        self._execution_queue_for_op(op_name).put_nowait(item)
+
     async def _put_execution_item(
         self,
         op_name: str,
         item: tuple[int, int, int, str],
     ) -> None:
-        await self._execution_queue_for_op(op_name).put(item)
+        self._publish_execution_item(op_name, item)
 
     def _effective_schedule_key(
         self, op_name: str, step: int
@@ -2618,6 +2644,8 @@ class SPMDWorker:
             effective_priority = base_priority
             if self._deadline_boost_active(op_name, step):
                 effective_priority += policy.boost_priority
+            if self._uses_lane_aware_phase_priority(policy):
+                effective_priority += self._lane_priority(policy, policy.lane)
             return (-effective_priority, prepare_state, step, op_name)
         if kind in ("phase_order", "phase_graph"):
             phase_order = policy.phase_ordering
@@ -2646,6 +2674,9 @@ class SPMDWorker:
             )
         if kind != "fifo":
             raise ValueError(f"Unsupported schedule policy {kind!r} for op={op_name}.")
+        if self._uses_lane_aware_phase_priority(policy):
+            lane_priority = self._lane_priority(policy, policy.lane)
+            return (-base_priority - lane_priority, prepare_state, step, op_name)
         return (-base_priority, prepare_state, step, op_name)
 
     @staticmethod
@@ -2659,17 +2690,7 @@ class SPMDWorker:
 
     @staticmethod
     def _lane_priority(policy: SchedulePolicy, lane: str | None) -> int:
-        if lane is None:
-            return 0
-        priorities = policy.lane_priorities
-        if lane in priorities:
-            return priorities[lane]
-        lane_order = policy.lane_ordering
-        if not lane_order:
-            return 0
-        if lane not in lane_order:
-            raise ValueError(f"lane {lane!r} is not in lane_order={lane_order!r}.")
-        return len(lane_order) - lane_order.index(lane) - 1
+        return compute_lane_priority(policy, lane)
 
     @staticmethod
     def _phase_priority(policy: SchedulePolicy, phase: str) -> int:
@@ -2912,7 +2933,12 @@ class SPMDWorker:
                         op_name,
                     ) == _EXECUTION_STOP_ITEM:
                         break
-                    if profiler_recorder is not None:
+                    if (
+                        profiler_recorder is not None
+                        and profiler_recorder.event_enabled(
+                            WORKER_QUEUE_DEQUEUE, step=step
+                        )
+                    ):
                         profiler_recorder.worker_scheduler_instant(
                             spec=WORKER_QUEUE_DEQUEUE,
                             payload=profiler_recorder.worker_op_payload(
@@ -2931,6 +2957,16 @@ class SPMDWorker:
                         break
 
                     decision = self._admission_state.evaluate(op_name, step)
+                    if (
+                        profiler_recorder is not None
+                        and profiler_recorder.event_enabled(WORKER_ADMISSION, step=step)
+                    ):
+                        profiler_recorder.worker_admission(
+                            op_name=op_name,
+                            step=step,
+                            action=decision.action.value,
+                            reason=decision.reason,
+                        )
                     if decision.action is not AdmissionAction.DISPATCH:
                         continue
                     self._start_local_step_plan(op_name, step)
@@ -3294,22 +3330,22 @@ class SPMDWorker:
 
     def _bounded_async_ops(self) -> tuple[str, ...]:
         metas = self._operator_specs
-        result = []
-        for name, meta in metas.items():
-            if (
-                meta.runtime_policy.mode == "bounded_stale"
-                and meta.runtime_policy.max_async_lag is not None
-            ):
-                result.append(name)
+        result = [
+            name
+            for name, meta in metas.items()
+            if meta.runtime_policy.has_bounded_staleness
+        ]
         return tuple(sorted(result))
 
     def _async_lag_limit_reached(self, op_name: str, step: int) -> bool:
         meta = self.op_manager._get_operator_spec(op_name)
-        if meta.runtime_policy.mode != "bounded_stale":
+        if not meta.runtime_policy.has_bounded_staleness:
             return False
-        max_async_lag = meta.runtime_policy.max_async_lag
-        if max_async_lag is None:
-            return False
+        max_staleness = meta.runtime_policy.max_staleness
+        if max_staleness is None:
+            raise RuntimeError(
+                f"Operator {op_name!r} has bounded staleness but max_staleness is None."
+            )
         peers = self._bounded_async_ops()
         if len(peers) < 2:
             return False
@@ -3319,7 +3355,7 @@ class SPMDWorker:
         own_completed = self._completed_step_count.get(op_name, 0)
         if own_completed <= slowest_completed:
             return False
-        return step - slowest_completed > max_async_lag
+        return step - slowest_completed > max_staleness
 
     def _phase_order_step_blocked(self, op_name: str, step: int) -> bool:
         gate = self._phase_schedule.gates.get(op_name)
@@ -4592,10 +4628,13 @@ class SPMDWorker:
         mailbox_ready_steps.difference_update(
             step for step in tuple(mailbox_ready_steps) if step >= terminal_step
         )
-        direct_mailbox_ready_steps = self._direct_local_ready_steps[op_name]
-        direct_mailbox_ready_steps.difference_update(
-            step for step in tuple(direct_mailbox_ready_steps) if step >= terminal_step
-        )
+        direct_mailbox_ready_steps = self._direct_local_ready_steps.get(op_name)
+        if direct_mailbox_ready_steps is not None:
+            direct_mailbox_ready_steps.difference_update(
+                step
+                for step in tuple(direct_mailbox_ready_steps)
+                if step >= terminal_step
+            )
         self._in_op_step_queue.difference_update(
             {
                 (queued_op, step)
@@ -4879,14 +4918,12 @@ class SPMDWorker:
         static_args = self.op_manager.get_static_args()
         input_types = self.op_manager.get_operator_input_types(op_name)
         meta, parameter_codes = self._operator_input_transfer_codes(op_name)
-        direct_codes = self._direct_local_input_transfer_codes(op_name)
-        step_slots = self._direct_local_input_slots.get(op_name, {}).get(step, {})
-        if not direct_codes.issubset(step_slots.keys()):
+        mailbox = self._get_operator_mailbox(op_name)
+        if not isinstance(mailbox, DirectLocalMailbox):
             raise ValueError(
-                "Direct local input fast path missing tensors: "
-                f"op={op_name} step={step} expected={sorted(direct_codes)} "
-                f"available={sorted(step_slots.keys())}."
+                f"Direct local assemble invoked for operator without DirectLocalMailbox: op={op_name}"
             )
+        step_slots = mailbox.get_step_slots(step)
 
         transfer_to_assembled = {
             transfer_code: slot.tensor for transfer_code, slot in step_slots.items()
@@ -6604,6 +6641,9 @@ class SPMDWorker:
         deliveries: list[asyncio.Task[Any]],
     ) -> tuple[asyncio.Task[Any], ...]:
         wrapped_results: dict[int, TransportTensor] = {}
+        profiler_recorder = (
+            self._profiler_runtime.recorder if self._profiler_runtime.enabled else None
+        )
         await self._deposit_local_only_orderings(
             send_context.compiled_plan,
             exec_step,
@@ -6651,6 +6691,8 @@ class SPMDWorker:
                     tensor_route.transfer_code,
                 )
                 output_instance = CoherenceInstance(output_subject, exec_step)
+                ticket_id = self._coherence_sequencer.allocate_ticket_id()
+                leaf_tensor._bind_coherence_ticket_id(ticket_id)
                 deposit_complete = asyncio.get_running_loop().create_future()
 
                 async def retire_local_output(
@@ -6660,6 +6702,7 @@ class SPMDWorker:
                     output_instance=output_instance,
                     tensor_route=tensor_route,
                     deposit_complete=deposit_complete,
+                    ticket_id=ticket_id,
                 ) -> None:
                     try:
                         output_entry = self._coherence_directory.admit(output_instance)
@@ -6680,11 +6723,20 @@ class SPMDWorker:
                         leaf_tensor._bind_consumer_lease_owner(
                             self._coherence_sequencer
                         )
-                        leaf_tensor._reserve_consumer_lease()
+                        leaf_tensor._reserve_consumer_lease(ticket_id=ticket_id)
                         target_op = tensor_route.target_op
-                        if self._uses_direct_local_input_fast_path(target_op):
-                            self._deposit_direct_local_input(
-                                op_name=target_op,
+                        mailbox = self._get_operator_mailbox(target_op)
+                        if isinstance(mailbox, DirectLocalMailbox):
+                            mailbox.deposit(
+                                tensor_route.transfer_code,
+                                exec_step,
+                                self.spmd_id,
+                                self.rank,
+                                leaf_tensor,
+                            )
+                        elif isinstance(mailbox, DelegatedWorkerMailbox):
+                            self._ensure_step_declared(target_op, exec_step)
+                            await mailbox.deposit_local_tensor(
                                 transfer_code=tensor_route.transfer_code,
                                 step=exec_step,
                                 sender_id=self.spmd_id,
@@ -6692,14 +6744,8 @@ class SPMDWorker:
                                 tensor=leaf_tensor,
                             )
                         else:
-                            self._ensure_step_declared(target_op, exec_step)
-                            await self._mailbox.deposit_local_tensor(
-                                target_op,
-                                tensor_route.transfer_code,
-                                exec_step,
-                                self.spmd_id,
-                                self.rank,
-                                leaf_tensor,
+                            raise TypeError(
+                                f"Unsupported operator mailbox type: {type(mailbox)!r}"
                             )
                         if not deposit_complete.done():
                             deposit_complete.set_result(None)
@@ -6713,6 +6759,7 @@ class SPMDWorker:
                     self._coherence_sequencer.commit_payload(
                         (output_instance,),
                         retire_local_output,
+                        ticket_id=ticket_id,
                     )
                 )
 
@@ -6730,8 +6777,28 @@ class SPMDWorker:
 
                 retirement_task.add_done_callback(complete_deposit)
 
-                async def await_deposit(deposit_complete=deposit_complete) -> None:
-                    await asyncio.shield(deposit_complete)
+                lane_status, active_leases = (
+                    self._coherence_sequencer.inspect_lane_status(output_instance)
+                )
+
+                async def await_deposit(
+                    deposit_complete=deposit_complete,
+                    tensor_route=tensor_route,
+                    lane_status=lane_status,
+                    active_leases=active_leases,
+                ) -> None:
+                    if profiler_recorder is None:
+                        await asyncio.shield(deposit_complete)
+                    else:
+                        async with profiler_recorder.worker_local_delivery(
+                            op_name=send_context.compiled_plan.op_name,
+                            transfer_code=tensor_route.transfer_code,
+                            logical_tuuid=tensor_route.logical_tuuid,
+                            step=exec_step,
+                            active_consumer_leases=active_leases,
+                            status=lane_status,
+                        ):
+                            await asyncio.shield(deposit_complete)
 
                 deliveries.append(asyncio.create_task(await_deposit()))
         return tuple(deliveries)

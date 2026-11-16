@@ -419,10 +419,13 @@ sequenceDiagram
     W->>S: close_intent(epoch=7)
     W->>S: Await both results concurrently
     S->>R: Admit epoch 7 and execute complete fanout
-    R-->>S: Delivery complete
-    S->>S: Retire in order once consumer leases and other<br/>conditions settle
-    S->>R: Epoch 8 becomes runnable at lane head
-    R-->>S: Delivery complete
+    R-->>S: Epoch 7 delivery complete
+    par Epoch 8 Pipelined Delivery
+        S->>R: Epoch 8 admitted and executes fanout (decoupled from epoch 7 lease)
+        R-->>S: Epoch 8 delivery complete
+    and Epoch 7 Safe Retirement
+        S->>S: Retire epoch 7 in order once consumer leases settle
+    end
     S-->>W: Results complete in subject order
 ```
 
@@ -503,6 +506,64 @@ Reservation state and its index have separate thread protection. Fence snapshots
 the index, then cleans each record through the same state machine. Claim racing
 with fence cannot leave active counts behind. A worker-thread lease release
 schedules the count change on the sequencer's owner event loop.
+
+### Decoupled Delivery Pipeline and Resource Retirement
+
+`CoherenceSequencer` explicitly decouples data delivery from underlying resource retirement:
+
+1. **Delivery Pipeline (`next_intent_to_publish`)**: Governs when downstream operators can access data.
+   Once an epoch's payload delivery completes (`delivery_complete == True`), the next epoch on the same lane
+   can immediately be admitted and delivered without waiting for consumer leases of earlier epochs to be returned.
+   This prevents downstream compute latencies from causing Head-of-Line Blocking on the transport channel.
+2. **Resource Retirement (`discard_completed_prefix`)**: Governs when underlying memory buffers and directory
+   entries can be safely freed. An epoch intent is only retired (`TicketPhase.RETIRED`) and reclaimed when
+   `is_completed` is true (`sealed and active_payloads == 0 and active_consumer_leases == 0`).
+3. **Ticket-Level Lease Binding**: `acquire_consumer_lease()` and `reserve_consumer_lease()` bind target
+   payloads via explicit `ticket_id`. `TransportTensor` carries its assigned `coherence_ticket_id` during lease
+   reservation and acquisition. If an intent contains multiple tickets and no `ticket_id` is passed,
+   a `CoherenceStateTransitionError` is raised directly to eliminate ambiguity.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant W as Upstream Producer
+    participant S as CoherenceSequencer
+    participant C as Downstream Consumer
+
+    Note over W,C: Phase 1: Epoch N Delivery
+    W->>S: commit_payload(Epoch N)
+    S->>C: Deliver Tensor (DELIVERED)
+    C->>S: Acquire Consumer Lease (active_leases = 1)
+
+    Note over W,C: Phase 2: Decoupled Pipeline (Epoch N+1 does not wait for lease return)
+    W->>S: commit_payload(Epoch N+1)
+    rect rgb(240, 248, 255)
+    Note over S,C: Parallel: Consumer execution overlaps with subsequent delivery
+    C->>C: Consumer executes computation on Epoch N
+    S->>C: Sequencer admits and delivers Epoch N+1
+    end
+
+    Note over W,C: Phase 3: Safe Retirement and Reclamation
+    C->>S: Release Epoch N Lease (active_leases = 0)
+    S->>S: Epoch N safely retired and buffer reclaimed (RETIRED)
+```
+
+```mermaid
+flowchart LR
+    subgraph Channel["Subject Transport Lane Pipeline"]
+        direction LR
+        subgraph E1["Epoch N (Computing)"]
+            D1["Payload Delivered (DELIVERED)"] --> L1["Downstream Consumer Lease Active"]
+            L1 -->|Release Lease| R1["Retire & Reclaim (RETIRED)"]
+        end
+
+        subgraph E2["Epoch N+1 (Delivering)"]
+            D2["Admit & Deliver (DELIVERING)"] --> L2["Deliver to Downstream"]
+        end
+
+        D1 -.->|"Proceed upon delivery; do not wait for lease return"| D2
+    end
+```
 
 ## Release operator inputs
 

@@ -14,26 +14,27 @@ from typing import Any
 import numpy as np
 from numba import njit
 
-from fluxway.transport.manifest import (  # type: ignore
+from fluxway.common.coherence import CoherenceAction
+from fluxway.transport.coherence import pack_entry_state_flags
+from fluxway.transport.manifest import (
+    ENTRY_AUX,
     ENTRY_COMPACT_BEGIN,
-    ENTRY_COMPACT_COUNT,
-    ENTRY_EMPTY_KIND,  # type: ignore
     ENTRY_EXPECTED_COUNT,
     ENTRY_GLOBAL_SHAPE_BEGIN,
     ENTRY_GLOBAL_SHAPE_COUNT,
-    ENTRY_META_STATE,
-    ENTRY_MIN_ROWS,  # type: ignore
     ENTRY_PAYLOAD_BEGIN,
     ENTRY_PAYLOAD_COUNT,
-    ENTRY_TUUID,  # type: ignore
+    ENTRY_ROUTE_CODE,
+    ENTRY_STATE_FLAGS,
     ENTRY_WIDTH,
+    FRAME_ABI_TAG_FIELD,
     FRAME_ENTRY_COUNT,
     FRAME_FLAGS,
     FRAME_PAYLOAD_COUNT,
     FRAME_SENDER_RANK,
     FRAME_SENDER_SPMD_CODE,
     FRAME_SENDER_WORLD_SIZE,
-    FRAME_ABI_TAG_FIELD,
+    FRAME_STEP,
     FRAME_WIDTH,
     PAYLOAD_DTYPE,
     PAYLOAD_FLAGS,
@@ -45,8 +46,8 @@ from fluxway.transport.manifest import (  # type: ignore
     PAYLOAD_VALID_COUNT,
     PAYLOAD_WIDTH,
     TRANSPORT_ABI_TAG,
-    TensorEntryKind,
     PayloadRole,
+    TensorEntryKind,
     TransportFrame,
     TransportFrameBuilder,
     dtype_code,
@@ -110,19 +111,19 @@ def frame_metadata_nbytes(frame: TransportFrame) -> int:
 
 def build_current_frame(edge_count: int, rows: int, cols: int) -> TransportFrame:
     segment = np.zeros((rows, cols), dtype=np.float32)
-    builder = TransportFrameBuilder(  # type: ignore
+    builder = TransportFrameBuilder(
         step=7,
         sender_spmd_code=3,
         sender_rank=1,
         sender_world_size=4,
     )
     for edge_idx in range(edge_count):
-        edge = builder.add_entry(  # type: ignore
-            tuuid=1000 + edge_idx,
-            meta_state=0,
-            empty_kind=TensorEntryKind.DATA_EMPTY_ALLOWED,  # type: ignore
-            min_rows=0,
+        edge = builder.add_tensor_transfer_entry(
+            transfer_code=1000 + edge_idx,
+            layout_state=0,
+            tensor_kind=TensorEntryKind.TENSOR,
             expected_count=4,
+            coherence_epoch=0,
             global_shape=(rows, cols),
         )
         builder.add_payload(edge, PayloadRole.VALUES, segment, rows)
@@ -134,7 +135,7 @@ def build_preallocated_frame(edge_count: int, rows: int, cols: int) -> Transport
     idx = np.arange(edge_count, dtype=np.int32)
     frame_i32 = np.empty(FRAME_WIDTH, dtype=np.int32)
     frame_i32[FRAME_ABI_TAG_FIELD] = TRANSPORT_ABI_TAG
-    frame_i32[1] = 7
+    frame_i32[FRAME_STEP] = 7
     frame_i32[FRAME_SENDER_SPMD_CODE] = 3
     frame_i32[FRAME_SENDER_RANK] = 1
     frame_i32[FRAME_SENDER_WORLD_SIZE] = 4
@@ -143,17 +144,17 @@ def build_preallocated_frame(edge_count: int, rows: int, cols: int) -> Transport
     frame_i32[FRAME_FLAGS] = 0
 
     entry_i32 = np.zeros((edge_count, ENTRY_WIDTH), dtype=np.int32)
-    entry_i32[:, ENTRY_TUUID] = 1000 + idx
-    entry_i32[:, ENTRY_META_STATE] = 0
-    entry_i32[:, ENTRY_EMPTY_KIND] = 0  # type: ignore
+    entry_i32[:, ENTRY_ROUTE_CODE] = 1000 + idx
+    entry_i32[:, ENTRY_STATE_FLAGS] = pack_entry_state_flags(
+        0, int(TensorEntryKind.TENSOR), CoherenceAction.BUS_RD
+    )
     entry_i32[:, ENTRY_PAYLOAD_BEGIN] = idx
     entry_i32[:, ENTRY_PAYLOAD_COUNT] = 1
-    entry_i32[:, ENTRY_MIN_ROWS] = 0
     entry_i32[:, ENTRY_EXPECTED_COUNT] = 4
     entry_i32[:, ENTRY_COMPACT_BEGIN] = 0
-    entry_i32[:, ENTRY_COMPACT_COUNT] = 0
     entry_i32[:, ENTRY_GLOBAL_SHAPE_BEGIN] = idx * 2
     entry_i32[:, ENTRY_GLOBAL_SHAPE_COUNT] = 2
+    entry_i32[:, ENTRY_AUX] = 0
 
     payload_i32 = np.zeros((edge_count, PAYLOAD_WIDTH), dtype=np.int32)
     payload_i32[:, PAYLOAD_ROLE] = int(PayloadRole.VALUES)

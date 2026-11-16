@@ -99,7 +99,7 @@ python -m pip install "fluxway[profiler]"
 from pathlib import Path
 
 from fluxway import Graph, PlacementRecipe, start
-from fluxway.profiler import ProfilerConfig
+from fluxway.profiler import ProfilerConfig, ProfilerLevel
 
 
 async def profile_job(
@@ -108,6 +108,7 @@ async def profile_job(
     trace_directory: str | Path,
     run_id: str,
     *,
+    level: ProfilerLevel = ProfilerLevel.STANDARD,
     skip_initial_steps: int = 0,
     step_interval: int = 1,
     target_steps: tuple[int, ...] | None = None,
@@ -117,6 +118,7 @@ async def profile_job(
     config = ProfilerConfig(
         trace_dir=str(trace_directory),
         run_id=run_id,
+        level=level,
         skip_initial_steps=skip_initial_steps,
         step_interval=step_interval,
         target_steps=target_steps,
@@ -131,6 +133,14 @@ async def profile_job(
     assert config.output_path.is_file()
     return config.output_path
 ```
+
+Profiler 采集分为四个等级：`standard`（默认）保留算法相关的 prepare、
+local-plan、算子和高层 transport 计时；`summary` 只保留最高层事件；
+`detailed` 增加 runtime queue/future、delivery 和 mailbox 内部事件；callable
+线程执行仍属于 `standard`；`debug` 再增加
+scheduler、heartbeat、FSM 以及 admission decision。关闭的事件会在
+事件注册和 trace buffer 写入前过滤。Heartbeat 诊断仍需通过
+`ProfilerDiagnostic.HEARTBEAT` 单独开启。
 
 控制器在完成阶段收集工作进程的快照并写出轨迹。
 默认输出为 `trace_directory/run_id/trace.pftrace`；可以用 `output_file` 指定其他位置。

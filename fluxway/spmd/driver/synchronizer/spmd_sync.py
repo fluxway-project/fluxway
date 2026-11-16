@@ -49,11 +49,20 @@ class SyncPolicy(ABC):
         pass
 
 
-class MaxSkewSyncPolicy(SyncPolicy):
-    """Blocks a worker if its step is too far ahead of the slowest peer."""
+class MaxRankStepSkewSyncPolicy(SyncPolicy):
+    """Bound completed-step skew between ranks in one SPMD."""
 
-    def __init__(self, max_skew: int = 1):
-        self.max_skew = max_skew
+    def __init__(self, max_rank_step_skew: int = 0):
+        if (
+            not isinstance(max_rank_step_skew, int)
+            or isinstance(max_rank_step_skew, bool)
+            or max_rank_step_skew < 0
+        ):
+            raise ValueError(
+                "max_rank_step_skew must be a non-negative integer, "
+                f"got {max_rank_step_skew!r}."
+            )
+        self.max_rank_step_skew = max_rank_step_skew
 
     def evaluate(
         self,
@@ -66,7 +75,7 @@ class MaxSkewSyncPolicy(SyncPolicy):
     ) -> bool:
         skew_diff = max_step - min_step
         worker_step = worker_steps[rank].get(op_name, 0)
-        return skew_diff > self.max_skew and worker_step >= max_step
+        return skew_diff > self.max_rank_step_skew and worker_step >= max_step
 
 
 class OpRunnableEpochIssuer:
@@ -103,7 +112,7 @@ class SPMDSynchronizer:
     ):
         self.spmd_id = spmd_id
         self.num_workers = num_workers
-        self.sync_policy = sync_policy or MaxSkewSyncPolicy()
+        self.sync_policy = sync_policy or MaxRankStepSkewSyncPolicy()
 
         # Worker-level completed count tracking: rank -> {op_name -> count}
         self._worker_completed_count: dict[int, dict[str, int]] = {

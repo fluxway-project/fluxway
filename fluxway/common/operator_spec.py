@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from enum import StrEnum
+import inspect
 from typing import Annotated, Any
 
 from pydantic import (
@@ -49,6 +51,34 @@ type TensorAccessMap = Annotated[
 ]
 
 
+class OperatorExecutionTrait(StrEnum):
+    SYNC_COMPUTE = "sync_compute"
+    ASYNC_COROUTINE = "async_coroutine"
+
+    @classmethod
+    def from_callable(cls, fn: Any) -> OperatorExecutionTrait:
+        """Resolve the execution trait from any callable, safely unwrapping wrappers."""
+        if fn is None:
+            return cls.SYNC_COMPUTE
+        unwrapped = inspect.unwrap(fn)
+        if hasattr(unwrapped, "func"):
+            unwrapped = inspect.unwrap(unwrapped.func)
+        if inspect.iscoroutinefunction(unwrapped):
+            return cls.ASYNC_COROUTINE
+        return cls.SYNC_COMPUTE
+
+    @classmethod
+    def from_owner(
+        cls, owner: type | None, method_name: str | None
+    ) -> OperatorExecutionTrait:
+        """Resolve the execution trait from an owner class and method name."""
+        if owner is not None and isinstance(owner, type) and method_name:
+            fn = getattr(owner, method_name, None)
+            if fn is not None:
+                return cls.from_callable(fn)
+        return cls.SYNC_COMPUTE
+
+
 class OperatorSpec(BaseModel):
     _runtime_policy: CompiledAsyncPolicy = PrivateAttr()
 
@@ -62,6 +92,7 @@ class OperatorSpec(BaseModel):
     name: str = Field(min_length=1)
     owner: type | None = None
     method_name: str = Field(default="", min_length=1)
+    execution_trait: OperatorExecutionTrait | None = None
     requires_worker_process: bool = False
     is_source: bool | None = None
     source: Any | None = None
@@ -84,13 +115,16 @@ class OperatorSpec(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def default_method_name(cls, value: Any) -> Any:
-        if (
-            isinstance(value, Mapping)
-            and not value.get("method_name")
-            and value.get("name")
-        ):
-            return {**value, "method_name": value["name"]}
+    def default_execution_trait_and_method(cls, value: Any) -> Any:
+        if isinstance(value, Mapping):
+            val_dict = dict(value)
+            if not val_dict.get("method_name") and val_dict.get("name"):
+                val_dict["method_name"] = val_dict["name"]
+            if val_dict.get("execution_trait") is None:
+                val_dict["execution_trait"] = OperatorExecutionTrait.from_owner(
+                    val_dict.get("owner"), val_dict.get("method_name")
+                )
+            return val_dict
         return value
 
     @field_validator("owner")
@@ -229,6 +263,10 @@ class OperatorSpec(BaseModel):
     @property
     def has_source_descriptor(self) -> bool:
         return self.source is not None
+
+    @property
+    def is_coroutine_function(self) -> bool:
+        return self.execution_trait == OperatorExecutionTrait.ASYNC_COROUTINE
 
     @property
     def requires_source_control_runtime(self) -> bool:

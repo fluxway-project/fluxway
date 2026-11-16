@@ -66,9 +66,8 @@ class Metrics:
 
 
 def phase_policy(phase: str) -> AsyncPolicy:
-    return AsyncPolicy.pipeline_parallel(
+    return AsyncPolicy.pipelined(
         depth=2,
-        phases=PHASES,
         schedule=SchedulePolicy.phase_graph(
             phase=phase,
             phase_order=PHASES,

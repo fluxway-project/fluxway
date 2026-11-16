@@ -307,7 +307,7 @@ flowchart LR
     subgraph DownstreamLanes["Downstream Operator Lanes (InputSPMD)"]
         direction TB
         AsyncUnique["GPU/Network Communication async_unique"]
-        CpuFinalize["ctx.run_in_lane('compute')\nNumba & Tensor Materialization"]
+        CpuFinalize["Sync Compute Operator (compute lane)\nFeature & Tensor Materialization"]
         AsyncUnique --> CpuFinalize
     end
 
@@ -319,7 +319,7 @@ flowchart LR
 ### 1. Synchronous operator contract and non-blocking lane isolation
 * **Plain synchronous methods (`def read(self)`)**: Users write clean, idiomatic Python logic. The runtime scheduler (`UserCallableExecutor`) automatically dispatches standard synchronous functions to the `WORKER_PROCESS` thread pool lane.
 * **Hardware-level multi-core concurrency**: Underlying PyArrow, NumPy, and Numba C/C++ routines release the GIL during execution, achieving true hardware-level multi-core speedup while keeping the main asyncio event loop completely unblocked for cluster heartbeats and network coordination.
-* **Avoid CPU-heavy work in coroutines**: Never execute heavy Arrow/NumPy conversions or `TransportTensor` materializations directly on the asyncio event loop thread (`async def`). When CPU work must be conducted inside an async operator, offload it using `await self.ctx.run_in_lane(...)`.
+* **Sync and async isolation across canonical lanes**: Synchronous ingestion and compute operators run bounded on dedicated canonical lanes (`io` and `compute`), where C extensions release the GIL; cross-node asynchronous communication executes on `async def` coroutines with zero event loop blocking.
 
 ### 2. Zero-cost pipeline prefetching
 * No custom prefetcher classes, background queues, or circular buffers are required.
@@ -352,8 +352,7 @@ class ParquetRecommendationReader(BaseReader):
 
 | Paradigm / API | Signature | Execution Host | Best For | Architectural Advantages |
 | :--- | :--- | :--- | :--- | :--- |
-| **Sync Operator** | `def read(self)` / `def op(self)` | `WORKER_PROCESS` thread pool | Ingestion IO, unpacking, Arrow / NumPy parsing, matrix math | Zero async boilerplate, C extensions release GIL, event loop never blocked. |
-| **Async Operator** | `async def op(self)` | `COROUTINE_ASYNC` event loop | Network transfers, async IPC, lightweight event dispatch | Minimal context switch overhead for IO-bound concurrency. |
-| **Lane Offload** | `await self.ctx.run_in_lane(fn, *args, lane="compute")` | Dedicated bounded thread lane | Heavy CPU postprocessing (Numba, DLPack, indexing) within an async op | Bounded thread pool prevents CPU thrashing; propagates `contextvars` and profiler scopes without manual semaphores. |
-| **Unified Invoker** | `await invoke_callable_async(fn, *args, lane="default")` | Self-adapting dispatcher | Pipeline wrappers, generic adapters, custom transforms | Completely eliminates fragile `inspect.iscoroutinefunction` branching in client code. |
+| **Sync Ingestion Operator (IO)** | `def read(self)` (inherits `BaseReader` or `is_source=True`) | `WORKER_PROCESS` thread pool (`io` lane) | Ingestion IO, unpacking, Arrow / NumPy parsing, disk scans | Automatically assigned to `io` lane at compile time; zero async boilerplate; C extensions release GIL. |
+| **Sync Compute Operator (Compute)** | `def op(self)` | `WORKER_PROCESS` thread pool (`compute` lane) | Dense matrix math, feature hashing, forward passes, tensor processing | Automatically assigned to `compute` lane; auto-paired with `io` via `lane_order=("compute", "io")` for backpressure priority. |
+| **Async Operator** | `async def op(self)` | `COROUTINE_ASYNC` event loop (no lane) | Network transfers, async IPC, lightweight event dispatch | Minimal context switch overhead for IO-bound concurrency without taking worker thread slots. |
 

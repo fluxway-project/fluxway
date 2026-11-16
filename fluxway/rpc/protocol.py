@@ -5,10 +5,13 @@ Control plane operations (scheduling, heartbeats) still use native Ray.
 """
 
 from abc import ABC, abstractmethod
+import asyncio
 from dataclasses import dataclass
 from enum import StrEnum
 from inspect import isawaitable
 from typing import Any, ClassVar
+
+import ray
 
 from fluxway.common.tensor_backend import ensure_cpu_serializable
 from fluxway.common.tensor_protocol import DLPackTensor, dlpack_device
@@ -123,6 +126,19 @@ async def _await_required(result: Any, method_name: str) -> Any:
     return await result
 
 
+async def _await_ray_object_ref(ref: Any) -> Any:
+    if not isinstance(ref, ray.ObjectRef):
+        raise TypeError(
+            f"Ray ObjectRef wait requires ObjectRef, got {type(ref).__name__}."
+        )
+
+    try:
+        return await asyncio.to_thread(ray.get, ref)
+    except asyncio.CancelledError:
+        ray.cancel(ref, force=False)
+        raise
+
+
 class DataPlaneCallable(ABC):
     """
     Abstract base class providing a decoupled interface for data transmission.
@@ -196,7 +212,9 @@ class RayActorDataPlane(DataPlaneCallable):
 
         if profiler_recorder is None:
             cpu_frames = serialize_frames()
-            result = await self._handle.receive_transport_frames.remote(cpu_frames)
+            result = await _await_ray_object_ref(
+                self._handle.receive_transport_frames.remote(cpu_frames),
+            )
             return ReceiverIngressCompletion(result)
 
         with profiler_recorder.data_plane_ray_payload_serialize(
@@ -207,12 +225,13 @@ class RayActorDataPlane(DataPlaneCallable):
         with profiler_recorder.data_plane_ray_rpc_submit(frame_count=len(frames)):
             ref = self._handle.receive_transport_frames.remote(cpu_frames)
         async with profiler_recorder.data_plane_ray_rpc_wait(frame_count=len(frames)):
-            return ReceiverIngressCompletion(await ref)
+            return ReceiverIngressCompletion(await _await_ray_object_ref(ref))
 
     async def receive_control(
         self, op_name: str, step: int, names: list[str], values: list[Any]
     ) -> Any:
-        return await self._handle.receive_control.remote(op_name, step, names, values)
+        ref = self._handle.receive_control.remote(op_name, step, names, values)
+        return await _await_ray_object_ref(ref)
 
     def __repr__(self):
         return f"RayActorDataPlane(handle={self._handle})"

@@ -22,6 +22,7 @@ class PlainBusinessClass:
     resource_profile=ResourceProfile(base={"CPU": 1}),
     mesh_axis_names=("dp",),
     mesh_axis_shapes=(2,),
+    max_rank_step_skew=3,
 )
 class DecoratedSPMD:
     @operator(
@@ -59,6 +60,7 @@ def test_bind_spmd_creates_spmd_from_plain_class():
         resource_profile=ResourceProfile(base={"CPU": 2, "GPU": 1}),
         mesh_axis_names=("dp",),
         mesh_axis_shapes=(4,),
+        max_rank_step_skew=2,
         step={
             "input_sharding": {"emb": {"type": "static", "axis": ["dp"]}},
             "output_sharding": {"grad": {"type": "static", "axis": ["dp"]}},
@@ -73,6 +75,7 @@ def test_bind_spmd_creates_spmd_from_plain_class():
     assert "emb" in config.operator_specs["step"].input_sharding
     assert "grad" in config.operator_specs["step"].output_sharding
     assert config.mesh.size == 4
+    assert config.max_rank_step_skew == 2
 
     profile = BoundCls.get_resource_profile()
     assert profile.base["GPU"] == 1
@@ -112,6 +115,10 @@ def test_bind_spmd_preserves_business_class_identity() -> None:
         "business.right",
         "SharedName",
     )
+
+
+def test_spmd_decorator_sets_per_spmd_rank_step_skew():
+    assert DecoratedSPMD.get_spmd_config().max_rank_step_skew == 3
 
 
 def test_bind_spmd_multiple_operators():
@@ -173,6 +180,7 @@ def test_bind_spmd_as_source():
         resource_profile=ResourceProfile(base={"CPU": 1}),
         mesh_axis_names=("worker",),
         mesh_axis_shapes=(1,),
+        max_rank_step_skew=1,
         is_source=True,
         interleaved=True,
         interleave_unit_size=1,
@@ -183,6 +191,30 @@ def test_bind_spmd_as_source():
     config = BoundCls.get_spmd_config()
     meta = config.operator_specs["step"]
     assert meta.is_source is True
+    assert config.max_rank_step_skew == 1
+
+
+def test_spmd_config_rejects_negative_rank_step_skew():
+    with pytest.raises(ValueError, match="greater than or equal to 0"):
+        bind_spmd(
+            PlainBusinessClass,
+            mesh_axis_names=("worker",),
+            mesh_axis_shapes=(1,),
+            max_rank_step_skew=-1,
+            step={},
+        ).get_spmd_config()
+
+
+@pytest.mark.parametrize("value", [True, 1.0, "1"])
+def test_spmd_config_rejects_non_integer_rank_step_skew(value):
+    with pytest.raises(ValueError, match="valid integer"):
+        bind_spmd(
+            PlainBusinessClass,
+            mesh_axis_names=("worker",),
+            mesh_axis_shapes=(1,),
+            max_rank_step_skew=value,
+            step={},
+        ).get_spmd_config()
 
 
 def test_bind_spmd_source_descriptor_is_validated_with_source_trait():

@@ -645,6 +645,22 @@ def test_zero_copy_alias_has_independent_runtime_lifetime():
     assert alias.flat_values.tolist() == values.tolist()
 
 
+def test_zero_copy_alias_has_independent_coherence_ticket_lifetime():
+    values = np.arange(6, dtype=np.float32)
+    tensor = TransportTensor(values)
+    tensor._bind_coherence_ticket_id(7)
+
+    for make_alias in (tensor.zero_copy_alias, tensor.zero_copy_readonly_alias):
+        alias = make_alias()
+
+        assert tensor.coherence_ticket_id == 7
+        assert alias.coherence_ticket_id is None
+
+        alias._bind_coherence_ticket_id(11)
+        assert alias.coherence_ticket_id == 11
+        assert tensor.coherence_ticket_id == 7
+
+
 def test_zero_copy_readonly_alias_is_readonly_until_operator_grant():
     import numpy as np
     from fluxway.common.coherence import TensorAccessIntent

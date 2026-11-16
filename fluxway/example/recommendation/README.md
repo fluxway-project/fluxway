@@ -27,7 +27,7 @@ flowchart TD
 | Stage | Computation and ownership |
 | --- | --- |
 | Reader | Synchronous `def read(self)` operator declaring `AsyncPolicy.pipelined(depth=4)`, executed on the worker thread lane to pipeline batch materialization; reads canonical intervals acquired from `LogicalWorkLedger`. |
-| Input | Deduplicates IDs within its microbatch using `async_unique` and `ctx.run_in_lane("compute")` for concurrent worker-lane tensor materialization, preserving inverse indices and sample provenance. |
+| Input | Deduplicates IDs within its microbatch using `async_unique` and materializes tensors, preserving inverse indices and sample provenance. |
 | Embedding tables | Own keys by `key % shard_count`, perform lookups and apply sparse Adam updates. With two shards, shard 0 owns even keys and shard 1 owns odd keys. |
 | Dense | Reconstructs and pools embeddings, combines them with dense features, and computes a single linear output with mean squared error. Dense parameters use SGD with gradient accumulation. |
 | Checkpoint | Coordinates the source cut, Dense model state and sparse parameter/optimizer state. Recovery restores fresh actors before authorizing execution. |

@@ -14,6 +14,13 @@ class ProfilerDiagnostic(StrEnum):
     HEARTBEAT = "heartbeat"
 
 
+class ProfilerLevel(StrEnum):
+    SUMMARY = "summary"
+    STANDARD = "standard"
+    DETAILED = "detailed"
+    DEBUG = "debug"
+
+
 @dataclass(frozen=True, slots=True)
 class ProfilerConfig:
     trace_dir: str
@@ -29,12 +36,15 @@ class ProfilerConfig:
     target_steps: Iterable[int] | None = None
     max_steps: int | None = None
     steady_state_only: bool = False
+    level: ProfilerLevel = ProfilerLevel.STANDARD
 
     def __post_init__(self) -> None:
         if not self.trace_dir:
             raise ValueError("ProfilerConfig.trace_dir must be non-empty.")
         if not self.run_id:
             raise ValueError("ProfilerConfig.run_id must be non-empty.")
+        if not isinstance(self.level, ProfilerLevel):
+            raise TypeError("ProfilerConfig.level must be a ProfilerLevel")
         if self.buffer_bytes_per_process <= 0:
             raise ValueError(
                 "ProfilerConfig.buffer_bytes_per_process must be positive."

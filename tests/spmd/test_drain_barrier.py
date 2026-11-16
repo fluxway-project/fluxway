@@ -28,14 +28,19 @@ from fluxway.common.types import (
     DrainPhase,
     reduce_drain_boundary,
 )
-from fluxway.spmd.driver.synchronizer import SPMDSynchronizer, MaxSkewSyncPolicy
+from fluxway.spmd.driver.synchronizer import (
+    MaxRankStepSkewSyncPolicy,
+    SPMDSynchronizer,
+)
 
 
 def _make_sync(num_workers: int = 2) -> SPMDSynchronizer:
     return SPMDSynchronizer(
         spmd_id="test_spmd",
         num_workers=num_workers,
-        sync_policy=MaxSkewSyncPolicy(max_skew=100),  # disable policy blocking
+        sync_policy=MaxRankStepSkewSyncPolicy(
+            max_rank_step_skew=100
+        ),  # disable policy blocking
     )
 
 

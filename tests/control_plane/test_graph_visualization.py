@@ -30,9 +30,8 @@ _CONDITION = _condition_factory(0)
 
 
 def _phase_policy(phase: str, lane: str) -> AsyncPolicy:
-    return AsyncPolicy.pipeline_parallel(
+    return AsyncPolicy.pipelined(
         depth=2,
-        phases=_PHASE_ORDER,
         schedule=SchedulePolicy.phase_graph(
             phase=phase,
             phase_order=_PHASE_ORDER,

@@ -20,6 +20,38 @@ def _make_executor() -> LocalStepPlanExecutor:
     )
 
 
+def test_plan_rejects_invalid_metadata_at_construction():
+    with pytest.raises(ValueError, match="dependency_offsets length"):
+        LocalStepPlan(
+            node_kinds=(int(LocalStepNodeKind.CALL),),
+            callable_ids=("op",),
+            resource_ids=(-1,),
+            dependency_offsets=(0,),
+            dependencies=(),
+            result_node=0,
+        )
+
+
+def test_plan_freezes_sequence_inputs_before_caching_derived_state():
+    node_kinds = [int(LocalStepNodeKind.CALL)]
+    callable_ids = ["op"]
+    plan = LocalStepPlan(
+        node_kinds=node_kinds,
+        callable_ids=callable_ids,
+        resource_ids=[-1],
+        dependency_offsets=[0, 0],
+        dependencies=[],
+        result_node=0,
+    )
+
+    node_kinds.append(int(LocalStepNodeKind.SEND))
+    callable_ids.clear()
+
+    assert plan.node_kinds == (int(LocalStepNodeKind.CALL),)
+    assert plan.callable_ids == ("op",)
+    assert plan._serial_chain
+
+
 @pytest.mark.asyncio
 async def test_single_call_plan_returns_result():
     executor = _make_executor()
@@ -27,6 +59,28 @@ async def test_single_call_plan_returns_result():
     registry = MappingCallableRegistry({"op": lambda: 7})
 
     assert await executor.execute(plan, registry) == 7
+
+
+@pytest.mark.asyncio
+async def test_execution_uses_construction_time_plan_validation(monkeypatch):
+    validate = LocalStepPlan.validate
+    validation_count = 0
+
+    def count_validation(plan):
+        nonlocal validation_count
+        validation_count += 1
+        validate(plan)
+
+    monkeypatch.setattr(LocalStepPlan, "validate", count_validation)
+    plan = LocalStepPlan.single_call("op")
+    initial_validations = validation_count
+    assert initial_validations == 1
+
+    executor = _make_executor()
+    result = await executor.execute(plan, MappingCallableRegistry({"op": lambda: 7}))
+
+    assert result == 7
+    assert validation_count == initial_validations
 
 
 @pytest.mark.asyncio
@@ -260,3 +314,54 @@ async def test_drain_waits_for_active_plan():
     await task
     await drain_task
     assert finished
+
+
+@pytest.mark.asyncio
+async def test_transitive_dependency_chain_uses_serial_execution():
+    executor = _make_executor()
+    events: list[str] = []
+
+    async def wait_inputs():
+        events.append("wait")
+        return 1
+
+    async def call_user(value):
+        events.append("call")
+        return value + 1
+
+    async def send(wait_value, call_value):
+        events.append("send")
+        return wait_value + call_value
+
+    async def commit(value):
+        events.append("commit")
+        return value
+
+    plan = LocalStepPlan(
+        node_kinds=(
+            int(LocalStepNodeKind.WAIT),
+            int(LocalStepNodeKind.CALL),
+            int(LocalStepNodeKind.SEND),
+            int(LocalStepNodeKind.BARRIER),
+        ),
+        callable_ids=("wait", "call", "send", "commit"),
+        resource_ids=(-1, -1, -1, -1),
+        dependency_offsets=(0, 0, 1, 3, 4),
+        dependencies=(0, 0, 1, 2),
+        result_node=3,
+    )
+
+    result = await executor.execute(
+        plan,
+        MappingCallableRegistry(
+            {
+                "wait": wait_inputs,
+                "call": call_user,
+                "send": send,
+                "commit": commit,
+            }
+        ),
+    )
+
+    assert result == 3
+    assert events == ["wait", "call", "send", "commit"]

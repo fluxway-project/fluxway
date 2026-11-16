@@ -5,6 +5,7 @@ import asyncio
 import json
 import statistics
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -105,11 +106,14 @@ def build_registry(config: BenchConfig) -> MappingCallableRegistry:
         ):
             checksum = (microstep + 1) * 100 + len(suffix)
 
-            async def run(delay_s: float = delay, value: int = checksum) -> int:
-                await asyncio.sleep(delay_s)
-                return value
+            def _make_run(delay_s: float, value: int) -> Callable[..., Any]:
+                async def run(*_args: Any) -> int:
+                    await asyncio.sleep(delay_s)
+                    return value
 
-            callables[f"m{microstep}:{suffix}"] = run
+                return run
+
+            callables[f"m{microstep}:{suffix}"] = _make_run(delay, checksum)
     return MappingCallableRegistry(callables)
 
 

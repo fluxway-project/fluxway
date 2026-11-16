@@ -99,8 +99,21 @@ class SchedulePolicy(FluxwayBaseSchema):
     micro_step_key: str = "step"
 
     @classmethod
-    def fifo(cls, base_priority: int = 0) -> SchedulePolicy:
-        return cls(kind="fifo", base_priority=base_priority)
+    def fifo(
+        cls,
+        base_priority: int = 0,
+        *,
+        lane: str | None = None,
+        lane_order: tuple[str, ...] = (),
+        lane_priorities: dict[str, int] | None = None,
+    ) -> SchedulePolicy:
+        return cls(
+            kind="fifo",
+            base_priority=base_priority,
+            lane=lane,
+            lane_order=lane_order,
+            lane_priorities={} if lane_priorities is None else lane_priorities,
+        )
 
     @classmethod
     def deadline_boost(
@@ -108,12 +121,19 @@ class SchedulePolicy(FluxwayBaseSchema):
         base_priority: int = 0,
         boost_priority: int = 100,
         trigger: str = "staleness_limit",
+        *,
+        lane: str | None = None,
+        lane_order: tuple[str, ...] = (),
+        lane_priorities: dict[str, int] | None = None,
     ) -> SchedulePolicy:
         return cls(
             kind="deadline_boost",
             base_priority=base_priority,
             boost_priority=boost_priority,
             trigger=trigger,
+            lane=lane,
+            lane_order=lane_order,
+            lane_priorities={} if lane_priorities is None else lane_priorities,
         )
 
     @classmethod
@@ -124,6 +144,9 @@ class SchedulePolicy(FluxwayBaseSchema):
         phase_order: tuple[str, ...],
         micro_step_key: str = "step",
         base_priority: int = 0,
+        lane: str | None = None,
+        lane_order: tuple[str, ...] = (),
+        lane_priorities: dict[str, int] | None = None,
     ) -> SchedulePolicy:
         return cls(
             kind="phase_order",
@@ -131,6 +154,9 @@ class SchedulePolicy(FluxwayBaseSchema):
             phase_order=phase_order,
             micro_step_key=micro_step_key,
             base_priority=base_priority,
+            lane=lane,
+            lane_order=lane_order,
+            lane_priorities={} if lane_priorities is None else lane_priorities,
         )
 
     @classmethod
@@ -290,11 +316,18 @@ class AsyncPolicy(FluxwayBaseSchema):
     state: StatePolicy = Field(default_factory=StatePolicy.exclusive)
     schedule: SchedulePolicy = Field(default_factory=SchedulePolicy.fifo)
     max_staleness: int | None = None
-    phases: tuple[str, ...] = ()
 
     @classmethod
-    def sync(cls) -> AsyncPolicy:
-        return cls(mode="sync")
+    def sync(
+        cls,
+        schedule: SchedulePolicy | None = None,
+        state: StatePolicy | None = None,
+    ) -> AsyncPolicy:
+        return cls(
+            mode="sync",
+            schedule=SchedulePolicy.fifo() if schedule is None else schedule,
+            state=StatePolicy.exclusive() if state is None else state,
+        )
 
     @classmethod
     def pipelined(
@@ -308,8 +341,8 @@ class AsyncPolicy(FluxwayBaseSchema):
             mode="pipelined",
             depth=depth,
             commit=commit,
-            schedule=schedule or SchedulePolicy.fifo(),
-            state=state or StatePolicy.exclusive(),
+            schedule=SchedulePolicy.fifo() if schedule is None else schedule,
+            state=StatePolicy.exclusive() if state is None else state,
         )
 
     @classmethod
@@ -326,29 +359,12 @@ class AsyncPolicy(FluxwayBaseSchema):
             depth=depth,
             commit=commit,
             max_staleness=max_staleness,
-            schedule=schedule or SchedulePolicy.deadline_boost(),
-            state=state or StatePolicy.thread_safe(),
-        )
-
-    @classmethod
-    def pipeline_parallel(
-        cls,
-        depth: int,
-        phases: tuple[str, ...],
-        schedule: SchedulePolicy,
-        commit: str = "ordered",
-    ) -> AsyncPolicy:
-        return cls(
-            mode="pipeline_parallel",
-            depth=depth,
-            commit=commit,
-            phases=phases,
-            schedule=schedule,
-            state=StatePolicy.exclusive(),
+            schedule=SchedulePolicy.deadline_boost() if schedule is None else schedule,
+            state=StatePolicy.thread_safe() if state is None else state,
         )
 
     def model_post_init(self, __context: Any) -> None:
-        if self.mode not in ("sync", "pipelined", "bounded_stale", "pipeline_parallel"):
+        if self.mode not in ("sync", "pipelined", "bounded_stale"):
             raise ValueError(f"Unsupported AsyncPolicy mode {self.mode!r}.")
         if self.depth <= 0:
             raise ValueError(f"AsyncPolicy.depth must be positive, got {self.depth}.")
@@ -359,37 +375,26 @@ class AsyncPolicy(FluxwayBaseSchema):
         if self.mode == "sync" and self.depth != 1:
             raise ValueError("AsyncPolicy.sync() must use depth=1.")
         if self.mode == "bounded_stale":
-            limit = self.max_staleness_limit()
-            if limit is None:
+            if self.max_staleness is None:
                 raise ValueError("AsyncPolicy.bounded_stale requires max_staleness.")
-            if limit < 0:
+            if self.max_staleness < 0:
                 raise ValueError(
-                    f"AsyncPolicy.max_staleness must be non-negative, got {limit}."
+                    f"AsyncPolicy.max_staleness must be non-negative, got {self.max_staleness}."
                 )
-            if self.depth > limit + 1:
+            if self.depth > self.max_staleness + 1:
                 raise ValueError(
                     "AsyncPolicy.bounded_stale requires depth <= max_staleness + 1, "
-                    f"got depth={self.depth} max_staleness={limit}."
+                    f"got depth={self.depth} max_staleness={self.max_staleness}."
                 )
         elif self.max_staleness is not None:
             raise ValueError(
                 f"AsyncPolicy mode {self.mode!r} cannot define max_staleness."
             )
-        if self.mode == "pipeline_parallel":
-            if not self.phases:
-                raise ValueError("AsyncPolicy.pipeline_parallel requires phases.")
-            if self.schedule.kind not in ("phase_order", "phase_graph"):
-                raise ValueError(
-                    "AsyncPolicy.pipeline_parallel requires a phase schedule."
-                )
-
-    def max_staleness_limit(self) -> int | None:
-        return self.max_staleness
 
     def compile(self) -> CompiledAsyncPolicy:
-        max_async_lag = self.max_staleness_limit()
-        if self.mode in ("pipelined", "pipeline_parallel"):
-            max_async_lag = self.depth - 1
+        max_async_lag = (
+            self.depth - 1 if self.mode == "pipelined" else self.max_staleness
+        )
         return CompiledAsyncPolicy(
             mode=self.mode,
             pipeline_depth=self.depth,
@@ -400,6 +405,7 @@ class AsyncPolicy(FluxwayBaseSchema):
             state_resource=self.state.resource,
             schedule=self.schedule,
             priority=self.schedule.base_priority,
+            max_staleness=self.max_staleness,
         )
 
 
@@ -414,3 +420,12 @@ class CompiledAsyncPolicy:
     state_resource: str | None
     schedule: SchedulePolicy
     priority: int
+    max_staleness: int | None = None
+
+    @property
+    def is_pipelined(self) -> bool:
+        return self.pipeline_depth > 1
+
+    @property
+    def has_bounded_staleness(self) -> bool:
+        return self.max_staleness is not None

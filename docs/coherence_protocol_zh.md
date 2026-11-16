@@ -390,10 +390,13 @@ sequenceDiagram
     W->>S: close_intent(epoch=7)
     W->>S: 并发等待两个版本结果
     S->>R: 准入版本 7，执行完整扇出
-    R-->>S: 交付完成
-    S->>S: 满足消费租约等退休条件后有序退休
-    S->>R: 版本 8 成为可执行的通道首部
-    R-->>S: 交付完成
+    R-->>S: 版本 7 交付完成
+    par 版本 8 流水线交付
+        S->>R: 准入版本 8 并执行扇出（解耦推进，无需等待版本 7 租约归还）
+        R-->>S: 版本 8 交付完成
+    and 版本 7 安全退役
+        S->>S: 满足消费租约归还等条件后有序退役版本 7
+    end
     S-->>W: 按主体顺序完成结果
 ```
 
@@ -464,6 +467,56 @@ asyncio.run(reserved_consumer())
 
 预留状态和索引各有线程保护。封锁先取得索引快照，再通过同一状态机清理各条记录，
 领取与封锁交错不能遗留活动计数。工作线程释放租约时，将计数变更提交到排序器所属事件循环。
+
+### 数据交付与资源回收解耦机制
+
+`CoherenceSequencer` 将**数据交付推进**与**底层资源回收**这两个生命周期严格解耦：
+
+1. **交付推进（Delivery Pipeline）**：由 `next_intent_to_publish` 调度，关注下游算子何时能获取数据。当 Epoch N 的张量送达完成（`delivery_complete == True`）后，同一通道上的 Epoch N+1 即可立即准入并开始送达，完全不阻塞于下游算子对 Epoch N 的消费耗时，彻底消除通道排头阻塞（Head-of-Line Blocking）与流水线气泡。
+2. **资源安全回收（Resource Retirement）**：由 `discard_completed_prefix` 驱动，关注底层内存与目录条目何时能安全释放。Epoch N+1 交付计算的同时，Epoch N 占用的内存与状态由独立的消费者租约（Consumer Lease）严密锁定；只有当所有下游算子计算完毕并归还租约（`active_consumer_leases == 0`）且意图密封（`sealed`）后，Epoch N 才会正式退役（`TicketPhase.RETIRED`）并回收底层资源。
+3. **Ticket 级精确租约控制**：同一 Epoch 内若包含多个张量，每个张量通过唯一的 `ticket_id` 精确绑定目标交付载荷，独立计数并归还租约。若存在多个 ticket 且未指定 `ticket_id`，系统直接抛出 `CoherenceStateTransitionError`，彻底避免歧义。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant W as 上游传输 (Producer)
+    participant S as 排序器 (Sequencer)
+    participant C as 下游算子 (Consumer)
+
+    Note over W,C: 阶段 1：Epoch N 交付
+    W->>S: commit_payload(Epoch N)
+    S->>C: 交付 Tensor (DELIVERED)
+    C->>S: 持有消费租约 (active_leases = 1)
+
+    Note over W,C: 阶段 2：交付解耦推进（Epoch N+1 无需等待租约归还）
+    W->>S: commit_payload(Epoch N+1)
+    rect rgb(240, 248, 255)
+    Note over S,C: 并行执行：消费与下一轮交付重叠
+    C->>C: 算子并行执行 Epoch N 计算
+    S->>C: 并行完成 Epoch N+1 传输并交付
+    end
+
+    Note over W,C: 阶段 3：安全退役与内存回收
+    C->>S: 计算完毕，释放 Epoch N 租约 (active_leases = 0)
+    S->>S: Epoch N 安全退役 (Retire)，回收底层 Buffer
+```
+
+```mermaid
+flowchart LR
+    subgraph Channel["同一 Subject 传输通道流水线"]
+        direction LR
+        subgraph E1["Epoch N (计算中)"]
+            D1["载荷送达 (DELIVERED)"] --> L1["持有 Lease 算子消费中"]
+            L1 -->|归还租约| R1["退役回收 (RETIRED)"]
+        end
+
+        subgraph E2["Epoch N+1 (交付中)"]
+            D2["准入并送达 (DELIVERING)"] --> L2["交付算子"]
+        end
+
+        D1 -.->|"送达即放行，不等 Lease 归还"| D2
+    end
+```
 
 ## 释放算子输入
 

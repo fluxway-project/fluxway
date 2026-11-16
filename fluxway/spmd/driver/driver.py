@@ -42,7 +42,10 @@ from fluxway.common.effect_scheduler import (
 from fluxway.rpc.protocol import DataPlaneCallable
 from fluxway.spmd.driver.credit import CreditUpdate, CreditWindow
 from fluxway.spmd.driver.state_machine import DriverStateMachine
-from fluxway.spmd.driver.synchronizer import SPMDSynchronizer, MaxSkewSyncPolicy
+from fluxway.spmd.driver.synchronizer import (
+    MaxRankStepSkewSyncPolicy,
+    SPMDSynchronizer,
+)
 from fluxway.spmd.driver.monitor import SPMDMonitor
 from fluxway.spmd.driver.executor.ray_executor import RayWorkerExecutor
 from fluxway.spmd.driver.snapshot.orchestrator import SnapshotOrchestrator
@@ -100,7 +103,7 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
         self.spmd_synchronizer = SPMDSynchronizer(
             spmd_id=spmd_id,
             num_workers=config.num_workers,
-            sync_policy=MaxSkewSyncPolicy(config.max_worker_step_skew),
+            sync_policy=MaxRankStepSkewSyncPolicy(config.max_rank_step_skew),
         )
         self.spmd_synchronizer.register_expected_ops(
             config.require_graph_view().operator_ids

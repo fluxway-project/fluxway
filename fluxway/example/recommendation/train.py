@@ -15,7 +15,7 @@ import fluxway
 from fluxway.control_plane.graph.functional import FunctionalGraph
 from fluxway.control_plane.checkpointer.directory import CheckpointDirectory
 from fluxway.common.types import CheckpointConfig, SourceControlConfig
-from fluxway.profiler import ProfilerDiagnostic
+from fluxway.profiler import ProfilerDiagnostic, ProfilerLevel
 from fluxway.placement import (
     AFFINITY_FIRST,
     PlacementRecipe,
@@ -57,6 +57,7 @@ def _build_profiler_config(args):
     config = ProfilerConfig(
         trace_dir=args.profiler_trace_dir,
         run_id=run_id,
+        level=ProfilerLevel(args.profiler_level),
         buffer_bytes_per_process=args.profiler_buffer_mib * 1024 * 1024,
         clock_sync_rounds=args.profiler_clock_sync_rounds,
         max_clock_uncertainty_ns=args.profiler_max_clock_uncertainty_us * 1000,
@@ -499,6 +500,12 @@ def main():
         "--profiler-run-id",
         default=None,
         help="Profiler run id under --profiler-trace-dir",
+    )
+    parser.add_argument(
+        "--profiler-level",
+        choices=[item.value for item in ProfilerLevel],
+        default=ProfilerLevel.STANDARD.value,
+        help="Profiler event level: summary, standard, detailed, or debug",
     )
     parser.add_argument(
         "--profiler-buffer-mib",

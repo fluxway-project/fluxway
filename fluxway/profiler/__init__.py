@@ -1,6 +1,6 @@
 """Optional low-overhead profiler runtime for Fluxway."""
 
-from fluxway.profiler.config import ProfilerConfig, ProfilerDiagnostic
+from fluxway.profiler.config import ProfilerConfig, ProfilerDiagnostic, ProfilerLevel
 from fluxway.profiler.errors import (
     CausalClockViolation,
     ClockSyncUnstable,
@@ -31,6 +31,7 @@ __all__ = [
     "ProfilerBufferExhausted",
     "ProfilerConfig",
     "ProfilerDiagnostic",
+    "ProfilerLevel",
     "ProfilerRuntimeFactory",
     "TraceCarrier",
     "TraceEventKind",
